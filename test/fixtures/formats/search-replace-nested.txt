@@ -1,0 +1,14 @@
+function foo() {
+  const nested = {
+    key: `<<<<<<< SEARCH
+old code
+=======
+new code
+>>>>>>> REPLACE`
+  };
+<<<<<<< SEARCH
+  return nested.key;
+=======
+  return nested.key.toUpperCase();
+>>>>>>> REPLACE
+}

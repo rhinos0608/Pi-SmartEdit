@@ -1,0 +1,13 @@
+*** Begin Patch
+*** Update File: src/main.ts
+@@ function handleLogin(email) {
+-  const user = db.findUser(email);
++  const user = await db.findUser(email);
++  console.log('found user');
+ }
+@@ function handleLogout(userId) {
+-  session.clear(userId);
++  await session.clear(userId);
++  emit('logout', userId);
+ }
+*** End Patch

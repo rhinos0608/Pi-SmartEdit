@@ -1,0 +1,18 @@
+--- a/src/main.ts
++++ b/src/main.ts
+@@ -1,12 +1,13 @@
+ import { greet } from './utils';
+ 
++// Entry point
+ console.log('Hello');
++console.log('World');
+ 
+ function main() {
+   // stuff
+ }
+ 
+ export function helper() {
+-  const temp = 1;
+-  return temp;
++  return 42;
+ }

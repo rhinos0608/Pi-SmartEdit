@@ -1,0 +1,7 @@
+// Simple search/replace test
+function hello() {
+<<<<<<< SEARCH
+  console.log("hello");
+=======
+  console.log("hi there");
+>>>>>>> REPLACE

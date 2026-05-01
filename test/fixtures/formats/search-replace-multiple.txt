@@ -1,0 +1,13 @@
+file1.ts
+<<<<<<< SEARCH
+const a = 1;
+=======
+const a = 10;
+>>>>>>> REPLACE
+
+file2.ts
+<<<<<<< SEARCH
+const b = 2;
+=======
+const b = 20;
+>>>>>>> REPLACE

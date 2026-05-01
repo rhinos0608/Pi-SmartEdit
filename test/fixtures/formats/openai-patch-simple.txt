@@ -1,0 +1,7 @@
+*** Begin Patch
+*** Update File: src/file.ts
+@@ function fetchData(userId) {
+-  const response = await fetch(`/api/users/${userId}`);
++  const response = await fetch(`/api/users/${userId}`, { headers });
+ }
+*** End Patch
