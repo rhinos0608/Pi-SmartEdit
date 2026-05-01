@@ -46,6 +46,8 @@ import { parseOpenAIPatch, openAIPatchToEditItem } from "./src/formats/openai-pa
 
 import { LSPManager } from "./src/lsp/lsp-manager";
 import { checkPostEditDiagnostics } from "./src/lsp/diagnostics";
+import { getCompilerForLanguage } from "./src/lsp/diagnostic-dispatcher";
+import type { DiagnosticResult } from "./src/lsp/diagnostic-dispatcher";
 
 import type {
   EditAnchor,
@@ -1548,32 +1550,52 @@ export default function smartEdit(pi: ExtensionAPI) {
             text = `Successfully replaced ${matchCount} block(s) in ${path}.`;
           }
 
-          // ── Post-edit LSP diagnostics (non-blocking) ──
+          // ── Post-edit diagnostic check: LSP + compiler fallback ──
+          // First check LSP diagnostics, then fall back to compilers if no results
           if (lspManager) {
             const languageId = detectLanguageFromExtension(path);
             if (languageId) {
+              // Phase 1: LSP diagnostics
               const diagResult = await checkPostEditDiagnostics(
                 absolutePath,
                 normalizedContent,
                 languageId,
                 lspManager,
               );
-              if (diagResult.source === "lsp" && diagResult.diagnostics.length > 0) {
-                const errors = diagResult.diagnostics.filter((d) => d.severity === 1);
-                const warnings = diagResult.diagnostics.filter((d) => d.severity === 2);
+
+              // Phase 2: Compiler fallback (runs if LSP found nothing)
+              const compilerRunner = getCompilerForLanguage(languageId);
+              let compilerResult: DiagnosticResult = { diagnostics: [], source: "none" };
+              if (compilerRunner && diagResult.diagnostics.length === 0) {
+                compilerResult = await compilerRunner(absolutePath, dirname(absolutePath));
+              }
+
+              // Aggregate results from both phases
+              const allDiagnostics = [...diagResult.diagnostics];
+              if (compilerResult.diagnostics.length > 0) {
+                allDiagnostics.push(...compilerResult.diagnostics);
+              }
+
+              if (allDiagnostics.length > 0) {
+                const errors = allDiagnostics.filter((d) => d.severity === 1);
+                const warnings = allDiagnostics.filter((d) => d.severity === 2);
+                const sources = new Set([diagResult.source, compilerResult.source].filter(s => s !== "none"));
 
                 if (errors.length > 0) {
                   matchNotes.push(
-                    `⚠ LSP detected ${errors.length} error(s) after edit: ` +
+                    `⚠ ${[...sources].join("+")} detected ${errors.length} error(s): ` +
                     errors.map((e) => `line ${e.range.start.line + 1}: ${e.message}`).join("; ")
                   );
                 }
                 if (warnings.length > 0) {
                   matchNotes.push(
-                    `ℹ LSP has ${warnings.length} warning(s): ` +
+                    `ℹ ${[...sources].join("+")} has ${warnings.length} warning(s): ` +
                     warnings.map((w) => w.message).join("; ")
                   );
                 }
+              } else if (diagResult.source !== "none") {
+                // LSP is active and found no issues
+                matchNotes.push("✓ LSP validated: no issues found");
               }
             }
           }

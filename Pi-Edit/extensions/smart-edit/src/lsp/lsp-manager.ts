@@ -45,6 +45,7 @@ export class LSPManager {
    * an issue in practice.
    */
   private static readonly SERVER_CONFIGS: ServerConfig[] = [
+    // TypeScript / JavaScript
     {
       command: "typescript-language-server",
       args: ["--stdio"],
@@ -54,6 +55,80 @@ export class LSPManager {
       command: "typescriptlangserver",
       args: ["--stdio"],
       languageIds: ["typescript", "typescriptreact", "javascript", "javascriptreact"],
+    },
+    // Python
+    {
+      command: "pyright",
+      args: ["--stdio"],
+      languageIds: ["python"],
+    },
+    {
+      command: "pylsp",
+      args: ["--stdio"],
+      languageIds: ["python"],
+    },
+    {
+      command: "pyls",
+      args: ["--stdio"],
+      languageIds: ["python"],
+    },
+    {
+      command: "jedi-language-server",
+      args: ["--stdio"],
+      languageIds: ["python"],
+    },
+    // Rust
+    {
+      command: "rust-analyzer",
+      args: ["--stdio"],
+      languageIds: ["rust"],
+    },
+    // Go
+    {
+      command: "gopls",
+      args: [],
+      languageIds: ["go"],
+    },
+    // Java
+    {
+      command: "java",
+      args: ["-jar", "${JDT_LS_JAR}", "--stdio"],
+      languageIds: ["java"],
+    },
+    {
+      command: "jdtls",
+      args: [],
+      languageIds: ["java"],
+    },
+    // Ruby
+    {
+      command: "solargraph",
+      args: ["--stdio"],
+      languageIds: ["ruby"],
+    },
+    // JSON
+    {
+      command: "vscode-json-language-server",
+      args: ["--stdio"],
+      languageIds: ["json"],
+    },
+    // HTML
+    {
+      command: "vscode-html-language-server",
+      args: ["--stdio"],
+      languageIds: ["html"],
+    },
+    // CSS
+    {
+      command: "vscode-css-language-server",
+      args: ["--stdio"],
+      languageIds: ["css"],
+    },
+    // Markdown
+    {
+      command: "marksman",
+      args: ["--stdio"],
+      languageIds: ["markdown"],
     },
   ];
 
@@ -87,10 +162,24 @@ export class LSPManager {
         continue;
       }
 
+      // Resolve runtime config values (e.g., JDT_LS_JAR for Java)
+      let args = [...config.args];
+      if (config.languageIds.includes("java")) {
+        const jdtLsJar = process.env.JDT_LS_JAR;
+        if (!jdtLsJar) {
+          console.warn("[smart-edit] JDT_LS_JAR environment variable is not set for Java LSP");
+          continue;
+        }
+        // Substitute the jar path
+        args = args.map((arg) =>
+          arg === "${JDT_LS_JAR}" ? jdtLsJar : arg
+        );
+      }
+
       // Start and initialize server
       let conn: LSPConnection | undefined;
       try {
-        conn = new LSPConnection(commandPath, config.args);
+        conn = new LSPConnection(commandPath, args);
         await conn.initialize(this.rootUri);
         // Only cache after successful initialization
         this.connections.set(languageId, conn);
