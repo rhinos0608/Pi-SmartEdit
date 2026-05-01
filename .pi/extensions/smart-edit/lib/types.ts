@@ -190,8 +190,8 @@ export interface FileSnapshot {
   hashline?: {
     /** Map from LINE+ID anchor to { text, line } for all lines in the file */
     anchors: Map<string, { text: string; line: number }>;
-    /** Full file content with hashline prefixes prepended to each line: "42ab|text" */
-    formattedContent: string;
+    /** Formatted lines with hashline prefixes prepended: "42ab|text" */
+    formattedLines: string[];
   };
 }
 
@@ -208,9 +208,8 @@ export interface EditResult {
 /**
  * Fast content hash using SHA-256 truncated to 16 hex chars.
  * Provides sub-ms hashing for typical source files.
- * Note: Not xxhash64 — using crypto SHA-256 for portability
- * (no native addon dependency). Truncation makes it suitable
- * for content comparison, not cryptographic use.
+ * Uses crypto SHA-256 for portability (no native addon dependency).
+ * Truncation makes it suitable for content comparison, not cryptographic use.
  */
 import { createHash } from "crypto";
 
