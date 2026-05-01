@@ -11,7 +11,10 @@
  * - Zero native dependencies — all via web-tree-sitter WASM
  */
 
+import { createRequire } from "module";
 import type Parser from "web-tree-sitter";
+
+const _require = createRequire(import.meta.url);
 
 const VSCODE_WASM_PACKAGE = "@vscode/tree-sitter-wasm";
 const WASM_DIR = "wasm";
@@ -72,7 +75,7 @@ async function initParser(): Promise<typeof Parser> {
  */
 function resolveWasmPath(wasmFile: string): string {
   try {
-    return require.resolve(`${VSCODE_WASM_PACKAGE}/${WASM_DIR}/${wasmFile}`);
+    return _require.resolve(`${VSCODE_WASM_PACKAGE}/${WASM_DIR}/${wasmFile}`);
   } catch {
     throw new Error(
       `Grammar WASM ${wasmFile} not found in ${VSCODE_WASM_PACKAGE}. ` +
