@@ -168,7 +168,7 @@ describe("AST fallback token extraction", () => {
       getSnapshot: () => ({ contentHash: "abc", partial: false }),
       recordRead: () => {},
       lspManager: null,
-      astResolver: null,
+      astResolver: undefined,
     };
     const result = await buildSemanticContext(
       { path: "/test/greet.ts", lineRange: { startLine: 1, endLine: 4 } },
@@ -201,7 +201,7 @@ export async function createOrder(
       getSnapshot: () => ({ contentHash: "abc", partial: false }),
       recordRead: () => {},
       lspManager: null,
-      astResolver: null,
+      astResolver: undefined,
     };
     const result = await buildSemanticContext(
       { path: "/test/service.ts", lineRange: { startLine: 4, endLine: 10 } },
@@ -223,7 +223,7 @@ export async function createOrder(
       getSnapshot: () => ({ contentHash: "abc", partial: false }),
       recordRead: () => {},
       lspManager: null,
-      astResolver: null,
+      astResolver: undefined,
     };
     const result = await buildSemanticContext(
       { path: "/test/x.ts", lineRange: { startLine: 1, endLine: 1 } },

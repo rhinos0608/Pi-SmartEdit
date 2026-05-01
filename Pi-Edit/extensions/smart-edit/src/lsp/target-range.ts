@@ -28,8 +28,9 @@ export interface TargetRangeOptions {
   anchor?: { symbolName?: string; symbolKind?: string; symbolLine?: number };
   symbol?: { name: string; kind?: string; line?: number };
   hashline?: { pos: string; end?: string };
-  snapshot: FileSnapshot | null;
-  astResolver?: { findSymbolNode(name: string, kind?: string, line?: number): any | null };
+  /** Accepts a full FileSnapshot or the partial shape returned by deps.getSnapshot */
+  snapshot: FileSnapshot | { partial?: boolean; contentHash?: string; hashline?: { anchors: Map<string, { text: string; line: number }> } } | null;
+  astResolver?: { findSymbolNode(name: string, kind?: string, line?: number): any | null } | null;
   documentSymbols?: DocumentSymbol[];
 }
 

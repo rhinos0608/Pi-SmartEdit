@@ -22,7 +22,8 @@ import { detectInputFormat, type InputFormat } from './formats/format-detector';
 import { parseSearchReplace } from './formats/search-replace';
 import { parseUnifiedDiffToEditItems } from './formats/unified-diff';
 import { parseOpenAIPatch, openAIPatchToEditItem } from './formats/openai-patch';
-import { applyEdits, type EditItem } from '../lib/edit-diff';
+import { applyEdits } from '../lib/edit-diff';
+import type { EditItem } from '../lib/types';
 
 export interface PipelineInput {
   /** The file path (required for raw edits, optional for format-embedded patches) */
@@ -35,7 +36,7 @@ export interface PipelineInput {
 
 export interface PipelineResult {
   success: boolean;
-  edits: Array<{ path: string; oldText: string; newText: string }>;
+  edits: Array<{ path?: string; oldText: string; newText: string }>;
   applied: boolean;
   matchNotes: string[];
   error?: string;

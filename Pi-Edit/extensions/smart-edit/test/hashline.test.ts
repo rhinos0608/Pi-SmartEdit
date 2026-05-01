@@ -38,26 +38,26 @@ describe("Bigram Table", () => {
   });
 
   it("excludes zz (end-of-token boundary marker)", () => {
-    assert.ok(!HASHLINE_BIGRAMS.includes("zz"), "zz should be excluded");
+    assert.ok(!(HASHLINE_BIGRAMS as readonly string[]).includes("zz"), "zz should be excluded");
   });
 
   it("excludes xz (x never precedes z in valid words)", () => {
-    assert.ok(!HASHLINE_BIGRAMS.includes("xz"), "xz should be excluded");
+    assert.ok(!(HASHLINE_BIGRAMS as readonly string[]).includes("xz"), "xz should be excluded");
   });
 
   it("excludes zy (z never precedes y in valid words)", () => {
-    assert.ok(!HASHLINE_BIGRAMS.includes("zy"), "zy should be excluded");
+    assert.ok(!(HASHLINE_BIGRAMS as readonly string[]).includes("zy"), "zy should be excluded");
   });
 
   it("excludes qz (q never followed by z in any valid English/technical word)", () => {
-    assert.ok(!HASHLINE_BIGRAMS.includes("qz"), "qz should be excluded");
+    assert.ok(!(HASHLINE_BIGRAMS as readonly string[]).includes("qz"), "qz should be excluded");
   });
 
   it("includes q* bigrams except qz (qa,qb,...,qy are valid code tokens)", () => {
     // All q* except qz should be in the table
     const qBigrams = HASHLINE_BIGRAMS.filter((bg) => bg.startsWith("q"));
     assert.ok(qBigrams.length > 0, "Should have some q* bigrams");
-    assert.ok(!qBigrams.includes("qz"), "qz should be excluded");
+    assert.ok(!qBigrams.includes("qz" as typeof HASHLINE_BIGRAMS[number]), "qz should be excluded");
   });
 
   it("has no empty strings", () => {

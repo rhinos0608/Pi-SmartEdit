@@ -691,7 +691,9 @@ describe("tryRebaseAll", () => {
     }];
     const result = tryRebaseAll(edits, fileLines);
     assert.strictEqual(result.allResolved, true);
-    assert.strictEqual(result.rebasedEdits[0].pos.line, 1);
+    const firstEdit = result.rebasedEdits[0];
+    assert.ok(firstEdit.op === "replace_range");
+    assert.strictEqual(firstEdit.pos.line, 1);
     assert.ok(result.warnings.length >= 1);
   });
 

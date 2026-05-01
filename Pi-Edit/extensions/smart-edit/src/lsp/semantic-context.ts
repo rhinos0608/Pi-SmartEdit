@@ -202,7 +202,7 @@ export async function buildSemanticContext(
     }
 
     // References
-    if (input.includeReferences && input.includeReferences !== false) {
+    if (input.includeReferences) {
       const refs = await findReferences(input.path, token.line, token.character, languageId, deps.lspManager);
       for (const ref of refs.slice(0, 2)) {
         await processLocation({ location: ref }, "reference", token.name, token.score - 20);

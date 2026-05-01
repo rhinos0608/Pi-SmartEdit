@@ -124,11 +124,12 @@ describe("post-edit-evidence", () => {
         lspManager: null,
         config: {
           enabled: true,
-          policy: "warn",
+          policy: "warn" as const,
           maxInlineMs: 500,
+          maxBackgroundMs: 30000,
           concurrency: {
             enabled: true,
-            runMode: "inline",
+            runMode: "inline" as const,
             commands: [],
             autoDetectKnownTools: false,
           },
@@ -144,7 +145,7 @@ describe("post-edit-evidence", () => {
             maxChars: 1000,
             includeBlame: false,
           },
-        } as VerificationConfig,
+        },
       });
       assert.ok(Array.isArray(result.notes));
     });

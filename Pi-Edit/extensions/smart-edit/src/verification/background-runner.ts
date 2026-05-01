@@ -14,6 +14,7 @@
  */
 
 import { randomUUID } from "crypto";
+import { spawn, type ChildProcess } from "child_process";
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -45,6 +46,7 @@ interface ManagedRun {
   resolve: (status: VerificationRunStatus) => void;
   reject: (err: Error) => void;
   timer?: ReturnType<typeof setTimeout>;
+  child?: ChildProcess;
 }
 
 // ─── Registry ───────────────────────────────────────────────────────
@@ -93,6 +95,9 @@ export class BackgroundRunRegistry {
 
       // Timeout guard
       run.timer = setTimeout(() => {
+        if (child && !child.killed) {
+          child.kill("SIGKILL");
+        }
         this.finalize(runId, {
           runId,
           startedAt,
@@ -111,6 +116,47 @@ export class BackgroundRunRegistry {
 
       this.runs.set(runId, run);
       this.activeCount++;
+
+      // Spawn the child process
+      const [cmd, ...args] = command;
+      const child = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"] });
+      run.child = child;
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (data: Buffer) => { stdout += data.toString(); });
+      child.stderr.on("data", (data: Buffer) => { stderr += data.toString(); });
+
+      child.on("close", (code) => {
+        // If already finalized (timeout/cancel), skip
+        if (!this.runs.has(runId)) return;
+
+        const status: VerificationRunStatus["status"] = code === 0 ? "passed" : "failed";
+        const output = (stdout + stderr).trim();
+        this.finalize(runId, {
+          runId,
+          startedAt,
+          finishedAt: Date.now(),
+          status,
+          command,
+          diagnostics: code === 0 ? [] : [{ message: output || `Process exited with code ${code}`, severity: 2 }],
+          summary: code === 0
+            ? `Passed. Command: ${command.join(" ")}`
+            : `Failed (exit ${code}). Command: ${command.join(" ")}`,
+        });
+      });
+
+      child.on("error", (err) => {
+        if (!this.runs.has(runId)) return;
+        this.finalize(runId, {
+          runId,
+          startedAt,
+          finishedAt: Date.now(),
+          status: "failed",
+          command,
+          diagnostics: [{ message: err.message, severity: 2 }],
+          summary: `Error: ${err.message}. Command: ${command.join(" ")}`,
+        });
+      });
     });
 
     return { runId, promise };
@@ -199,6 +245,11 @@ export class BackgroundRunRegistry {
   cancel(runId: string): boolean {
     const run = this.runs.get(runId);
     if (!run) return false;
+
+    // Kill the child process if still running
+    if (run.child && !run.child.killed) {
+      run.child.kill("SIGKILL");
+    }
 
     this.finalize(runId, {
       runId,

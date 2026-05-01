@@ -1,11 +1,28 @@
-import { describe, it } from "node:test";
+import { describe, it, afterEach } from "node:test";
 import assert from "node:assert";
 import { BackgroundRunRegistry } from "../../src/verification/background-runner.js";
 
 describe("background-runner", () => {
   describe("BackgroundRunRegistry", () => {
+    // Clean up any active runs after each test to prevent hanging
+    const registries: BackgroundRunRegistry[] = [];
+
+    afterEach(() => {
+      for (const registry of registries) {
+        for (const run of registry.listRuns(false)) {
+          registry.cancel(run.runId);
+        }
+      }
+      registries.length = 0;
+    });
+
+    function createRegistry(opts?: { maxConcurrent?: number; defaultTimeoutMs?: number; evictAfterMs?: number }): BackgroundRunRegistry {
+      const r = new BackgroundRunRegistry(opts);
+      registries.push(r);
+      return r;
+    }
     it("schedules a run and returns runId", async () => {
-      const registry = new BackgroundRunRegistry({ maxConcurrent: 3 });
+      const registry = createRegistry({ maxConcurrent: 3 });
       const { runId, promise } = registry.schedule(["echo", "hello"]);
       assert.ok(typeof runId === "string" && runId.length > 0);
       const status = await promise;
@@ -13,7 +30,7 @@ describe("background-runner", () => {
     });
 
     it("rejects when max concurrent runs reached", async () => {
-      const registry = new BackgroundRunRegistry({ maxConcurrent: 1 });
+      const registry = createRegistry({ maxConcurrent: 1 });
       registry.schedule(["sleep", "10"]); // occupies the slot
       assert.throws(() => {
         registry.schedule(["echo", "world"]);
@@ -21,7 +38,7 @@ describe("background-runner", () => {
     });
 
     it("getStatus returns running status for active runs", async () => {
-      const registry = new BackgroundRunRegistry({ maxConcurrent: 3 });
+      const registry = createRegistry({ maxConcurrent: 3 });
       const { runId } = registry.schedule(["sleep", "30"]);
       const status = registry.getStatus(runId);
       assert.ok(status, "Expected status for active run");
@@ -29,7 +46,7 @@ describe("background-runner", () => {
     });
 
     it("getStatus returns completed status after finalize", async () => {
-      const registry = new BackgroundRunRegistry({ maxConcurrent: 3 });
+      const registry = createRegistry({ maxConcurrent: 3 });
       const { runId, promise } = registry.schedule(["echo", "done"]);
 
       // Wait for completion
@@ -44,13 +61,13 @@ describe("background-runner", () => {
     });
 
     it("getStatus returns null for unknown runId", async () => {
-      const registry = new BackgroundRunRegistry({ maxConcurrent: 3 });
+      const registry = createRegistry({ maxConcurrent: 3 });
       const status = registry.getStatus("nonexistent-id");
       assert.strictEqual(status, null);
     });
 
     it("listRuns returns active runs", async () => {
-      const registry = new BackgroundRunRegistry({ maxConcurrent: 3 });
+      const registry = createRegistry({ maxConcurrent: 3 });
       registry.schedule(["sleep", "30"]);
       const runs = registry.listRuns(false);
       assert.ok(runs.length >= 1);
@@ -58,7 +75,7 @@ describe("background-runner", () => {
     });
 
     it("listRuns with includeCompleted returns completed runs too", async () => {
-      const registry = new BackgroundRunRegistry({ maxConcurrent: 3 });
+      const registry = createRegistry({ maxConcurrent: 3 });
       const { runId, promise } = registry.schedule(["echo", "done"]);
       await promise; // wait for completion
       const runs = registry.listRuns(true);
@@ -68,7 +85,7 @@ describe("background-runner", () => {
     });
 
     it("cancel stops a running verification", async () => {
-      const registry = new BackgroundRunRegistry({ maxConcurrent: 3 });
+      const registry = createRegistry({ maxConcurrent: 3 });
       const { runId } = registry.schedule(["sleep", "30"]);
       const cancelled = registry.cancel(runId);
       assert.ok(cancelled, "Expected cancel to return true");
@@ -81,13 +98,13 @@ describe("background-runner", () => {
     });
 
     it("cancel returns false for unknown runId", async () => {
-      const registry = new BackgroundRunRegistry({ maxConcurrent: 3 });
+      const registry = createRegistry({ maxConcurrent: 3 });
       const cancelled = registry.cancel("nonexistent");
       assert.strictEqual(cancelled, false);
     });
 
     it("times out long-running commands", async () => {
-      const registry = new BackgroundRunRegistry({
+      const registry = createRegistry({
         maxConcurrent: 3,
         defaultTimeoutMs: 100, // very short timeout
         evictAfterMs: 5000,
