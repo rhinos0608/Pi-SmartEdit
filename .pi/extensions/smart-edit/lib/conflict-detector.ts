@@ -92,55 +92,62 @@ export function createConflictDetector(
     turnCounter++;
 
     const resolver = getAstResolver?.();
+    const hasResolver = resolver != null && config.enabled;
 
-    for (const span of editSpans) {
-      // Try AST-based symbol resolution first
-      if (resolver && config.enabled) {
-        let parseResult: Awaited<ReturnType<typeof resolver.parseFile>> | null = null;
-        try {
-          parseResult = await resolver.parseFile(content, filePath);
-          if (parseResult && !parseResult.tree.rootNode.hasError) {
-            const symbols = resolver.findEnclosingSymbols(
-              parseResult.tree,
-              span.startIndex,
-              span.endIndex,
-            );
-
-            for (const symbol of symbols) {
-              const record: SymbolEditRecord = {
-                symbol,
-                turn: turnCounter,
-                editRange: { startIndex: span.startIndex, endIndex: span.endIndex },
-                description: editDescription,
-              };
-
-              const existing = editHistory.get(filePath) ?? [];
-              existing.push(record);
-              editHistory.set(filePath, existing);
-            }
-            continue; // Skip line-range fallback for this span
-          }
-        } catch {
-          // AST resolution failed — fall through to line-range fallback
-        } finally {
-          if (parseResult) {
-            resolver?.disposeParseResult(parseResult);
-          }
-        }
+    // Parse the file ONCE and share across all span checks.
+    // Avoids re-parsing N times for N edit spans.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let sharedParseResult: Awaited<ReturnType<NonNullable<typeof resolver>['parseFile']>> | null = null;
+    if (hasResolver) {
+      try {
+        sharedParseResult = await resolver.parseFile(content, filePath);
+      } catch {
+        // Parse failed — will fall through to line-range fallback
       }
+    }
 
-      // Fallback: line-range tracking (byte level)
-      const lineRecord: LineRangeEdit = {
-        filePath,
-        startByte: span.startIndex,
-        endByte: span.endIndex,
-        turn: turnCounter,
-        description: editDescription,
-      };
+    try {
+      for (const span of editSpans) {
+        // Try AST-based symbol resolution first
+        if (hasResolver && sharedParseResult && !sharedParseResult.tree.rootNode.hasError) {
+          const symbols = resolver.findEnclosingSymbols(
+            sharedParseResult.tree,
+            span.startIndex,
+            span.endIndex,
+          );
 
-      const existing = lineRangeHistory.get(filePath) ?? [];
-      existing.push(lineRecord);
-      lineRangeHistory.set(filePath, existing);
+          for (const symbol of symbols) {
+            const record: SymbolEditRecord = {
+              symbol,
+              turn: turnCounter,
+              editRange: { startIndex: span.startIndex, endIndex: span.endIndex },
+              description: editDescription,
+            };
+
+            const existing = editHistory.get(filePath) ?? [];
+            existing.push(record);
+            editHistory.set(filePath, existing);
+          }
+          continue; // Skip line-range fallback for this span
+        }
+
+        // Fallback: line-range tracking (byte level)
+        const lineRecord: LineRangeEdit = {
+          filePath,
+          startByte: span.startIndex,
+          endByte: span.endIndex,
+          turn: turnCounter,
+          description: editDescription,
+        };
+
+        const existing = lineRangeHistory.get(filePath) ?? [];
+        existing.push(lineRecord);
+        lineRangeHistory.set(filePath, existing);
+      }
+    } finally {
+      if (sharedParseResult) {
+        resolver?.disposeParseResult(sharedParseResult);
+      }
     }
   }
 
@@ -159,11 +166,13 @@ export function createConflictDetector(
 
     const reports: ConflictReport[] = [];
     const resolver = getAstResolver?.();
+    const hasResolver = resolver != null;
 
     // Parse the file ONCE and share across all span checks.
     // This avoids re-parsing N times for N edit spans.
-    let sharedParseResult: Awaited<ReturnType<typeof resolver.parseFile>> | null = null;
-    if (resolver) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let sharedParseResult: Awaited<ReturnType<NonNullable<typeof resolver>['parseFile']>> | null = null;
+    if (hasResolver) {
       try {
         sharedParseResult = await resolver.parseFile(content, filePath);
       } catch {
@@ -174,7 +183,7 @@ export function createConflictDetector(
     try {
       for (const span of editSpans) {
         // Try AST-based checking with the shared parse result
-        if (resolver && sharedParseResult && !sharedParseResult.tree.rootNode.hasError) {
+        if (hasResolver && sharedParseResult && !sharedParseResult.tree.rootNode.hasError) {
           const localReports = checkAstConflictsFromTree(
             resolver,
             filePath,
