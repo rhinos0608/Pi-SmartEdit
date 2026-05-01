@@ -63,8 +63,8 @@ export class LSPManager {
 
   /**
    * Get or create an LSP server connection for a given language ID.
-   * Returns null if no server is configured for the language or the
-   * server binary is not found in PATH.
+   * Returns null if no server is configured for the language or no
+   * configured server can be successfully initialized.
    *
    * @param languageId  LSP language ID (e.g., "typescript", "python")
    * @returns The LSP connection, or null if unavailable
@@ -74,28 +74,42 @@ export class LSPManager {
     const existing = this.connections.get(languageId);
     if (existing) return existing;
 
-    // Find matching server config
-    const config = LSPManager.SERVER_CONFIGS.find((c) =>
+    // Find all matching server configs
+    const configs = LSPManager.SERVER_CONFIGS.filter((c) =>
       c.languageIds.includes(languageId)
     );
-    if (!config) return null;
+    if (configs.length === 0) return null;
 
-    // Check if command exists in PATH
-    const commandPath = await this.findInPath(config.command);
-    if (!commandPath) {
-      return null;
+    for (const config of configs) {
+      // Check if command exists in PATH
+      const commandPath = await this.findInPath(config.command);
+      if (!commandPath) {
+        continue;
+      }
+
+      // Start and initialize server
+      let conn: LSPConnection | undefined;
+      try {
+        conn = new LSPConnection(commandPath, config.args);
+        await conn.initialize(this.rootUri);
+        // Only cache after successful initialization
+        this.connections.set(languageId, conn);
+        return conn;
+      } catch (err) {
+        console.warn(`[smart-edit] Failed to start LSP server "${config.command}":`, err);
+        // Clean up failed connection attempt
+        if (conn) {
+          try {
+            await conn.shutdown();
+          } catch {
+            // Ignore cleanup errors
+          }
+        }
+        // Continue to the next config if available
+      }
     }
 
-    // Start server
-    try {
-      const conn = new LSPConnection(commandPath, config.args);
-      await conn.initialize(this.rootUri);
-      this.connections.set(languageId, conn);
-      return conn;
-    } catch (err) {
-      console.warn(`[smart-edit] Failed to start LSP server "${config.command}":`, err);
-      return null;
-    }
+    return null;
   }
 
   /**

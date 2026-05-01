@@ -46,6 +46,7 @@ export class LSPConnection {
   private pending = new Map<number, PendingCallback>();
   private buffer = "";
   private notificationHandlers = new Map<string, Array<(params: unknown) => void>>();
+  public serverCapabilities: any;
 
   /**
    * Create a new LSP connection by spawning a server process.
@@ -110,13 +111,32 @@ export class LSPConnection {
       capabilities: {
         textDocument: {
           diagnostic: { dynamicRegistration: true },
-          definition: { dynamicRegistration: true },
+          declaration: { dynamicRegistration: true, linkSupport: true },
+          definition: { dynamicRegistration: true, linkSupport: true },
+          typeDefinition: { dynamicRegistration: true, linkSupport: true },
+          implementation: { dynamicRegistration: true, linkSupport: true },
           references: { dynamicRegistration: true },
-          hover: { dynamicRegistration: true },
+          hover: { dynamicRegistration: true, contentFormat: ["markdown", "plaintext"] },
+          documentSymbol: {
+            dynamicRegistration: true,
+            hierarchicalDocumentSymbolSupport: true,
+          },
+          semanticTokens: {
+            dynamicRegistration: true,
+            requests: { range: true, full: true },
+            tokenTypes: [
+              "class", "enum", "interface", "namespace", "typeParameter", "type", "parameter", "variable", "property", "function", "method"
+            ],
+            tokenModifiers: [
+              "declaration", "definition", "readonly", "static", "deprecated", "abstract", "async", "modification", "documentation", "defaultLibrary"
+            ],
+            formats: ["relative"],
+          },
         },
       },
     });
 
+    this.serverCapabilities = result;
     await this.notify("initialized", {});
     return result;
   }
@@ -128,17 +148,44 @@ export class LSPConnection {
    * @returns The response result
    * @throws If the request times out (5s) or the server returns an error
    */
-  async request(method: string, params?: unknown): Promise<unknown> {
+  async request(method: string, params?: unknown, signal?: AbortSignal): Promise<unknown> {
+    if (signal?.aborted) {
+      return Promise.reject(new Error(`LSP request "${method}" was aborted`));
+    }
+
     const id = ++this.messageId;
     return new Promise((resolve, reject) => {
+      const abortHandler = () => {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(new Error(`LSP request "${method}" was aborted`));
+      };
+
+      if (signal) {
+        signal.addEventListener("abort", abortHandler, { once: true });
+      }
+
       const timer = setTimeout(() => {
+        if (signal) {
+          signal.removeEventListener("abort", abortHandler);
+        }
         this.pending.delete(id);
         reject(
           new Error(`LSP request "${method}" timed out after 5s`)
         );
       }, 5000);
 
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, {
+        resolve: (v) => {
+          if (signal) signal.removeEventListener("abort", abortHandler);
+          resolve(v);
+        },
+        reject: (e) => {
+          if (signal) signal.removeEventListener("abort", abortHandler);
+          reject(e);
+        },
+        timer
+      });
       this.write({ jsonrpc: "2.0", id, method, params });
 
       // Don't let this timer prevent Node from exiting

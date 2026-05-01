@@ -11,10 +11,75 @@ import { LSPManager } from "./lsp-manager";
 
 export interface Location {
   uri: string;
-  range: {
-    start: { line: number; character: number };
-    end: { line: number; character: number };
-  };
+  range: LSPRange;
+}
+
+export interface LSPRange {
+  start: { line: number; character: number };
+  end: { line: number; character: number };
+}
+
+export interface LocationLink {
+  originSelectionRange?: LSPRange;
+  targetUri: string;
+  targetRange: LSPRange;
+  targetSelectionRange: LSPRange;
+}
+
+export interface ResolvedLocation {
+  location: Location;
+  originRange?: LSPRange;
+}
+
+export interface DocumentSymbol {
+  name: string;
+  detail?: string;
+  kind: number;
+  range: LSPRange;
+  selectionRange: LSPRange;
+  children?: DocumentSymbol[];
+}
+
+export interface SemanticToken {
+  line: number;
+  character: number;
+  length: number;
+  tokenType?: string;
+  tokenModifiers: string[];
+  text: string;
+}
+
+/**
+ * Normalizes various LSP location responses into a unified ResolvedLocation array.
+ * Handles null, single Location, Location[], and LocationLink[].
+ */
+export function normalizeLocations(response: unknown): ResolvedLocation[] {
+  if (!response) return [];
+
+  if (Array.isArray(response)) {
+    return response.map((item: any) => {
+      if (item.targetUri && item.targetRange) {
+        // LocationLink
+        return {
+          location: {
+            uri: item.targetUri,
+            range: item.targetRange,
+          },
+          originRange: item.originSelectionRange,
+        };
+      } else {
+        // Location
+        return {
+          location: item as Location,
+        };
+      }
+    });
+  }
+
+  // Single Location
+  return [{
+    location: response as Location,
+  }];
 }
 
 /**
@@ -29,8 +94,23 @@ export async function goToDefinition(
   languageId: string,
   lspManager: LSPManager,
 ): Promise<Location | null> {
+  const definitions = await goToDefinitions(filePath, line, character, languageId, lspManager);
+  return definitions.length > 0 ? definitions[0].location : null;
+}
+
+/**
+ * Find all definitions of a symbol at the given position.
+ * Returns normalized ResolvedLocation array.
+ */
+export async function goToDefinitions(
+  filePath: string,
+  line: number,
+  character: number,
+  languageId: string,
+  lspManager: LSPManager,
+): Promise<ResolvedLocation[]> {
   const server = await lspManager.getServer(languageId);
-  if (!server) return null;
+  if (!server) return [];
 
   try {
     const response = await server.request("textDocument/definition", {
@@ -38,16 +118,178 @@ export async function goToDefinition(
       position: { line, character },
     });
 
-    if (!response) return null;
+    return normalizeLocations(response);
+  } catch {
+    return [];
+  }
+}
 
-    // Definition can return a single Location or an array
-    if (Array.isArray(response)) {
-      return (response as Location[])[0] ?? null;
+/**
+ * Find the declaration of a symbol at the given position.
+ */
+export async function goToDeclaration(
+  filePath: string,
+  line: number,
+  character: number,
+  languageId: string,
+  lspManager: LSPManager,
+): Promise<ResolvedLocation[]> {
+  const server = await lspManager.getServer(languageId);
+  if (!server) return [];
+
+  try {
+    const response = await server.request("textDocument/declaration", {
+      textDocument: { uri: `file://${resolve(filePath)}` },
+      position: { line, character },
+    });
+
+    return normalizeLocations(response);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Find the type definition of a symbol at the given position.
+ */
+export async function goToTypeDefinition(
+  filePath: string,
+  line: number,
+  character: number,
+  languageId: string,
+  lspManager: LSPManager,
+): Promise<ResolvedLocation[]> {
+  const server = await lspManager.getServer(languageId);
+  if (!server) return [];
+
+  try {
+    const response = await server.request("textDocument/typeDefinition", {
+      textDocument: { uri: `file://${resolve(filePath)}` },
+      position: { line, character },
+    });
+
+    return normalizeLocations(response);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Find the implementation of a symbol at the given position.
+ */
+export async function goToImplementation(
+  filePath: string,
+  line: number,
+  character: number,
+  languageId: string,
+  lspManager: LSPManager,
+): Promise<ResolvedLocation[]> {
+  const server = await lspManager.getServer(languageId);
+  if (!server) return [];
+
+  try {
+    const response = await server.request("textDocument/implementation", {
+      textDocument: { uri: `file://${resolve(filePath)}` },
+      position: { line, character },
+    });
+
+    return normalizeLocations(response);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Get document symbols for the given file.
+ */
+export async function getDocumentSymbols(
+  filePath: string,
+  languageId: string,
+  lspManager: LSPManager,
+): Promise<DocumentSymbol[]> {
+  const server = await lspManager.getServer(languageId);
+  if (!server) return [];
+
+  try {
+    const response = await server.request("textDocument/documentSymbol", {
+      textDocument: { uri: `file://${resolve(filePath)}` },
+    });
+
+    if (!response || !Array.isArray(response)) return [];
+
+    // Response can be DocumentSymbol[] or SymbolInformation[]
+    // For now we assume the server supports hierarchical DocumentSymbol
+    return response as DocumentSymbol[];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Get semantic tokens for a given range in a file.
+ */
+export async function getSemanticTokensForRange(
+  filePath: string,
+  range: LSPRange,
+  languageId: string,
+  lspManager: LSPManager,
+): Promise<SemanticToken[]> {
+  const server = await lspManager.getServer(languageId);
+  if (!server) return [];
+
+  try {
+    const response = await server.request("textDocument/semanticTokens/range", {
+      textDocument: { uri: `file://${resolve(filePath)}` },
+      range,
+    });
+
+    if (!response || !Array.isArray((response as any).data)) return [];
+
+    const data = (response as any).data as number[];
+    const legend = server.serverCapabilities?.capabilities?.semanticTokensProvider?.legend;
+    if (!legend) return [];
+
+    const tokenTypes = legend.tokenTypes as string[];
+    const tokenModifiers = legend.tokenModifiers as string[];
+
+    const result: SemanticToken[] = [];
+    let currentLine = 0;
+    let currentChar = 0;
+
+    for (let i = 0; i < data.length; i += 5) {
+      const deltaLine = data[i];
+      const deltaChar = data[i + 1];
+      const length = data[i + 2];
+      const tokenTypeIdx = data[i + 3];
+      const tokenModifiersBitmask = data[i + 4];
+
+      currentLine += deltaLine;
+      if (deltaLine === 0) {
+        currentChar += deltaChar;
+      } else {
+        currentChar = deltaChar;
+      }
+
+      const modifiers: string[] = [];
+      for (let j = 0; j < tokenModifiers.length; j++) {
+        if ((tokenModifiersBitmask >> j) & 1) {
+          modifiers.push(tokenModifiers[j]);
+        }
+      }
+
+      result.push({
+        line: currentLine,
+        character: currentChar,
+        length,
+        tokenType: tokenTypes[tokenTypeIdx],
+        tokenModifiers: modifiers,
+        text: "", // To be populated by caller if needed
+      });
     }
 
-    return response as Location;
+    return result;
   } catch {
-    return null;
+    return [];
   }
 }
 

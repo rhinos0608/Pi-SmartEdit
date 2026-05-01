@@ -32,7 +32,10 @@ import {
   defaultConflictConfig,
 } from "./lib/conflict-detector";
 
-import { recordRead, checkStale, recordReadWithStat, recordReadSession, getSessionReads, checkEditAllowed, checkRangeCoverage } from "./lib/read-cache";
+import { buildSemanticContext } from "./src/lsp/semantic-context";
+import type { SemanticContextInput } from "./src/lsp/semantic-context";
+import { detectLanguageFromExtension } from "./src/lsp/language-id";
+import { recordRead, checkStale, recordReadWithStat, recordReadSession, getSessionReads, checkEditAllowed, checkRangeCoverage, getSnapshot } from "./lib/read-cache";
 import { buildHashlineAnchors } from "./lib/hashline";
 import type { HashlineEditInput } from "./lib/hashline-edit";
 
@@ -246,6 +249,29 @@ const editSchema = Type.Object(
     ]),
   },
 );
+
+const semanticContextSchema = Type.Object({
+  path: Type.String({ description: "Path to the file to inspect semantically" }),
+  lineRange: Type.Optional(Type.Object({
+    startLine: Type.Number({ description: "1-based start line (inclusive)" }),
+    endLine: Type.Optional(Type.Number({ description: "1-based end line (inclusive)" })),
+  })),
+  symbol: Type.Optional(Type.Object({
+    name: Type.String({ description: "Symbol name (function, class, interface, etc.)" }),
+    kind: Type.Optional(Type.String({ description: "Kind hint (e.g., 'function', 'class', 'interface')" })),
+    line: Type.Optional(Type.Number({ description: "1-based line hint" })),
+  })),
+  maxTokens: Type.Optional(Type.Number({ default: 3000, description: "Maximum tokens in the response" })),
+  maxDepth: Type.Optional(Type.Number({ default: 1, description: "Max depth for following references" })),
+  includeReferences: Type.Optional(Type.Union([
+    Type.Literal(false),
+    Type.Literal("examples"),
+    Type.Literal("all"),
+  ], { default: "examples" })),
+  includeImplementations: Type.Optional(Type.Boolean({ default: false })),
+  includeTypeDefinitions: Type.Optional(Type.Boolean({ default: true })),
+  includeHover: Type.Optional(Type.Boolean({ default: true })),
+});
 
 // ─── Error formatting (actionable client-facing errors) ─────────────
 
@@ -793,19 +819,6 @@ let conflictDetector: ReturnType<typeof createConflictDetector> | null = null;
 let lspManager: LSPManager | null = null;
 
 /**
- * Detect the LSP language ID from a file path extension.
- * Returns null for unsupported file types.
- */
-function detectLanguageFromExtension(filePath: string): string | null {
-  const ext = filePath.toLowerCase();
-  if (ext.endsWith(".ts") || ext.endsWith(".mts") || ext.endsWith(".cts")) return "typescript";
-  if (ext.endsWith(".tsx")) return "typescriptreact";
-  if (ext.endsWith(".js") || ext.endsWith(".mjs") || ext.endsWith(".cjs")) return "javascript";
-  if (ext.endsWith(".jsx")) return "javascriptreact";
-  return null;
-}
-
-/**
  * Resolve an edit's anchor/lineRange to a SearchScope for narrowing.
  * Called per-edit before matching.
  */
@@ -1203,6 +1216,7 @@ export default function smartEdit(pi: ExtensionAPI) {
       "All edits are matched against the original file content, not after earlier edits. Do not emit overlapping edits — merge nearby changes into one edit.",
       "Keep oldText minimal but unique. Include enough surrounding context to uniquely identify the region.",
       "The tool tolerates minor indentation and Unicode differences, but exact snippets are always safer.",
+      "Before editing code that depends on custom types, imported factories, interfaces, or unfamiliar symbols, call semantic_context for the target range instead of reading whole dependency files.",
     ],
 
     parameters: editSchema as any,
@@ -1628,6 +1642,86 @@ export default function smartEdit(pi: ExtensionAPI) {
     // ── TUI rendering (delegates to same diff rendering as built-in) ──
     // renderCall and renderResult are optional; Pi's built-in rendering
     // provides sensible defaults for tools with text results.
+  } as unknown));
+
+  // ── Register the semantic_context retrieval tool ──
+  (pi.registerTool as (t: unknown) => void)(({
+    name: "semantic_context",
+    label: "semantic_context",
+    description: `Retrieve semantic context (type definitions, interfaces, implementations, and examples) for a code range without reading whole files.
+
+Before editing code that depends on custom types, imported factories, interfaces, or unfamiliar symbols, call semantic_context for the target range instead of reading whole dependency files.
+
+Examples:
+  semantic_context({ path: "src/service.ts", lineRange: { startLine: 42, endLine: 78 }, maxTokens: 3000 })
+  semantic_context({ path: "src/types.ts", symbol: { name: "CreateOrderInput" } })
+  semantic_context({ path: "src/service.ts", lineRange: { startLine: 10, endLine: 30 }, includeReferences: "examples", includeTypeDefinitions: true, maxTokens: 1500 })`,
+
+    promptSnippet: "Retrieve type definitions, implementations, and examples for symbols in a range.",
+
+    parameters: semanticContextSchema as any,
+    renderShell: "self" as const,
+
+    async execute(
+      _toolCallId: string,
+      input: Record<string, unknown>,
+      signal: AbortSignal | undefined,
+      _onUpdate: ((update: { content: Array<{ type: "text"; text: string }> }) => void) | undefined,
+      _ctx: unknown,
+    ): Promise<{ content: Array<{ type: "text"; text: string }>; details?: any }> {
+      const cwd = process.cwd();
+      const path = input.path as string;
+      const absolutePath = resolve(cwd, path);
+
+      // Check if file has been read (Safety guard)
+      const snapshot = getSnapshot(path, cwd);
+      if (!snapshot) {
+        return {
+          content: [{
+            type: "text",
+            text: `Cannot retrieve semantic context for ${path} — this file has not been read in the current session. Read the file first, then retry semantic_context.`
+          }]
+        };
+      }
+
+      // Check if aborted
+      if (signal?.aborted) {
+        throw new Error("Operation aborted");
+      }
+
+      try {
+        const result = await buildSemanticContext(input as any, {
+          cwd,
+          lspManager,
+          astResolver,
+          async readFile(p: string) {
+            return (await fsReadFile(resolve(cwd, p))).toString("utf-8");
+          },
+          getSnapshot(p: string, c: string) {
+            return getSnapshot(p, c);
+          },
+          recordRead(p: string, c: string, content: string, partial?: boolean) {
+            recordRead(p, c, content, partial);
+          },
+          recordReadSession(p: string, c: string, lineRanges: Array<{ startLine: number; endLine: number }>) {
+            // Map snippets back to session read ranges so the edit tool validates coverage
+            for (const range of lineRanges) {
+              recordReadSession(p, c, range.startLine, range.endLine - range.startLine + 1, 0, "semantic_context");
+            }
+          }
+        });
+
+        return {
+          content: [{ type: "text", text: result.markdown }],
+          details: result.details,
+        };
+      } catch (error) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        return {
+          content: [{ type: "text", text: `❌ Semantic context retrieval failed: ${err.message}` }]
+        };
+      }
+    }
   } as unknown));
 }
 
