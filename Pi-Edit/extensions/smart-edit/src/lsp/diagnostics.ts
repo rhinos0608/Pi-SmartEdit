@@ -3,6 +3,14 @@
  *
  * After an edit is applied, opens the file in the LSP server and collects
  * any diagnostics (errors, warnings) that the server reports.
+ *
+ * Uses a two-phase approach:
+ * 1. Wait for push-based `textDocument/publishDiagnostics` notification
+ * 2. Fall back to pull-based `textDocument/diagnostic` request (LSP 3.17)
+ *
+ * This handles servers that don't immediately push diagnostics for newly
+ * opened files, which is the common case for TypeScript language servers
+ * processing standalone files.
  */
 
 import { resolve } from "path";
@@ -98,6 +106,10 @@ function waitForDiagnostics(
  * Opens the file in the LSP server (with updated content), waits for
  * diagnostics to be published, then closes the document.
  *
+ * Uses a two-phase approach:
+ * 1. Wait up to 3s for push-based `textDocument/publishDiagnostics` notification
+ * 2. If none received, try pull-based `textDocument/diagnostic` request (LSP 3.17)
+ *
  * Returns `source: 'none'` if no LSP server is available for the language.
  *
  * @param filePath     Absolute path to the file (used for file:// URI)
@@ -127,8 +139,28 @@ export async function checkPostEditDiagnostics(
       },
     });
 
-    // Wait for diagnostics (server pushes them as a notification)
-    const diagnostics = await waitForDiagnostics(server, uri, 2000);
+    // Phase 1: Wait for push-based diagnostics notification (up to 3s).
+    // TypeScript language servers typically push diagnostics within 1-2s
+    // for files that are part of a tsconfig.json project.
+    let diagnostics = await waitForDiagnostics(server, uri, 3000);
+
+    // Phase 2: If no diagnostics received via notification, try the
+    // pull-based `textDocument/diagnostic` request (LSP 3.17).
+    // This is needed for standalone files or servers that don't auto-push.
+    if (diagnostics.length === 0) {
+      try {
+        const pullResult = await server.request("textDocument/diagnostic", {
+          textDocument: { uri },
+        }) as { items?: Diagnostic[]; kind?: string } | null;
+
+        if (pullResult?.items) {
+          diagnostics = pullResult.items;
+        }
+      } catch {
+        // textDocument/diagnostic not supported (pre-LSP 3.17 servers)
+        // or request failed — diagnostics remains empty, which is fine.
+      }
+    }
 
     // Close the document — keep server alive for future edits
     await server.notify("textDocument/didClose", {

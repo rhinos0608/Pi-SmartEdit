@@ -1,6 +1,17 @@
-.pi/extensions/smart-edit/node_modules
+# Dependencies
+node_modules/
+Pi-Edit/extensions/smart-edit/node_modules
+
+# Smart-read tag cache
 .pi-smartread.tags.cache/
+**/.pi-smartread.tags.cache/
+
+# Progress tracking
 progress.md
-.pi/extensions/.DS_Store
-.pi/.DS_Store
+
+# Symlink for test imports — code lives in Pi-Edit/extensions/smart-edit/
+.pi/extensions/smart-edit
+
+# macOS
 .DS_Store
+**/.DS_Store

@@ -17,7 +17,7 @@
  * corrected. Only a second consecutive mismatch triggers the error.
  */
 
-import { statSync } from "fs";
+import { statSync, readFileSync } from "fs";
 import { readFile } from "fs/promises";
 import { resolve } from "path";
 import type { FileSnapshot } from "./types";
@@ -43,6 +43,71 @@ function sleep(ms: number): Promise<void> {
 
 /** In-memory cache of file snapshots */
 const snapshotCache = new Map<string, FileSnapshot>();
+
+// ─── Session read tracking (for range coverage validation) ────────────
+
+/**
+ * Range of a file read during a session.
+ * Tracks what portion of a file was actually read/displayed to the model,
+ * enabling range coverage validation on edit (P1: pi-lens read-guard pattern).
+ */
+export interface ReadRange {
+  /** 1-based start line (inclusive). Defaults to 1. */
+  offset: number;
+  /** Number of lines read, or -1 for full file. */
+  limit: number;
+  /** Total file lines at time of read (0 if unknown). */
+  totalLines: number;
+  /** Timestamp of the read. */
+  timestamp: number;
+  /** Which tool performed the read ("read", "read_multiple_files", "intent_read"). */
+  source: string;
+}
+
+/** Track ALL reads across the session for range coverage checks. */
+const sessionReads = new Map<string, ReadRange[]>();
+
+/**
+ * Record a file read in the session map.
+ * Called from index.ts when any read tool succeeds.
+ *
+ * This is separate from the snapshot cache (which handles stale detection).
+ * sessionReads tracks the range of content the model actually saw,
+ * enabling range coverage validation before edits.
+ */
+export function recordReadSession(
+  path: string,
+  cwd: string,
+  offset: number,
+  limit: number,
+  totalLines: number,
+  source: string,
+): void {
+  const normalized = normalizePath(path, cwd);
+  const reads = sessionReads.get(normalized) ?? [];
+  reads.push({ offset, limit, totalLines, timestamp: Date.now(), source });
+  sessionReads.set(normalized, reads);
+}
+
+/**
+ * Get all session reads for a file, or empty array if never read.
+ */
+export function getSessionReads(path: string, cwd: string): ReadRange[] {
+  const normalized = normalizePath(path, cwd);
+  return sessionReads.get(normalized) ?? [];
+}
+
+/**
+ * Get the most recent full-file read, or null.
+ */
+export function getLastFullRead(path: string, cwd: string): ReadRange | null {
+  const reads = getSessionReads(path, cwd);
+  // Walk backwards to find the most recent full-file read
+  for (let i = reads.length - 1; i >= 0; i--) {
+    if (reads[i].limit === -1 && reads[i].totalLines > 0) return reads[i];
+  }
+  return null;
+}
 
 /**
  * Normalize a path for cache key lookup.
@@ -242,4 +307,122 @@ export function recordReadWithStat(
  */
 export function clearCache(): void {
   snapshotCache.clear();
+}
+
+// ─── Range coverage validation (P1: pi-lens read-guard pattern) ──────
+
+/**
+ * Check if a byte range is covered by session reads.
+ *
+ * Merges all read intervals for the file (supporting multiple partial reads)
+ * and checks that [editStartLine, editEndLine] falls within at least one.
+ *
+ * Returns null if covered, or an error message with actionable hints if not.
+ */
+export function checkRangeCoverage(
+  path: string,
+  cwd: string,
+  editStartLine: number,
+  editEndLine: number,
+): { covered: true } | { covered: false; reason: string } {
+  const normalized = normalizePath(path, cwd);
+  const reads = sessionReads.get(normalized);
+  if (!reads || reads.length === 0) {
+    return {
+      covered: false,
+      reason: `Cannot validate range coverage for ${path}: no read recorded.`,
+    };
+  }
+
+  // Merge all read intervals
+  const intervals: Array<[number, number]> = reads
+    .map((r) => {
+      const start = r.offset;
+      const end = r.limit === -1 ? r.totalLines : r.offset + r.limit - 1;
+      return [start, end] as [number, number];
+    })
+    .filter(([s, e]) => s > 0 && e >= s)
+    .sort((a, b) => a[0] - b[0]);
+
+  if (intervals.length === 0) return { covered: true }; // no valid intervals — allow
+
+  // Merge overlapping/adjacent intervals
+  const merged: Array<[number, number]> = [];
+  for (const [s, e] of intervals) {
+    if (merged.length > 0 && s <= merged[merged.length - 1][1] + 1) {
+      merged[merged.length - 1][1] = Math.max(merged[merged.length - 1][1], e);
+    } else {
+      merged.push([s, e]);
+    }
+  }
+
+  // Check if [editStartLine, editEndLine] falls within any merged interval
+  for (const [s, e] of merged) {
+    if (editStartLine >= s && editEndLine <= e) {
+      return { covered: true };
+    }
+  }
+
+  // Not covered — build actionable error
+  const lastRead = reads[reads.length - 1];
+  const lastRange =
+    lastRead.limit === -1
+      ? `lines 1-${lastRead.totalLines}`
+      : `lines ${lastRead.offset}-${lastRead.offset + lastRead.limit - 1}`;
+
+  // Suggest a sensible re-read range
+  const reReadOffset = Math.max(1, editStartLine - 10);
+  const reReadLimit = Math.min(100, editEndLine - reReadOffset + 20);
+
+  return {
+    covered: false,
+    reason:
+      `🔴 Edit outside read range
+
+` +
+      `You read \`${path}\` as ${lastRange} (${lastRead.source}),
+` +
+      `but your edit targets lines ${editStartLine}-${editEndLine}.
+
+` +
+      `To proceed:
+` +
+      `  1. Read the file section: \`read path="${path}" offset=${reReadOffset} limit=${reReadLimit}\`
+` +
+      `  2. Or read the full file: \`read path="${path}"\``,
+  };
+}
+
+/**
+ * Unified edit-safety check combining stale detection + range coverage.
+ *
+ * This is the primary guard function. Call it before applying any edit.
+ * Replaces raw calls to checkStale() with a more complete validation.
+ *
+ * @param path - File path (relative or absolute)
+ * @param cwd - Current working directory
+ * @param editLines - Optional [startLine, endLine] (1-based) for range coverage check.
+ *   If omitted, only stale-file check is performed.
+ * @returns { allowed: true } or { allowed: false, reason: string }
+ */
+export async function checkEditAllowed(
+  path: string,
+  cwd: string,
+  editLines?: [number, number],
+): Promise<{ allowed: true } | { allowed: false; reason: string }> {
+  // Check 1: Stale file detection (also handles zero-read via snapshotCache)
+  const staleError = await checkStale(path, cwd);
+  if (staleError) {
+    return { allowed: false, reason: staleError };
+  }
+
+  // Check 2: Range coverage (if edit line range provided)
+  if (editLines) {
+    const coverage = checkRangeCoverage(path, cwd, editLines[0], editLines[1]);
+    if (!coverage.covered) {
+      return { allowed: false, reason: coverage.reason };
+    }
+  }
+
+  return { allowed: true };
 }

@@ -41,6 +41,25 @@ import { resolveToCwd } from "./path-utils";
 const SIMILARITY_MATCH_THRESHOLD = 0.85;
 const SIMILARITY_REPORT_THRESHOLD = 0.3; // for findClosestMatch hints only
 
+// ─── Pipeline telemetry (P2) ────────────────────────────────────
+
+/**
+ * Telemetry record for one matching tier.
+ * Captures timing, success, and match count for observability.
+ */
+export interface TierTelemetry {
+  /** Which tier was attempted */
+  tier: MatchTier;
+  /** Duration in milliseconds */
+  durationMs: number;
+  /** Whether this tier found a match */
+  success: boolean;
+  /** Number of matches found (0 if not applicable) */
+  matchCount: number;
+  /** Human-readable note about this tier's behavior */
+  note?: string;
+}
+
 // ─── Line ending utilities ───────────────────────────────────────
 
 export function detectLineEnding(content: string): string {
@@ -495,13 +514,20 @@ function mapCharInLine(
  *
  * When found, returns position in ORIGINAL content, not normalized.
  */
-export function findText(
+/**
+ * Find text with per-tier telemetry timing.
+ * Wraps the standard findText function with timing instrumentation.
+ * Returns match result + telemetry array.
+ */
+export function findTextWithTelemetry(
   originalContent: string,
   oldText: string,
   indentationStyle: IndentationStyle,
   startOffset: number = 0,
   searchScope?: SearchScope,
-): MatchResult {
+): { result: MatchResult; telemetry: TierTelemetry[] } {
+  const telemetry: TierTelemetry[] = [];
+
   // Determine the search range
   const searchStart = searchScope?.startIndex ?? startOffset;
   const searchEnd = searchScope?.endIndex ?? originalContent.length;
@@ -510,47 +536,99 @@ export function findText(
     : originalContent;
 
   // Tier 1: Exact match
+  let tierStart = performance.now();
   let exactIndex = -1;
   if (searchScope) {
-    // searchContent is a slice, so indexOf returns position relative to that slice
     const localIndex = searchContent.indexOf(oldText);
     if (localIndex !== -1) exactIndex = searchStart + localIndex;
   } else {
-    // searchContent is the full content; indexOf with offset returns absolute position
     exactIndex = searchContent.indexOf(oldText, searchStart);
   }
+  const exactDuration = performance.now() - tierStart;
   if (exactIndex !== -1) {
+    telemetry.push({ tier: MatchTier.EXACT, durationMs: exactDuration, success: true, matchCount: 1 });
     return {
-      found: true,
-      index: exactIndex,
-      matchLength: oldText.length,
-      tier: MatchTier.EXACT,
-      usedFuzzyMatch: false,
-      matchedText: oldText,
+      result: {
+        found: true,
+        index: exactIndex,
+        matchLength: oldText.length,
+        tier: MatchTier.EXACT,
+        usedFuzzyMatch: false,
+        matchedText: oldText,
+      },
+      telemetry,
     };
   }
+  telemetry.push({ tier: MatchTier.EXACT, durationMs: exactDuration, success: false, matchCount: 0 });
 
   // Tier 2: Indentation-normalized match
+  tierStart = performance.now();
   const indentResult = tryIndentationMatch(originalContent, oldText, indentationStyle, searchStart);
-  if (indentResult && (!searchScope || (indentResult.index >= searchStart && indentResult.index < searchEnd))) return indentResult;
+  const indentDuration = performance.now() - tierStart;
+  if (indentResult && (!searchScope || (indentResult.index >= searchStart && indentResult.index < searchEnd))) {
+    telemetry.push({
+      tier: MatchTier.INDENTATION,
+      durationMs: indentDuration,
+      success: true,
+      matchCount: 1,
+      note: `File uses ${indentationStyle.char === "\t" ? "tabs" : `${indentationStyle.width}-space`}`,
+    });
+    return { result: indentResult, telemetry };
+  }
+  telemetry.push({ tier: MatchTier.INDENTATION, durationMs: indentDuration, success: false, matchCount: 0 });
 
   // Tier 3: Unicode-normalized match (maps back to original)
+  tierStart = performance.now();
   const unicodeResult = tryUnicodeMatch(originalContent, oldText, searchStart);
-  if (unicodeResult && (!searchScope || (unicodeResult.index >= searchStart && unicodeResult.index < searchEnd))) return unicodeResult;
+  const unicodeDuration = performance.now() - tierStart;
+  if (unicodeResult && (!searchScope || (unicodeResult.index >= searchStart && unicodeResult.index < searchEnd))) {
+    telemetry.push({ tier: MatchTier.UNICODE, durationMs: unicodeDuration, success: true, matchCount: 1 });
+    return { result: unicodeResult, telemetry };
+  }
+  telemetry.push({ tier: MatchTier.UNICODE, durationMs: unicodeDuration, success: false, matchCount: 0 });
 
   // Tier 4: Similarity-scored match (safety net for near-matches)
+  tierStart = performance.now();
   const similarityResult = trySimilarityMatch(originalContent, oldText, searchStart);
-  if (similarityResult && (!searchScope || (similarityResult.index >= searchStart && similarityResult.index < searchEnd))) return similarityResult;
+  const similarityDuration = performance.now() - tierStart;
+  if (similarityResult && (!searchScope || (similarityResult.index >= searchStart && similarityResult.index < searchEnd))) {
+    telemetry.push({ tier: MatchTier.SIMILARITY, durationMs: similarityDuration, success: true, matchCount: 1 });
+    return { result: similarityResult, telemetry };
+  }
+  telemetry.push({ tier: MatchTier.SIMILARITY, durationMs: similarityDuration, success: false, matchCount: 0 });
 
   // No match found across all tiers
   return {
-    found: false,
-    index: -1,
-    matchLength: 0,
-    tier: MatchTier.EXACT,
-    usedFuzzyMatch: false,
-    matchedText: "",
+    result: {
+      found: false,
+      index: -1,
+      matchLength: 0,
+      tier: MatchTier.EXACT,
+      usedFuzzyMatch: false,
+      matchedText: "",
+    },
+    telemetry,
   };
+}
+
+/**
+ * Standard findText — kept for backward compatibility.
+ * Core 4-tier matching pipeline: exact → indentation → unicode → similarity.
+ */
+export function findText(
+  originalContent: string,
+  oldText: string,
+  indentationStyle: IndentationStyle,
+  startOffset: number = 0,
+  searchScope?: SearchScope,
+): MatchResult {
+  return findTextWithTelemetry(
+    originalContent,
+    oldText,
+    indentationStyle,
+    startOffset,
+    searchScope,
+  ).result;
 }
 
 /**

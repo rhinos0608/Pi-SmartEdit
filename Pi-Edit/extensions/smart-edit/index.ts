@@ -32,7 +32,7 @@ import {
   defaultConflictConfig,
 } from "./lib/conflict-detector";
 
-import { recordRead, checkStale, recordReadWithStat } from "./lib/read-cache";
+import { recordRead, checkStale, recordReadWithStat, recordReadSession, getSessionReads, checkEditAllowed, checkRangeCoverage } from "./lib/read-cache";
 import { buildHashlineAnchors } from "./lib/hashline";
 import type { HashlineEditInput } from "./lib/hashline-edit";
 
@@ -857,6 +857,148 @@ async function resolveAnchorToScope(
   return null;
 }
 
+// ─── Re-read helpers for failed edits ──────────────────────────────
+
+/**
+ * Find approximate line numbers for a text snippet in file content.
+ * Returns the first line (1-based) where oldText appears, or null.
+ */
+function findTextLineRange(
+  content: string,
+  oldText: string,
+): { startLine: number; endLine: number } | null {
+  if (!oldText) return null;
+  const lines = content.split('\n');
+  const searchText = oldText.split('\n')[0]; // First line of oldText
+  if (!searchText) return null;
+
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].includes(searchText)) {
+      const startLine = i + 1; // 1-based
+      const endLine = Math.min(startLine + oldText.split('\n').length - 1, lines.length);
+      return { startLine, endLine };
+    }
+  }
+  return null;
+}
+
+/**
+ * Compute the containing line range for a set of edits from their oldText.
+ * Returns [startLine, endLine] (1-based) or null if oldText can't be located.
+ *
+ * Used by the range coverage guard to validate that edit targets fall within
+ * lines that were actually read this session.
+ */
+function computeEditContainingRange(
+  content: string,
+  edits: EditItem[],
+): [number, number] | null {
+  let minStart = Infinity;
+  let maxEnd = -Infinity;
+  const contentLines = content.split("\n");
+
+  for (const edit of edits) {
+    if (!edit.oldText) continue;
+    const searchLine = edit.oldText.split("\n")[0];
+    if (!searchLine) continue;
+
+    for (let i = 0; i < contentLines.length; i++) {
+      if (contentLines[i].includes(searchLine)) {
+        const startLine = i + 1; // 1-based
+        const endLine = Math.min(
+          startLine + edit.oldText.split("\n").length - 1,
+          contentLines.length,
+        );
+        if (startLine < minStart) minStart = startLine;
+        if (endLine > maxEnd) maxEnd = endLine;
+        break; // only first match per edit
+      }
+    }
+  }
+
+  if (minStart === Infinity || maxEnd === -Infinity) return null;
+  return [minStart, maxEnd];
+}
+
+/**
+ * Read a range of lines from a file and return them as a string.
+ * Returns the lines with their line numbers for context.
+ */
+function readLinesWithContext(
+  lines: string[],
+  startLine: number,
+  endLine: number,
+  contextLines: number = 5,
+): string {
+  const totalLines = lines.length;
+  // Expand range to include context lines
+  const ctxStart = Math.max(1, startLine - contextLines);
+  const ctxEnd = Math.min(totalLines, endLine + contextLines);
+
+  const result: string[] = [];
+  for (let i = ctxStart - 1; i < ctxEnd; i++) {
+    const lineNum = i + 1;
+    const marker = (lineNum >= startLine && lineNum <= endLine) ? '>>>' : '   ';
+    result.push(`${marker} ${lineNum.toString().padStart(4)}: ${lines[i]}`);
+  }
+  return result.join('\n');
+}
+
+/**
+ * After a failed edit, re-read the file from disk and build an enhanced
+ * error message that includes the current file content around the edit
+ * location. Also updates the read cache with the fresh content.
+ */
+async function reReadAfterFailure(
+  absolutePath: string,
+  path: string,
+  cwd: string,
+  edits: EditItem[],
+  error: Error,
+): Promise<Error> {
+  let currentContent: string;
+  try {
+    currentContent = (await fsReadFile(absolutePath)).toString('utf-8');
+  } catch {
+    // Can't re-read — return original error
+    return error;
+  }
+
+  // Update the read cache with the fresh content so the user can retry
+  const lines = currentContent.split('\n');
+  const hashline = await buildHashlineAnchors(lines);
+  recordRead(path, cwd, currentContent, false, hashline);
+
+  // Build context snippets for each edit that failed
+  const contextParts: string[] = [];
+  for (const edit of edits) {
+    if (!edit.oldText) continue;
+
+    // Try to find where this oldText should be
+    const lineRange = findTextLineRange(currentContent, edit.oldText);
+    if (lineRange) {
+      const context = readLinesWithContext(lines, lineRange.startLine, lineRange.endLine);
+      contextParts.push(
+        `Edit target (lines ${lineRange.startLine}–${lineRange.endLine}):\n${context}`
+      );
+    }
+  }
+
+  // If no line ranges found, show the whole file (up to first 100 lines)
+  if (contextParts.length === 0) {
+    const previewLines = lines.slice(0, 100);
+    contextParts.push(
+      `File preview (first ${previewLines.length} lines):\n` +
+      previewLines.map((line, i) => `     ${(i + 1).toString().padStart(4)}: ${line}`).join('\n')
+    );
+  }
+
+  const contextStr = contextParts.join('\n\n---\n\n');
+  const enhancedMessage = `${error.message}\n\n📖 Current file content around edit location:\n\n${contextStr}`;
+
+  return new Error(enhancedMessage);
+}
+
 // ─── Extension entry point ──────────────────────────────────────────
 
 export default function smartEdit(pi: ExtensionAPI) {
@@ -886,7 +1028,12 @@ export default function smartEdit(pi: ExtensionAPI) {
           const lines = fullText.split("\n");
           const hashline = await buildHashlineAnchors(lines);
           recordRead(inputPath, process.cwd(), fullText, true, hashline);
-            return;
+
+          // Track read range for coverage validation
+          const readOffset = (event.input as any)?.offset ?? 1;
+          const readLimit = (event.input as any)?.limit ?? lines.length;
+          recordReadSession(inputPath, process.cwd(), readOffset, readLimit, lines.length, "read");
+          return;
           }
 
           // Detect Pi's automatic output truncation: if the file on disk is
@@ -907,6 +1054,9 @@ export default function smartEdit(pi: ExtensionAPI) {
           const lines = fullText.split("\n");
           const hashline = await buildHashlineAnchors(lines);
           recordRead(inputPath, process.cwd(), fullText, isTruncated, hashline);
+
+          // Track read range for coverage validation
+          recordReadSession(inputPath, process.cwd(), 1, -1, lines.length, "read");
         }
       } catch {
         /* silently ignore cache population errors */
@@ -931,6 +1081,11 @@ export default function smartEdit(pi: ExtensionAPI) {
                 const lines = content.split("\n");
                 const hashline = await buildHashlineAnchors(lines);
                 recordRead(file.path, process.cwd(), content, isPartial, hashline);
+
+                // Track read range for coverage validation
+                const readOffset = file.offset ?? 1;
+                const readLimit = file.limit ?? -1;
+                recordReadSession(file.path, process.cwd(), readOffset, readLimit, lines.length, "read_multiple_files");
               }
             } catch {
               // File may not exist or can't be read — skip silently
@@ -967,6 +1122,10 @@ export default function smartEdit(pi: ExtensionAPI) {
                 const lines = content.split("\n");
                 const hashline = await buildHashlineAnchors(lines);
                 recordRead(file.path, process.cwd(), content, isPartial, hashline);
+
+                // Track read range for coverage validation
+                // intent_read reads full files, so offset=1, limit=-1 (full file)
+                recordReadSession(file.path, process.cwd(), 1, -1, lines.length, "intent_read");
               }
             } catch {
               // File may not exist or can't be read — skip silently
@@ -991,6 +1150,10 @@ export default function smartEdit(pi: ExtensionAPI) {
         const content = (await fsReadFile(resolvedPath)).toString("utf-8");
         if (content) {
           recordRead(writePath, process.cwd(), content);
+
+          // Track write as a read (write-then-edit flow bypasses stale guard)
+          const lines = content.split("\n");
+          recordReadSession(writePath, process.cwd(), 1, -1, lines.length, "write");
         }
       } catch {
         // File might not exist yet or can't be read — skip silently
@@ -1086,7 +1249,7 @@ export default function smartEdit(pi: ExtensionAPI) {
 
           if (aborted) throw new Error("Operation aborted");
 
-          // ── Stale file check (checkStale handles its own APFS retry internally) ──
+          // ── Stale file check (checkStale handles its own APFS retry + zero-read) ──
           const staleError = await checkStale(path, cwd);
           if (staleError) {
             if (signal) signal.removeEventListener("abort", onAbort);
@@ -1096,6 +1259,19 @@ export default function smartEdit(pi: ExtensionAPI) {
           // Read the file
           const buffer = await fsReadFile(absolutePath);
           const rawContent = buffer.toString("utf-8");
+
+          // ── Range coverage check (P1: read-guard pattern) ──
+          // Validate that edit targets fall within lines actually read this session.
+          // This prevents edits to sections of a file the model hasn't seen.
+          // Uses the edits' oldText to determine target lines.
+          const editLineRange = computeEditContainingRange(rawContent, edits);
+          if (editLineRange) {
+            const coverageResult = checkRangeCoverage(path, cwd, editLineRange[0], editLineRange[1]);
+            if (!coverageResult.covered) {
+              if (signal) signal.removeEventListener("abort", onAbort);
+              throw new Error(coverageResult.reason);
+            }
+          }
 
           if (aborted) throw new Error("Operation aborted");
 
@@ -1144,7 +1320,7 @@ export default function smartEdit(pi: ExtensionAPI) {
               applyHashlinePath,
             } = await import("./lib/hashline-edit.js");
             const { getSnapshot } = await import("./lib/read-cache.js");
-            const { findText, detectIndentation } = await import("./lib/edit-diff.js");
+            const { findText, findTextWithTelemetry, detectIndentation } = await import("./lib/edit-diff.js");
 
             // Get file snapshot from cache for oldText reconstruction
             const snapshot = getSnapshot(path, cwd);
@@ -1164,6 +1340,22 @@ export default function smartEdit(pi: ExtensionAPI) {
               return scope;
             };
 
+            // Wrap findText with telemetry for matching instrumentation
+            const findTextWithT: typeof findText = (content, search, style, offset, scope) => {
+              const { result, telemetry } = findTextWithTelemetry(content, search, style, offset, scope);
+              // Only report telemetry when a fuzzy tier was used
+              if (telemetry && telemetry.length > 0) {
+                const successTiers = telemetry.filter((t: { success: boolean }) => t.success);
+                if (successTiers.length > 0) {
+                  const summary = successTiers
+                    .map((t: { tier: string; durationMs: number }) => `${t.tier}: ${t.durationMs.toFixed(1)}ms`)
+                    .join(", ");
+                  matchNotes.push(`[match-telemetry] ${summary}`);
+                }
+              }
+              return result;
+            };
+
             for (const { editIdx, hashline } of hashlineEdits) {
               const rawEdit = hashline as {
                 anchor?: HashlineEditInput["anchor"];
@@ -1180,7 +1372,7 @@ export default function smartEdit(pi: ExtensionAPI) {
                 normalizedContent,
                 snapshot,
                 resolveScopeFn,
-                findText as Parameters<typeof applyHashlinePath>[4],
+                findTextWithT as Parameters<typeof applyHashlinePath>[4],
                 detectIndentation,
               );
 
@@ -1219,7 +1411,12 @@ export default function smartEdit(pi: ExtensionAPI) {
                         endIndex: s.matchIndex + s.matchLength,
                       }));
 
-                      const conflicts = await conflictDetector!.checkConflicts(
+                      // Capture baseline before checking delta conflicts
+                      // This ensures we only report NEW conflicts since the
+                      // last successful edit to this file.
+                      conflictDetector!.captureBaseline(path);
+
+                      const conflicts = await conflictDetector!.checkDeltaConflicts(
                         path,
                         normalizedContent,
                         realSpans,
@@ -1397,7 +1594,31 @@ export default function smartEdit(pi: ExtensionAPI) {
           if (signal) signal.removeEventListener("abort", onAbort);
 
           if (!aborted) {
-            throw error instanceof Error ? error : new Error(String(error));
+            const err = error instanceof Error ? error : new Error(String(error));
+
+            // For edit-matching failures (stale file, oldText not found, etc.),
+            // re-read the file from disk and include current content in the error.
+            // This gives the user immediate context for retrying the edit.
+            const isMatchFailure =
+              err.message.includes("not found") ||
+              err.message.includes("No matches") ||
+              err.message.includes("has been modified") ||
+              err.message.includes("not been read") ||
+              err.message.includes("unique") ||
+              err.message.includes("ambiguous");
+
+            if (isMatchFailure) {
+              const enhancedError = await reReadAfterFailure(
+                absolutePath,
+                path,
+                cwd,
+                edits,
+                err,
+              );
+              throw enhancedError;
+            }
+
+            throw err;
           }
           throw new Error("Operation aborted");
         }

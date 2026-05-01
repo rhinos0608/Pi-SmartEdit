@@ -80,6 +80,13 @@ export function createConflictDetector(
   let turnCounter = 0;
 
   /**
+   * Baseline snapshots for delta mode.
+   * Stores a snapshot of edit history per file at the time captureBaseline() was called.
+   * Used by checkDeltaConflicts to return only NEW conflicts since baseline.
+   */
+  const baselineHistory = new Map<string, Set<string>>();
+
+  /**
    * Record that an edit was applied to a set of symbols in a file.
    * Called AFTER a successful edit application.
    */
@@ -371,12 +378,86 @@ export function createConflictDetector(
   function clearAll(): void {
     editHistory.clear();
     lineRangeHistory.clear();
+    baselineHistory.clear();
     turnCounter = 0;
+  }
+
+  // ─── Delta mode (P3: pi-lens delta pattern) ─────────────────────
+
+  /**
+   * Capture a baseline snapshot of the current edit history state.
+   * After calling captureBaseline, subsequent checkDeltaConflicts calls
+   * will only report conflicts involving edits that were ADDED after
+   * this baseline.
+   *
+   * Call before the first edit to a file to suppress stale conflict
+   * reports from previous session history.
+   *
+   * The baseline is a Set of "symbolName:symbolKind" keys representing
+   * the edits that existed at the time of capture. Any new edit that
+   * creates a conflict with a symbol NOT in this set is reported as new.
+   */
+  function captureBaseline(filePath: string): void {
+    const history = editHistory.get(filePath);
+    const baseline = new Set<string>();
+
+    if (history) {
+      for (const record of history) {
+        baseline.add(`${record.symbol.name}:${record.symbol.kind}`);
+      }
+    }
+
+    // Also capture line-range history baseline
+    const lineHistory = lineRangeHistory.get(filePath);
+    if (lineHistory) {
+      for (const record of lineHistory) {
+        baseline.add(`byte-range:${record.turn}`);
+      }
+    }
+
+    baselineHistory.set(filePath, baseline);
+  }
+
+  /**
+   * Clear the baseline for a file (forces fresh capture on next call).
+   */
+  function clearBaseline(filePath: string): void {
+    baselineHistory.delete(filePath);
+  }
+
+  /**
+   * Check conflicts, returning only NEW conflicts since the last baseline.
+   *
+   * If no baseline has been captured for this file, returns all conflicts
+   * (same as checkConflicts). Call captureBaseline() first to enable delta mode.
+   */
+  async function checkDeltaConflicts(
+    filePath: string,
+    content: string,
+    editSpans: Array<{ startIndex: number; endIndex: number }>,
+  ): Promise<ConflictReport[]> {
+    // Get all conflicts (existing logic)
+    const allConflicts = await checkConflicts(filePath, content, editSpans);
+
+    // No baseline — return all conflicts (first-time warning)
+    const baseline = baselineHistory.get(filePath);
+    if (!baseline) return allConflicts;
+
+    // Filter to only NEW conflicts (involving symbols not in baseline)
+    const newConflicts = allConflicts.filter((c) => {
+      const key = `${c.previousSymbol.name}:${c.previousSymbol.kind}`;
+      return !baseline.has(key);
+    });
+
+    return newConflicts;
   }
 
   return {
     recordEdit,
     checkConflicts,
+    checkDeltaConflicts,
+    captureBaseline,
+    clearBaseline,
     clearForFile,
     clearAll,
   };
