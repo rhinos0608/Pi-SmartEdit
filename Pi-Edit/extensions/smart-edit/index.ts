@@ -49,6 +49,10 @@ import { checkPostEditDiagnostics } from "./src/lsp/diagnostics";
 import { getCompilerForLanguage } from "./src/lsp/diagnostic-dispatcher";
 import type { DiagnosticResult } from "./src/lsp/diagnostic-dispatcher";
 
+import { runPostEditEvidencePipeline } from "./src/verification/post-edit-evidence";
+import { defaultVerificationConfig } from "./src/verification/config";
+import type { PostEditEvidenceResult } from "./src/verification/types";
+
 import type {
   EditAnchor,
   EditItem,

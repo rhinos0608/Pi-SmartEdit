@@ -21,6 +21,7 @@
     ]
   },
   "scripts": {
-    "test": "tsx --test test/hashline.test.ts && tsx --test test/formats.test.ts && tsx --test ../../../test/error-handling.test.ts && tsx --test ../../../test/read-cache.test.ts && tsx --test ../../../test/edit-diff.test.ts && tsx --test ../../../test/ast-resolver.test.ts && tsx --test ../../../test/ast-integration.test.ts && tsx --test ../../../test/conflict-detector.test.ts && tsx --test ../../../test/integration.test.ts && tsx --test ../../../test/lsp.test.ts"
+    "test": "tsx --test test/hashline.test.ts && tsx --test test/formats.test.ts && tsx --test ../../../test/error-handling.test.ts && tsx --test ../../../test/read-cache.test.ts && tsx --test ../../../test/edit-diff.test.ts && tsx --test ../../../test/ast-resolver.test.ts && tsx --test ../../../test/ast-integration.test.ts && tsx --test ../../../test/conflict-detector.test.ts && tsx --test ../../../test/integration.test.ts && tsx --test ../../../test/lsp.test.ts && tsx --test test/verification/background-runner.test.ts && tsx --test test/verification/command-runner.test.ts && tsx --test test/verification/concurrency-detector.test.ts && tsx --test test/verification/change-targets.test.ts && tsx --test test/verification/traceability.test.ts && tsx --test test/verification/history-context.test.ts && tsx --test test/verification/post-edit-evidence.test.ts",
+"test:v": "tsx --test test/verification/background-runner.test.ts && tsx --test test/verification/command-runner.test.ts && tsx --test test/verification/concurrency-detector.test.ts && tsx --test test/verification/change-targets.test.ts && tsx --test test/verification/traceability.test.ts && tsx --test test/verification/history-context.test.ts && tsx --test test/verification/post-edit-evidence.test.ts"
   }
 }
