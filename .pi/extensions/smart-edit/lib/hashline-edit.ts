@@ -213,9 +213,13 @@ export function tryRebaseAll(
     if (editRebased.rebased) {
       rebasedEdits.push(editRebased.edit!);
       const [posAnchor, endAnchor] = getAnchorStrings(edit);
+      const rebasedEdit = editRebased.edit!;
+      const rebasedLine = rebasedEdit.op === 'replace_range' ? rebasedEdit.pos.line : -1;
+      const endMoved = editRebased.endMoved;
+      const originalEndLine = edit.op === 'replace_range' ? edit.end.line : -1;
       warnings.push(
-        `Anchor ${posAnchor}${editRebased.endMoved ? `-${editRebased.endAnchor}` : ""} ` +
-        `was rebased to line ${editRebased.edit!.pos.line}${editRebased.endMoved ? ` (was ${edit.end.line})` : ""}.`
+        `Anchor ${posAnchor}${endMoved ? `-${editRebased.endAnchor}` : ""} ` +
+        `was rebased to line ${rebasedLine}${endMoved ? ` (was ${originalEndLine})` : ""}.`
       );
     } else if (editRebased.notFound) {
       failedEdits.push(editIdx);
@@ -331,7 +335,7 @@ export function hashlineParseText(
  */
 export function resolveHashlineEdits(
   rawEdits: Array<{
-    anchor: {
+    anchor?: {
       symbol?: { name: string; kind?: string; line?: number };
       range: { pos: string; end: string };
     };
@@ -360,6 +364,10 @@ export function resolveHashlineEdits(
       if (posStr === "start" || posStr === "BOF") {
         return { op: "prepend_file" as const, lines };
       }
+    }
+
+    if (!raw.anchor?.range) {
+      throw new Error("hashline edit requires an anchor with range field");
     }
 
     const pos = parseTag(raw.anchor.range.pos);
@@ -540,7 +548,7 @@ export function applyHashlineEdits(
         current: result.current ?? "<empty>",
       });
     } else {
-      if (firstChanged === undefined || result.firstChangedLine < firstChanged) {
+      if (firstChanged === undefined || (result.firstChangedLine ?? Infinity) < firstChanged) {
         firstChanged = result.firstChangedLine;
       }
     }
@@ -955,7 +963,7 @@ export async function applyHashlinePath(
   const warnings: string[] = [];
 
   // ── Step 1: Resolve hashline edits ──────────────────────────────────────────
-  const resolvedEdits = resolveHashlineEdits([input]);
+  const resolvedEdits = resolveHashlineEdits([{ ...input, content: input.content ?? null }]);
   if (resolvedEdits.length === 0) {
     return {
       newContent: fileContent,
