@@ -50,6 +50,7 @@ import type {
   EditInput,
   EditResult,
   LineRange,
+  MatchSpan,
   SearchScope,
 } from "./lib/types";
 
@@ -1085,23 +1086,8 @@ export default function smartEdit(pi: ExtensionAPI) {
 
           if (aborted) throw new Error("Operation aborted");
 
-          // ── Stale file check with retry (handles macOS APFS mtime granularity) ──
-          const MAX_RETRIES = 3;
-          const INITIAL_DELAY_MS = 50;
-          let staleError: string | null = null;
-
-          for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-            staleError = await checkStale(path, cwd);
-            if (!staleError) break;
-
-            if (attempt < MAX_RETRIES - 1) {
-              // Wait with exponential backoff before retry
-              await new Promise(
-                (r) => setTimeout(r, INITIAL_DELAY_MS * Math.pow(2, attempt))
-              );
-            }
-          }
-
+          // ── Stale file check (checkStale handles its own APFS retry internally) ──
+          const staleError = await checkStale(path, cwd);
           if (staleError) {
             if (signal) signal.removeEventListener("abort", onAbort);
             throw new Error(staleError);
@@ -1116,7 +1102,7 @@ export default function smartEdit(pi: ExtensionAPI) {
           // Strip BOM for matching
           const { bom, text: content } = stripBom(rawContent);
           const originalEnding = detectLineEnding(content);
-          const normalizedContent = normalizeToLF(content);
+          let normalizedContent = normalizeToLF(content);
 
           // ── Re-inject replaceAll/anchor/lineRange from Symbol-keyed extra data ──
           const extraData = (input as any)[kExtraEditData] as ExtraEditData | undefined;
@@ -1142,18 +1128,20 @@ export default function smartEdit(pi: ExtensionAPI) {
             }
           }
 
-          // If there are hashline edits, handle them first with the hashline pipeline
+          // ── Save original content for diff generation (before any edits) ──
+          const baseContent = normalizedContent;
+
+          // ── Collect match notes and conflict warnings ──
+          const matchNotes: string[] = [];
+          const conflictWarnings: string[] = [];
+          let resultMatchSpans: MatchSpan[] = [];
+          let replacementCount = 0;
+
+          // ── Phase A: Apply hashline edits (if any) ──
           if (hashlineEdits.length > 0) {
             // Import hashline-edit functions at runtime to avoid circular deps
             const {
-              resolveHashlineEdits,
-              validateHashlineEdits,
-              applyHashlineEdits,
-              tryRebaseAll,
-              HashlineMismatchError,
-              detectEditFormat,
               applyHashlinePath,
-              parseSymbolAnchor,
             } = await import("./lib/hashline-edit.js");
             const { getSnapshot } = await import("./lib/read-cache.js");
             const { findText, detectIndentation } = await import("./lib/edit-diff.js");
@@ -1161,8 +1149,7 @@ export default function smartEdit(pi: ExtensionAPI) {
             // Get file snapshot from cache for oldText reconstruction
             const snapshot = getSnapshot(path, cwd);
 
-            // Build adapter functions for applyHashlinePath
-            // resolveScopeFn: convert SearchScope | null to the simpler {startIndex,endIndex,description} | null
+            // Build adapter for AST scope resolution
             const resolveScopeFn = async (
               anchor: EditAnchor,
               content: string,
@@ -1174,22 +1161,8 @@ export default function smartEdit(pi: ExtensionAPI) {
                 path,
               );
               if (!scope) return null;
-              return {
-                startIndex: scope.startIndex,
-                endIndex: scope.endIndex,
-                description: scope.description,
-              };
+              return scope;
             };
-
-            // Process each hashline edit using the routing pipeline
-            const hashlineResults: Array<{
-              editIdx: number;
-              result: string;
-              diff?: string;
-              firstChangedLine?: number;
-              warning?: string;
-              tier?: string;
-            }> = [];
 
             for (const { editIdx, hashline } of hashlineEdits) {
               const rawEdit = hashline as {
@@ -1202,176 +1175,97 @@ export default function smartEdit(pi: ExtensionAPI) {
                 content: rawEdit.content as string[] | null | undefined,
               };
 
-              // Use the main routing function — handles all fallback tiers
               const pathResult = await applyHashlinePath(
                 input,
                 normalizedContent,
                 snapshot,
                 resolveScopeFn,
-                findText,
+                findText as Parameters<typeof applyHashlinePath>[4],
                 detectIndentation,
               );
 
-              // Collect result
-              hashlineResults.push({
-                editIdx,
-                result: pathResult.newContent,
-                firstChangedLine: pathResult.firstChangedLine,
-                warning: pathResult.warnings[0],
-                tier: pathResult.tier,
-              });
+              if (pathResult.warnings.length > 0) {
+                matchNotes.push(...pathResult.warnings);
+              }
 
-              // Update normalizedContent for subsequent edits in the same batch
               normalizedContent = pathResult.newContent;
             }
+          }
 
-            // Apply remaining legacy edits after all hashline edits
-            // (hashline edits already updated normalizedContent in place)
-            // For simplicity, apply legacy edits on top of the hashline result
-            // This ensures the final file reflects all edits in sequence.
-            // NOTE: This is a simplification. In production, we'd want to
-            // interleave hashline and legacy edits in correct order.
-
-            // For now: use the hashline result as the base for any legacy edits
-            if (legacyEdits.length > 0) {
-              // Apply legacy edits on top of hashline result
-              const scopes: (SearchScope | undefined)[] = [];
-              for (const { edit } of legacyEdits) {
-                if (edit.anchor || edit.lineRange) {
-                  const scope = await resolveAnchorToScope(edit, normalizedContent, path);
-                  scopes.push(scope ?? undefined);
-                } else {
-                  scopes.push(undefined);
-                }
-              }
-
-              const legacyResult = await applyEdits(
-                normalizedContent,
-                legacyEdits.map(e => e.edit),
-                path,
-                { searchScopes: scopes },
-              );
-
-              // Merge results
-              const allMatchSpans = legacyResult.matchSpans;
-              const diffResult = generateDiffString(normalizedContent, legacyResult.newContent);
-
-              // Build success message
-              const totalEdits = edits.length;
-              const text = `Successfully replaced ${allMatchSpans.length} block(s) in ${path}.`;
-
-              return {
-                content: [{ type: "text", text }],
-                details: {
-                  diff: diffResult.diff,
-                  firstChangedLine: diffResult.firstChangedLine,
-                },
-              };
-            } else {
-              // No legacy edits — return hashline result directly
-              const finalContent = hashlineResults[hashlineResults.length - 1]?.result ?? normalizedContent;
-              const allWarnings = hashlineResults.map(r => r.warning).filter(Boolean);
-              const allTiers = hashlineResults.map(r => r.tier).filter(Boolean) as string[];
-
-              // Count fallback tier usage for the success message
-              const directCount = allTiers.filter(t => t === "hashline-direct").length;
-              const rebasedCount = allTiers.filter(t => t === "hashline-rebased").length;
-              const scopedCount = allTiers.filter(t => t === "scoped-fallback").length;
-              const fuzzyCount = allTiers.filter(t => t === "full-fuzzy-fallback").length;
-
-              const diffResult = generateDiffString(normalizedContent.split("\n").join("\n"), finalContent);
-
-              const matchCount = hashlineResults.length;
-              const hasFallback = rebasedCount > 0 || scopedCount > 0 || fuzzyCount > 0;
-              let text: string;
-
-              if (hasFallback) {
-                const parts: string[] = [];
-                if (directCount > 0) parts.push(`${directCount} direct`);
-                if (rebasedCount > 0) parts.push(`${rebasedCount} rebased`);
-                if (scopedCount > 0) parts.push(`${scopedCount} scoped`);
-                if (fuzzyCount > 0) parts.push(`${fuzzyCount} fuzzy-fallback`);
-                text = `Successfully applied ${matchCount} hashline edit(s) in ${path} (${parts.join(", ")}).`;
+          // ── Phase B: Apply legacy edits (if any) ──
+          if (legacyEdits.length > 0) {
+            // Resolve anchors to search scopes
+            const resolvedScopes: (SearchScope | undefined)[] = [];
+            for (const { edit } of legacyEdits) {
+              if (edit.anchor || edit.lineRange) {
+                const scope = await resolveAnchorToScope(edit, normalizedContent, path);
+                resolvedScopes.push(scope ?? undefined);
               } else {
-                text = `Successfully replaced ${matchCount} block(s) in ${path} via hashline anchors.`;
+                resolvedScopes.push(undefined);
               }
-
-              if (allWarnings.length > 0) {
-                text += "\nNote: " + allWarnings.join("; ");
-              }
-
-              return {
-                content: [{ type: "text", text }],
-                details: {
-                  diff: diffResult.diff,
-                  firstChangedLine: diffResult.firstChangedLine,
-                },
-              };
             }
-          }
 
-          // ── Resolve anchors to search scopes ──
-          // Do this before applyEdits so the scopes can be passed explicitly.
-          const resolvedScopes: (SearchScope | undefined)[] = [];
-          for (const edit of edits) {
-            if (edit.anchor || edit.lineRange) {
-              const scope = await resolveAnchorToScope(edit, normalizedContent, path);
-              resolvedScopes.push(scope ?? undefined);
-            } else {
-              resolvedScopes.push(undefined);
-            }
-          }
+            // Apply legacy edits with pre-apply hooks (conflict detection)
+            const legacyResult = await applyEdits(
+              normalizedContent,
+              legacyEdits.map(e => e.edit),
+              path,
+              {
+                searchScopes: resolvedScopes,
+                onBeforeApply: conflictDetector
+                  ? async (spans) => {
+                      const realSpans = spans.map((s) => ({
+                        startIndex: s.matchIndex,
+                        endIndex: s.matchIndex + s.matchLength,
+                      }));
 
-          // ── Conflict warnings collector for warn mode ──
-          const conflictWarnings: string[] = [];
-
-          // Apply edits with pre-apply hooks and anchor scopes
-          const result = await applyEdits(
-            normalizedContent,
-            edits,
-            path,
-            {
-              searchScopes: resolvedScopes,
-              onBeforeApply: conflictDetector
-                ? async (spans) => {
-                    // Check conflicts with real MatchSpans
-                    const realSpans = spans.map((s) => ({
-                      startIndex: s.matchIndex,
-                      endIndex: s.matchIndex + s.matchLength,
-                    }));
-
-                    const conflicts = await conflictDetector!.checkConflicts(
-                      path,
-                      normalizedContent,
-                      realSpans,
-                    );
-
-                    if (conflicts.length > 0) {
-                      const conflictMessages = conflicts.map(
-                        (c) => `  - "${c.previousSymbol.name}" (${c.previousSymbol.kind}): ${c.suggestion}`,
+                      const conflicts = await conflictDetector!.checkConflicts(
+                        path,
+                        normalizedContent,
+                        realSpans,
                       );
-                      const warningMsg =
-                        `⚠ Conflict detected with previous edit:\n` +
-                        conflictMessages.join("\n") +
-                        `\nConsider re-reading the file to get updated content.`;
 
-                      if (defaultConflictConfig.onConflict === "error") {
-                        throw new Error(warningMsg);
-                      } else {
-                        // Collect warning — emit in output below
-                        conflictWarnings.push(warningMsg);
+                      if (conflicts.length > 0) {
+                        const conflictMessages = conflicts.map(
+                          (c) => `  - "${c.previousSymbol.name}" (${c.previousSymbol.kind}): ${c.suggestion}`,
+                        );
+                        const warningMsg =
+                          `⚠ Conflict detected with previous edit:\n` +
+                          conflictMessages.join("\n") +
+                          `\nConsider re-reading the file to get updated content.`;
+
+                        if (defaultConflictConfig.onConflict === "error") {
+                          throw new Error(warningMsg);
+                        } else {
+                          conflictWarnings.push(warningMsg);
+                        }
                       }
                     }
-                  }
-                : undefined,
-            },
-          );
+                  : undefined,
+              },
+            );
+
+            if (aborted) throw new Error("Operation aborted");
+
+            normalizedContent = legacyResult.newContent;
+            matchNotes.push(...(legacyResult.matchNotes || []));
+            resultMatchSpans = legacyResult.matchSpans;
+            replacementCount = legacyResult.replacementCount;
+          }
+
+          // ── Guard: no-op check ──
+          if (baseContent === normalizedContent) {
+            const msg = edits.length === 1
+              ? `No changes made to ${path}. The replacement produced identical content.`
+              : `No changes made to ${path}. The replacements produced identical content.`;
+            throw new Error(msg);
+          }
 
           if (aborted) throw new Error("Operation aborted");
 
           // Reconstruct with BOM and line endings
           const finalContent =
-            bom + restoreLineEndings(result.newContent, originalEnding);
+            bom + restoreLineEndings(normalizedContent, originalEnding);
 
           // Atomic write
           await atomicWrite(absolutePath, finalContent);
@@ -1398,38 +1292,43 @@ export default function smartEdit(pi: ExtensionAPI) {
             }
             await new Promise((r) => setTimeout(r, 20 * Math.pow(2, attempt)));
           }
-          recordReadWithStat(path, cwd, finalContent, settledMtimeMs, expectedSize);
+
+          // Build hashline anchors for the post-edit content so follow-up
+          // hashline edits can use the cached snapshot without re-reading.
+          const postEditLines = normalizedContent.split("\n");
+          const postEditHashline = await buildHashlineAnchors(postEditLines);
+          recordReadWithStat(path, cwd, finalContent, settledMtimeMs, expectedSize, postEditHashline);
 
           if (aborted) throw new Error("Operation aborted");
 
           // Record successful edit for future conflict detection
           // (after atomicWrite, so no phantom record if write fails)
-          if (conflictDetector) {
+          if (conflictDetector && resultMatchSpans.length > 0) {
             await conflictDetector.recordEdit(
               path,
               normalizedContent,
-              result.matchSpans.map((s) => ({
+              resultMatchSpans.map((s) => ({
                 startIndex: s.matchIndex,
                 endIndex: s.matchIndex + s.matchLength,
               })),
             );
           }
 
-          // Generate diff
-          const diffResult = generateDiffString(result.baseContent, result.newContent);
+          // Generate diff (baseContent saved before any edits were applied)
+          const diffResult = generateDiffString(baseContent, normalizedContent);
 
           // ── Post-edit AST validation ──
           // Check that the file still parses correctly after the edit.
           // If validation is enabled, surface a warning but don't block success.
           if (astResolver) {
-            const syntaxResult = await validateSyntax(result.newContent, path);
+            const syntaxResult = await validateSyntax(normalizedContent, path);
             if (!syntaxResult.valid) {
-              result.matchNotes.push(syntaxResult.error);
+              matchNotes.push(syntaxResult.error);
             }
           }
 
           // Build success message — use actual match count, not edit object count
-          const matchCount = result.replacementCount;
+          const matchCount = replacementCount || edits.length;
           let text: string;
           if (matchCount > edits.length) {
             // replaceAll expanded one edit into multiple replacements
@@ -1444,7 +1343,7 @@ export default function smartEdit(pi: ExtensionAPI) {
             if (languageId) {
               const diagResult = await checkPostEditDiagnostics(
                 absolutePath,
-                result.newContent,
+                normalizedContent,
                 languageId,
                 lspManager,
               );
@@ -1453,13 +1352,13 @@ export default function smartEdit(pi: ExtensionAPI) {
                 const warnings = diagResult.diagnostics.filter((d) => d.severity === 2);
 
                 if (errors.length > 0) {
-                  result.matchNotes.push(
+                  matchNotes.push(
                     `⚠ LSP detected ${errors.length} error(s) after edit: ` +
                     errors.map((e) => `line ${e.range.start.line + 1}: ${e.message}`).join("; ")
                   );
                 }
                 if (warnings.length > 0) {
-                  result.matchNotes.push(
+                  matchNotes.push(
                     `ℹ LSP has ${warnings.length} warning(s): ` +
                     warnings.map((w) => w.message).join("; ")
                   );
@@ -1469,8 +1368,8 @@ export default function smartEdit(pi: ExtensionAPI) {
           }
 
           // Add match notes for transparency
-          if (result.matchNotes.length > 0) {
-            text += "\nNote: " + result.matchNotes.join(" ");
+          if (matchNotes.length > 0) {
+            text += "\nNote: " + matchNotes.join(" ");
           }
 
           // Append conflict warnings
@@ -1483,8 +1382,8 @@ export default function smartEdit(pi: ExtensionAPI) {
             diff: diffResult.diff,
             firstChangedLine: diffResult.firstChangedLine,
           };
-          if (result.matchNotes.length > 0) {
-            details.matchNotes = result.matchNotes;
+          if (matchNotes.length > 0) {
+            details.matchNotes = matchNotes;
           }
           if (conflictWarnings.length > 0) {
             details.conflictWarnings = conflictWarnings;
