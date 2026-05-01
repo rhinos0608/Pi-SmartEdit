@@ -1,3 +1,6 @@
 .pi/extensions/smart-edit/node_modules
 .pi-smartread.tags.cache/
 progress.md
+.pi/extensions/.DS_Store
+.pi/.DS_Store
+.DS_Store
