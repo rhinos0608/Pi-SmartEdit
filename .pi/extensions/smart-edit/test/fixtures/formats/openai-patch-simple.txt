@@ -1,0 +1,7 @@
+*** Begin Patch
+*** Update File: src/example.ts
+@@ const greeting = "hello"; @@
+-const oldValue = 42;
++const newValue = 43;
+ const trailing = "world";
+*** End Patch

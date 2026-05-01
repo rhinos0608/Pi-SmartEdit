@@ -1,0 +1,13 @@
+*** Begin Patch
+*** Update File: src/example.ts
+@@ function calculate(x) { @@
+-  const result = x * 2;
++  const result = x * 3;
+   return result;
+ }
+
+@@ function format(value) { @@
+-  return value.toString();
++  return String(value);
+ }
+*** End Patch

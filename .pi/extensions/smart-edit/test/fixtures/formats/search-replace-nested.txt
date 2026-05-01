@@ -1,0 +1,23 @@
+src/utils.ts
+<<<<<<< SEARCH
+// Example with nested <<<<<<< markers in comments
+function process(data) {
+  if (data.type === 'search') {
+    return data.query;
+  }
+  // Note: <<<<<<< SEARCH in code should not split
+  // And >>>>>>> REPLACE in comments either
+  return null;
+}
+=======
+// Updated version
+function process(data) {
+  if (data.type === 'query') {
+    return data.search;
+  }
+  // Nested markers in comments
+  // <<<<<<< SEARCH
+  // >>>>>>> REPLACE
+  return data;
+}
+>>>>>>> REPLACE

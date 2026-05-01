@@ -1,0 +1,17 @@
+src/foo.ts
+<<<<<<< SEARCH
+function oldFn() {
+  return 1;
+}
+=======
+function newFn() {
+  return 2;
+}
+>>>>>>> REPLACE
+
+lib/bar.ts
+<<<<<<< SEARCH
+const x = 1;
+=======
+const x = 2;
+>>>>>>> REPLACE

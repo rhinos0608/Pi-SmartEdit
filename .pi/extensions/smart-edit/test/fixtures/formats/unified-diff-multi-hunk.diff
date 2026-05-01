@@ -1,0 +1,15 @@
+--- a/src/example.ts
++++ b/src/example.ts
+@@ -1,5 +1,5 @@
+ const greeting = "hello";
+-const oldValue = 42;
++const newValue = 43;
+ const trailing = "world";
+
+@@ -10,5 +10,5 @@
+ function test() {
+   console.log("test");
+-  const result = 1;
++  const answer = 1;
+   return result;
+ }

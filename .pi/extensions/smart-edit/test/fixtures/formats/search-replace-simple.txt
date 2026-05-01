@@ -1,0 +1,5 @@
+<<<<<<< SEARCH
+const oldValue = "old";
+=======
+const newValue = "new";
+>>>>>>> REPLACE

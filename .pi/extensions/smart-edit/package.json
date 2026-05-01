@@ -1,0 +1,26 @@
+{
+  "name": "smart-edit",
+  "version": "0.1.0",
+  "description": "Improved edit tool for Pi Coding Agent — 4-tier matching (exact/indent/unicode/similarity), replaceAll, AST-anchored targeting, line-range scoping, semantic conflict detection, LSP diagnostics, multi-format input (search/replace, unified diff, OpenAI patch), stale-file guard, atomic writes, and mutation queuing",
+  "private": true,
+  "main": "index.ts",
+  "dependencies": {
+    "@vscode/tree-sitter-wasm": "^0.3.1",
+    "diff": "^7.0.0",
+    "web-tree-sitter": "^0.22.6",
+    "xxhash-wasm": "^1.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.21.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "tsx --test test/hashline.test.ts && tsx --test test/formats.test.ts && tsx --test ../../../test/error-handling.test.ts && tsx --test ../../../test/read-cache.test.ts && tsx --test ../../../test/edit-diff.test.ts && tsx --test ../../../test/ast-resolver.test.ts && tsx --test ../../../test/ast-integration.test.ts && tsx --test ../../../test/conflict-detector.test.ts && tsx --test ../../../test/integration.test.ts && tsx --test ../../../test/lsp.test.ts"
+  }
+}

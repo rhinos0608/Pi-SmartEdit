@@ -1,0 +1,494 @@
+{
+  "config": {
+    "model": "anthropic/claude-sonnet-4-6",
+    "runs": 3,
+    "taskCount": 0
+  },
+  "fixtures": [
+    {
+      "name": "single-line-replace",
+      "source": "function hello() {\n  console.log('Hello, World!');\n}",
+      "targetStart": 2,
+      "targetEnd": 2,
+      "newLines": [
+        "  console.log('Hello, Hashline!');"
+      ]
+    },
+    {
+      "name": "multi-line-replace",
+      "source": "function getUser(id: string) {\n  const user = db.find(id);\n  return {\n    name: user.name,\n    email: user.email,\n  };\n}",
+      "targetStart": 3,
+      "targetEnd": 5,
+      "newLines": [
+        "  return {",
+        "    name: user.name,",
+        "  };"
+      ]
+    },
+    {
+      "name": "delete-range",
+      "source": "// Debug logging\nconsole.log('DEBUG: entering handler');\nconsole.log('DEBUG: request body:', body);\n\nreturn process(body);",
+      "targetStart": 1,
+      "targetEnd": 3,
+      "newLines": []
+    },
+    {
+      "name": "function-body-replace",
+      "source": "function validate(data: Input): void {\n  if (!data.name) throw Error('name required');\n  if (!data.email) throw Error('email required');\n  if (data.age < 0) throw Error('invalid age');\n}",
+      "targetStart": 2,
+      "targetEnd": 4,
+      "newLines": [
+        "  if (!data.name) throw Error('name required');",
+        "  if (!data.email) throw Error('email required');"
+      ]
+    },
+    {
+      "name": "indentation-fix",
+      "source": "if (condition) {\n  doThing();\n    doOtherThing();\n  cleanup();\n}",
+      "targetStart": 3,
+      "targetEnd": 3,
+      "newLines": [
+        "  doOtherThing();"
+      ]
+    },
+    {
+      "name": "syntax-fix",
+      "source": "function add(a, b) {\n  return a + b\n}",
+      "targetStart": 2,
+      "targetEnd": 2,
+      "newLines": [
+        "  return a + b;"
+      ]
+    }
+  ],
+  "results": [
+    {
+      "fixture": "single-line-replace",
+      "mode": "hashline",
+      "run": 0,
+      "success": true,
+      "durationMs": 1.76,
+      "tokens": {
+        "input": 15,
+        "output": 4
+      }
+    },
+    {
+      "fixture": "single-line-replace",
+      "mode": "legacy",
+      "run": 0,
+      "success": true,
+      "durationMs": 0.16,
+      "tier": "exact",
+      "tokens": {
+        "input": 13,
+        "output": 8
+      }
+    },
+    {
+      "fixture": "multi-line-replace",
+      "mode": "hashline",
+      "run": 0,
+      "success": true,
+      "durationMs": 0.06,
+      "tokens": {
+        "input": 32,
+        "output": 4
+      }
+    },
+    {
+      "fixture": "multi-line-replace",
+      "mode": "legacy",
+      "run": 0,
+      "success": true,
+      "durationMs": 0.02,
+      "tier": "exact",
+      "tokens": {
+        "input": 30,
+        "output": 24
+      }
+    },
+    {
+      "fixture": "delete-range",
+      "mode": "hashline",
+      "run": 0,
+      "success": true,
+      "durationMs": 0.03,
+      "tokens": {
+        "input": 32.5,
+        "output": 4
+      }
+    },
+    {
+      "fixture": "delete-range",
+      "mode": "legacy",
+      "run": 0,
+      "success": true,
+      "durationMs": 0.01,
+      "tier": "exact",
+      "tokens": {
+        "input": 30.5,
+        "output": 24
+      }
+    },
+    {
+      "fixture": "function-body-replace",
+      "mode": "hashline",
+      "run": 0,
+      "success": true,
+      "durationMs": 0.03,
+      "tokens": {
+        "input": 48.5,
+        "output": 4
+      }
+    },
+    {
+      "fixture": "function-body-replace",
+      "mode": "legacy",
+      "run": 0,
+      "success": true,
+      "durationMs": 0.01,
+      "tier": "exact",
+      "tokens": {
+        "input": 46.5,
+        "output": 24
+      }
+    },
+    {
+      "fixture": "indentation-fix",
+      "mode": "hashline",
+      "run": 0,
+      "success": true,
+      "durationMs": 0.05,
+      "tokens": {
+        "input": 18,
+        "output": 4
+      }
+    },
+    {
+      "fixture": "indentation-fix",
+      "mode": "legacy",
+      "run": 0,
+      "success": true,
+      "durationMs": 0.01,
+      "tier": "exact",
+      "tokens": {
+        "input": 16,
+        "output": 8
+      }
+    },
+    {
+      "fixture": "syntax-fix",
+      "mode": "hashline",
+      "run": 0,
+      "success": true,
+      "durationMs": 0.05,
+      "tokens": {
+        "input": 11.25,
+        "output": 4
+      }
+    },
+    {
+      "fixture": "syntax-fix",
+      "mode": "legacy",
+      "run": 0,
+      "success": true,
+      "durationMs": 0.01,
+      "tier": "exact",
+      "tokens": {
+        "input": 9.25,
+        "output": 8
+      }
+    },
+    {
+      "fixture": "single-line-replace",
+      "mode": "hashline",
+      "run": 1,
+      "success": true,
+      "durationMs": 0.02,
+      "tokens": {
+        "input": 15,
+        "output": 4
+      }
+    },
+    {
+      "fixture": "single-line-replace",
+      "mode": "legacy",
+      "run": 1,
+      "success": true,
+      "durationMs": 0.01,
+      "tier": "exact",
+      "tokens": {
+        "input": 13,
+        "output": 8
+      }
+    },
+    {
+      "fixture": "multi-line-replace",
+      "mode": "hashline",
+      "run": 1,
+      "success": true,
+      "durationMs": 0.04,
+      "tokens": {
+        "input": 32,
+        "output": 4
+      }
+    },
+    {
+      "fixture": "multi-line-replace",
+      "mode": "legacy",
+      "run": 1,
+      "success": true,
+      "durationMs": 0.01,
+      "tier": "exact",
+      "tokens": {
+        "input": 30,
+        "output": 24
+      }
+    },
+    {
+      "fixture": "delete-range",
+      "mode": "hashline",
+      "run": 1,
+      "success": true,
+      "durationMs": 0.03,
+      "tokens": {
+        "input": 32.5,
+        "output": 4
+      }
+    },
+    {
+      "fixture": "delete-range",
+      "mode": "legacy",
+      "run": 1,
+      "success": true,
+      "durationMs": 0,
+      "tier": "exact",
+      "tokens": {
+        "input": 30.5,
+        "output": 24
+      }
+    },
+    {
+      "fixture": "function-body-replace",
+      "mode": "hashline",
+      "run": 1,
+      "success": true,
+      "durationMs": 0.02,
+      "tokens": {
+        "input": 48.5,
+        "output": 4
+      }
+    },
+    {
+      "fixture": "function-body-replace",
+      "mode": "legacy",
+      "run": 1,
+      "success": true,
+      "durationMs": 0,
+      "tier": "exact",
+      "tokens": {
+        "input": 46.5,
+        "output": 24
+      }
+    },
+    {
+      "fixture": "indentation-fix",
+      "mode": "hashline",
+      "run": 1,
+      "success": true,
+      "durationMs": 0.03,
+      "tokens": {
+        "input": 18,
+        "output": 4
+      }
+    },
+    {
+      "fixture": "indentation-fix",
+      "mode": "legacy",
+      "run": 1,
+      "success": true,
+      "durationMs": 0.01,
+      "tier": "exact",
+      "tokens": {
+        "input": 16,
+        "output": 8
+      }
+    },
+    {
+      "fixture": "syntax-fix",
+      "mode": "hashline",
+      "run": 1,
+      "success": true,
+      "durationMs": 0.02,
+      "tokens": {
+        "input": 11.25,
+        "output": 4
+      }
+    },
+    {
+      "fixture": "syntax-fix",
+      "mode": "legacy",
+      "run": 1,
+      "success": true,
+      "durationMs": 0,
+      "tier": "exact",
+      "tokens": {
+        "input": 9.25,
+        "output": 8
+      }
+    },
+    {
+      "fixture": "single-line-replace",
+      "mode": "hashline",
+      "run": 2,
+      "success": true,
+      "durationMs": 0.03,
+      "tokens": {
+        "input": 15,
+        "output": 4
+      }
+    },
+    {
+      "fixture": "single-line-replace",
+      "mode": "legacy",
+      "run": 2,
+      "success": true,
+      "durationMs": 0.01,
+      "tier": "exact",
+      "tokens": {
+        "input": 13,
+        "output": 8
+      }
+    },
+    {
+      "fixture": "multi-line-replace",
+      "mode": "hashline",
+      "run": 2,
+      "success": true,
+      "durationMs": 0.02,
+      "tokens": {
+        "input": 32,
+        "output": 4
+      }
+    },
+    {
+      "fixture": "multi-line-replace",
+      "mode": "legacy",
+      "run": 2,
+      "success": true,
+      "durationMs": 0.01,
+      "tier": "exact",
+      "tokens": {
+        "input": 30,
+        "output": 24
+      }
+    },
+    {
+      "fixture": "delete-range",
+      "mode": "hashline",
+      "run": 2,
+      "success": true,
+      "durationMs": 0.03,
+      "tokens": {
+        "input": 32.5,
+        "output": 4
+      }
+    },
+    {
+      "fixture": "delete-range",
+      "mode": "legacy",
+      "run": 2,
+      "success": true,
+      "durationMs": 0,
+      "tier": "exact",
+      "tokens": {
+        "input": 30.5,
+        "output": 24
+      }
+    },
+    {
+      "fixture": "function-body-replace",
+      "mode": "hashline",
+      "run": 2,
+      "success": true,
+      "durationMs": 0.02,
+      "tokens": {
+        "input": 48.5,
+        "output": 4
+      }
+    },
+    {
+      "fixture": "function-body-replace",
+      "mode": "legacy",
+      "run": 2,
+      "success": true,
+      "durationMs": 0.02,
+      "tier": "exact",
+      "tokens": {
+        "input": 46.5,
+        "output": 24
+      }
+    },
+    {
+      "fixture": "indentation-fix",
+      "mode": "hashline",
+      "run": 2,
+      "success": true,
+      "durationMs": 0.02,
+      "tokens": {
+        "input": 18,
+        "output": 4
+      }
+    },
+    {
+      "fixture": "indentation-fix",
+      "mode": "legacy",
+      "run": 2,
+      "success": true,
+      "durationMs": 0.01,
+      "tier": "exact",
+      "tokens": {
+        "input": 16,
+        "output": 8
+      }
+    },
+    {
+      "fixture": "syntax-fix",
+      "mode": "hashline",
+      "run": 2,
+      "success": true,
+      "durationMs": 0.01,
+      "tokens": {
+        "input": 11.25,
+        "output": 4
+      }
+    },
+    {
+      "fixture": "syntax-fix",
+      "mode": "legacy",
+      "run": 2,
+      "success": true,
+      "durationMs": 0,
+      "tier": "exact",
+      "tokens": {
+        "input": 9.25,
+        "output": 8
+      }
+    }
+  ],
+  "summary": {
+    "hashline": {
+      "success": 18,
+      "total": 18,
+      "rate": 100,
+      "avgMs": 0.12611111111111106
+    },
+    "legacy": {
+      "success": 18,
+      "total": 18,
+      "rate": 100,
+      "avgMs": 0.016666666666666673
+    }
+  }
+}
