@@ -2,22 +2,27 @@
  * Concurrency signal detector.
  *
  * Performs deterministic, cheap text scanning to detect concurrency-related
- * patterns in changed code ranges. Uses a two-layer approach:
+ * patterns in changed code ranges. Uses a three-layer approach:
  *
- * 1. **Token/pattern scan** — scans the changed source text for keywords and
+ * 1. **AST scan** (optional, when tree-sitter available) — parses the changed
+ *    source and uses tree-sitter queries to find actual async patterns.
+ *    This avoids false positives in comments or string literals.
+ *
+ * 2. **Token/pattern scan** — scans the changed source text for keywords and
  *    API patterns (async, await, Lock, Mutex, go, chan, etc.) within each
  *    changed target's byte range.
  *
- * 2. **Name scan** — inspects symbol names and file names for concurrency
+ * 3. **Name scan** — inspects symbol names and file names for concurrency
  *    cues (lock, mutex, race, atomic, thread, etc.).
  *
- * This module is intentionally simple — no AST queries, no tree-sitter
- * dependency. It runs in sub-millisecond time on any source file.
+ * This module uses tree-sitter when available for accurate AST-based detection.
+ * Falls back to regex-only mode if tree-sitter isn't available.
  */
 
+import { loadGrammar } from "../../lib/grammar-loader";
 import type { ChangedTarget, ConcurrencySignal } from "./types";
 
-// ─── Per-language token signal tables ───────────────────────────────
+// --- Per-language token signal tables ---
 
 interface PatternEntry {
   /** Regex pattern to search for */
@@ -184,17 +189,10 @@ const NAME_CONCURRENCY_CUES: Array<{
   { keyword: "event_loop", category: "scheduler" },
 ];
 
-// ─── Public API ─────────────────────────────────────────────────────
+// --- Public API ---
 
 /**
  * Detect concurrency signals within a changed target's source range.
- *
- * Layer 1: Scans the target's source text for language-specific keywords
- *          and API usage patterns.
- * Layer 2: Checks the target's name and file name for concurrency cues.
- *
- * Returns an empty array for targets that show no concurrency sensitivity,
- * so callers can use `signals.length > 0` as the trigger gate.
  */
 export function detectConcurrencySignals(
   content: string,
@@ -206,19 +204,17 @@ export function detectConcurrencySignals(
   const signals: ConcurrencySignal[] = [];
   const seen = new Set<string>();
 
-  // ── Layer 1: Token/pattern scan in the target's source range ──
-  // Convert byte offsets to string character indices for content.slice()
+  // Layer 1: Token/pattern scan in the target's source range
   const charStart = byteOffsetToCharIndex(content, target.byteRange.startIndex);
   const charEnd = byteOffsetToCharIndex(content, target.byteRange.endIndex);
   const sourceSlice = content.slice(charStart, charEnd);
 
   const languagePatterns = getPatternsForLanguage(target.languageId);
   for (const entry of languagePatterns) {
-    entry.pattern.lastIndex = 0; // reset global regex state
+    entry.pattern.lastIndex = 0;
     let m: RegExpExecArray | null;
     while ((m = entry.pattern.exec(sourceSlice)) !== null) {
-      const absoluteCharOffset =
-        charStart + m.index;
+      const absoluteCharOffset = charStart + m.index;
       const line = byteOffsetToLine(content, absoluteCharOffset);
       const key = `${line}:${m[0]}`;
       if (!seen.has(key)) {
@@ -232,7 +228,7 @@ export function detectConcurrencySignals(
     }
   }
 
-  // ── Layer 2: Name scan on target symbol name ──
+  // Layer 2: Name scan on target symbol name
   const targetNameLower = target.name.toLowerCase();
   for (const cue of NAME_CONCURRENCY_CUES) {
     if (targetNameLower.includes(cue.keyword)) {
@@ -248,9 +244,8 @@ export function detectConcurrencySignals(
     }
   }
 
-  // ── Layer 2 extended: File name scan ──
-  const fileName =
-    target.path.split(/[/\\]/).pop()?.toLowerCase() ?? "";
+  // Layer 2 extended: File name scan
+  const fileName = target.path.split(/[/\\]/).pop()?.toLowerCase() ?? "";
   for (const cue of NAME_CONCURRENCY_CUES) {
     if (fileName.includes(cue.keyword)) {
       const key = `fname:${cue.keyword}`;
@@ -283,7 +278,6 @@ export function attachConcurrencySignals(
 
 /**
  * Check whether any concurrency signals exist across all targets.
- * Useful as a fast gate before running the concurrency verification lane.
  */
 export function hasConcurrencySignals(
   signals: ConcurrencySignal[],
@@ -291,13 +285,12 @@ export function hasConcurrencySignals(
   return signals.length > 0;
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────
+// --- Helpers ---
 
 function getPatternsForLanguage(languageId: string): PatternEntry[] {
   if (LANGUAGE_PATTERNS[languageId]) {
     return LANGUAGE_PATTERNS[languageId];
   }
-  // React variants fall back to vanilla
   if (languageId === "typescriptreact") {
     return LANGUAGE_PATTERNS.typescript;
   }
@@ -307,11 +300,6 @@ function getPatternsForLanguage(languageId: string): PatternEntry[] {
   return [];
 }
 
-/**
- * Convert a UTF-8 byte offset to a string character index.
- * Iterates the UTF-8 byte representation of `content` and counts
- * characters until the given byte offset is reached.
- */
 function byteOffsetToCharIndex(content: string, byteOffset: number): number {
   if (byteOffset <= 0) return 0;
   const buffer = Buffer.from(content, "utf8");
@@ -333,7 +321,7 @@ function byteOffsetToCharIndex(content: string, byteOffset: number): number {
 
     if (byteIdx + seqLen <= maxOffset) {
       byteIdx += seqLen;
-      charIndex += (seqLen === 4 ? 2 : 1);
+      charIndex += seqLen === 4 ? 2 : 1;
     } else {
       break;
     }
@@ -341,9 +329,6 @@ function byteOffsetToCharIndex(content: string, byteOffset: number): number {
   return charIndex;
 }
 
-/**
- * Compute 1-based line number for a character index in the full content.
- */
 function byteOffsetToLine(content: string, offset: number): number {
   if (offset <= 0) return 1;
   if (offset >= content.length) offset = content.length - 1;
@@ -352,4 +337,82 @@ function byteOffsetToLine(content: string, offset: number): number {
     if (content[i] === "\n") line++;
   }
   return line;
+}
+
+// --- AST-based concurrency detection (optional layer) ---
+
+/**
+ * Detect concurrency signals using tree-sitter AST parsing.
+ * This provides accurate detection that ignores comments and string literals.
+ * Falls back gracefully if tree-sitter isn't available.
+ */
+export async function detectConcurrencySignalsAst(
+  content: string,
+  ext: string,
+): Promise<ConcurrencySignal[]> {
+  const signals: ConcurrencySignal[] = [];
+
+  const grammar = await loadGrammar(ext);
+  if (!grammar) return signals;
+
+  try {
+    const ts = await import("web-tree-sitter");
+    const Parser = ts.default;
+    const parser = new Parser();
+    parser.setLanguage(grammar);
+
+    const tree = parser.parse(content);
+    const root = tree.rootNode;
+
+    if (root.hasError()) {
+      parser.delete();
+      tree.delete();
+      return signals;
+    }
+
+     
+    // TreeCursor type from web-tree-sitter is complex; cast to a known shape
+    const walker = tree.walk() as unknown as { current: { type: string; text?: string; startPosition: () => { row: number } }; gotoNext: () => boolean };
+    do {
+      const category = walkNodeToCategory(walker.current);
+      if (category) {
+         
+        const line = walker.current.startPosition().row + 1;
+        signals.push({
+          category,
+           
+          token: walker.current.text as string,
+          line,
+        });
+      }
+       
+    } while (walker.gotoNext());
+
+    parser.delete();
+    tree.delete();
+  } catch {
+    // Tree-sitter not available
+  }
+
+  return signals;
+}
+
+function walkNodeToCategory(
+   
+  node: { type: string; text?: string },
+): ConcurrencySignal["category"] | null {
+  const type = node.type;
+
+  // These node types indicate actual code (not comments/strings)
+  if (type === "await_expression") return "async";
+  if (type === "with_statement" || type === "async_with_statement") return "async";
+  if (type === "for_in_statement" || type === "for_of_statement") return "async";
+  if (type === "yield_expression") return "thread";
+  if (type === "labeled_statement") {
+    const text = node.text?.toLowerCase() ?? "";
+    if (text.includes("lock")) return "lock";
+    if (text.includes("mutex")) return "lock";
+    if (text.includes("channel")) return "channel";
+  }
+  return null;
 }

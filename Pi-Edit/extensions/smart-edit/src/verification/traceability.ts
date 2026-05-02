@@ -178,9 +178,10 @@ async function analyzeSingleTarget(
   // Normalize paths for reliable comparison (resolve to absolute, normalized paths)
   const editedTests = linkedTests.filter((lt) =>
     editedPaths.some((ep) => {
-      const normLt = lt.split("\\").join("/");
-      const normEp = ep.split("\\").join("/");
-      return normEp === normLt || normEp.endsWith("/" + normLt.split("/").pop()!);
+      const normLt = lt.replace(/\\/g, "/");
+      const normEp = ep.replace(/\\/g, "/");
+      const ltFile = normLt.split("/").pop() ?? normLt;
+      return normEp === normLt || normEp.endsWith("/" + ltFile);
     }),
   );
 
@@ -227,7 +228,8 @@ async function discoverTestFiles(
   const walkStack: string[] = [cwd];
 
   while (walkStack.length > 0) {
-    const dir = walkStack.pop()!;
+    const dir = walkStack.pop();
+    if (!dir) continue;
     if (visited.has(dir)) continue;
     visited.add(dir);
 

@@ -43,7 +43,7 @@ export async function withOpenDocument<T>(
 
   // 1. Serialization per URI
   const prevLock = locks.get(uri) || Promise.resolve();
-  let resolveLock: () => void;
+  let resolveLock: () => void = () => {};
   const nextLock = new Promise<void>((resolve) => {
     resolveLock = resolve;
   });
@@ -88,7 +88,7 @@ export async function withOpenDocument<T>(
     }
   } finally {
     // Release lock
-    resolveLock!();
+    resolveLock();
     if (locks.get(uri) === nextLock) {
       locks.delete(uri);
     }

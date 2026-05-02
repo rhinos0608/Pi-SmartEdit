@@ -47,7 +47,7 @@ export class LSPConnection {
   private pending = new Map<number, PendingCallback>();
   private buffer = "";
   private notificationHandlers = new Map<string, Array<(params: unknown) => void>>();
-  public serverCapabilities: any;
+  public serverCapabilities: unknown;
 
   /**
    * Create a new LSP connection by spawning a server process.
@@ -61,7 +61,7 @@ export class LSPConnection {
     });
 
     // Handle stdout — parse Content-Length headers and dispatch JSON messages
-    this.process.stdout!.on("data", (chunk: Buffer) => {
+    this.process.stdout?.on("data", (chunk: Buffer) => {
       this.onData(chunk);
     });
 
@@ -253,9 +253,10 @@ export class LSPConnection {
   }
 
   private write(msg: object): void {
+    if (!this.process.stdin) return;
     const content = JSON.stringify(msg);
     const header = `Content-Length: ${Buffer.byteLength(content, "utf-8")}\r\n\r\n`;
-    this.process.stdin!.write(header + content);
+    this.process.stdin.write(header + content);
   }
 
   /**
@@ -279,7 +280,7 @@ export class LSPConnection {
 
       const contentLength = parseInt(headerMatch[1], 10);
       const headerEnd =
-        headerMatch.index! + headerMatch[0].length + "\r\n".length;
+        (headerMatch.index ?? 0) + headerMatch[0].length + "\r\n".length;
 
       if (this.buffer.length < headerEnd + contentLength) {
         // Don't have the full body yet — wait for more data
@@ -291,20 +292,23 @@ export class LSPConnection {
       this.buffer = this.buffer.slice(headerEnd + contentLength);
 
       try {
-        const message = JSON.parse(body);
+        const message = JSON.parse(body) as { id?: number; error?: unknown; result?: unknown; method?: string; params?: unknown };
 
         // Check if this is a response to a pending request
         if (message.id != null && this.pending.has(message.id)) {
-          const cb = this.pending.get(message.id)!;
+          const cb = this.pending.get(message.id);
+          if (!cb) break;
           this.pending.delete(message.id);
 
           // Clear the timeout timer so it doesn't keep Node alive
           if (cb.timer) clearTimeout(cb.timer);
 
-          if (message.error) {
+
+          const errorObj = message.error;
+          if (errorObj && typeof errorObj === "object") {
             cb.reject(
               new Error(
-                `LSP error: ${message.error.message} (code: ${message.error.code})`
+                `LSP error: ${(errorObj as { message?: string }).message ?? "Unknown"} (code: ${(errorObj as { code?: number }).code ?? 0})`
               )
             );
           } else {

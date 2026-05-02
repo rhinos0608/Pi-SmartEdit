@@ -56,16 +56,18 @@ export interface SemanticToken {
 export function normalizeLocations(response: unknown): ResolvedLocation[] {
   if (!response) return [];
 
+
   if (Array.isArray(response)) {
-    return response.map((item: any) => {
-      if (item.targetUri && item.targetRange) {
+    return response.map((item: unknown) => {
+      const record = item as Record<string, unknown>;
+      if (record.targetUri && record.targetRange) {
         // LocationLink
         return {
           location: {
-            uri: item.targetUri,
-            range: item.targetRange,
+            uri: record.targetUri as string,
+            range: record.targetRange as LSPRange,
           },
-          originRange: item.originSelectionRange,
+          originRange: record.originSelectionRange as LSPRange | undefined,
         };
       } else {
         // Location
@@ -75,6 +77,7 @@ export function normalizeLocations(response: unknown): ResolvedLocation[] {
       }
     });
   }
+
 
   // Single Location
   return [{
@@ -243,10 +246,12 @@ export async function getSemanticTokensForRange(
       range,
     });
 
-    if (!response || !Array.isArray((response as any).data)) return [];
+    if (!response || !Array.isArray((response as Record<string, unknown>).data as unknown[])) return [];
 
-    const data = (response as any).data as number[];
-    const legend = server.serverCapabilities?.capabilities?.semanticTokensProvider?.legend;
+    const data = (response as Record<string, unknown>).data as number[];
+    const caps = server.serverCapabilities as Record<string, unknown> | undefined;
+    const innerCaps = (caps?.capabilities ?? caps) as Record<string, unknown> | undefined;
+    const legend = (innerCaps?.semanticTokensProvider as Record<string, unknown> | undefined)?.legend as { tokenTypes: string[]; tokenModifiers: string[] } | undefined;
     if (!legend) return [];
 
     const tokenTypes = legend.tokenTypes as string[];

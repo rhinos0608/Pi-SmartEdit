@@ -36,7 +36,7 @@ import { buildSemanticContext } from "./src/lsp/semantic-context";
 import type { SemanticContextInput } from "./src/lsp/semantic-context";
 import { detectLanguageFromExtension } from "./src/lsp/language-id";
 import { recordRead, checkStale, recordReadWithStat, recordReadSession, getSessionReads, checkEditAllowed, checkRangeCoverage, getSnapshot } from "./lib/read-cache";
-import { buildHashlineAnchors } from "./lib/hashline";
+import { buildHashlineAnchors, initHashline } from "./lib/hashline";
 import type { HashlineEditInput } from "./lib/hashline-edit";
 
 import { detectInputFormat } from "./src/formats/format-detector";
@@ -308,7 +308,7 @@ function tryRepairJSONString(raw: string): unknown {
       },
     );
     if (repaired !== raw) {
-      const result = JSON.parse(repaired);
+      const result = JSON.parse(repaired) as Record<string, unknown>;
       if (result !== undefined) return result;
     }
   } catch {
@@ -374,7 +374,7 @@ function tryExtractPartialEdits(raw: string): unknown[] {
       if (depth === 0 && start >= 0) {
         const objStr = raw.slice(start, i + 1);
         try {
-          const parsed = JSON.parse(objStr);
+          const parsed = JSON.parse(objStr) as Record<string, unknown>;
           if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
             results.push(parsed);
           }
@@ -1043,8 +1043,8 @@ export default function smartEdit(pi: ExtensionAPI) {
           recordRead(inputPath, process.cwd(), fullText, true, hashline);
 
           // Track read range for coverage validation
-          const readOffset = (event.input as any)?.offset ?? 1;
-          const readLimit = (event.input as any)?.limit ?? lines.length;
+          const readOffset = (event.input as { offset?: number })?.offset ?? 1;
+          const readLimit = (event.input as { limit?: number })?.limit ?? lines.length;
           recordReadSession(inputPath, process.cwd(), readOffset, readLimit, lines.length, "read");
           return;
           }
@@ -1219,7 +1219,7 @@ export default function smartEdit(pi: ExtensionAPI) {
       "Before editing code that depends on custom types, imported factories, interfaces, or unfamiliar symbols, call semantic_context for the target range instead of reading whole dependency files.",
     ],
 
-    parameters: editSchema as any,
+    parameters: editSchema as unknown as Record<string, unknown>,
     renderShell: "self" as const,
 
     async execute(
@@ -1232,12 +1232,12 @@ export default function smartEdit(pi: ExtensionAPI) {
       await initHashline();
       input = prepareArguments(input) || input;
 
-      let extraData: any;
+      let extraData: Record<string, unknown> | null = null;
       if (typeof input.path === "string") {
         const extraIdx = input.path.indexOf("??smartEditExtra=");
         if (extraIdx !== -1) {
           try {
-            extraData = JSON.parse(Buffer.from(input.path.slice(extraIdx + 17), "base64").toString("utf-8"));
+            extraData = JSON.parse(Buffer.from(input.path.slice(extraIdx + 17), "base64").toString("utf-8")) as Record<string, unknown> | null;
           } catch {}
           input.path = input.path.slice(0, extraIdx);
         }
@@ -1308,10 +1308,10 @@ export default function smartEdit(pi: ExtensionAPI) {
           let normalizedContent = normalizeToLF(content);
 
           // ── Re-inject replaceAll/anchor/lineRange from extracted extra data ──
-          const localFlags = extraData?.replaceAllFlags ?? null;
-          const localAnchors = extraData?.anchorData ?? null;
-          const localRanges = extraData?.lineRangeData ?? null;
-          const localHashlines = extraData?.hashlineData ?? null;
+          const localFlags = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).replaceAllFlags as unknown[] ?? null : null;
+          const localAnchors = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).anchorData as unknown[] ?? null : null;
+          const localRanges = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).lineRangeData as unknown[] ?? null : null;
+          const localHashlines = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).hashlineData as unknown[] ?? null : null;
 
           // Separate hashline edits from legacy edits
           const hashlineEdits: Array<{ editIdx: number; hashline: Record<string, unknown> }> = [];
@@ -1440,13 +1440,11 @@ export default function smartEdit(pi: ExtensionAPI) {
                       // Capture baseline before checking delta conflicts
                       // This ensures we only report NEW conflicts since the
                       // last successful edit to this file.
-                      conflictDetector!.captureBaseline(path);
+                      if (conflictDetector) conflictDetector.captureBaseline(path);
 
-                      const conflicts = await conflictDetector!.checkDeltaConflicts(
-                        path,
-                        normalizedContent,
-                        realSpans,
-                      );
+                      const conflicts = conflictDetector
+                        ? await conflictDetector.checkDeltaConflicts(path, normalizedContent, realSpans)
+                        : [];
 
                       if (conflicts.length > 0) {
                         const conflictMessages = conflicts.map(
@@ -1691,7 +1689,7 @@ Examples:
 
     promptSnippet: "Retrieve type definitions, implementations, and examples for symbols in a range.",
 
-    parameters: semanticContextSchema as any,
+    parameters: semanticContextSchema as Record<string, unknown>,
     renderShell: "self" as const,
 
     async execute(
@@ -1700,7 +1698,7 @@ Examples:
       signal: AbortSignal | undefined,
       _onUpdate: ((update: { content: Array<{ type: "text"; text: string }> }) => void) | undefined,
       _ctx: unknown,
-    ): Promise<{ content: Array<{ type: "text"; text: string }>; details?: any }> {
+    ): Promise<{ content: Array<{ type: "text"; text: string }>; details?: Record<string, unknown> }> {
       const cwd = process.cwd();
       const path = input.path as string;
       const absolutePath = resolve(cwd, path);
@@ -1722,7 +1720,7 @@ Examples:
       }
 
       try {
-        const result = await buildSemanticContext(input as any, {
+        const result = await buildSemanticContext(input as unknown as SemanticContextInput, {
           cwd,
           lspManager,
           astResolver,

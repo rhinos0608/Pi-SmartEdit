@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import { execSync } from "node:child_process";
+import { execSync, spawnSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
@@ -43,7 +43,6 @@ function createGitRepo(dir: string, files: Record<string, string>, commits: Arra
     } else {
       committed.add(c.file);
     }
-    const { spawnSync } = require("node:child_process");
     execSync(`git add -A`, { cwd: dir, stdio: "pipe" });
     spawnSync("git", ["commit", "-m", c.msg], { cwd: dir, stdio: "pipe" });
   }

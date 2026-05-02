@@ -211,9 +211,13 @@ export function tryRebaseAll(
     const editRebased = rebaseEdit(edit, fileLines);
 
     if (editRebased.rebased) {
-      rebasedEdits.push(editRebased.edit!);
+      const rebasedEdit = editRebased.edit;
+      if (!rebasedEdit) {
+        failedEdits.push(editIdx);
+        continue;
+      }
+      rebasedEdits.push(rebasedEdit);
       const [posAnchor, endAnchor] = getAnchorStrings(edit);
-      const rebasedEdit = editRebased.edit!;
       const rebasedLine = rebasedEdit.op === 'replace_range' ? rebasedEdit.pos.line : -1;
       const endMoved = editRebased.endMoved;
       const originalEndLine = edit.op === 'replace_range' ? edit.end.line : -1;

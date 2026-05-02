@@ -200,11 +200,12 @@ export function findSymbolNode(
   if (candidates.length === 0) return null;
 
   // If symbolLine provided, prefer the node whose name is closest to that line
-  if (anchor.symbolLine && candidates.length > 1) {
+  if (anchor.symbolLine != null && candidates.length > 1) {
+    const targetLine = anchor.symbolLine;
     candidates.sort(
       (a, b) =>
-        Math.abs(a.nameLine - anchor.symbolLine!) -
-        Math.abs(b.nameLine - anchor.symbolLine!),
+        Math.abs(a.nameLine - targetLine) -
+        Math.abs(b.nameLine - targetLine),
     );
   }
 

@@ -60,7 +60,7 @@ export function createConflictDetector(
     } | null>;
     findEnclosingSymbols(
 
-      tree: any,
+      tree: unknown,
       startByte: number,
       endByte: number,
     ): SymbolRef[];
@@ -221,6 +221,7 @@ export function createConflictDetector(
    * is shared across all span checks — avoiding N parses for N spans.
    */
   function checkAstConflictsFromTree(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     resolver: NonNullable<Exclude<typeof getAstResolver, null | undefined>> extends (...args: any[]) => infer R ? NonNullable<R> : never,
     filePath: string,
     _content: string,

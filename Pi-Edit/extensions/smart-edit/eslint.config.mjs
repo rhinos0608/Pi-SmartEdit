@@ -29,11 +29,10 @@ export default tseslint.config(
     rules: {
       "@typescript-eslint/consistent-type-imports": ["error", { prefer: "type-imports" }],
       "@typescript-eslint/no-dynamic-delete": "off",
-      "@typescript-eslint/no-explicit-any": "off",
-      "@typescript-eslint/no-floating-promises": "off",
-      "@typescript-eslint/no-non-null-assertion": "off",
-      "@typescript-eslint/no-unsafe-argument": "off",
-      "@typescript-eslint/no-unsafe-assignment": "off",
+      "@typescript-eslint/no-explicit-any": "warn",
+      "@typescript-eslint/no-unsafe-assignment": "warn",
+      "@typescript-eslint/no-floating-promises": "warn",
+      "@typescript-eslint/no-unsafe-call": "error",
       "@typescript-eslint/no-unsafe-member-access": "off",
       "@typescript-eslint/no-unsafe-return": "off",
       "@typescript-eslint/no-unnecessary-condition": "off",
@@ -43,6 +42,16 @@ export default tseslint.config(
       "@typescript-eslint/require-await": "off",
       "@typescript-eslint/restrict-template-expressions": "off",
       "no-console": "off",
+    },
+  },
+  {
+    files: ["test/**/*.ts"],
+    rules: {
+      "@typescript-eslint/no-floating-promises": "off",
+      "@typescript-eslint/no-explicit-any": "off",
+      "@typescript-eslint/no-unsafe-assignment": "off",
+      "@typescript-eslint/no-unsafe-argument": "off",
+      "@typescript-eslint/no-non-null-assertion": "off",
     },
   },
 );

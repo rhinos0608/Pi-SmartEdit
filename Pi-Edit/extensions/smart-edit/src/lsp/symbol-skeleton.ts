@@ -99,7 +99,12 @@ export function extractSymbolExcerpt(
 }
 
 /** Check if range A contains range B */
-function contains(a: any, b: any): boolean {
+interface RangeLike {
+  start: { line: number; character: number };
+  end: { line: number; character: number };
+}
+
+function contains(a: RangeLike, b: RangeLike): boolean {
   if (a.start.line > b.start.line) return false;
   if (a.start.line === b.start.line && a.start.character > b.start.character) return false;
   if (a.end.line < b.end.line) return false;

@@ -144,7 +144,8 @@ async function ensureXXHash32(): Promise<(input: string, seed?: number) => numbe
   if (_xxhash32) return _xxhash32;
   if (_initPromise) {
     await _initPromise;
-    return _xxhash32!;
+    if (_xxhash32) return _xxhash32;
+    throw new Error("xxhash32 initialization failed");
   }
 
   _initPromise = (async () => {
@@ -167,7 +168,8 @@ async function ensureXXHash32(): Promise<(input: string, seed?: number) => numbe
   })();
 
   await _initPromise;
-  return _xxhash32!;
+  if (!_xxhash32) throw new Error("xxhash32 initialization failed");
+  return _xxhash32;
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

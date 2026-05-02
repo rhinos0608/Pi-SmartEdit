@@ -151,7 +151,7 @@ interface RunResult {
   durationMs: number;
   tokens?: { input: number; output: number };
   tier?: string;
-  error?: string;
+  error?: Error | string;
 }
 
 /**
@@ -307,13 +307,15 @@ const errors = results.filter(r => r.error);
 if (errors.length > 0) {
   console.log("  Errors:");
   for (const e of errors) {
-    console.log(`  - ${e.fixture} (${e.mode}): ${e.error}`);
+    console.log(`  - ${e.fixture} (${e.mode}): ${e.error && typeof e.error === 'object' && 'message' in e.error ? (e.error as Error).message : String(e.error)}`);
   }
   console.log("");
 }
 
 // Write report
-const outDir = join(import.meta.dir || ".", "runs");
+const arg0 = import.meta.dir as string | undefined;
+const arg1 = 'runs';
+const outDir = join(arg0 || '.', arg1);
 mkdirSync(outDir, { recursive: true });
 const ts = new Date().toISOString().replace(/[:.]/g, "-");
 const outPath = join(outDir, `benchmark-${ts}.json`);

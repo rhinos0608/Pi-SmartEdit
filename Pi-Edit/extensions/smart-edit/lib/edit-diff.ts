@@ -1085,7 +1085,7 @@ function levenshteinRatio(a: string, b: string): number {
     prev = curr;
     curr = tmp;
     if (curr.length < b.length + 1) {
-      curr = new Array(b.length + 1);
+      curr = new Array<number>(b.length + 1);
     }
     curr[0] = i;
 

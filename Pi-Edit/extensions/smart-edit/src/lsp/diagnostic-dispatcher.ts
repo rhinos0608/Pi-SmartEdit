@@ -55,18 +55,19 @@ export function parseTscOutput(output: string): Diagnostic[] {
  */
 export function parsePyrightOutput(output: string): Diagnostic[] {
   try {
-    const parsed = JSON.parse(output);
+    const parsed = JSON.parse(output) as Record<string, unknown>;
     const diagnostics: Diagnostic[] = [];
     
-    for (const diag of parsed.generalDiagnostics || []) {
-      if (!["error", "warning"].includes(diag.severity)) continue;
+    for (const diag of (parsed.generalDiagnostics as unknown[] || [])) {
+      const d = diag as Record<string, unknown>;
+      if (!["error", "warning"].includes(d.severity as string)) continue;
       diagnostics.push({
-        message: diag.message,
-        severity: diag.severity === "error" ? 1 : 2,
+        message: d.message as string,
+        severity: d.severity === "error" ? 1 : 2,
         range: {
           // Pyright uses 0-indexed values in range
-          start: { line: (diag.range?.start?.line ?? 0), character: (diag.range?.start?.character ?? 0) },
-          end: { line: (diag.range?.end?.line ?? 0), character: (diag.range?.end?.character ?? 0) },
+          start: { line: ((d.range as Record<string, unknown> | undefined)?.start as Record<string, number> | undefined)?.line ?? 0, character: ((d.range as Record<string, unknown> | undefined)?.start as Record<string, number> | undefined)?.character ?? 0 },
+          end: { line: ((d.range as Record<string, unknown> | undefined)?.end as Record<string, number> | undefined)?.line ?? 0, character: ((d.range as Record<string, unknown> | undefined)?.end as Record<string, number> | undefined)?.character ?? 0 },
         },
         source: "pyright",
       });
@@ -262,17 +263,18 @@ export async function checkCargoDiagnostics(
   for (const line of `${result.stdout || ""}\n${result.stderr || ""}`.split("\n")) {
     if (!line.trim()) continue;
     try {
-      const msg = JSON.parse(line);
+      const msg = JSON.parse(line) as Record<string, unknown>;
       if (msg.reason !== "compiler-message") continue;
-      const inner = msg.message;
-      if (!inner || !["error", "warning"].includes(inner.level)) continue;
+      const inner = msg.message as Record<string, unknown>;
+      if (!inner || !["error", "warning"].includes(inner.level as string)) continue;
 
       const spans = Array.isArray(inner.spans) ? inner.spans : [];
-      const span = spans[0];
+      const span = spans[0] as Record<string, number> | undefined;
+      const rawMessage = inner.message;
       const message =
-        typeof inner.message === "string"
-          ? inner.message
-          : inner.message?.text ?? inner.message?.rendered ?? "(no message)";
+        typeof rawMessage === "string"
+          ? rawMessage
+          : (rawMessage as Record<string, string>)?.text ?? (rawMessage as Record<string, string>)?.rendered ?? "(no message)";
       const range = span
         ? {
             start: {
@@ -381,7 +383,7 @@ export async function checkRubocopDiagnostics(
   const diagnostics: Diagnostic[] = [];
 
   try {
-    const output = JSON.parse(result.stdout || result.stderr || "");
+    const output = JSON.parse(result.stdout || result.stderr || "") as { files?: Array<{ offenses?: Array<{ message: string; severity: string; location: { line: number; column: number; last_line?: number; last_column?: number } }> }> };
     for (const file of output.files || []) {
       for (const offense of file.offenses || []) {
         diagnostics.push({
