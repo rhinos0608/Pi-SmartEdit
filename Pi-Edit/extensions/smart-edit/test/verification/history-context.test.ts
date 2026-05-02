@@ -1,8 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
 import { execSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
-import { join } from "node:path";
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { retrieveHistory } from "../../src/verification/history-context.js";
 import { defaultHistoryConfig } from "../../src/verification/config.js";
@@ -29,22 +29,23 @@ function createGitRepo(dir: string, files: Record<string, string>, commits: Arra
 
   for (const [path, content] of Object.entries(files)) {
     const fullPath = join(dir, path);
-    mkdirSync(require("path").dirname(fullPath), { recursive: true });
+    mkdirSync(dirname(fullPath), { recursive: true });
     writeFileSync(fullPath, content, "utf-8");
   }
 
-  let committed = new Set<string>();
+  const committed = new Set<string>();
   for (const c of commits) {
     const fullPath = join(dir, c.file);
     if (committed.has(c.file)) {
       // Append to create a distinct change
-      const existing = require("fs").readFileSync(fullPath, "utf-8");
+      const existing = readFileSync(fullPath, "utf-8");
       writeFileSync(fullPath, existing + "\n// " + (c.append ?? c.msg), "utf-8");
     } else {
       committed.add(c.file);
     }
+    const { spawnSync } = await import("node:child_process");
     execSync(`git add -A`, { cwd: dir, stdio: "pipe" });
-    execSync(`git commit -m "${c.msg}"`, { cwd: dir, stdio: "pipe" });
+    spawnSync("git", ["commit", "-m", c.msg], { cwd: dir, stdio: "pipe" });
   }
 }
 
@@ -60,14 +61,19 @@ describe("history-context", () => {
     });
 
     it("returns empty array for non-git directory", async () => {
+      const { rmSync } = await import("node:fs");
       const noGitDir = mkdtempSync(join(tmpdir(), "no-git-"));
-      const target = makeTarget("testFn", { path: join(noGitDir, "test.ts") });
-      const result = await retrieveHistory({
-        cwd: noGitDir,
-        changedTargets: [target],
-        config: defaultHistoryConfig(),
-      });
-      assert.strictEqual(result.length, 0);
+      try {
+        const target = makeTarget("testFn", { path: join(noGitDir, "test.ts") });
+        const result = await retrieveHistory({
+          cwd: noGitDir,
+          changedTargets: [target],
+          config: defaultHistoryConfig(),
+        });
+        assert.strictEqual(result.length, 0);
+      } finally {
+        rmSync(noGitDir, { recursive: true, force: true });
+      }
     });
 
     it("returns commits for a function in a git repo", async () => {

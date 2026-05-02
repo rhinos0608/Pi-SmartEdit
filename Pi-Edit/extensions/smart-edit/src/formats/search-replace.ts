@@ -92,7 +92,7 @@ export function parseSearchReplace(input: string): SearchReplaceBlock[] {
  * Normalize marker content: strip leading/trailing blank lines.
  */
 function normalizeContent(text: string): string {
-  let lines = text.split('\n');
+  const lines = text.split('\n');
   while (lines.length > 0 && lines[0].trim().length === 0) lines.shift();
   while (lines.length > 0 && lines[lines.length - 1].trim().length === 0) lines.pop();
   return lines.join('\n');

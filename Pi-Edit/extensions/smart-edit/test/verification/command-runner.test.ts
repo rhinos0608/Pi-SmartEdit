@@ -31,7 +31,8 @@ describe("command-runner", () => {
 
     it("truncates long output", async () => {
       const maxChars = 100;
-      const result = await runCommand("sh", ["-c", "printf 'a%.0s' {1..1000}"], {
+      // Using a POSIX-compliant loop instead of bash {1..1000}
+      const result = await runCommand("sh", ["-c", "i=0; while [ $i -lt 1000 ]; do printf 'a'; i=$((i+1)); done"], {
         maxOutputChars: maxChars,
       });
       assert.ok(result.stdout.length <= maxChars + 50, // slight overhead from truncation message

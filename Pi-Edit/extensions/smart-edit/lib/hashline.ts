@@ -276,7 +276,7 @@ export async function computeLineHash(
     seed = lineNumber;
   }
 
-  const hash = Number(hasher(normalized, seed)) % HASHLINE_BIGRAMS_COUNT;
+  const hash = hasher(normalized, seed) % HASHLINE_BIGRAMS_COUNT;
   return HASHLINE_BIGRAMS[hash];
 }
 
@@ -307,7 +307,7 @@ export function computeLineHashSync(
     seed = lineNumber;
   }
 
-  const hash = Number(_xxhash32(normalized, seed)) % HASHLINE_BIGRAMS_COUNT;
+  const hash = _xxhash32(normalized, seed) % HASHLINE_BIGRAMS_COUNT;
   return HASHLINE_BIGRAMS[hash];
 }
 

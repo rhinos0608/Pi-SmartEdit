@@ -212,7 +212,7 @@ async function findGitRoot(cwd: string): Promise<string | null> {
       }
     });
 
-    child.on("error", () => resolve(null));
+    child.on("error", () => { resolve(null); });
   });
 }
 
@@ -393,7 +393,7 @@ function extractNearbyComments(
     const semiIdx = line.indexOf(";");
 
     let bestIdx = -1;
-    let bestPrefix = "";
+    const bestPrefix = "";
 
     // Find the earliest comment marker not inside a string literal
     const candidates: Array<{ idx: number; prefix: string }> = [];

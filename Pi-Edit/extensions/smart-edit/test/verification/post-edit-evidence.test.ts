@@ -36,7 +36,7 @@ describe("post-edit-evidence", () => {
       });
 
       // Should have detected at least some targets (may be unknown in fallback)
-      assert.ok(result.details.changes.length >= 0);
+      assert.ok(result.details.changes.length > 0, "Expected at least one change target");
       // No concurrency signals expected for `const x = 1`
       assert.strictEqual(result.details.concurrency.length, 0);
     });

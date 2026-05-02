@@ -69,7 +69,7 @@ describe("change-targets", () => {
         matchSpans: [{ startIndex: 0, endIndex: 5 }],
         testGlobs: ["**/*.test.*"],
       });
-      assert.ok(targets.length >= 0);
+      assert.ok(targets.length > 0, "Expected at least one target");
       const testTargets = targets.filter((t) => t.editKind === "test");
       // Most importantly, non-logic classification works in fallback
       for (const t of targets) {
@@ -136,7 +136,7 @@ describe("change-targets", () => {
         languageId: "typescript",
         matchSpans: [{ startIndex: 0, endIndex: 4 }],
       });
-      assert.ok(targets.length >= 0);
+      assert.ok(targets.length > 0, "Expected at least one target");
     });
   });
 });

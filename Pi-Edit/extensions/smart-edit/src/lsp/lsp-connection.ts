@@ -6,7 +6,8 @@
  * request/response correlation with timeouts.
  */
 
-import { spawn, ChildProcess, SpawnOptions } from "child_process";
+import type { ChildProcess, SpawnOptions } from "child_process";
+import { spawn } from "child_process";
 
 export interface LSPRequest {
   id: number;

@@ -136,11 +136,8 @@ describe("traceability", () => {
         });
         const entry = result.targets.find((t) => t.target.name === "processOrder");
         assert.ok(entry, "Expected traceability entry for processOrder");
-        // Could be covered if the test file references match, or candidate otherwise
-        assert.ok(
-          entry.status === "covered" || entry.status === "candidate" || entry.status === "missing",
-          `Unexpected status: ${entry.status}`,
-        );
+        // Covered is the expected status
+        assert.strictEqual(entry.status, "covered");
       } finally {
         // Temp dir cleaned by OS
       }

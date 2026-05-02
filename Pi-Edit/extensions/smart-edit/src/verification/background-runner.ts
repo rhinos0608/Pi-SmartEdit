@@ -174,12 +174,10 @@ export class BackgroundRunRegistry {
     this.runs.delete(runId);
     this.activeCount--;
 
-    this.completedRuns.set(runId, {
-      ...status,
-      finishedAt: status.finishedAt ?? Date.now(),
-    });
+      const finalized = { ...status, finishedAt: status.finishedAt ?? Date.now() };
+      this.completedRuns.set(runId, finalized);
 
-    run.resolve(status);
+      run.resolve(finalized);
 
     // Schedule eviction of old completed runs
     setTimeout(() => {

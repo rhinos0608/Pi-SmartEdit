@@ -68,10 +68,11 @@ describe("background-runner", () => {
 
     it("listRuns returns active runs", async () => {
       const registry = createRegistry({ maxConcurrent: 3 });
-      registry.schedule(["sleep", "30"]);
+      const { runId } = registry.schedule(["sleep", "30"]);
       const runs = registry.listRuns(false);
       assert.ok(runs.length >= 1);
       assert.ok(runs.every((r) => r.status === "running"));
+      registry.cancel(runId);
     });
 
     it("listRuns with includeCompleted returns completed runs too", async () => {

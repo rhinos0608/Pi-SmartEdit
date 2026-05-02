@@ -320,16 +320,23 @@ function byteOffsetToCharIndex(content: string, byteOffset: number): number {
   let byteIdx = 0;
   while (byteIdx < maxOffset && charIndex < content.length) {
     const byte = buffer[byteIdx];
+    let seqLen = 1;
     if (byte < 0x80) {
-      byteIdx += 1;
+      seqLen = 1;
     } else if (byte < 0xE0) {
-      byteIdx += 2;
+      seqLen = 2;
     } else if (byte < 0xF0) {
-      byteIdx += 3;
+      seqLen = 3;
     } else {
-      byteIdx += 4;
+      seqLen = 4;
     }
-    charIndex++;
+
+    if (byteIdx + seqLen <= maxOffset) {
+      byteIdx += seqLen;
+      charIndex += (seqLen === 4 ? 2 : 1);
+    } else {
+      break;
+    }
   }
   return charIndex;
 }

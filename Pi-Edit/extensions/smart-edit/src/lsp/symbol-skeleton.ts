@@ -3,7 +3,7 @@
  * Used by LSP-RAG to provide context without returning full files.
  */
 
-import { DocumentSymbol, Location } from "./semantic-nav";
+import type { DocumentSymbol, Location } from "./semantic-nav";
 
 /**
  * Finds the innermost DocumentSymbol that completely encloses a given Location.
@@ -50,7 +50,7 @@ export function extractSymbolExcerpt(
   const lines = content.split("\n");
 
   // If no symbol provided, or it's a reference (not a definition), just show context around location
-  if (!symbol || options.preferSkeleton === false) {
+  if (!symbol || !options.preferSkeleton) {
     const startLine = Math.max(0, range.start.line - 2);
     const endLine = Math.min(lines.length - 1, range.end.line + 2);
     const excerptLines = lines.slice(startLine, endLine + 1);

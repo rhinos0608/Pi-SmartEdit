@@ -170,6 +170,7 @@ Use the same interface as the built-in `edit` tool.
 
 ```bash
 cd .pi/extensions/smart-edit
+npm run lint
 npm test
 ```
 

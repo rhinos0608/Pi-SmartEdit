@@ -66,7 +66,7 @@ export function renderSemanticContext(
     { title: "Hover Info", key: "hover" },
   ];
 
-  let omittedCounts: Record<string, number> = {
+  const omittedCounts: Record<string, number> = {
     definition: 0,
     typeDefinition: 0,
     implementation: 0,

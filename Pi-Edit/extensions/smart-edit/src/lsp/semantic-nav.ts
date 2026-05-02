@@ -7,7 +7,7 @@
 
 import { resolve } from "path";
 
-import { LSPManager } from "./lsp-manager";
+import type { LSPManager } from "./lsp-manager";
 
 export interface Location {
   uri: string;

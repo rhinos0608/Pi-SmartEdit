@@ -9,10 +9,15 @@
  * - Full-file fallback
  */
 
-import { FileSnapshot, LineRange } from "../../lib/types";
+import type { FileSnapshot } from "../../lib/types";
 import { lineRangeToByteRange } from "../../lib/edit-diff";
 import { parseTag, tryRebaseAnchor } from "../../lib/hashline-edit";
-import { DocumentSymbol } from "./semantic-nav";
+import type { DocumentSymbol } from "./semantic-nav";
+
+interface SymbolNodeLike {
+  startIndex: number;
+  endIndex: number;
+}
 
 export interface ResolvedTarget {
   lineRange: { startLine: number; endLine: number };
@@ -30,7 +35,7 @@ export interface TargetRangeOptions {
   hashline?: { pos: string; end?: string };
   /** Accepts a full FileSnapshot or the partial shape returned by deps.getSnapshot */
   snapshot: FileSnapshot | { partial?: boolean; contentHash?: string; hashline?: { anchors: Map<string, { text: string; line: number }> } } | null;
-  astResolver?: { findSymbolNode(name: string, kind?: string, line?: number): any | null } | null;
+  astResolver?: { findSymbolNode(name: string, kind?: string, line?: number): SymbolNodeLike | null } | null;
   documentSymbols?: DocumentSymbol[];
 }
 

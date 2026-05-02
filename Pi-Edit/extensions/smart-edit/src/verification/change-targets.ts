@@ -84,8 +84,8 @@ function classifyEditKind(
 }
 
 /**
- * Simple glob matcher supporting * (non-slash wildcard) and double-star directory prefixes.
- * Does NOT support brace expansion, ?, or character classes.
+ * Simple glob matcher supporting * (non-slash wildcard), ? (single-character non-slash), and double-star directory prefixes.
+ * Does NOT support brace expansion or character classes.
  * Uses a Set of special-regex characters to avoid inline regex issues with esbuild.
  */
 const REGEX_SPECIAL = new Set([".", "+", "?", "^", "$", "{", "}", "(", ")", "|", "[", "]", "\\"]);

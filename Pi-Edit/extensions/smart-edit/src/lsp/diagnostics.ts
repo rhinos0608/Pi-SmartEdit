@@ -15,8 +15,8 @@
 
 import { resolve } from "path";
 
-import { LSPConnection } from "./lsp-connection";
-import { LSPManager } from "./lsp-manager";
+import type { LSPConnection } from "./lsp-connection";
+import type { LSPManager } from "./lsp-manager";
 
 export interface Diagnostic {
   message: string;
@@ -57,16 +57,7 @@ function waitForDiagnostics(
 ): Promise<Diagnostic[]> {
   return new Promise((resolve) => {
     const allDiagnostics: Diagnostic[] = [];
-    let unsubscribe: (() => void) | undefined;
     let didResolve = false;
-
-    function done(diagnostics: Diagnostic[]) {
-      if (didResolve) return;
-      didResolve = true;
-      clearTimeout(timer);
-      unsubscribe?.();
-      resolve(diagnostics);
-    }
 
     const timer = setTimeout(() => {
       done(allDiagnostics);
@@ -75,10 +66,7 @@ function waitForDiagnostics(
     // Don't let this timer keep Node alive if everything else is done
     timer.unref();
 
-    // Register a per-call listener — the returned unsubscribe function
-    // ensures this listener is removed when the promise settles, so
-    // concurrent calls do not interfere.
-    unsubscribe = conn.onNotification(
+    const unsubscribe = conn.onNotification(
       "textDocument/publishDiagnostics",
       (params) => {
         const typedParams = params as { uri?: string; diagnostics?: Diagnostic[] };
@@ -97,6 +85,14 @@ function waitForDiagnostics(
         }
       },
     );
+
+    function done(diagnostics: Diagnostic[]) {
+      if (didResolve) return;
+      didResolve = true;
+      clearTimeout(timer);
+      unsubscribe();
+      resolve(diagnostics);
+    }
   });
 }
 
@@ -168,7 +164,7 @@ export async function checkPostEditDiagnostics(
     });
 
     return { diagnostics, source: "lsp" };
-  } catch (err) {
+  } catch {
     // Diagnostics check failed — silently degrade
     return { diagnostics: [], source: "none" };
   }

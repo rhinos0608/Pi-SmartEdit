@@ -8,7 +8,7 @@
  * diagnostics, semantic retrieval, and other concurrent LSP operations.
  */
 
-import { LSPConnection } from "./lsp-connection";
+import type { LSPConnection } from "./lsp-connection";
 
 // In-memory locks per document URI to serialize operations
 const locks = new Map<string, Promise<void>>();

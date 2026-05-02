@@ -125,8 +125,8 @@ describe("applyHashlinePath — fast path", () => {
 
   it("applies directly when hashes match", async () => {
     const content = "function hello() {\n  return 'hi';\n}\n";
-    const h1 = `${1}${computeLineHashSync(1, "function hello() {")}`;
-    const h2 = `${2}${computeLineHashSync(2, "  return 'hi';")}`;
+    const h1 = `1${computeLineHashSync(1, "function hello() {")}`;
+    const h2 = `2${computeLineHashSync(2, "  return 'hi';")}`;
 
     const result = await applyHashlinePath(
       { anchor: { range: { pos: h1, end: h2 } }, content: ["  return 'hello';"] },
@@ -144,7 +144,7 @@ describe("applyHashlinePath — fast path", () => {
 
   it("records hashlineDirect metric", async () => {
     const content = "const x = 1;\n";
-    const h1 = `${1}${computeLineHashSync(1, "const x = 1;")}`;
+    const h1 = `1${computeLineHashSync(1, "const x = 1;")}`;
 
     await applyHashlinePath(
       { anchor: { range: { pos: h1, end: h1 } }, content: ["const y = 2;"] },
@@ -161,8 +161,8 @@ describe("applyHashlinePath — fast path", () => {
 
   it("handles null/undefined content (delete)", async () => {
     const content = "line one\nline two\nline three\n";
-    const h1 = `${1}${computeLineHashSync(1, "line one")}`;
-    const h2 = `${2}${computeLineHashSync(2, "line two")}`;
+    const h1 = `1${computeLineHashSync(1, "line one")}`;
+    const h2 = `2${computeLineHashSync(2, "line two")}`;
 
     const result = await applyHashlinePath(
       { anchor: { range: { pos: h1, end: h2 } }, content: null },
@@ -188,7 +188,7 @@ describe("applyHashlinePath — rebase", () => {
     // File shifted by 2 lines — hash of "const x = 1;" was at line 1, now at line 3
     const content = "// comment\n// comment\nconst x = 1;\n";
     // Use hash of target content at line 1 (will be at line 3)
-    const staleAnchor = `${1}${computeLineHashSync(1, "const x = 1;")}`;
+    const staleAnchor = `1${computeLineHashSync(1, "const x = 1;")}`;
 
     const result = await applyHashlinePath(
       { anchor: { range: { pos: staleAnchor, end: staleAnchor } }, content: ["const x = 99;"] },
@@ -207,7 +207,7 @@ describe("applyHashlinePath — rebase", () => {
   it("throws HashlineMismatchError when rebase window exhausted", async () => {
     const content = "// line 1\n// line 2\n// line 3\n// line 4\n// line 5\n// line 6\n// line 7\n// line 8\n// line 9\nfunction hello() {\n  return 'hi';\n}\n";
     // Hash at line 1, but target moved to line 10 (beyond ±5 window)
-    const staleAnchor = `${1}${computeLineHashSync(1, "function hello() {")}`;
+    const staleAnchor = `1${computeLineHashSync(1, "function hello() {")}`;
 
     await assert.rejects(
       () => applyHashlinePath(
@@ -235,8 +235,8 @@ describe("applyHashlinePath — scoped fallback", () => {
     const content = "function handleRequest(req) {\n  return user.getName();\n}\n";
 
     // Stale anchor with hash of text that won't appear in current file
-    const stalePos = `${1}${computeLineHashSync(1, "this text does not appear anywhere in this file abcxyz123")}`;
-    const staleEnd = `${2}${computeLineHashSync(2, "another piece of text that is completely unique defghi456")}`;
+    const stalePos = `1${computeLineHashSync(1, "this text does not appear anywhere in this file abcxyz123")}`;
+    const staleEnd = `2${computeLineHashSync(2, "another piece of text that is completely unique defghi456")}`;
 
     const snapshot = {
       path: "test.ts",
@@ -292,8 +292,8 @@ describe("applyHashlinePath — scoped fallback", () => {
     const content = "function hello() {\n  return 'world';\n}\n";
 
     // Stale anchors
-    const stalePos = `${1}${computeLineHashSync(1, "text not in file abcdefghijklmnop")}`;
-    const staleEnd = `${2}${computeLineHashSync(2, "more text not in file qrstuvwxyz")}`;
+    const stalePos = `1${computeLineHashSync(1, "text not in file abcdefghijklmnop")}`;
+    const staleEnd = `2${computeLineHashSync(2, "more text not in file qrstuvwxyz")}`;
 
     const snapshot = {
       path: "test.ts",
@@ -347,8 +347,8 @@ describe("applyHashlinePath — scoped fallback", () => {
     const content = "function hello() {\n  return 'changed';\n}\n";
 
     // Stale anchor with no snapshot → cannot fall back
-    const stalePos = `${1}${computeLineHashSync(1, "completely unrelated text never in file")}`;
-    const staleEnd = `${2}${computeLineHashSync(2, "another unique text that doesn't exist either")}`;
+    const stalePos = `1${computeLineHashSync(1, "completely unrelated text never in file")}`;
+    const staleEnd = `2${computeLineHashSync(2, "another unique text that doesn't exist either")}`;
 
     await assert.rejects(
       () => applyHashlinePath(
@@ -374,8 +374,8 @@ describe("applyHashlinePath — full fuzzy fallback", () => {
     const content = "function hello() {\n  return 'world';\n}\n";
 
     // Stale anchors with hashes not in file
-    const stalePos = `${1}${computeLineHashSync(1, "text not in file at all aaaabbbcccdddeee")}`;
-    const staleEnd = `${3}${computeLineHashSync(3, "closing brace text not present ffgghhiijjkk")}`;
+    const stalePos = `1${computeLineHashSync(1, "text not in file at all aaaabbbcccdddeee")}`;
+    const staleEnd = `3${computeLineHashSync(3, "closing brace text not present ffgghhiijjkk")}`;
 
     const snapshot = {
       path: "test.ts",
@@ -438,8 +438,8 @@ describe("applyHashlinePath — full fuzzy fallback", () => {
     const content = "function hello() {\n  return 'world';\n}\n";
 
     // Stale anchors with hashes not in file
-    const stalePos = `${1}${computeLineHashSync(1, "text not in file xxxxxxxxxxxxxxxxxxxxxx")}`;
-    const staleEnd = `${2}${computeLineHashSync(2, "other text not present yyyyyyyyyyyyyyyy")}`;
+    const stalePos = `1${computeLineHashSync(1, "text not in file xxxxxxxxxxxxxxxxxxxxxx")}`;
+    const staleEnd = `2${computeLineHashSync(2, "other text not present yyyyyyyyyyyyyyyy")}`;
 
     const snapshot = {
       path: "test.ts",
@@ -512,7 +512,7 @@ describe("fallback chain — end-to-end", () => {
 
   it("Tier 1 -> direct apply when hashes match", async () => {
     const content = "const x = 1;\n";
-    const h1 = `${1}${computeLineHashSync(1, "const x = 1;")}`;
+    const h1 = `1${computeLineHashSync(1, "const x = 1;")}`;
 
     const result = await applyHashlinePath(
       { anchor: { range: { pos: h1, end: h1 } }, content: ["const x = 2;"] },
@@ -530,7 +530,7 @@ describe("fallback chain — end-to-end", () => {
   it("Tier 2 -> rebase when hashes stale within window", async () => {
     // Hash of "const x = 1;" is at line 3 (shifted by 2)
     const content = "// shift\n// shift\nconst x = 1;\n";
-    const staleAnchor = `${1}${computeLineHashSync(1, "const x = 1;")}`;
+    const staleAnchor = `1${computeLineHashSync(1, "const x = 1;")}`;
 
     const result = await applyHashlinePath(
       { anchor: { range: { pos: staleAnchor, end: staleAnchor } }, content: ["const x = 99;"] },
@@ -549,8 +549,8 @@ describe("fallback chain — end-to-end", () => {
     const content = "function foo() {\n  return 1;\n}\n";
 
     // Stale anchors with hashes not in file
-    const stalePos = `${1}${computeLineHashSync(1, "text not present in this file zzzzzzzzzzzzzzz")}`;
-    const staleEnd = `${2}${computeLineHashSync(2, "more unique text that doesn't match anything aaaaaaa")}`;
+    const stalePos = `1${computeLineHashSync(1, "text not present in this file zzzzzzzzzzzzzzz")}`;
+    const staleEnd = `2${computeLineHashSync(2, "more unique text that doesn't match anything aaaaaaa")}`;
 
     const snapshot = {
       path: "test.ts",
@@ -598,8 +598,8 @@ describe("fallback chain — end-to-end", () => {
     const content = "function foo() {\n  return 1;\n}\n";
 
     // Stale anchors
-    const stalePos = `${1}${computeLineHashSync(1, "text not in file bbbbbbbbbbbbbbbbb")}`;
-    const staleEnd = `${2}${computeLineHashSync(2, "unique text not matching ccccccccccccccc")}`;
+    const stalePos = `1${computeLineHashSync(1, "text not in file bbbbbbbbbbbbbbbbb")}`;
+    const staleEnd = `2${computeLineHashSync(2, "unique text not matching ccccccccccccccc")}`;
 
     const snapshot = {
       path: "test.ts",
@@ -648,8 +648,8 @@ describe("fallback chain — end-to-end", () => {
   it("Rejection when all tiers fail", async () => {
     const content = "function foo() {\n  return 1;\n}\n";
     // Stale anchors with no snapshot
-    const stalePos = `${99}${computeLineHashSync(99, "text not in file")}`;
-    const staleEnd = `${99}${computeLineHashSync(99, "}")}`;
+    const stalePos = `99${computeLineHashSync(99, "text not in file")}`;
+    const staleEnd = `99${computeLineHashSync(99, "}")}`;
 
     await assert.rejects(
       () => applyHashlinePath(

@@ -6,25 +6,32 @@
  */
 
 import { resolve } from "path";
-import { 
-  goToDefinitions, 
-  goToTypeDefinition, 
-  goToImplementation, 
-  findReferences, 
-  getHoverInfo, 
+import type {
+  DocumentSymbol,
+  ResolvedLocation,
+  SemanticToken,
+} from "./semantic-nav";
+import {
+  goToDefinitions,
+  goToTypeDefinition,
+  goToImplementation,
+  findReferences,
+  getHoverInfo,
   getSemanticTokensForRange,
   getDocumentSymbols,
-  ResolvedLocation,
-  Location,
-  LSPRange,
-  SemanticToken,
-  DocumentSymbol
 } from "./semantic-nav";
 import { withOpenDocument } from "./document-sync";
-import { resolveTargetRange, ResolvedTarget } from "./target-range";
-import { ContextItem, renderSemanticContext, estimateTokens } from "./context-renderer";
+import type { ResolvedTarget } from "./target-range";
+import { resolveTargetRange } from "./target-range";
+import type { ContextItem } from "./context-renderer";
+import { renderSemanticContext, estimateTokens } from "./context-renderer";
 import { findEnclosingDocumentSymbol, extractSymbolExcerpt } from "./symbol-skeleton";
 import { detectLanguageFromExtension } from "./language-id";
+import type { LSPManager } from "./lsp-manager";
+
+interface AstResolverLike {
+  findSymbolNode(name: string, kind?: string, line?: number): { startIndex: number; endIndex: number } | null;
+}
 
 export interface SemanticContextInput {
   path: string;
@@ -45,8 +52,8 @@ export interface SemanticContextDeps {
   getSnapshot(path: string, cwd: string): { partial?: boolean; contentHash?: string; hashline?: { anchors: Map<string, { text: string; line: number }> } } | null;
   recordRead(path: string, cwd: string, content: string, partial?: boolean): void;
   recordReadSession?(path: string, cwd: string, lineRanges: Array<{ startLine: number; endLine: number }>): void;
-  lspManager: any; // LSPManager instance
-  astResolver: any; // Result of createAstResolver()
+  lspManager: Pick<LSPManager, "getServer"> | null;
+  astResolver: AstResolverLike | null;
 }
 
 export interface SemanticContextDetails {
@@ -315,7 +322,7 @@ function scoreToken(t: SemanticToken): number {
   return 10;
 }
 
-async function extractTokensViaAst(content: string, byteRange: { startIndex: number; endIndex: number }, _astResolver: any): Promise<{ name: string; line: number; character: number; score: number }[]> {
+async function extractTokensViaAst(content: string, byteRange: { startIndex: number; endIndex: number }, _astResolver: AstResolverLike | null): Promise<{ name: string; line: number; character: number; score: number }[]> {
   const result: { name: string; line: number; character: number; score: number }[] = [];
   
   // Regex fallback: find whole-word identifiers

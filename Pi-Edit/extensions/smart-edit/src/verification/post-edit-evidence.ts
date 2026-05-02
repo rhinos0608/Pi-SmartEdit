@@ -173,8 +173,9 @@ export async function runPostEditEvidencePipeline(
             continue;
           }
           const testPath = shortenPath(t.linkedTests[0], input.cwd);
+          const linkedCount = t.linkedTests.length;
           notes.push(
-            `ℹ Traceability: changed \`${t.target.name}\`. ${t.linkedTests.length === 1 ? "Candidate test: " + testPath + ". Consider running it." : "Found " + t.linkedTests.length + " candidate tests."}`,
+            `ℹ Traceability: changed \`${t.target.name}\`. ${linkedCount === 1 ? `Candidate test: ${testPath}. Consider running it.` : `Found ${linkedCount} candidate tests.`}`,
           );
         }
       }
@@ -267,7 +268,10 @@ function mergeConfig(partial?: Partial<VerificationConfig>): VerificationConfig 
  */
 function shortenPath(absolutePath: string, cwd: string): string {
   const rel = relative(cwd, absolutePath);
-  if (!rel.startsWith("..") && !rel.startsWith("/")) {
+  const isWindows = process.platform === "win32";
+  const isCrossDrive = isWindows && /^[A-Za-z]:\\/.test(rel);
+
+  if (!isCrossDrive && !rel.startsWith("..") && !rel.startsWith("/")) {
     return "./" + rel;
   }
   return absolutePath;

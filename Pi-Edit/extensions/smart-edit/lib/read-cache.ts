@@ -132,7 +132,7 @@ export function recordRead(
   cwd: string,
   content: string,
   partial?: boolean,
-  hashline?: Awaited<ReturnType<typeof import("./hashline").buildHashlineAnchors>>,
+  hashline?: Awaited<ReturnType<typeof buildHashlineAnchors>>,
 ): void {
   const normalized = normalizePath(path, cwd);
   const stat = statSync(normalized);
@@ -283,7 +283,7 @@ export function recordReadWithStat(
   content: string,
   mtimeMs: number,
   size: number,
-  hashline?: Awaited<ReturnType<typeof import("./hashline").buildHashlineAnchors>>,
+  hashline?: Awaited<ReturnType<typeof buildHashlineAnchors>>,
 ): void {
   const normalized = normalizePath(path, cwd);
   const snapshot: FileSnapshot = {

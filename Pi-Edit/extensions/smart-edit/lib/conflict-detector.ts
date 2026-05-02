@@ -59,7 +59,7 @@ export function createConflictDetector(
       parser: { delete: () => void };
     } | null>;
     findEnclosingSymbols(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
       tree: any,
       startByte: number,
       endByte: number,
@@ -103,7 +103,7 @@ export function createConflictDetector(
 
     // Parse the file ONCE and share across all span checks.
     // Avoids re-parsing N times for N edit spans.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
     let sharedParseResult: Awaited<ReturnType<NonNullable<typeof resolver>['parseFile']>> | null = null;
     if (hasResolver) {
       try {
@@ -177,7 +177,7 @@ export function createConflictDetector(
 
     // Parse the file ONCE and share across all span checks.
     // This avoids re-parsing N times for N edit spans.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
     let sharedParseResult: Awaited<ReturnType<NonNullable<typeof resolver>['parseFile']>> | null = null;
     if (hasResolver) {
       try {
