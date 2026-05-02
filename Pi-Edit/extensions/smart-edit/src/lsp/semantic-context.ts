@@ -29,7 +29,7 @@ import { findEnclosingDocumentSymbol, extractSymbolExcerpt } from "./symbol-skel
 import { detectLanguageFromExtension } from "./language-id";
 import type { LSPManager } from "./lsp-manager";
 
-interface AstResolverLike {
+export interface AstResolverLike {
   findSymbolNode(name: string, kind?: string, line?: number): { startIndex: number; endIndex: number } | null;
 }
 

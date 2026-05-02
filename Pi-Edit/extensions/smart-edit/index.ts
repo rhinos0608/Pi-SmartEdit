@@ -33,7 +33,7 @@ import {
 } from "./lib/conflict-detector";
 
 import { buildSemanticContext } from "./src/lsp/semantic-context";
-import type { SemanticContextInput } from "./src/lsp/semantic-context";
+import type { SemanticContextInput, AstResolverLike } from "./src/lsp/semantic-context";
 import { detectLanguageFromExtension } from "./src/lsp/language-id";
 import { recordRead, checkStale, recordReadWithStat, recordReadSession, getSessionReads, checkEditAllowed, checkRangeCoverage, getSnapshot } from "./lib/read-cache";
 import { buildHashlineAnchors, initHashline } from "./lib/hashline";
@@ -1689,7 +1689,7 @@ Examples:
 
     promptSnippet: "Retrieve type definitions, implementations, and examples for symbols in a range.",
 
-    parameters: semanticContextSchema as Record<string, unknown>,
+    parameters: semanticContextSchema as unknown as Record<string, unknown>,
     renderShell: "self" as const,
 
     async execute(
@@ -1723,7 +1723,7 @@ Examples:
         const result = await buildSemanticContext(input as unknown as SemanticContextInput, {
           cwd,
           lspManager,
-          astResolver,
+          astResolver: astResolver as unknown as AstResolverLike | null,
           async readFile(p: string) {
             return (await fsReadFile(resolve(cwd, p))).toString("utf-8");
           },
@@ -1743,7 +1743,7 @@ Examples:
 
         return {
           content: [{ type: "text", text: result.markdown }],
-          details: result.details,
+          details: result.details as unknown as Record<string, unknown>,
         };
       } catch (error) {
         const err = error instanceof Error ? error : new Error(String(error));
