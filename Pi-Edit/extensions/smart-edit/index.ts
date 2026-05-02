@@ -63,18 +63,6 @@ import type {
   SearchScope,
 } from "./lib/types";
 
-// Symbol key for carrying replaceAll/anchor/lineRange data through
-// schema validation without module-level side channels.
-// The data is stored directly on the input object (scoped per-call)
-// so concurrent calls cannot corrupt each other's state.
-const kExtraEditData = Symbol('smartEditExtra');
-
-interface ExtraEditData {
-  replaceAllFlags: boolean[] | null;
-  anchorData: (EditAnchor | undefined)[] | null;
-  lineRangeData: (LineRange | undefined)[] | null;
-}
-
 // ─── Schema (must match built-in edit schema exactly) ──────────────
 // Extra properties like `replaceAll`, `anchor`, `lineRange` are stripped
 // by prepareArguments before validation, then restored in execute().
@@ -646,6 +634,7 @@ function prepareArguments(input: Record<string, unknown>): Record<string, unknow
     const flags: boolean[] = [];
     const anchors: (EditAnchor | undefined)[] = [];
     const ranges: (LineRange | undefined)[] = [];
+    const hashlines: (Record<string, unknown> | undefined)[] = [];
 
     for (const edit of args.edits as Array<Record<string, unknown>>) {
       // replaceAll
@@ -672,24 +661,29 @@ function prepareArguments(input: Record<string, unknown>): Record<string, unknow
         ranges.push(undefined);
       }
 
-      // hashline (extract and preserve for later routing)
+      // hashline
       if (edit.hashline && typeof edit.hashline === 'object') {
-        // Mark this edit as hashline format; restore in execute() for routing
-        (edit as any).__hashline = edit.hashline;
+        hashlines.push(edit.hashline as Record<string, unknown>);
         delete edit.hashline;
-        // No extra array entries — arrays stay 1:1 with edits
+      } else {
+        hashlines.push(undefined);
       }
     }
 
     const hasFlags = flags.some((f) => f);
     const hasAnchors = anchors.some((a) => a);
     const hasRanges = ranges.some((r) => r);
-    if (hasFlags || hasAnchors || hasRanges) {
-      (args as any)[kExtraEditData] = {
+    const hasHashlines = hashlines.some((h) => h);
+    if (hasFlags || hasAnchors || hasRanges || hasHashlines) {
+      const extraData = {
         replaceAllFlags: hasFlags ? flags : null,
         anchorData: hasAnchors ? anchors : null,
         lineRangeData: hasRanges ? ranges : null,
-      } as ExtraEditData;
+        hashlineData: hasHashlines ? hashlines : null,
+      };
+      if (typeof args.path === "string" && !args.path.includes("??smartEditExtra=")) {
+        args.path = args.path + "??smartEditExtra=" + Buffer.from(JSON.stringify(extraData)).toString("base64");
+      }
     }
   }
 
@@ -1235,7 +1229,20 @@ export default function smartEdit(pi: ExtensionAPI) {
       _onUpdate: ((update: { content: Array<{ type: "text"; text: string }> }) => void) | undefined,
       _ctx: unknown,
     ): Promise<{ content: Array<{ type: "text"; text: string }>; details?: EditResult["details"] }> {
+      await initHashline();
       input = prepareArguments(input) || input;
+
+      let extraData: any;
+      if (typeof input.path === "string") {
+        const extraIdx = input.path.indexOf("??smartEditExtra=");
+        if (extraIdx !== -1) {
+          try {
+            extraData = JSON.parse(Buffer.from(input.path.slice(extraIdx + 17), "base64").toString("utf-8"));
+          } catch {}
+          input.path = input.path.slice(0, extraIdx);
+        }
+      }
+
       const { path, edits } = validateInput(input);
 
       // Resolve path
@@ -1300,12 +1307,11 @@ export default function smartEdit(pi: ExtensionAPI) {
           const originalEnding = detectLineEnding(content);
           let normalizedContent = normalizeToLF(content);
 
-          // ── Re-inject replaceAll/anchor/lineRange from Symbol-keyed extra data ──
-          const extraData = (input as any)[kExtraEditData] as ExtraEditData | undefined;
-          delete (input as any)[kExtraEditData];
+          // ── Re-inject replaceAll/anchor/lineRange from extracted extra data ──
           const localFlags = extraData?.replaceAllFlags ?? null;
           const localAnchors = extraData?.anchorData ?? null;
           const localRanges = extraData?.lineRangeData ?? null;
+          const localHashlines = extraData?.hashlineData ?? null;
 
           // Separate hashline edits from legacy edits
           const hashlineEdits: Array<{ editIdx: number; hashline: Record<string, unknown> }> = [];
@@ -1313,8 +1319,8 @@ export default function smartEdit(pi: ExtensionAPI) {
 
           for (let i = 0; i < edits.length; i++) {
             const rawEdit = edits[i] as unknown as Record<string, unknown>;
-            if (rawEdit.__hashline) {
-              hashlineEdits.push({ editIdx: i, hashline: rawEdit.__hashline as Record<string, unknown> });
+            if (localHashlines?.[i] || rawEdit.__hashline) {
+              hashlineEdits.push({ editIdx: i, hashline: (localHashlines?.[i] || rawEdit.__hashline) as Record<string, unknown> });
             } else {
               // Restore replaceAll/anchor/lineRange
               if (localFlags?.[i]) (edits[i] as unknown as Record<string, unknown>).replaceAll = true;

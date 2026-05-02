@@ -43,7 +43,7 @@ function createGitRepo(dir: string, files: Record<string, string>, commits: Arra
     } else {
       committed.add(c.file);
     }
-    const { spawnSync } = await import("node:child_process");
+    const { spawnSync } = require("node:child_process");
     execSync(`git add -A`, { cwd: dir, stdio: "pipe" });
     spawnSync("git", ["commit", "-m", c.msg], { cwd: dir, stdio: "pipe" });
   }
