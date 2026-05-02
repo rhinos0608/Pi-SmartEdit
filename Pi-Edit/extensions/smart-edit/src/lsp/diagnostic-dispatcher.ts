@@ -15,6 +15,7 @@ export interface Diagnostic {
     end: { line: number; character: number };
   };
   source: string;
+  filePath?: string;
 }
 
 export interface DiagnosticResult {
@@ -42,6 +43,7 @@ export function parseTscOutput(output: string): Diagnostic[] {
         end: { line: parseInt(line) - 1, character: parseInt(col) - 1 },
       },
       source: "tsc",
+      filePath: file,
     });
   }
   
@@ -153,6 +155,45 @@ async function findAncestorDirWithFile(
   }
 }
 
+async function findNearestTsconfig(filePath: string, cwd: string): Promise<string | null> {
+  const fromFile = await findAncestorDirWithFile(dirname(filePath), "tsconfig.json");
+  if (fromFile) {
+    return resolve(fromFile, "tsconfig.json");
+  }
+
+  const fromCwd = await findAncestorDirWithFile(cwd, "tsconfig.json");
+  if (fromCwd) {
+    return resolve(fromCwd, "tsconfig.json");
+  }
+
+  return null;
+}
+
+function resolveDiagnosticPath(candidate: string, cwd: string, tsconfigPath: string | null): string[] {
+  const resolved = new Set<string>([resolve(cwd, candidate)]);
+
+  if (tsconfigPath) {
+    resolved.add(resolve(dirname(tsconfigPath), candidate));
+  }
+
+  return [...resolved];
+}
+
+function isRelevantDiagnostic(
+  diagnostic: Diagnostic,
+  targetPath: string,
+  cwd: string,
+  tsconfigPath: string | null,
+): boolean {
+  if (!diagnostic.filePath) {
+    return true;
+  }
+
+  const target = resolve(targetPath);
+  return resolveDiagnosticPath(diagnostic.filePath, cwd, tsconfigPath)
+    .some((candidate) => candidate === target);
+}
+
 /**
  * Run TypeScript compiler and get diagnostics.
  */
@@ -160,14 +201,22 @@ export async function checkTscDiagnostics(
   filePath: string,
   cwd: string
 ): Promise<DiagnosticResult> {
+  const tsconfigPath = await findNearestTsconfig(filePath, cwd);
+
   // Using npx tsc to catch global tsc vs local
-  const result = await safeSpawnAsync("npx", ["tsc", "--noEmit", "--pretty", "false", filePath], {
+  const args = tsconfigPath
+    ? ["tsc", "--noEmit", "--pretty", "false", "-p", tsconfigPath]
+    : ["tsc", "--noEmit", "--pretty", "false", filePath];
+
+  const result = await safeSpawnAsync("npx", args, {
     cwd,
     timeout: 60000,
   });
   
   const output = result.stdout + result.stderr;
-  const diagnostics = parseTscOutput(output);
+  const diagnostics = parseTscOutput(output).filter((diagnostic) =>
+    isRelevantDiagnostic(diagnostic, filePath, cwd, tsconfigPath),
+  );
   
   return {
     diagnostics,

@@ -1,4 +1,7 @@
 import { execSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import assert from "node:assert";
 import {
@@ -100,6 +103,53 @@ describe("Diagnostic Dispatcher", () => {
       assert.ok(result && typeof result === "object");
       assert.ok(Array.isArray(result.diagnostics));
       assert.strictEqual(typeof result.source, "string");
+    });
+
+    testTsc("uses the nearest tsconfig and filters unrelated project diagnostics", async () => {
+      const rootDir = mkdtempSync(join(tmpdir(), "smart-edit-tsc-"));
+      const srcDir = join(rootDir, "src");
+      mkdirSync(srcDir, { recursive: true });
+
+      writeFileSync(
+        join(rootDir, "tsconfig.json"),
+        JSON.stringify(
+          {
+            compilerOptions: {
+              target: "ES2022",
+              module: "ESNext",
+              strict: true,
+              noEmit: true,
+            },
+            include: ["src/**/*.ts"],
+          },
+          null,
+          2,
+        ),
+      );
+
+      const targetFile = join(srcDir, "bad.ts");
+      writeFileSync(targetFile, "function echo(value) {\n  return value;\n}\n");
+
+      const noisyFile = join(srcDir, "noisy.ts");
+      writeFileSync(noisyFile, "const shouldBeNumber: number = 'x';\n");
+
+      const result = await checkTscDiagnostics(targetFile, rootDir);
+      const messages = result.diagnostics.map((diagnostic) => diagnostic.message);
+
+      assert.ok(
+        messages.some((message) =>
+          message.includes("bad.ts:Parameter 'value' implicitly has an 'any' type.")
+        ),
+        messages.join("\n"),
+      );
+      assert.ok(
+        !messages.some((message) => message.includes("noisy.ts")),
+        messages.join("\n"),
+      );
+      assert.ok(
+        !messages.some((message) => message.includes("tsconfig.json is present but will not be loaded")),
+        messages.join("\n"),
+      );
     });
   });
 });
