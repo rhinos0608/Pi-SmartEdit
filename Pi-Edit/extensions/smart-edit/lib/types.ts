@@ -202,6 +202,32 @@ export interface EditResult {
     firstChangedLine?: number;
     matchNotes?: string[];
     conflictWarnings?: string[];
+    /**
+     * Absolute paths of files mutated by this edit, emitted so
+     * the context optimizer can trigger semantic cache invalidation
+     * without re-parsing tool result text.
+     *
+     * Integration: consumed by Pi Context Optimizer's tool_result
+     * handler to mark affected paths for cache invalidation.
+     */
+    mutatedPaths?: string[];
+    /**
+     * Structured post-edit diagnostics from LSP/compiler checks.
+     * Emitted so the context optimizer's tool_result handler can
+     * classify errors as high-confidence "current-failure" class
+     * with exact file+line context, rather than re-parsing from
+     * unstructured text.
+     *
+     * Mirrors the Diagnostic interface from src/lsp/diagnostics.ts
+     * and src/lsp/diagnostic-dispatcher.ts.
+     */
+    diagnostics?: Array<{
+      message: string;
+      severity: 1 | 2 | 3 | 4;
+      range: { start: { line: number; character: number }; end: { line: number; character: number } };
+      source?: string;
+      filePath?: string;
+    }>;
   };
 }
 

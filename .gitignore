@@ -15,3 +15,7 @@ progress.md
 # macOS
 .DS_Store
 **/.DS_Store
+.pi/context-optimizer/store-version.json
+.pi/context-optimizer/telemetry.jsonl
+Pi-Edit/extensions/smart-edit/.pi/context-optimizer/semantic-cache.json
+Pi-Edit/extensions/smart-edit/.pi-smartread.embeddings.cache/bfc4cec1c7f5ec45.json

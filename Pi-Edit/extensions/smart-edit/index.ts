@@ -981,6 +981,8 @@ async function reReadAfterFailure(
   const lines = currentContent.split('\n');
   const hashline = await buildHashlineAnchors(lines);
   recordRead(path, cwd, currentContent, false, hashline);
+  // Also update session reads so range coverage doesn't reject the retry
+  recordReadSession(path, cwd, 1, -1, lines.length, "reReadAfterFailure");
 
   // Build context snippets for each edit that failed
   const contextParts: string[] = [];
@@ -1287,6 +1289,21 @@ export default function smartEdit(pi: ExtensionAPI) {
           const buffer = await fsReadFile(absolutePath);
           const rawContent = buffer.toString("utf-8");
 
+          // ── Session read fallback ──
+          // Edge case: snapshot exists (file was read) but session reads weren't
+          // recorded. This can happen when:
+          //   - The tool_result handler didn't fire for this read
+          //   - A previous reReadAfterFailure populated the snapshot without session reads
+          //   - The file was injected via --context or @mention
+          // If we passed checkStale (snapshot exists) but have no session reads,
+          // populate them from the fresh file content so range coverage can validate.
+          // This is safe because checkStale already confirmed the file was read.
+          const existingSessions = getSessionReads(path, cwd);
+          if (existingSessions.length === 0 && getSnapshot(path, cwd)) {
+            const rawLines = rawContent.split('\n');
+            recordReadSession(path, cwd, 1, -1, rawLines.length, "edit_fallback");
+          }
+
           // ── Range coverage check (P1: read-guard pattern) ──
           // Validate that edit targets fall within lines actually read this session.
           // This prevents edits to sections of a file the model hasn't seen.
@@ -1559,7 +1576,15 @@ export default function smartEdit(pi: ExtensionAPI) {
           }
 
           // ── Post-edit diagnostic check: LSP + compiler fallback ──
-          // First check LSP diagnostics, then fall back to compilers if no results
+          // First check LSP diagnostics, then fall back to compilers if no results.
+          // allDiagnostics is declared at this scope so the details section below
+          // can emit structured diagnostics for context-optimizer integration.
+          let allDiagnostics: Array<{
+            message: string;
+            severity: 1 | 2 | 3 | 4;
+            range: { start: { line: number; character: number }; end: { line: number; character: number } };
+            source?: string;
+          }> = [];
           if (lspManager) {
             const languageId = detectLanguageFromExtension(path);
             if (languageId) {
@@ -1579,7 +1604,7 @@ export default function smartEdit(pi: ExtensionAPI) {
               }
 
               // Aggregate results from both phases
-              const allDiagnostics = [...diagResult.diagnostics];
+              allDiagnostics = [...diagResult.diagnostics];
               if (compilerResult.diagnostics.length > 0) {
                 allDiagnostics.push(...compilerResult.diagnostics);
               }
@@ -1619,7 +1644,20 @@ export default function smartEdit(pi: ExtensionAPI) {
           }
 
           // Add conflict details to details output
-          const details: { diff?: string; firstChangedLine?: number; matchNotes?: string[]; conflictWarnings?: string[] } = {
+          const details: {
+            diff?: string;
+            firstChangedLine?: number;
+            matchNotes?: string[];
+            conflictWarnings?: string[];
+            mutatedPaths?: string[];
+            diagnostics?: Array<{
+              message: string;
+              severity: 1 | 2 | 3 | 4;
+              range: { start: { line: number; character: number }; end: { line: number; character: number } };
+              source?: string;
+              filePath?: string;
+            }>;
+          } = {
             diff: diffResult.diff,
             firstChangedLine: diffResult.firstChangedLine,
           };
@@ -1628,6 +1666,27 @@ export default function smartEdit(pi: ExtensionAPI) {
           }
           if (conflictWarnings.length > 0) {
             details.conflictWarnings = conflictWarnings;
+          }
+
+          // Emit mutated path for context-optimizer integration.
+          // This signals which files were actually changed so the context
+          // optimizer can invalidate semantic cache entries without
+          // re-parsing tool result text.
+          details.mutatedPaths = [absolutePath];
+
+          // Emit structured diagnostics for context-optimizer integration.
+          // When diagnostics are available, the context optimizer's
+          // tool_result_classifier consumes them as high-confidence
+          // "current-failure" class content with exact file+line context,
+          // rather than re-parsing from unstructured text.
+          if (allDiagnostics && allDiagnostics.length > 0) {
+            details.diagnostics = allDiagnostics.map((d) => ({
+              message: d.message,
+              severity: d.severity,
+              range: d.range,
+              source: d.source,
+              filePath: (d as Record<string, unknown>).filePath as string | undefined,
+            }));
           }
 
           return {
