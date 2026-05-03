@@ -88,7 +88,7 @@ describe("prepareArguments — JSON string edits", () => {
       () => prepareArguments({ path: "/test.ts", edits: "" }),
       (err: Error) => {
         assert(err.message.includes("empty string"));
-        assert(err.message.includes("array of { oldText, newText }"));
+        assert(err.message.includes("hashline"));
         return true;
       },
     );
@@ -263,7 +263,7 @@ describe("validateInput", () => {
     assert.throws(
       () => validateInput({ path: "/test.ts", edits: [] }),
       (err: Error) => {
-        assert(err.message.includes("at least one replacement"));
+        assert(err.message.includes("at least one edit"));
         return true;
       },
     );
@@ -273,7 +273,7 @@ describe("validateInput", () => {
     assert.throws(
       () => validateInput({ path: "/test.ts", edits: "string" }),
       (err: Error) => {
-        assert(err.message.includes("at least one replacement"));
+        assert(err.message.includes("at least one edit"));
         return true;
       },
     );

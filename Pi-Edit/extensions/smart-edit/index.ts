@@ -69,14 +69,8 @@ import type {
 
 const editItemSchema = Type.Object(
   {
-    oldText: Type.String({
-      description:
-        "Exact text for one targeted replacement. Use replaceAll: true to replace every occurrence. " +
-        "When replaceAll is false (default), oldText must match a unique, non-overlapping region.",
-    }),
-    newText: Type.String({
-      description: "Replacement text for this targeted edit.",
-    }),
+    oldText: Type.Optional(Type.String()),
+    newText: Type.Optional(Type.String()),
     replaceAll: Type.Optional(
       Type.Boolean({
         description:
@@ -210,10 +204,12 @@ const editItemSchema = Type.Object(
         },
         {
           description:
-            "Hashline-anchored edit: references LINE+ID anchors instead of reproducing text. " +
+            "PREFERRED edit format when hashline anchors are available from a recent read. " +
+            "References LINE+ID anchors from the read output instead of reproducing text. " +
             "Format: { hashline: { range: { pos: '42ab', end: '45cd' }, content: ['new lines'] } } " +
             "Anchors are shown in read output (e.g., '42ab|function hello() {'). " +
-            "This format is faster and more reliable than oldText reproduction.",
+            "This format provides freshness checking and eliminates text reproduction errors. " +
+            "Always use this when the file was recently read with hashline anchors.",
         },
       ),
     ),
@@ -228,11 +224,15 @@ const editSchema = Type.Object(
     edits: Type.Union([
       Type.Array(editItemSchema, {
         description:
-          "One or more targeted replacements. Each edit is matched against the original file, " +
-          "not incrementally (all edits use the pre-edit file state). " +
-          "\n- For unique text: emit edits with oldText/newText only. " +
-          "\n- For repeated text: add replaceAll: true to replace every occurrence. " +
-          "\n- For scoped edits: add anchor (AST symbol) or lineRange to narrow the search. " +
+          "One or more targeted edits using hashline-anchored format. " +
+          "Each edit references LINE+ID anchors from the read output (e.g., '42ab|function hello() {'). " +
+          "Edits are matched against the original file, not incrementally. " +
+          "\nFormat: { hashline: { range: { pos: '42ab', end: '45cd' }, content: ['new lines'] } } " +
+          "\n- Single-line edit: pos and end are the same anchor. " +
+          "\n- Append to file: pos='EOF', end='EOF'. " +
+          "\n- Prepend to file: pos='start', end='start'. " +
+          "\n- Insert after anchor: pos='42ab:after', end='42ab'. " +
+          "\n- Insert before anchor: pos='42ab:before', end='42ab'. " +
           "\nDo not include overlapping or nested edits — merge nearby changes into one edit.",
       }),
       Type.String({
@@ -413,7 +413,7 @@ function prepareArguments(input: Record<string, unknown>): Record<string, unknow
 ` +
       `  path: string   — path to the file to edit (relative or absolute)
 ` +
-      `  edits: array   — one or more { oldText, newText } replacement objects
+      `  edits: array   — one or more hashline-anchored edit objects
 
 ` +
       `Example:
@@ -422,7 +422,7 @@ function prepareArguments(input: Record<string, unknown>): Record<string, unknow
 ` +
       `    path: "src/foo.ts",
 ` +
-      `    edits: [{ oldText: "const x = 1;", newText: "const x = 2;" }]
+      `    edits: [{ hashline: { range: { pos: '42ab', end: '42ab' }, content: ["new line"] } }]
 ` +
       `  })`
     );
@@ -438,7 +438,7 @@ function prepareArguments(input: Record<string, unknown>): Record<string, unknow
 ` +
       `    path: "src/foo.ts",  // <-- add this — relative or absolute path
 ` +
-      `    edits: [{ oldText: "...", newText: "..." }]
+      `    edits: [{ hashline: { range: { pos: '42ab', end: '42ab' }, content: [...] } }]
 ` +
       `  }`
     );
@@ -454,8 +454,8 @@ function prepareArguments(input: Record<string, unknown>): Record<string, unknow
     if (!raw) {
       throw formatEditError(
         `edits was received as an empty string.`,
-        `Send edits as an array of { oldText, newText } objects:\n` +
-        `  edits: [{ oldText: "...", newText: "..." }]`
+        `Send edits as a hashline array:\n` +
+        `  edits: [{ hashline: { range: { pos: '42ab', end: '42ab' }, content: [...] } }]`
       );
     }
 
@@ -554,7 +554,8 @@ function prepareArguments(input: Record<string, unknown>): Record<string, unknow
         }
         throw formatEditError(
           `edits was received as a JSON string but parsed into ${typeDesc}, not an array.`,
-          `edits must be an array of { oldText, newText } objects.\n` +
+          `edits must be an array of hashline edit objects.\n` +
+          `Format: { hashline: { range: { pos: '42ab', end: '45cd' }, content: ['lines'] } }\n` +
           `Raw value (${raw.length} chars) starts with:\n  ${snippet}\n\n` +
           `This typically happens when the JSON is improperly escaped or truncated.\n` +
           `Automatic repair was attempted but could not recover a valid edits array.\n` +
@@ -564,26 +565,33 @@ function prepareArguments(input: Record<string, unknown>): Record<string, unknow
     }
 
     // Validate each item is an object with required fields
+    // Hashline-only edits don't need oldText/newText
     const parsedArr = parsed as unknown[];
     for (let i = 0; i < parsedArr.length; i++) {
       const item = parsedArr[i] as Record<string, unknown>;
       if (item === null || typeof item !== "object") {
         throw formatEditError(
           `edits[${i}] is ${item === null ? "null" : `a ${typeof item}`}, not an object.`,
-          `Each element in edits must be an object with oldText and newText string fields.`
+          `Each element in edits must be an object with a hashline field (or legacy oldText/newText fields).`
         );
       }
-      if (typeof item.oldText !== "string") {
-        throw formatEditError(
-          `edits[${i}].oldText is ${typeof item.oldText}, but must be a string.`,
-          `oldText is the exact text to find in the file for replacement.`
-        );
-      }
-      if (typeof item.newText !== "string") {
-        throw formatEditError(
-          `edits[${i}].newText is ${typeof item.newText}, but must be a string.`,
-          `newText is the replacement text to write in place of oldText.`
-        );
+      const isHashlineEdit = item.hashline && typeof item.hashline === "object" &&
+        (item.hashline as Record<string, unknown>).range;
+      if (!isHashlineEdit) {
+        if (typeof item.oldText !== "string") {
+          throw formatEditError(
+            `edits[${i}].oldText is ${typeof item.oldText}, but must be a string.`,
+            `oldText is the exact text to find in the file for replacement. ` +
+            `Alternatively, use hashline format: { hashline: { range: { pos: '42ab', end: '45cd' }, content: [...] } }`
+          );
+        }
+        if (typeof item.newText !== "string") {
+          throw formatEditError(
+            `edits[${i}].newText is ${typeof item.newText}, but must be a string.`,
+            `newText is the replacement text to write in place of oldText. ` +
+            `Alternatively, use hashline format with content array.`
+          );
+        }
       }
     }
 
@@ -622,7 +630,7 @@ function prepareArguments(input: Record<string, unknown>): Record<string, unknow
 ` +
       `    path: "${typeof args.path === "string" ? args.path : "..."}",
 ` +
-      `    edits: [{ oldText: "...", newText: "..." }]  // <-- add this
+      `    edits: [{ hashline: { range: { pos: '42ab', end: '42ab' }, content: [...] } }]  // <-- add this
 ` +
       `  }`
     );
@@ -698,9 +706,9 @@ function validateInput(input: Record<string, unknown>): EditInput {
     (input.edits as EditItem[]).length === 0
   ) {
     throw formatEditError(
-      "Edit tool input is invalid: edits must contain at least one replacement.",
-      "Make sure edits is an array of { oldText, newText } objects, " +
-      "each with the exact text from the file as oldText."
+      "Edit tool input is invalid: edits must contain at least one edit.",
+      "Make sure edits is an array of edit objects using hashline format: " +
+      "{ hashline: { range: { pos: '42ab', end: '45cd' }, content: ['lines'] } }."
     );
   }
   return {
@@ -896,6 +904,31 @@ function findTextLineRange(
 }
 
 /**
+ * Extract the target line number from a hashline anchor string.
+ * Handles special anchors, numeric anchors, and :after/:before suffixes.
+ * Used by the range coverage guard to validate hashline-only edits.
+ */
+function getHashlineAnchorLine(anchorStr: string, totalLines: number): number | null {
+  const trimmed = anchorStr.trim();
+
+  // Special anchors
+  if (trimmed === "EOF" || trimmed === "end") return totalLines;
+  if (trimmed === "start" || trimmed === "BOF") return 1;
+
+  // Strip :after / :before suffix
+  const base = trimmed.replace(/:after$|:before$/, "");
+
+  // Extract leading number from LINE+HASH format
+  const lineMatch = base.match(/^(\d+)/);
+  if (lineMatch) {
+    const ln = parseInt(lineMatch[1], 10);
+    return ln >= 1 && ln <= totalLines ? ln : null;
+  }
+
+  return null;
+}
+
+/**
  * Compute the containing line range for a set of edits from their oldText.
  * Returns [startLine, endLine] (1-based) or null if oldText can't be located.
  *
@@ -1046,8 +1079,27 @@ export default function smartEdit(pi: ExtensionAPI) {
 
           // Track read range for coverage validation
           const readOffset = (event.input as { offset?: number })?.offset ?? 1;
-          const readLimit = (event.input as { limit?: number })?.limit ?? lines.length;
-          recordReadSession(inputPath, process.cwd(), readOffset, readLimit, lines.length, "read");
+          const explicitLimit = (event.input as { limit?: number })?.limit;
+
+          // When no explicit limit is given (offset-only read), use -1 to mean
+          // "through end of file" so range coverage can validate correctly.
+          // Determine the actual total file line count from snapshot's hashline
+          // data (if available) rather than relying on the returned output, which
+          // may be truncated by Pi's output limit.
+          if (explicitLimit === undefined) {
+            let totalFileLines = lines.length + readOffset - 1;
+            try {
+              const snapshot = getSnapshot(inputPath, process.cwd());
+              if (snapshot?.hashline?.formattedLines?.length) {
+                totalFileLines = snapshot.hashline.formattedLines.length;
+              }
+            } catch {
+              // Fall back to computed value
+            }
+            recordReadSession(inputPath, process.cwd(), readOffset, -1, totalFileLines, "read");
+          } else {
+            recordReadSession(inputPath, process.cwd(), readOffset, explicitLimit, lines.length + readOffset - 1, "read");
+          }
           return;
           }
 
@@ -1207,17 +1259,18 @@ export default function smartEdit(pi: ExtensionAPI) {
     name: "edit",
     label: "edit",
     description:
-      "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.",
+      "Edit a single file using hashline-anchored edits. Each edit references LINE+ID anchors from the read output (e.g., '42ab'). " +
+      "If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. " +
+      "Do not include large unchanged regions just to connect distant changes.",
 
     promptSnippet:
-      "Make precise file edits with exact text replacement, including multiple disjoint edits in one call",
+      "Make precise file edits using hashline anchors (LINE+ID from read output) for freshness-checked, text-free editing.",
 
     promptGuidelines: [
-      "Use edit for precise file modifications. Copy exact snippets from the latest file read as oldText.",
-      "Use multiple edits in one call for independent changes to the same file.",
-      "All edits are matched against the original file content, not after earlier edits. Do not emit overlapping edits — merge nearby changes into one edit.",
-      "Keep oldText minimal but unique. Include enough surrounding context to uniquely identify the region.",
-      "The tool tolerates minor indentation and Unicode differences, but exact snippets are always safer.",
+      "When a file was recently read, use hashline anchors for edits. Each line in the read output has a LINE+ID prefix (e.g., '42ab|function hello() {'). Use these anchors to target edits — they provide freshness checking and eliminate text reproduction errors.",
+      "Format hashline edits as: { hashline: { range: { pos: '42ab', end: '45cd' }, content: ['new line 1', 'new line 2'] } }. For single-line edits, pos and end are the same anchor. Use 'EOF' or 'end' to append, 'start' or 'BOF' to prepend. Append ':after' or ':before' to an anchor for insert operations.",
+      "Use multiple edits in one call for independent changes to the same file. All edits are matched against the original file content, not incrementally.",
+      "Do not emit overlapping edits — merge nearby changes into one edit. Keep content arrays concise — only include lines that change.",
       "Before editing code that depends on custom types, imported factories, interfaces, or unfamiliar symbols, call semantic_context for the target range instead of reading whole dependency files.",
     ],
 
@@ -1308,7 +1361,35 @@ export default function smartEdit(pi: ExtensionAPI) {
           // Validate that edit targets fall within lines actually read this session.
           // This prevents edits to sections of a file the model hasn't seen.
           // Uses the edits' oldText to determine target lines.
-          const editLineRange = computeEditContainingRange(rawContent, edits);
+          // ── Range coverage guard ──
+          // Priority 1: Derive range from oldText (works for legacy edits)
+          // Priority 2: Derive range from hashline anchors (works for hashline-only edits)
+          let editLineRange = computeEditContainingRange(rawContent, edits);
+
+          if (!editLineRange && extraData?.hashlineData) {
+            const totalLines = rawContent.split('\n').length;
+            let minStart = Infinity;
+            let maxEnd = -Infinity;
+
+            for (const h of (extraData.hashlineData as unknown[])) {
+              if (!h) continue;
+              const he = h as Record<string, unknown>;
+              const range = he.range as { pos?: string; end?: string } | undefined;
+              if (!range?.pos || !range?.end) continue;
+
+              const startLine = getHashlineAnchorLine(range.pos, totalLines);
+              const endLine = getHashlineAnchorLine(range.end, totalLines);
+              if (startLine === null || endLine === null) continue;
+
+              if (startLine < minStart) minStart = startLine;
+              if (endLine > maxEnd) maxEnd = endLine;
+            }
+
+            if (minStart !== Infinity && maxEnd !== -Infinity) {
+              editLineRange = [minStart, maxEnd];
+            }
+          }
+
           if (editLineRange) {
             const coverageResult = checkRangeCoverage(path, cwd, editLineRange[0], editLineRange[1]);
             if (!coverageResult.covered) {
@@ -1339,6 +1420,15 @@ export default function smartEdit(pi: ExtensionAPI) {
             if (localHashlines?.[i] || rawEdit.__hashline) {
               hashlineEdits.push({ editIdx: i, hashline: (localHashlines?.[i] || rawEdit.__hashline) as Record<string, unknown> });
             } else {
+              // Guard: hashline-only edit with no oldText can't go through legacy pipeline
+              // This happens when the hashline side-channel (path-encoded extraData) fails to decode.
+              if (typeof rawEdit.oldText !== "string") {
+                throw new Error(
+                  `edits[${i}] has no oldText and no recoverable hashline data. ` +
+                  `This edit was sent as hashline format but the anchor data was lost during tool parameter processing. ` +
+                  `Re-read the file and retry the edit.`
+                );
+              }
               // Restore replaceAll/anchor/lineRange
               if (localFlags?.[i]) (edits[i] as unknown as Record<string, unknown>).replaceAll = true;
               if (localAnchors?.[i]) (edits[i] as unknown as Record<string, unknown>).anchor = localAnchors[i];
@@ -1355,6 +1445,31 @@ export default function smartEdit(pi: ExtensionAPI) {
           const conflictWarnings: string[] = [];
           let resultMatchSpans: MatchSpan[] = [];
           let replacementCount = 0;
+
+          // ── Soft hashline feedback ──
+          // When hashline anchors are available but legacy oldText/newText was used,
+          // apply the edit normally but add feedback so the model prefers hashline next time.
+          // Exceptions: replaceAll, AST anchor, lineRange — these are legacy-only features.
+          if (legacyEdits.length > 0) {
+            const snapshot = getSnapshot(path, cwd);
+            if (snapshot?.hashline?.anchors && snapshot.hashline.anchors.size > 0) {
+              const needsLegacy = legacyEdits.some(
+                ({ edit }) => edit.replaceAll || edit.anchor || edit.lineRange
+              );
+              if (!needsLegacy) {
+                const anchorExamples: string[] = [];
+                let count = 0;
+                for (const [anchor] of snapshot.hashline.anchors) {
+                  anchorExamples.push(anchor);
+                  if (++count >= 3) break;
+                }
+                matchNotes.push(
+                  `hint: hashline anchors are available for this file — prefer hashline format next time for freshness checking. ` +
+                  `Example: { hashline: { range: { pos: '${anchorExamples[0] ?? '42ab'}', end: '${anchorExamples[1] ?? '45cd'}' }, content: ['lines'] } }`
+                );
+              }
+            }
+          }
 
           // ── Phase A: Apply hashline edits (if any) ──
           if (hashlineEdits.length > 0) {
@@ -1400,13 +1515,15 @@ export default function smartEdit(pi: ExtensionAPI) {
             };
 
             for (const { editIdx, hashline } of hashlineEdits) {
-              const rawEdit = hashline as {
-                anchor?: HashlineEditInput["anchor"];
-                content?: string[] | null;
-              };
+              const rawEdit = hashline as Record<string, unknown>;
 
               const input: HashlineEditInput = {
-                anchor: rawEdit.anchor as HashlineEditInput["anchor"],
+                anchor: {
+                  range: rawEdit.range as { pos: string; end: string },
+                  ...(rawEdit.symbol
+                    ? { symbol: rawEdit.symbol as { name: string; kind?: string; line?: number } }
+                    : {}),
+                },
                 content: rawEdit.content as string[] | null | undefined,
               };
 

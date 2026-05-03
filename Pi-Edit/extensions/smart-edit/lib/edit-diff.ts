@@ -1327,12 +1327,24 @@ export async function applyEdits(
   replacementCount: number;
   matchSpans: MatchSpan[];
 }> {
-  // Normalize edit texts to LF
-  const normalizedEdits = edits.map((edit) => ({
-    ...edit,
-    oldText: normalizeToLF(edit.oldText),
-    newText: normalizeToLF(edit.newText),
-  }));
+  // Normalize edit texts to LF — guard against undefined oldText/newText
+  // (hashline-only edits can reach here if the hashline side-channel fails to decode)
+  const normalizedEdits: EditItem[] = [];
+  for (let i = 0; i < edits.length; i++) {
+    const edit = edits[i];
+    if (typeof edit.oldText !== "string") {
+      throw new Error(
+        `edits[${i}].oldText is ${typeof edit.oldText}, expected a string. ` +
+        `If using hashline format, the hashline anchor data may have been lost ` +
+        `during tool parameter processing. Re-read the file and retry with explicit hashline anchors.`
+      );
+    }
+    normalizedEdits.push({
+      ...edit,
+      oldText: normalizeToLF(edit.oldText),
+      newText: typeof edit.newText === "string" ? normalizeToLF(edit.newText) : "",
+    });
+  }
 
   // Validate: no empty oldText
   for (let i = 0; i < normalizedEdits.length; i++) {

@@ -967,7 +967,7 @@ export async function applyHashlinePath(
   const warnings: string[] = [];
 
   // ── Step 1: Resolve hashline edits ──────────────────────────────────────────
-  const resolvedEdits = resolveHashlineEdits([{ ...input, content: input.content ?? null }]);
+  const resolvedEdits = resolveHashlineEdits([{ ...input, content: input.content ?? null }], true);
   if (resolvedEdits.length === 0) {
     return {
       newContent: fileContent,
