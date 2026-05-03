@@ -4,4 +4,32 @@
 telemetry.jsonl
 store-version.json
 
-# Add any other specific artifacts here later if specified.
+# Graphify artifacts - knowledge graph outputs and caches
+graphify-out/
+.graphify_detect.json
+.graphify_extract.json
+.graphify_ast.json
+.graphify_semantic.json
+.graphify_analysis.json
+.graphify_labels.json
+.graphify_chunk_*.json
+.graphify_python
+manifest.json
+
+# Node modules (if present)
+node_modules/
+
+# Build outputs
+dist/
+build/
+lib/
+
+# Test coverage reports
+coverage/
+.ncover*
+
+# IDE artifacts
+.idea/
+.vscode/
+.idea/
+

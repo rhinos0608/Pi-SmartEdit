@@ -100,16 +100,37 @@ export const ANCHOR_REBASE_WINDOW = 5;
 const ANCHOR_RE = new RegExp(`^\\s*[>+\\-*]*\\s*(\\d+)(${HASHLINE_BIGRAM_RE_SRC})`);
 
 /**
+ * Regex for Pi-SmartRead's line-number-only anchor format: "42|".
+ * Matches one or more digits followed by a pipe separator.
+ */
+const LINE_ONLY_ANCHOR_RE = /^\s*(\d+)\|\s*$/;
+
+/**
  * Parse a LINE+ID anchor string (e.g., "42ab" or "  42nd|foo") into its
  * line number and hash components.
+ *
+ * Also supports Pi-SmartRead's line-number-only format "42|" — when the
+ * hash is "|" (pipe), the anchor is treated as a pure line reference
+ * without hash validation. The rebase logic skips hash comparison for
+ * these anchors.
  *
  * @param ref The anchor string to parse. Leading/trailing whitespace and
  *            common prefix markers (>, +, -, *) are stripped before parsing.
  * @returns The parsed anchor with 1-based line number and hash.
+ *          Hash is "|" for line-number-only anchors.
  * @throws Error if the string does not match the LINE+ID pattern.
  */
 export function parseTag(ref: string): Anchor {
   const trimmed = ref.trim();
+
+  // Check Pi-SmartRead line-number-only format first: "42|"
+  const lineOnlyMatch = trimmed.match(LINE_ONLY_ANCHOR_RE);
+  if (lineOnlyMatch) {
+    return {
+      line: parseInt(lineOnlyMatch[1], 10),
+      hash: "|",
+    };
+  }
   const match = trimmed.match(ANCHOR_RE);
 
   if (!match) {
@@ -165,6 +186,13 @@ export function tryRebaseAnchor(
   // Bounds check
   if (lineIdx < 0 || lineIdx >= fileLines.length) {
     return null;
+  }
+
+  // Line-number-only anchors (hash === "|") skip hash validation.
+  // These come from Pi-SmartRead's line-prefixed output format.
+  // Accept the anchor at the requested line position without hash check.
+  if (anchor.hash === "|") {
+    return "exact";
   }
 
   // Check exact position first
@@ -457,7 +485,9 @@ function validateEditAnchors(
           expectedHash = actualHash;
         }
 
-        if (actualHash !== expectedHash) {
+        // Line-number-only anchors (hash === "|") skip hash validation.
+        // These come from Pi-SmartRead's line-prefixed output.
+        if (expectedHash !== "|" && actualHash !== expectedHash) {
           // Check if this is a genuine mismatch or expected (interior line)
           // For interior lines, if expected == actual that's fine
           // For boundary lines, mismatch is a genuine error
@@ -488,7 +518,9 @@ function validateEditAnchors(
         });
       } else {
         const actualHash = computeLineHashSync(ln, fileLines[lineIdx]);
-        if (actualHash !== edit.pos.hash) {
+        // Line-number-only anchors (hash === "|") skip hash validation.
+        // These come from Pi-SmartRead's line-prefixed output.
+        if (edit.pos.hash !== "|" && actualHash !== edit.pos.hash) {
           mismatches.push({
             line: ln,
             expected: edit.pos.hash,

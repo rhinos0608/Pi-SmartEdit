@@ -19,3 +19,8 @@ progress.md
 .pi/context-optimizer/telemetry.jsonl
 Pi-Edit/extensions/smart-edit/.pi/context-optimizer/semantic-cache.json
 Pi-Edit/extensions/smart-edit/.pi-smartread.embeddings.cache/bfc4cec1c7f5ec45.json
+.pi/context-optimizer/semantic-cache.json
+Pi-Edit/extensions/.pi/context-optimizer/semantic-cache.json
+Pi-Edit/.graphify_uncached.txt
+Pi-Edit/.pi/context-optimizer/semantic-cache.json
+Pi-Edit/.pi-smartread/graph-mutations.jsonl

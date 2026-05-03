@@ -52,6 +52,7 @@ import type { DiagnosticResult } from "./src/lsp/diagnostic-dispatcher";
 import { runPostEditEvidencePipeline } from "./src/verification/post-edit-evidence";
 import { defaultVerificationConfig } from "./src/verification/config";
 import type { PostEditEvidenceResult } from "./src/verification/types";
+import { recordBreakage, recordCoChange } from "./src/smartread-bridge";
 
 import type {
   EditAnchor,
@@ -1726,7 +1727,27 @@ export default function smartEdit(pi: ExtensionAPI) {
                 allDiagnostics.push(...compilerResult.diagnostics);
               }
 
+              // ── Record cross-file breakage edges (Smart-Edit → Pi-SmartRead bridge) ──
+              // When diagnostics point to files OTHER than the one being edited,
+              // these are empirically observed semantic coupling edges that no
+              // static analysis captured. Record them so Pi-SmartRead's graph
+              // expansion considers them on subsequent retrieval calls.
               if (allDiagnostics.length > 0) {
+                try {
+                  for (const d of allDiagnostics) {
+                    if (d.severity === 1) {
+                      // Check if the diagnostic has a filePath that differs from the edit target
+                      const diagFilePath = (d as Record<string, unknown>).filePath as string | undefined;
+                      if (diagFilePath && diagFilePath !== absolutePath && diagFilePath !== path) {
+                        const contextMsg = d.message.slice(0, 120);
+                        recordBreakage(cwd, path, diagFilePath, contextMsg, 0.9);
+                      }
+                    }
+                  }
+                } catch {
+                  // Breakage recording is advisory — silently ignore failures
+                }
+
                 const errors = allDiagnostics.filter((d) => d.severity === 1);
                 const warnings = allDiagnostics.filter((d) => d.severity === 2);
                 const sources = new Set([diagResult.source, compilerResult.source].filter(s => s !== "none"));
@@ -1747,6 +1768,49 @@ export default function smartEdit(pi: ExtensionAPI) {
                 // LSP is active and found no issues
                 matchNotes.push("✓ LSP validated: no issues found");
               }
+            }
+          }
+
+          // ── Post-edit evidence pipeline (traceability, history, concurrency) ──
+          // Run the full evidence pipeline to gather historical context for changed
+          // symbols and detect co-change patterns. Co-change edges are recorded to
+          // Pi-SmartRead's mutation log for future graph expansion.
+          if (resultMatchSpans.length > 0) {
+            try {
+              const evidence = await runPostEditEvidencePipeline({
+                cwd,
+                path: absolutePath,
+                content: normalizedContent,
+                languageId: detectLanguageFromExtension(path) ?? "unknown",
+                matchSpans: resultMatchSpans.map((s) => ({
+                  startIndex: s.matchIndex,
+                  endIndex: s.matchIndex + s.matchLength,
+                })),
+                editedPaths: [absolutePath],
+                lspManager,
+              });
+
+              // Record co-change edges from git history analysis
+              // Each history entry tells us a file/symbol was changed alongside
+              // other files in the same commits. This is a weak signal (0.6)
+              // that decays with time, but accumulates across many edit sessions.
+              for (const h of evidence.details.history) {
+                if (h.commits.length > 0 && h.target.path) {
+                  try {
+                    recordCoChange(
+                      cwd,
+                      absolutePath,
+                      h.target.path,
+                      `recent history: ${h.commits[0].hash.slice(0, 8)} ${h.commits[0].subject.slice(0, 60)}`,
+                      0.6,
+                    );
+                  } catch {
+                    // Co-change recording is advisory
+                  }
+                }
+              }
+            } catch {
+              // Evidence pipeline failure is advisory — don't block the edit result
             }
           }
 
