@@ -363,6 +363,58 @@ export function checkRangeCoverage(
     }
   }
 
+  // ── Snapshot fallback ────────────────────────────────────────────
+  // If session reads don't cover the edit range but the snapshot exists
+  // (file was definitely read), auto-populate a full-file session read
+  // and retry. This handles edge cases where the tool_result handler
+  // didn't properly record a session read, or where an offset read's
+  // range was recorded with a truncated line count.
+  //
+  // This is safe because checkStale already verified the file hasn't
+  // changed since the snapshot was recorded — if it had, the edit
+  // would have been rejected before reaching this check.
+  const snapshot = snapshotCache.get(normalized);
+  if (snapshot?.hashline?.formattedLines?.length) {
+    const totalFileLines = snapshot.hashline.formattedLines.length;
+    if (editStartLine >= 1 && editEndLine <= totalFileLines) {
+      // Populate a full-file session read from snapshot data
+      const readsArr = sessionReads.get(normalized) ?? [];
+      readsArr.push({
+        offset: 1,
+        limit: -1,
+        totalLines: totalFileLines,
+        timestamp: Date.now(),
+        source: 'snapshot_fallback',
+      });
+      sessionReads.set(normalized, readsArr);
+
+      // Retry the merge with the new read included
+      const retryIntervals: Array<[number, number]> = readsArr
+        .map((r) => {
+          const start = r.offset;
+          const end = r.limit === -1 ? r.totalLines : r.offset + r.limit - 1;
+          return [start, end] as [number, number];
+        })
+        .filter(([s, e]) => s > 0 && e >= s)
+        .sort((a, b) => a[0] - b[0]);
+
+      const retryMerged: Array<[number, number]> = [];
+      for (const [s, e] of retryIntervals) {
+        if (retryMerged.length > 0 && s <= retryMerged[retryMerged.length - 1][1] + 1) {
+          retryMerged[retryMerged.length - 1][1] = Math.max(retryMerged[retryMerged.length - 1][1], e);
+        } else {
+          retryMerged.push([s, e]);
+        }
+      }
+
+      for (const [s, e] of retryMerged) {
+        if (editStartLine >= s && editEndLine <= e) {
+          return { covered: true };
+        }
+      }
+    }
+  }
+
   // Not covered — build actionable error
   const lastRead = reads[reads.length - 1];
   const lastRange =
