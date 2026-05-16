@@ -7,7 +7,7 @@ Smart Edit replaces Pi's built-in `edit` tool with safer matching, richer diagno
 - **4-tier matching**: exact → indentation → Unicode → similarity
 - **AST-scoped edits**: target a symbol with `anchor`
 - **Line-range scoping**: constrain matching with `lineRange`
-- **Hashline edits**: freshness-checked anchored edits for zero-text workflows
+- **Hashline edits**: freshness-checked anchored edits for zero-text workflows, available only in experimental mode
 - **Multi-format input**: accepts raw JSON edits, search/replace blocks, unified diffs, and OpenAI patch format
 - **Stale-file guard**: blocks edits when the file changed since read
 - **Range coverage guard**: blocks edits outside the lines you actually read
@@ -81,6 +81,8 @@ Pi loads the extension automatically when it starts.
 
 Use the same interface as the built-in `edit` tool.
 
+By default, Smart Edit stays on the `oldText`/`newText` fuzzy-matching path and keeps the current AST/LSP helpers in play. To try the hashline path, set `SMART_EDIT_USE_HASHLINE_EDITING=1` before starting Pi.
+
 ### Basic edit
 
 ```json
@@ -94,6 +96,8 @@ Use the same interface as the built-in `edit` tool.
   ]
 }
 ```
+
+This is the default path.
 
 ### Scoped edit
 
@@ -115,6 +119,31 @@ Use the same interface as the built-in `edit` tool.
   ]
 }
 ```
+
+The `anchor` and `lineRange` helpers still work on the default text path.
+
+### Experimental hashline edit
+
+```json
+{
+  "path": "src/foo.ts",
+  "edits": [
+    {
+      "hashline": {
+        "range": {
+          "pos": "42ab",
+          "end": "45cd"
+        },
+        "content": [
+          "const updated = true;"
+        ]
+      }
+    }
+  ]
+}
+```
+
+Only use this after enabling `SMART_EDIT_USE_HASHLINE_EDITING=1`.
 
 ### Replace all matches
 
@@ -159,7 +188,7 @@ Use the same interface as the built-in `edit` tool.
 ### Flow
 
 1. Read file and populate the snapshot cache
-2. Resolve anchors / line ranges / hashline anchors
+2. Resolve anchors / line ranges, and hashline anchors only when experimental mode is on
 3. Match with the 4-tier fallback pipeline
 4. Apply the edit atomically
 5. Run LSP diagnostics first

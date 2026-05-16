@@ -6,6 +6,10 @@ Pi-Edit/extensions/smart-edit/node_modules
 .pi-smartread.tags.cache/
 **/.pi-smartread.tags.cache/
 
+# SmartEdit runtime artifacts
+**/.smart-edit-undo/
+**/.test-tmp/
+
 # Progress tracking
 progress.md
 
@@ -24,3 +28,9 @@ Pi-Edit/extensions/.pi/context-optimizer/semantic-cache.json
 Pi-Edit/.graphify_uncached.txt
 Pi-Edit/.pi/context-optimizer/semantic-cache.json
 Pi-Edit/.pi-smartread/graph-mutations.jsonl
+Pi-Edit/extensions/.pi-smartread/graph-mutations.jsonl
+Pi-Edit/extensions/smart-edit/.pi/context-optimizer/tool-cache.json
+.pi/
+.pi-smartread/
+.pi-smartread.embeddings.cache/
+.pi-smartread.tags.cache/

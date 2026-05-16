@@ -23,7 +23,8 @@ import {
 } from "../lib/hashline-edit";
 import { findText, detectIndentation } from "../lib/edit-diff";
 import { mkdirSync, writeFileSync } from "fs";
-import { join } from "path";
+import { dirname, join } from "path";
+import { fileURLToPath } from "url";
 
 // ─── Configuration ─────────────────────────────────────────────────
 
@@ -313,9 +314,9 @@ if (errors.length > 0) {
 }
 
 // Write report
-const arg0 = import.meta.dir as string | undefined;
-const arg1 = 'runs';
-const outDir = join(arg0 || '.', arg1);
+const arg0 = dirname(fileURLToPath(import.meta.url));
+const arg1 = "runs";
+const outDir = join(arg0, arg1);
 mkdirSync(outDir, { recursive: true });
 const ts = new Date().toISOString().replace(/[:.]/g, "-");
 const outPath = join(outDir, `benchmark-${ts}.json`);
