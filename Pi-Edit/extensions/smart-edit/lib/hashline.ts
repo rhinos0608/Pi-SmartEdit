@@ -340,13 +340,17 @@ export async function initHashline(): Promise<void> {
 }
 
 /**
- * Build anchor map + formatted lines for a full file.
+ * Build anchor map + formatted lines for a file.
  *
  * @param lines Array of lines (no trailing newlines)
+ * @param offset 1-based line number of the first element in `lines`.
+ *        Default 1 (full file). Pass the read offset for
+ *        offset/limit reads so anchors use absolute line numbers.
  * @returns anchor map + formatted lines
  */
 export async function buildHashlineAnchors(
   lines: string[],
+  offset = 1,
 ): Promise<{
   anchors: Map<string, { text: string; line: number }>;
   formattedLines: string[];
@@ -355,7 +359,7 @@ export async function buildHashlineAnchors(
   const formattedLines: string[] = [];
 
   for (let i = 0; i < lines.length; i++) {
-    const lineNum = i + 1;
+    const lineNum = i + offset;
     const text = lines[i];
     const hash = await computeLineHash(lineNum, text);
     const anchor = `${lineNum}${hash}`;

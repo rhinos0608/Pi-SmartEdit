@@ -313,6 +313,25 @@ describe("hashlineParseText", () => {
     assert.deepStrictEqual(hashlineParseText(content), content);
   });
 
+  it("splits single multiline string content", () => {
+    assert.deepStrictEqual(hashlineParseText("line1\nline2\n"), ["line1", "line2"]);
+  });
+
+  it("strips hashline prefixes when model echoes read output", () => {
+    assert.deepStrictEqual(hashlineParseText(["1ab|line1", "2cd|  line2"]), ["line1", "  line2"]);
+  });
+
+  it("strips diff plus markers from pasted added lines", () => {
+    assert.deepStrictEqual(hashlineParseText(["+line1", "+  line2", "context"]), ["line1", "  line2", "context"]);
+  });
+
+  it("filters read truncation notices while stripping prefixes", () => {
+    assert.deepStrictEqual(
+      hashlineParseText(["1ab|line1", "[Showing lines 1-1 of 10. Use :L2 to continue]"]),
+      ["line1"],
+    );
+  });
+
   it("preserves empty array", () => {
     assert.deepStrictEqual(hashlineParseText([]), []);
   });
@@ -548,6 +567,41 @@ describe("applyHashlineEdits", () => {
     assert.strictEqual(result.lines, makeFile(["line 1", "inserted before line 2", "line 2", "line 3"]));
   });
 
+  it("treats repeated append_at insert as noop when inserted block is already after anchor", () => {
+    const content = makeFile(["line 1", "inserted a", "inserted b", "line 2"]);
+    const edits: HashlineEditOp[] = [{
+      op: "append_at",
+      pos: { line: 1, hash: computeLineHashSync(1, "line 1") },
+      lines: ["inserted a", "inserted b"],
+    }];
+    const result = applyHashlineEdits(content, edits);
+    assert.strictEqual(result.lines, content);
+    assert.ok(result.noopEdits && result.noopEdits.length === 1);
+  });
+
+  it("treats repeated prepend_at insert as noop when inserted block is already before anchor", () => {
+    const content = makeFile(["line 1", "inserted a", "inserted b", "line 2"]);
+    const edits: HashlineEditOp[] = [{
+      op: "prepend_at",
+      pos: { line: 4, hash: computeLineHashSync(4, "line 2") },
+      lines: ["inserted a", "inserted b"],
+    }];
+    const result = applyHashlineEdits(content, edits);
+    assert.strictEqual(result.lines, content);
+    assert.ok(result.noopEdits && result.noopEdits.length === 1);
+  });
+
+  it("treats repeated prepend_file insert as noop when file already starts with block", () => {
+    const content = makeFile(["header a", "header b", "line 1"]);
+    const edits: HashlineEditOp[] = [{
+      op: "prepend_file",
+      lines: ["header a", "header b"],
+    }];
+    const result = applyHashlineEdits(content, edits);
+    assert.strictEqual(result.lines, content);
+    assert.ok(result.noopEdits && result.noopEdits.length === 1);
+  });
+
   it("sorts multiple edits bottom-up", () => {
     // Two edits: one at line 5, one at line 2. Line 5 should apply first.
     const content = makeFile(["line 1", "line 2", "line 3", "line 4", "line 5"]);
@@ -625,7 +679,12 @@ describe("HashlineMismatchError", () => {
 
     assert.ok(err.cliMessage.includes("hash mismatch"));
     assert.ok(err.cliMessage.includes("expected ab, got cd"));
+    assert.ok(err.cliMessage.includes("Current file context"));
+    assert.ok(err.cliMessage.includes("line 1"));
+    assert.ok(err.cliMessage.includes("line 3"));
     assert.ok(err.modelMessage.includes("2cd")); // Corrected anchor
+    assert.ok(err.modelMessage.includes("Current file context"));
+    assert.ok(err.modelMessage.includes("line 2 modified"));
   });
 
   it("formats ambiguous error", () => {

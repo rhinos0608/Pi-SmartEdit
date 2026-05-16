@@ -501,7 +501,7 @@ The edit was NOT applied, please re-read the file and try again.
  43ef|}
 ```
 
-The model receives both the existing LINE+ID anchors (context lines) and the corrected anchors (mismatch lines), so it can immediately issue a corrected edit without re-reading.
+The model receives both the current LINE+ID anchors around each mismatch and the corrected anchors (mismatch lines), so it can immediately issue a corrected edit without re-reading.
 
 ### 10.2 Ambiguous Rebase
 

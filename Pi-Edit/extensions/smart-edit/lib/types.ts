@@ -183,10 +183,19 @@ export interface FileSnapshot {
    *  falling back to mtime-only verification. */
   partial?: boolean;
 
+  /** The 1-based file line offset for this snapshot.
+   *  For full-file reads (offset=1), display line N matches file line N.
+   *  For offset/limit reads (offset=70), display line 1 describes file line 70.
+   *  Hashline validation uses this to translate relative display line numbers
+   *  (what the model sees in read output) to absolute file line numbers.
+   *  Defaults to 1 (no translation needed). */
+  readOffset: number;
+
   /** Hashline anchor data, populated on read when hashline is enabled.
    *  Maps LINE+ID anchor strings (e.g. "42ab") to line text + line number.
-   *  Used by the hashline edit mode to validate freshness and reconstruct
-   *  oldText without requiring the model to reproduce text. */
+   *  Anchor line numbers are RELATIVE to the read offset, matching what
+   *  the model sees in read output (display line number, not absolute).
+   *  Used by hashline edit mode to validate freshness and reconstruct oldText. */
   hashline?: {
     /** Map from LINE+ID anchor to { text, line } for all lines in the file */
     anchors: Map<string, { text: string; line: number }>;

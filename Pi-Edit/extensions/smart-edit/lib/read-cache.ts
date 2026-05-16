@@ -126,6 +126,10 @@ function normalizePath(path: string, cwd: string): string {
  * @param hashline - Optional hashline anchor data. If provided, the snapshot
  *   stores LINE+ID anchors for each line, enabling hashline-anchored editing.
  *   Should be the result of buildHashlineAnchors(content.split('\n')).
+ * @param readOffset - The 1-based file line offset from which this snapshot was
+ *   read. For full-file reads, this is 1. For offset/limit reads, this is the
+ *   `offset` parameter value. Used to translate relative display line numbers
+ *   to absolute file line numbers during hashline validation.
  */
 export function recordRead(
   path: string,
@@ -133,6 +137,7 @@ export function recordRead(
   content: string,
   partial?: boolean,
   hashline?: Awaited<ReturnType<typeof buildHashlineAnchors>>,
+  readOffset?: number,
 ): void {
   const normalized = normalizePath(path, cwd);
   const stat = statSync(normalized);
@@ -144,6 +149,7 @@ export function recordRead(
     contentHash: fastHash(content),
     readAt: Date.now(),
     partial: partial ?? false,
+    readOffset: readOffset ?? 1,
   };
 
   if (hashline) {
@@ -276,6 +282,9 @@ export function getSnapshot(path: string, cwd: string): FileSnapshot | null {
  * immediately after atomicWrite's rename(). The caller provides settled
  * mtime/size from async stat with retry, and the guaranteed-correct
  * in-memory content (what was actually written).
+ *
+ * @param readOffset - The 1-based file line offset for this snapshot.
+ *   For full-file reads (e.g., after an edit), this is 1.
  */
 export function recordReadWithStat(
   path: string,
@@ -284,6 +293,7 @@ export function recordReadWithStat(
   mtimeMs: number,
   size: number,
   hashline?: Awaited<ReturnType<typeof buildHashlineAnchors>>,
+  readOffset?: number,
 ): void {
   const normalized = normalizePath(path, cwd);
   const snapshot: FileSnapshot = {
@@ -293,6 +303,7 @@ export function recordReadWithStat(
     contentHash: fastHash(content),
     readAt: Date.now(),
     partial: false,
+    readOffset: readOffset ?? 1,
   };
 
   if (hashline) {
@@ -374,7 +385,9 @@ export function checkRangeCoverage(
   // changed since the snapshot was recorded — if it had, the edit
   // would have been rejected before reaching this check.
   const snapshot = snapshotCache.get(normalized);
-  if (snapshot?.hashline?.formattedLines?.length) {
+  // Skip fallback for partial snapshots (offset/limit reads):
+  // formattedLines.length is the partial content length, not the full file.
+  if (snapshot?.hashline?.formattedLines?.length && !snapshot.partial) {
     const totalFileLines = snapshot.hashline.formattedLines.length;
     if (editStartLine >= 1 && editEndLine <= totalFileLines) {
       // Populate a full-file session read from snapshot data
@@ -416,11 +429,12 @@ export function checkRangeCoverage(
   }
 
   // Not covered — build actionable error
-  const lastRead = reads[reads.length - 1];
-  const lastRange =
-    lastRead.limit === -1
-      ? `lines 1-${lastRead.totalLines}`
-      : `lines ${lastRead.offset}-${lastRead.offset + lastRead.limit - 1}`;
+  const readRanges = reads
+    .map((read) => {
+      const end = read.limit === -1 ? read.totalLines : read.offset + read.limit - 1;
+      return `lines ${read.offset}-${end}`;
+    })
+    .join(", ");
 
   // Suggest a sensible re-read range
   const reReadOffset = Math.max(1, editStartLine - 10);
@@ -429,18 +443,11 @@ export function checkRangeCoverage(
   return {
     covered: false,
     reason:
-      `🔴 Edit outside read range
-
-` +
-      `You read \`${path}\` as ${lastRange} (${lastRead.source}),
-` +
-      `but your edit targets lines ${editStartLine}-${editEndLine}.
-
-` +
-      `To proceed:
-` +
-      `  1. Read the file section: \`read path="${path}" offset=${reReadOffset} limit=${reReadLimit}\`
-` +
+      `🔴 Edit outside read range\n\n` +
+      `You read \`${path}\` in these ranges: ${readRanges}.\n` +
+      `but your edit targets lines ${editStartLine}-${editEndLine}.\n\n` +
+      `To proceed:\n` +
+      `  1. Read the file section: \`read path="${path}" offset=${reReadOffset} limit=${reReadLimit}\`\n` +
       `  2. Or read the full file: \`read path="${path}"\``,
   };
 }

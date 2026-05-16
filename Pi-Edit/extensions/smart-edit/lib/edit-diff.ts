@@ -563,7 +563,7 @@ export function findTextWithTelemetry(
 
   // Tier 2: Indentation-normalized match
   tierStart = performance.now();
-  const indentResult = tryIndentationMatch(originalContent, oldText, indentationStyle, searchStart);
+  const indentResult = tryIndentationMatch(originalContent, oldText, indentationStyle, searchStart, searchEnd);
   const indentDuration = performance.now() - tierStart;
   if (indentResult && (!searchScope || (indentResult.index >= searchStart && indentResult.index < searchEnd))) {
     telemetry.push({
@@ -579,7 +579,7 @@ export function findTextWithTelemetry(
 
   // Tier 3: Unicode-normalized match (maps back to original)
   tierStart = performance.now();
-  const unicodeResult = tryUnicodeMatch(originalContent, oldText, searchStart);
+  const unicodeResult = tryUnicodeMatch(originalContent, oldText, searchStart, searchEnd);
   const unicodeDuration = performance.now() - tierStart;
   if (unicodeResult && (!searchScope || (unicodeResult.index >= searchStart && unicodeResult.index < searchEnd))) {
     telemetry.push({ tier: MatchTier.UNICODE, durationMs: unicodeDuration, success: true, matchCount: 1 });
@@ -589,7 +589,7 @@ export function findTextWithTelemetry(
 
   // Tier 4: Similarity-scored match (safety net for near-matches)
   tierStart = performance.now();
-  const similarityResult = trySimilarityMatch(originalContent, oldText, searchStart);
+  const similarityResult = trySimilarityMatch(originalContent, oldText, searchStart, searchEnd);
   const similarityDuration = performance.now() - tierStart;
   if (similarityResult && (!searchScope || (similarityResult.index >= searchStart && similarityResult.index < searchEnd))) {
     telemetry.push({ tier: MatchTier.SIMILARITY, durationMs: similarityDuration, success: true, matchCount: 1 });
@@ -639,12 +639,15 @@ function tryIndentationMatch(
   oldText: string,
   fileStyle: IndentationStyle,
   startOffset: number = 0,
+  endOffset?: number,
 ): MatchResult | null {
   // Normalize oldText's indentation to match file style
   const normalizedOldText = normalizeIndentation(oldText, fileStyle);
   const index = originalContent.indexOf(normalizedOldText, startOffset);
 
   if (index === -1) return null;
+  // Respect end bound: match must fit entirely within [startOffset, endOffset)
+  if (endOffset !== undefined && index + normalizedOldText.length > endOffset) return null;
 
   return {
     found: true,
@@ -666,8 +669,14 @@ function tryUnicodeMatch(
   originalContent: string,
   oldText: string,
   startOffset: number = 0,
+  endOffset?: number,
 ): MatchResult | null {
-  const fuzzyContent = normalizeForFuzzyMatch(originalContent);
+  // When an end bound is set, constrain the search to the scoped range
+  const searchContent = endOffset !== undefined
+    ? originalContent.slice(0, endOffset)
+    : originalContent;
+
+  const fuzzyContent = normalizeForFuzzyMatch(searchContent);
   const fuzzyOldText = normalizeForFuzzyMatch(oldText);
 
   // Map startOffset from original to fuzzy content position
@@ -685,7 +694,7 @@ function tryUnicodeMatch(
 
   // Map back to original content position
   const originalIndex = mapNormalizedToOriginal(
-    originalContent,
+    searchContent,
     fuzzyContent,
     fuzzyIndex,
   );
@@ -694,7 +703,7 @@ function tryUnicodeMatch(
   // multi-line blocks and any trailing whitespace stripped by normalization.
   const fuzzyEndIndex = fuzzyIndex + fuzzyOldText.length;
   const originalEndIndex = mapNormalizedToOriginal(
-    originalContent,
+    searchContent,
     fuzzyContent,
     fuzzyEndIndex,
   );
@@ -709,7 +718,12 @@ function tryUnicodeMatch(
     );
   }
 
+  // searchContent slices from 0, so originalIndex is already relative to originalContent
   const matchedText = originalContent.slice(originalIndex, originalIndex + matchLength);
+
+  // Bounds check: match must be within [startOffset, endOffset)
+  if (endOffset !== undefined && originalIndex + matchLength > endOffset) return null;
+  if (originalIndex < startOffset) return null;
 
   return {
     found: true,
@@ -736,12 +750,15 @@ function trySimilarityMatch(
   originalContent: string,
   oldText: string,
   startOffset: number = 0,
+  endOffset?: number,
   similarityThreshold: number = SIMILARITY_MATCH_THRESHOLD,
 ): MatchResult | null {
   // Empty or whitespace-only oldText cannot be matched meaningfully
   if (!oldText.trim()) return null;
 
-  const contentFromOffset = originalContent.slice(startOffset);
+  // Constrain search to [startOffset, endOffset) when endOffset is set
+  const searchEnd = endOffset ?? originalContent.length;
+  const contentFromOffset = originalContent.slice(startOffset, searchEnd);
   const contentLines = contentFromOffset.split("\n");
   const oldLines = oldText.split("\n");
 
@@ -789,6 +806,9 @@ function trySimilarityMatch(
   for (let i = 0; i < bestStartLine; i++) {
     matchIndex += contentLines[i].length + 1; // +1 for newline
   }
+
+  // Bounds check: entire match must sit within [startOffset, searchEnd)
+  if (matchIndex + matchedText.length > searchEnd) return null;
 
   return {
     found: true,
@@ -1557,11 +1577,6 @@ export async function applyEdits(
     }
   }
 
-  // Phase 1.5: Pre-apply hooks (conflict detection, etc.)
-  if (options?.onBeforeApply) {
-    await options.onBeforeApply(matchSpans, normalizedContent);
-  }
-
   // Phase 2: Check for overlaps
   matchSpans.sort((a, b) => a.matchIndex - b.matchIndex);
   for (let i = 1; i < matchSpans.length; i++) {
@@ -1583,6 +1598,13 @@ export async function applyEdits(
         `overlap in ${path}. Merge them into one edit or target disjoint regions.`,
       );
     }
+  }
+
+  // Phase 2.5: Pre-apply hooks (conflict detection, etc.)
+  // Only run hooks after structural validation so invalid batches cannot
+  // advance external state like conflict baselines.
+  if (options?.onBeforeApply) {
+    await options.onBeforeApply(matchSpans, normalizedContent);
   }
 
   // Phase 3: Apply replacements in reverse order against ORIGINAL content
