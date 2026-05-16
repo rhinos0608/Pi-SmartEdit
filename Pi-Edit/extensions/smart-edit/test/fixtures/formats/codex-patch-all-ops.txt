@@ -1,0 +1,15 @@
+*** Begin Patch
+*** Add File: src/new-feature.ts
+export function add(a: number, b: number): number {
+  return a + b;
+}
+*** Update File: src/main.ts
+@@ export function calculate(x)
+-  const result = x * 2;
++  const result = x * 3;
+   return result;
+@@ export function format(value)
+-  return value.toString();
++  return String(value);
+*** Delete File: src/old.ts
+*** End Patch

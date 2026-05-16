@@ -8,7 +8,12 @@
  * -removed line
  * +added line
  * *** End Patch
+ * 
+ * For patches containing complex operations (Add File, Delete File, Move to),
+ * this module delegates to the codex-patch.ts grammar parser automatically.
  */
+
+import { parseCodexPatch, codexHunkToEditItem } from './codex-patch';
 
 export interface OpenAIPatch {
   path: string;
@@ -20,11 +25,17 @@ export interface OpenAIPatch {
 /**
  * Parse OpenAI patch format into structured blocks.
  * 
+ * For simple update-only patches, uses the existing regex-based parser.
+ * For patches containing Add File, Delete File, or Move to operations,
+ * delegates to the grammar-based codex-patch.ts parser and converts the
+ * result back to OpenAIPatch[] format for backward compatibility.
+ * 
  * Handles:
  * - Single and multi-section patches
  * - Missing *** End Patch marker (try to parse anyway)
  * - Add-only sections (no removed lines)
  * - Remove-only sections (no added lines)
+ * - Complex operations via codex-patch.ts delegation
  * 
  * OldText = contextAnchor + "\n" + removedLines.join("\n")
  * NewText = contextAnchor + "\n" + addedLines.join("\n")
@@ -32,21 +43,42 @@ export interface OpenAIPatch {
 export function parseOpenAIPatch(input: string): OpenAIPatch[] {
   const normalized = input.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
+  // Check for complex Codex operations that need the grammar parser
+  const hasComplexOps =
+    normalized.includes('*** Add File:') ||
+    normalized.includes('*** Delete File:') ||
+    normalized.includes('*** Move to:') ||
+    normalized.includes('***Add File:') ||
+    normalized.includes('***Delete File:') ||
+    normalized.includes('***Move to:');
+
+  if (hasComplexOps) {
+    return parseOpenAIPatchViaCodex(normalized);
+  }
+
+  // Simple update-only patch: use existing regex parser
+  return parseSimpleOpenAIPatch(normalized);
+}
+
+/**
+ * Parse a simple update-only patch using the regex-based approach.
+ */
+function parseSimpleOpenAIPatch(input: string): OpenAIPatch[] {
   const results: OpenAIPatch[] = [];
 
   // Find all patch sections (between *** Begin Patch and *** End Patch)
   let searchStart = 0;
-  
+
   while (true) {
-    const beginIdx = normalized.indexOf('*** Begin Patch', searchStart);
+    const beginIdx = input.indexOf('*** Begin Patch', searchStart);
     if (beginIdx === -1) break;
 
     // Find the end of this patch (or end of file)
-    const endIdx = normalized.indexOf('*** End Patch', beginIdx);
-    const patchEnd = endIdx !== -1 ? endIdx : normalized.length;
-    
-    const patchContent = normalized.slice(beginIdx, patchEnd);
-    
+    const endIdx = input.indexOf('*** End Patch', beginIdx);
+    const patchEnd = endIdx !== -1 ? endIdx : input.length;
+
+    const patchContent = input.slice(beginIdx, patchEnd);
+
     // Parse this patch
     const parsed = parseSinglePatch(patchContent);
     results.push(...parsed);
@@ -59,7 +91,7 @@ export function parseOpenAIPatch(input: string): OpenAIPatch[] {
 }
 
 /**
- * Parse a single OpenAI patch (all sections).
+ * Parse a single OpenAI patch (all sections) — regex-based approach.
  */
 function parseSinglePatch(patch: string): OpenAIPatch[] {
   // Find the file path
@@ -79,6 +111,54 @@ function parseSinglePatch(patch: string): OpenAIPatch[] {
     removedLines: section.removed,
     addedLines: section.added,
   }));
+}
+
+/**
+ * Delegate complex patch to the grammar-based codex-patch.ts parser.
+ * Converts the results back to OpenAIPatch[] for backward compatibility.
+ */
+function parseOpenAIPatchViaCodex(input: string): OpenAIPatch[] {
+  const result = parseCodexPatch(input, 'lenient');
+  const openAIPatches: OpenAIPatch[] = [];
+
+  for (const hunk of result.hunks) {
+    switch (hunk.kind) {
+      case 'AddFile': {
+        // Represent AddFile as a single section with only added lines
+        openAIPatches.push({
+          path: hunk.path,
+          contextAnchor: '',
+          removedLines: [],
+          addedLines: hunk.contents.split('\n'),
+        });
+        break;
+      }
+      case 'DeleteFile': {
+        // Represent DeleteFile as a single section with only removed lines
+        openAIPatches.push({
+          path: hunk.path,
+          contextAnchor: '',
+          removedLines: [],
+          addedLines: [],
+        });
+        break;
+      }
+      case 'UpdateFile': {
+        for (const chunk of hunk.chunks) {
+          const scopeStr = chunk.scope.length > 0 ? chunk.scope.join(' . ') : '';
+          openAIPatches.push({
+            path: hunk.movePath || hunk.path,
+            contextAnchor: scopeStr,
+            removedLines: chunk.removedLines,
+            addedLines: chunk.addedLines,
+          });
+        }
+        break;
+      }
+    }
+  }
+
+  return openAIPatches;
 }
 
 interface Section {

@@ -1,0 +1,8 @@
+pre-amble text
+*** Begin Patch
+*** Update File: src/main.ts
+@@ function hello()
+-old
++new
+*** End Patch
+post-amble text

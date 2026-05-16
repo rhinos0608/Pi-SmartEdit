@@ -3,14 +3,16 @@
  * Identifies which format the input string uses.
  */
 
-export type InputFormat = 'search_replace' | 'unified_diff' | 'openai_patch' | 'raw_edits';
+export type InputFormat = 'search_replace' | 'unified_diff' | 'openai_patch' | 'codex_patch' | 'raw_edits';
 
 /**
  * Detect the input format from the raw input string.
  * 
  * Detection rules:
  * - `<<<<<<< SEARCH` → search_replace
- * - `*** Begin Patch` or `***Begin Patch` (with or without space) → openai_patch
+ * - `*** Begin Patch` or `***Begin Patch` (with or without space) →
+ *   - `codex_patch` if patch contains `*** Add File:`, `*** Delete File:`, or `*** Move to:`
+ *   - `openai_patch` otherwise (simple update-only patches)
  * - `--- ` AND `@@ ` → unified_diff
  * - Otherwise → raw_edits (JSON tool calls)
  */
@@ -25,6 +27,18 @@ export function detectInputFormat(input: string): InputFormat {
   }
 
   if (firstLine.startsWith('*** Begin Patch') || firstLine.startsWith('***Begin Patch')) {
+    // Check if patch contains Codex-specific markers that require the grammar parser
+    const hasCodexMarkers =
+      trimmed.includes('*** Add File:') ||
+      trimmed.includes('*** Delete File:') ||
+      trimmed.includes('*** Move to:') ||
+      trimmed.includes('***Add File:') ||
+      trimmed.includes('***Delete File:') ||
+      trimmed.includes('***Move to:');
+
+    if (hasCodexMarkers) {
+      return 'codex_patch';
+    }
     return 'openai_patch';
   }
 

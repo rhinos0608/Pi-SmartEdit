@@ -1,0 +1,12 @@
+*** Begin Patch
+*** Update File: src/main.ts
+@@ class BaseClass
+@@   def method():
+ context line
+-old code
++new code
+ more context
+@@   def other():
+-another old
++another new
+*** End Patch

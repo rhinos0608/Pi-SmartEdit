@@ -1,0 +1,7 @@
+*** Begin Patch
+*** Update File: src/example.ts
+@@ export function calculate(x) @@
+-  const result = x * 2;
++  const result = x * 3;
+   return result;
+*** End Patch

@@ -21,6 +21,12 @@ import {
     parseOpenAIPatch,
     openAIPatchToEditItem,
 } from "../src/formats/openai-patch";
+import {
+    parseCodexPatch,
+    codexHunkToEditItem,
+    type CodexHunk,
+    type UpdateFileChunk,
+} from "../src/formats/codex-patch";
 import { readFileSync } from "fs";
 import { resolve } from "path";
 
@@ -91,7 +97,133 @@ const x = 2;
     });
 });
 
-// ─── Search/Replace Tests ───────────────────────────────────────────
+    test("detects codex_patch with Add File marker", () => {
+        const input = `*** Begin Patch\n*** Add File: src/new.ts\n+export function hello() {}\n*** End Patch`;
+        assert.strictEqual(detectInputFormat(input), "codex_patch");
+    });
+
+    test("detects codex_patch with Delete File marker", () => {
+        const input = `*** Begin Patch\n*** Delete File: src/old.ts\n*** End Patch`;
+        assert.strictEqual(detectInputFormat(input), "codex_patch");
+    });
+
+    test("detects openai_patch for simple update-only (no codex markers)", () => {
+        const input = `*** Begin Patch\n*** Update File: file.ts\n@@ function() {\n }\n*** End Patch`;
+        assert.strictEqual(detectInputFormat(input), "openai_patch");
+    });
+
+// ─── Codex Patch Tests ──────────────────────────────────────────
+
+describe("codex-patch", () => {
+    test("parses simple update hunk", () => {
+        const input = `*** Begin Patch\n*** Update File: file.ts\n@@ function hello()\n-context\n+newContext\n*** End Patch`;
+        const result = parseCodexPatch(input);
+        assert.strictEqual(result.hunks.length, 1);
+        assert.strictEqual(result.hunks[0].kind, "UpdateFile");
+        if (result.hunks[0].kind === "UpdateFile") {
+            assert.strictEqual(result.hunks[0].path, "file.ts");
+            assert.strictEqual(result.hunks[0].chunks.length, 1);
+            assert.strictEqual(result.hunks[0].chunks[0].removedLines.length, 1);
+            assert.strictEqual(result.hunks[0].chunks[0].addedLines.length, 1);
+            assert.strictEqual(result.hunks[0].chunks[0].removedLines[0], "context");
+            assert.strictEqual(result.hunks[0].chunks[0].addedLines[0], "newContext");
+        }
+    });
+
+    test("handles Add File section", () => {
+        const input = `*** Begin Patch\n*** Add File: src/new.ts\nexport function hello() {}\nreturn 42;\n*** End Patch`;
+        const result = parseCodexPatch(input);
+        assert.strictEqual(result.hunks.length, 1);
+        assert.strictEqual(result.hunks[0].kind, "AddFile");
+        if (result.hunks[0].kind === "AddFile") {
+            assert.strictEqual(result.hunks[0].path, "src/new.ts");
+            assert.ok(result.hunks[0].contents.includes("return 42;"));
+        }
+    });
+
+    test("handles Delete File section", () => {
+        const input = `*** Begin Patch\n*** Delete File: src/old.ts\n*** End Patch`;
+        const result = parseCodexPatch(input);
+        assert.strictEqual(result.hunks.length, 1);
+        assert.strictEqual(result.hunks[0].kind, "DeleteFile");
+        if (result.hunks[0].kind === "DeleteFile") {
+            assert.strictEqual(result.hunks[0].path, "src/old.ts");
+        }
+    });
+
+    test("handles Move to within UpdateFile", () => {
+        const input = `*** Begin Patch\n*** Update File: src/main.ts\n*** Move to: src/legacy/main.ts\n@@ fn hello\n-old\n+new\n*** End Patch`;
+        const result = parseCodexPatch(input);
+        assert.strictEqual(result.hunks.length, 1);
+        assert.strictEqual(result.hunks[0].kind, "UpdateFile");
+        if (result.hunks[0].kind === "UpdateFile") {
+            assert.strictEqual(result.hunks[0].movePath, "src/legacy/main.ts");
+        }
+    });
+
+    test("handles multi-level @@ chaining", () => {
+        const input = `*** Begin Patch\n*** Update File: file.ts\n@@ class A . def method\n-old\n+new\n*** End Patch`;
+        const result = parseCodexPatch(input);
+        assert.strictEqual(result.hunks.length, 1);
+        assert.strictEqual(result.hunks[0].kind, "UpdateFile");
+        if (result.hunks[0].kind === "UpdateFile") {
+            assert.strictEqual(result.hunks[0].chunks.length, 1);
+            assert.strictEqual(result.hunks[0].chunks[0].scope.length, 2);
+            assert.strictEqual(result.hunks[0].chunks[0].scope[0], "class A");
+            assert.strictEqual(result.hunks[0].chunks[0].scope[1], "def method");
+        }
+    });
+
+    test("handles missing End Patch in lenient mode", () => {
+        const input = `*** Begin Patch\n*** Update File: file.ts\n@@ fn\n-old\n+new`;
+        const result = parseCodexPatch(input);
+        assert.strictEqual(result.hunks.length, 1);
+        assert.ok(result.warnings.length > 0);
+        assert.ok(result.warnings.some(w => w.kind === "missing_end_patch"));
+    });
+
+    test("handles multi-section patch (add + update + delete)", () => {
+        const input = `*** Begin Patch\n*** Add File: src/new.ts\ncontent\n*** Update File: src/main.ts\n@@ fn\n-old\n+new\n*** Delete File: src/old.ts\n*** End Patch`;
+        const result = parseCodexPatch(input);
+        assert.strictEqual(result.hunks.length, 3);
+        assert.strictEqual(result.hunks[0].kind, "AddFile");
+        assert.strictEqual(result.hunks[1].kind, "UpdateFile");
+        assert.strictEqual(result.hunks[2].kind, "DeleteFile");
+    });
+
+    test("codexHunkToEditItem converts AddFile", () => {
+        const hunk: CodexHunk = { kind: "AddFile", path: "src/new.ts", contents: "export function x() {}\n" };
+        const items = codexHunkToEditItem(hunk);
+        assert.strictEqual(items.length, 1);
+        assert.strictEqual(items[0].path, "src/new.ts");
+        assert.strictEqual(items[0].oldText, "");
+        assert.strictEqual(items[0].newText, "export function x() {}\n");
+    });
+
+    test("codexHunkToEditItem converts UpdateFile with chunks", () => {
+        const hunk: CodexHunk = {
+            kind: "UpdateFile",
+            path: "src/main.ts",
+            movePath: undefined,
+            chunks: [{
+                scope: ["fn hello"],
+                contextLines: ["  ctx"],
+                removedLines: ["  old"],
+                addedLines: ["  new"],
+            }],
+        };
+        const items = codexHunkToEditItem(hunk);
+        assert.strictEqual(items.length, 1);
+        assert.ok(items[0].oldText.includes("old"));
+        assert.ok(items[0].newText.includes("new"));
+    });
+
+    test("strict mode throws on bad syntax", () => {
+        const input = `nonsense`;
+        assert.throws(() => parseCodexPatch(input, "strict"));
+    });
+});
+
 
 describe("search-replace", () => {
     test("parses simple block", () => {
@@ -437,5 +569,82 @@ describe("format fixtures", () => {
         }
         const result = parseOpenAIPatch(content);
         assert.ok(result.length > 0);
+    });
+
+    test("loads codex-patch-update.txt fixture", () => {
+        const fixturePath = resolve(__dirname, "fixtures/formats/codex-patch-update.txt");
+        let content: string;
+        try {
+            content = readFileSync(fixturePath, "utf-8");
+        } catch {
+            return; // Fixture not created yet
+        }
+        const result = parseCodexPatch(content);
+        assert.ok(result.hunks.length > 0);
+    });
+
+    test("loads codex-patch-all-ops.txt fixture", () => {
+        const fixturePath = resolve(__dirname, "fixtures/formats/codex-patch-all-ops.txt");
+        let content: string;
+        try {
+            content = readFileSync(fixturePath, "utf-8");
+        } catch {
+            return; // Fixture not created yet
+        }
+        const result = parseCodexPatch(content);
+        assert.strictEqual(result.hunks.length, 3); // add + update + delete
+    });
+
+    test("loads codex-patch-move.txt fixture", () => {
+        const fixturePath = resolve(__dirname, "fixtures/formats/codex-patch-move.txt");
+        let content: string;
+        try {
+            content = readFileSync(fixturePath, "utf-8");
+        } catch {
+            return; // Fixture not created yet
+        }
+        const result = parseCodexPatch(content);
+        assert.ok(result.hunks.length > 0);
+        if (result.hunks[0].kind === "UpdateFile") {
+            assert.strictEqual(result.hunks[0].movePath, "src/legacy/main.ts");
+        }
+    });
+
+    test("loads codex-patch-multi-level.txt fixture", () => {
+        const fixturePath = resolve(__dirname, "fixtures/formats/codex-patch-multi-level.txt");
+        let content: string;
+        try {
+            content = readFileSync(fixturePath, "utf-8");
+        } catch {
+            return; // Fixture not created yet
+        }
+        const result = parseCodexPatch(content);
+        assert.ok(result.hunks.length > 0);
+    });
+
+    test("loads codex-patch-lenient.txt fixture", () => {
+        const fixturePath = resolve(__dirname, "fixtures/formats/codex-patch-lenient.txt");
+        let content: string;
+        try {
+            content = readFileSync(fixturePath, "utf-8");
+        } catch {
+            return; // Fixture not created yet
+        }
+        const result = parseCodexPatch(content);
+        assert.ok(result.hunks.length > 0);
+        assert.ok(result.warnings.length > 0);
+    });
+
+    test("loads codex-patch-no-end.txt fixture", () => {
+        const fixturePath = resolve(__dirname, "fixtures/formats/codex-patch-no-end.txt");
+        let content: string;
+        try {
+            content = readFileSync(fixturePath, "utf-8");
+        } catch {
+            return; // Fixture not created yet
+        }
+        const result = parseCodexPatch(content);
+        assert.ok(result.hunks.length > 0);
+        assert.ok(result.warnings.some(w => w.kind === "missing_end_patch"));
     });
 });

@@ -1,0 +1,7 @@
+*** Begin Patch
+*** Update File: src/main.ts
+*** Move to: src/legacy/main.ts
+@@ export function calculate(x) @@
+-  const result = x * 2;
++  const result = x * 3;
+*** End Patch
