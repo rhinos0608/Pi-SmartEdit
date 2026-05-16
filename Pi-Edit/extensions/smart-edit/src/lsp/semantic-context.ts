@@ -28,6 +28,7 @@ import { renderSemanticContext, estimateTokens } from "./context-renderer";
 import { findEnclosingDocumentSymbol, extractSymbolExcerpt } from "./symbol-skeleton";
 import { detectLanguageFromExtension } from "./language-id";
 import type { LSPManager } from "./lsp-manager";
+import { wrapInContextMarker } from "../formats/context-markers";
 
 export interface AstResolverLike {
   findSymbolNode(name: string, kind?: string, line?: number): { startIndex: number; endIndex: number } | null;
@@ -52,8 +53,8 @@ export interface SemanticContextDeps {
   getSnapshot(path: string, cwd: string): { partial?: boolean; contentHash?: string; hashline?: { anchors: Map<string, { text: string; line: number }> } } | null;
   recordRead(path: string, cwd: string, content: string, partial?: boolean): void;
   recordReadSession?(path: string, cwd: string, lineRanges: Array<{ startLine: number; endLine: number }>): void;
-  lspManager: Pick<LSPManager, "getServer"> | null;
-  astResolver: AstResolverLike | null;
+  lspManager?: Pick<LSPManager, "getServer"> | null;
+  astResolver?: AstResolverLike | null;
 }
 
 export interface SemanticContextDetails {
@@ -127,7 +128,13 @@ export async function buildSemanticContext(
   let keyTokens: { name: string; line: number; character: number; score: number }[] = [];
   let source: "lsp" | "ast" | "none" = "none";
 
-  if (server && server.serverCapabilities?.capabilities?.semanticTokensProvider) {
+  const serverCaps = server?.serverCapabilities as {
+    capabilities?: { semanticTokensProvider?: unknown };
+    semanticTokensProvider?: unknown;
+  } | undefined;
+  const semanticTokensProvider = serverCaps?.capabilities?.semanticTokensProvider ?? serverCaps?.semanticTokensProvider;
+
+  if (server && semanticTokensProvider) {
     source = "lsp";
     const lspRange = {
       start: { line: target.lineRange.startLine - 1, character: 0 },
@@ -136,7 +143,7 @@ export async function buildSemanticContext(
     // Use withOpenDocument for semantic tokens too? 
     // Usually it's already open from the block above but withOpenDocument handles nesting/locks.
     const tokens = await withOpenDocument(server, { uri: `file://${resolve(input.path)}`, languageId, content }, async () => {
-       return await getSemanticTokensForRange(input.path, lspRange, languageId, deps.lspManager);
+      return await getSemanticTokensForRange(input.path, lspRange, languageId, deps.lspManager);
     });
     
     keyTokens = tokens
@@ -299,8 +306,19 @@ export async function buildSemanticContext(
     return acc;
   }, { resolvedDefinitions: 0, resolvedTypeDefinitions: 0, resolvedImplementations: 0, resolvedReferences: 0 });
 
+  const markeddown = wrapInContextMarker(rendered.markdown, {
+    type: "semantic_context",
+    path: input.path,
+    range: target.lineRange
+      ? `${target.lineRange.startLine}-${target.lineRange.endLine}`
+      : undefined,
+    source,
+    tokens: rendered.details.tokenCount,
+    language: languageId ?? undefined,
+  });
+
   return {
-    markdown: rendered.markdown,
+    markdown: markeddown,
     items,
     details: {
       source,

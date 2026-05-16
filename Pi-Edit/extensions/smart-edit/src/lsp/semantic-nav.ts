@@ -9,6 +9,8 @@ import { resolve } from "path";
 
 import type { LSPManager } from "./lsp-manager";
 
+type LSPManagerLike = Pick<LSPManager, "getServer">;
+
 export interface Location {
   uri: string;
   range: LSPRange;
@@ -95,7 +97,7 @@ export async function goToDefinition(
   line: number,      // 0-based line number
   character: number, // 0-based character offset
   languageId: string,
-  lspManager: LSPManager,
+  lspManager: LSPManagerLike | null | undefined,
 ): Promise<Location | null> {
   const definitions = await goToDefinitions(filePath, line, character, languageId, lspManager);
   return definitions.length > 0 ? definitions[0].location : null;
@@ -110,8 +112,9 @@ export async function goToDefinitions(
   line: number,
   character: number,
   languageId: string,
-  lspManager: LSPManager,
+  lspManager: LSPManagerLike | null | undefined,
 ): Promise<ResolvedLocation[]> {
+  if (!lspManager) return [];
   const server = await lspManager.getServer(languageId);
   if (!server) return [];
 
@@ -135,8 +138,9 @@ export async function goToDeclaration(
   line: number,
   character: number,
   languageId: string,
-  lspManager: LSPManager,
+  lspManager: LSPManagerLike | null | undefined,
 ): Promise<ResolvedLocation[]> {
+  if (!lspManager) return [];
   const server = await lspManager.getServer(languageId);
   if (!server) return [];
 
@@ -160,8 +164,9 @@ export async function goToTypeDefinition(
   line: number,
   character: number,
   languageId: string,
-  lspManager: LSPManager,
+  lspManager: LSPManagerLike | null | undefined,
 ): Promise<ResolvedLocation[]> {
+  if (!lspManager) return [];
   const server = await lspManager.getServer(languageId);
   if (!server) return [];
 
@@ -185,8 +190,9 @@ export async function goToImplementation(
   line: number,
   character: number,
   languageId: string,
-  lspManager: LSPManager,
+  lspManager: LSPManagerLike | null | undefined,
 ): Promise<ResolvedLocation[]> {
+  if (!lspManager) return [];
   const server = await lspManager.getServer(languageId);
   if (!server) return [];
 
@@ -208,8 +214,9 @@ export async function goToImplementation(
 export async function getDocumentSymbols(
   filePath: string,
   languageId: string,
-  lspManager: LSPManager,
+  lspManager: LSPManagerLike | null | undefined,
 ): Promise<DocumentSymbol[]> {
+  if (!lspManager) return [];
   const server = await lspManager.getServer(languageId);
   if (!server) return [];
 
@@ -235,8 +242,9 @@ export async function getSemanticTokensForRange(
   filePath: string,
   range: LSPRange,
   languageId: string,
-  lspManager: LSPManager,
+  lspManager: LSPManagerLike | null | undefined,
 ): Promise<SemanticToken[]> {
+  if (!lspManager) return [];
   const server = await lspManager.getServer(languageId);
   if (!server) return [];
 
@@ -249,9 +257,14 @@ export async function getSemanticTokensForRange(
     if (!response || !Array.isArray((response as Record<string, unknown>).data as unknown[])) return [];
 
     const data = (response as Record<string, unknown>).data as number[];
-    const caps = server.serverCapabilities as Record<string, unknown> | undefined;
-    const innerCaps = (caps?.capabilities ?? caps) as Record<string, unknown> | undefined;
-    const legend = (innerCaps?.semanticTokensProvider as Record<string, unknown> | undefined)?.legend as { tokenTypes: string[]; tokenModifiers: string[] } | undefined;
+    const caps = server.serverCapabilities as {
+      capabilities?: Record<string, unknown>;
+      semanticTokensProvider?: { legend?: { tokenTypes: string[]; tokenModifiers: string[] } };
+    } | undefined;
+    const innerCaps = (caps?.capabilities ?? caps) as {
+      semanticTokensProvider?: { legend?: { tokenTypes: string[]; tokenModifiers: string[] } };
+    } | undefined;
+    const legend = innerCaps?.semanticTokensProvider?.legend;
     if (!legend) return [];
 
     const tokenTypes = legend.tokenTypes as string[];
@@ -308,8 +321,9 @@ export async function findReferences(
   line: number,
   character: number,
   languageId: string,
-  lspManager: LSPManager,
+  lspManager: LSPManagerLike | null | undefined,
 ): Promise<Location[]> {
+  if (!lspManager) return [];
   const server = await lspManager.getServer(languageId);
   if (!server) return [];
 
@@ -337,8 +351,9 @@ export async function getHoverInfo(
   line: number,
   character: number,
   languageId: string,
-  lspManager: LSPManager,
+  lspManager: LSPManagerLike | null | undefined,
 ): Promise<string | null> {
+  if (!lspManager) return null;
   const server = await lspManager.getServer(languageId);
   if (!server) return null;
 

@@ -364,7 +364,7 @@ export async function detectConcurrencySignalsAst(
     const tree = parser.parse(content);
     const root = tree.rootNode;
 
-    if (root.hasError()) {
+    if (root.hasError) {
       parser.delete();
       tree.delete();
       return signals;
