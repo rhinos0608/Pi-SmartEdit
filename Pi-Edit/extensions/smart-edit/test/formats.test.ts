@@ -95,7 +95,6 @@ const x = 2;
  context line`;
         assert.strictEqual(detectInputFormat(input), "raw_edits");
     });
-});
 
     test("detects codex_patch with Add File marker", () => {
         const input = `*** Begin Patch\n*** Add File: src/new.ts\n+export function hello() {}\n*** End Patch`;
@@ -111,6 +110,7 @@ const x = 2;
         const input = `*** Begin Patch\n*** Update File: file.ts\n@@ function() {\n }\n*** End Patch`;
         assert.strictEqual(detectInputFormat(input), "openai_patch");
     });
+});
 
 // ─── Codex Patch Tests ──────────────────────────────────────────
 

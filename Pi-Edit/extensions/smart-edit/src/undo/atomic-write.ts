@@ -44,10 +44,10 @@ export async function atomicWrite(
   const tmpName = `.${base}.smart_edit_tmp_${randomBytes(6).toString("hex")}`;
   const tmpPath = resolve(dir, tmpName);
 
+  let mode: number | undefined = options?.mode;
+
   try {
     // Determine mode to preserve
-    let mode: number | undefined = options?.mode;
-
     if (mode === undefined && options?.modeSource) {
       try {
         const stat = await fsStat(options.modeSource);
@@ -89,7 +89,7 @@ export async function atomicWrite(
       err instanceof Error &&
       (err as NodeJS.ErrnoException).code === "EXDEV"
     ) {
-      await fsWriteFile(filePath, content, "utf-8");
+      await fsWriteFile(filePath, content, { encoding: "utf-8", mode });
       return;
     }
 

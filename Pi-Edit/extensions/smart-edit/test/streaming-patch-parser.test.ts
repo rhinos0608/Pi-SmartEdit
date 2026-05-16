@@ -98,10 +98,14 @@ describe("StreamingPatchParser — basic", () => {
     );
     parser.finish();
 
-    // Should see all 3 hunks processed
+    // Should see all 3 hunks processed — verify distinct indicators for each
     const allText = messages.join("\n");
-    assert.ok(allText.includes("3") || messages.length >= 2,
-      `Expected 3 hunks in output, got: ${allText.slice(0, 300)}`);
+    assert.ok(allText.includes("Add File") || allText.includes("src/new.ts"),
+      `Expected AddFile indicator, got: ${allText.slice(0, 300)}`);
+    assert.ok(allText.includes("Update File") || allText.includes("src/main.ts"),
+      `Expected UpdateFile indicator, got: ${allText.slice(0, 300)}`);
+    assert.ok(allText.includes("Delete File") || allText.includes("src/old.ts"),
+      `Expected DeleteFile indicator, got: ${allText.slice(0, 300)}`);
   });
 });
 
@@ -136,13 +140,26 @@ describe("StreamingPatchParser — throttle", () => {
   });
 
   test("deferred flush fires within bufferIntervalMs", () => {
-    return new Promise<void>((resolve) => {
+    return new Promise<void>((resolve, reject) => {
       const messages: string[] = [];
+      let resolved = false;
       const onUpdate = (update: { content: Array<{ type: "text"; text: string }> }) => {
         for (const block of update.content) {
           messages.push(block.text);
         }
+        // Resolve as soon as onUpdate is called by the deferred flush
+        // (rather than relying on a fixed setTimeout).
+        // Use a guard to prevent re-entrant resolution.
+        if (!resolved) {
+          resolved = true;
+          clearTimeout(safetyTimer);
+          resolve();
+        }
       };
+      // Safety timeout in case the deferred flush never fires
+      const safetyTimer = setTimeout(() => {
+        reject(new Error("Deferred flush did not fire within 1s"));
+      }, 1000);
 
       const parser = new StreamingPatchParser(onUpdate, 50);
 
@@ -150,13 +167,6 @@ describe("StreamingPatchParser — throttle", () => {
       parser.pushDelta("*** Begin Patch\n*** Update File: file.ts\n@@ fn\n-old");
       // Immediately push more text — should trigger deferred flush
       parser.pushDelta("\n+new\n*** End Patch");
-
-      // Wait for timer to fire
-      setTimeout(() => {
-        parser.finish();
-        assert.ok(messages.length >= 1, "Deferred flush should have fired");
-        resolve();
-      }, 100);
     });
   });
 });
@@ -181,25 +191,23 @@ describe("StreamingPatchParser — incremental", () => {
       `Expected file reference, got: ${allText.slice(0, 200)}`);
   });
 
-  test("hunks discovered in later pushDelta emit separately", () => {
+  test("hunks discovered in later pushDelta emit separately", async () => {
     const { onUpdate, messages } = makeCollector();
     const parser = new StreamingPatchParser(onUpdate, 10);
 
     // First push: just the first hunk
     parser.pushDelta("*** Begin Patch\n*** Add File: src/a.ts\ncontent-a\n");
     // Small delay to let buffer fire
-    const p1 = new Promise<void>((resolve) => setTimeout(resolve, 30));
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
 
-    p1.then(() => {
-      // Second push: add another hunk
-      parser.pushDelta("*** Update File: src/b.ts\n@@ fn\n-old\n+new\n*** End Patch");
-      parser.finish();
+    // Second push: add another hunk
+    parser.pushDelta("*** Update File: src/b.ts\n@@ fn\n-old\n+new\n*** End Patch");
+    parser.finish();
 
-      const allText = messages.join("\n");
-      assert.ok(messages.length >= 2, `Expected at least 2 messages, got ${messages.length}`);
-      assert.ok(allText.includes("a.ts"), "First hunk (a.ts) should be referenced");
-      assert.ok(allText.includes("b.ts"), "Second hunk (b.ts) should be referenced");
-    });
+    const allText = messages.join("\n");
+    assert.ok(messages.length >= 2, `Expected at least 2 messages, got ${messages.length}`);
+    assert.ok(allText.includes("a.ts"), "First hunk (a.ts) should be referenced");
+    assert.ok(allText.includes("b.ts"), "Second hunk (b.ts) should be referenced");
   });
 });
 

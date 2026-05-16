@@ -96,26 +96,27 @@ export function parseCodexPatch(input: string, mode: ParseMode = 'lenient'): Cod
  *   "export function init"  → { name: "init", kind: "function" }
  *   "const FOO = 1"         → { name: "FOO", kind: "variable" }
  */
-function extractSymbolFromScope(scope: string): { name: string; kind?: string } {
-  // Ordered list of known kind prefixes — longer prefixes first to avoid partial matches.
-  const kindPatterns: Array<{ prefix: string; kind: string }> = [
-    { prefix: "export function ", kind: "function" },
-    { prefix: "export class ", kind: "class" },
-    { prefix: "export const ", kind: "variable" },
-    { prefix: "export let ", kind: "variable" },
-    { prefix: "export var ", kind: "variable" },
-    { prefix: "async function ", kind: "function" },
-    { prefix: "function ", kind: "function" },
-    { prefix: "class ", kind: "class" },
-    { prefix: "def ", kind: "method" },
-    { prefix: "method ", kind: "method" },
-    { prefix: "const ", kind: "variable" },
-    { prefix: "let ", kind: "variable" },
-    { prefix: "var ", kind: "variable" },
-  ];
 
+/** Ordered list of known kind prefixes — longer prefixes first to avoid partial matches. */
+const KIND_PATTERNS: Array<{ prefix: string; kind: string }> = [
+  { prefix: "export function ", kind: "function" },
+  { prefix: "export class ", kind: "class" },
+  { prefix: "export const ", kind: "variable" },
+  { prefix: "export let ", kind: "variable" },
+  { prefix: "export var ", kind: "variable" },
+  { prefix: "async function ", kind: "function" },
+  { prefix: "function ", kind: "function" },
+  { prefix: "class ", kind: "class" },
+  { prefix: "def ", kind: "method" },
+  { prefix: "method ", kind: "method" },
+  { prefix: "const ", kind: "variable" },
+  { prefix: "let ", kind: "variable" },
+  { prefix: "var ", kind: "variable" },
+];
+
+function extractSymbolFromScope(scope: string): { name: string; kind?: string } {
   const trimmed = scope.trim();
-  for (const { prefix, kind } of kindPatterns) {
+  for (const { prefix, kind } of KIND_PATTERNS) {
     if (trimmed.startsWith(prefix)) {
       const name = trimmed.slice(prefix.length).trim();
       // Strip trailing parens/colons from method-like syntax (e.g., "method():" → "method")
@@ -130,6 +131,13 @@ function extractSymbolFromScope(scope: string): { name: string; kind?: string } 
   // The AST resolver will try to match it as-is.
   return { name: trimmed };
 }
+
+/**
+ * Sentinel emitted as oldText when a DeleteFile operation has no
+ * available file contents. Callers should treat this marker as an
+ * unresolved deletion and supply actual file contents before applying.
+ */
+const DELETE_FILE_SENTINEL = '\0__DELETE_FILE__\0';
 
 /**
  * Convert multiple CodexHunks to EditItem-compatible format.
@@ -166,7 +174,7 @@ export function codexHunkToEditItem(
       // that signals "delete this file" — the caller must resolve.
       return [{
         path: hunk.path,
-        oldText: '\0__DELETE_FILE__\0',
+        oldText: DELETE_FILE_SENTINEL,
         newText: '',
       }];
     }

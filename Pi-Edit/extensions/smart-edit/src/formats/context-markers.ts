@@ -173,11 +173,28 @@ export function stripMarkers(text: string): string {
 // ─── Helpers ────────────────────────────────────────────────────────────
 
 /**
+ * Decode known HTML/XML entities in a single pass.
+ * Handles nested sequences correctly (e.g. &amp;amp; → &amp; → &).
+ */
+function decodeHTMLEntities(value: string): string {
+  return value.replace(/&(?:quot|lt|gt|amp);/g, (entity) => {
+    switch (entity) {
+      case "&quot;": return '"';
+      case "&lt;":   return "<";
+      case "&gt;":   return ">";
+      case "&amp;":  return "&";
+      default:       return entity;
+    }
+  });
+}
+
+/**
  * Encode a string for safe use as an XML attribute value.
  * Escapes `"`, `<`, `>`, `&` and strips control characters.
  */
 function encodeAttr(value: string): string {
   return value
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
     .replace(/&/g, "&amp;")
     .replace(/"/g, "&quot;")
     .replace(/</g, "&lt;")
@@ -197,11 +214,7 @@ function parseAttrs(openTag: string): ContextMarkerAttrs {
     const [, key, rawValue] = match;
     const value = key === "path"
       ? decodeURIComponent(rawValue)
-      : rawValue
-        .replace(/&quot;/g, '"')
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/&amp;/g, "&");
+      : decodeHTMLEntities(rawValue);
 
     switch (key) {
       case "type":
@@ -216,9 +229,11 @@ function parseAttrs(openTag: string): ContextMarkerAttrs {
       case "source":
         attrs.source = value;
         break;
-      case "tokens":
-        attrs.tokens = Number(value);
+      case "tokens": {
+        const parsed = Number(value);
+        attrs.tokens = isFinite(parsed) ? parsed : undefined;
         break;
+      }
       case "language":
         attrs.language = value;
         break;

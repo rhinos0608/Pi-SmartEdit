@@ -134,10 +134,12 @@ function parseOpenAIPatchViaCodex(input: string): OpenAIPatch[] {
         break;
       }
       case 'DeleteFile': {
-        // Represent DeleteFile as a single section with only removed lines
+        // Represent DeleteFile as a single section with a deletion sentinel.
+        // Original file contents are unavailable from the parsed hunk, so the
+        // contextAnchor signals that this is a file-deletion operation.
         openAIPatches.push({
           path: hunk.path,
-          contextAnchor: '',
+          contextAnchor: '<DELETE_FILE>',
           removedLines: [],
           addedLines: [],
         });

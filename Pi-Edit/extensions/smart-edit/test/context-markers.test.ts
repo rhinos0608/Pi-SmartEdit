@@ -249,4 +249,33 @@ describe("round-trip: wrap → parse → strip", () => {
     const stripped = stripMarkers(wrapped);
     assert.strictEqual(stripped, originalBody);
   });
+
+  it("round-trips XML special characters (&, <, >, \") in attributes", () => {
+    const originalBody = "body content";
+    const attrs = {
+      type: "test" as const,
+      path: "src/file&name.ts",
+      source: "lsp>v2" as const,
+    };
+    const wrapped = wrapInContextMarker(originalBody, attrs);
+    assert.ok(isMarkedFragment(wrapped));
+    const fragments = parseMarkerMetadata(wrapped);
+    assert.strictEqual(fragments.length, 1);
+    assert.strictEqual(fragments[0].attrs.type, "test");
+    assert.strictEqual(fragments[0].attrs.source, "lsp>v2");
+    assert.strictEqual(fragments[0].body, originalBody);
+  });
+
+  it("handles non-numeric tokens gracefully", () => {
+    const input = '<smartedit:context type="test" tokens="not-a-number">body</smartedit:context>';
+    const fragments = parseMarkerMetadata(input);
+    assert.strictEqual(fragments.length, 1);
+    assert.strictEqual(fragments[0].attrs.tokens, undefined);
+  });
+
+  it("returns zero fragments for missing closing tag", () => {
+    const input = '<smartedit:context type="test">unclosed body';
+    const fragments = parseMarkerMetadata(input);
+    assert.strictEqual(fragments.length, 0);
+  });
 });

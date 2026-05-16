@@ -26,4 +26,22 @@ describe("applyEdits batch validation", () => {
 
     assert.strictEqual(hookCalls, 0);
   });
+
+  it("runs pre-apply hooks for non-overlapping edits", async () => {
+    let hookCalls = 0;
+    await applyEdits(
+      "abcdef",
+      [
+        { oldText: "abc", newText: "ABC" },
+        { oldText: "def", newText: "DEF" },
+      ],
+      "sample.txt",
+      {
+        onBeforeApply: async () => {
+          hookCalls++;
+        },
+      },
+    );
+    assert.strictEqual(hookCalls, 1);
+  });
 });

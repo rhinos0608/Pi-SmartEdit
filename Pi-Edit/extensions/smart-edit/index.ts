@@ -12,7 +12,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "typebox";
 
-import { constants, statSync, readFileSync as fsReadFileSync } from "fs";
+import { constants, statSync } from "fs";
 import { access as fsAccess, readFile as fsReadFile, stat as fsStat } from "fs/promises";
 import { resolve, dirname } from "path";
 
@@ -406,7 +406,7 @@ function tryExtractPartialEdits(raw: string): unknown[] {
 
 // ─── Legacy input compatibility ─────────────────────────────────────
 
-function prepareArguments(input: Record<string, unknown>): Record<string, unknown> {
+async function prepareArguments(input: Record<string, unknown>): Promise<Record<string, unknown>> {
   if (!input || typeof input !== "object") return input;
 
   const args = { ...input } as Record<string, unknown>;
@@ -533,9 +533,9 @@ function prepareArguments(input: Record<string, unknown>): Record<string, unknow
               for (const hunk of codexResult.hunks) {
                 // Read file old contents for DeleteFile operations
                 let fileOldContents: string | undefined;
-                if (hunk.kind === 'DeleteFile' && args.path) {
+                if (hunk.kind === 'DeleteFile' && hunk.path) {
                   try {
-                    fileOldContents = fsReadFileSync(hunk.path, 'utf-8');
+                    fileOldContents = await fsReadFile(hunk.path, 'utf-8');
                   } catch {
                     // File doesn't exist — nothing to delete, skip silently
                     continue;
@@ -1349,7 +1349,7 @@ export default function smartEdit(pi: ExtensionAPI) {
       // Save original edits string for streaming (before prepareArguments converts it)
       const rawEditsString = typeof input.edits === "string" ? input.edits : undefined;
 
-      input = prepareArguments(input) || input;
+      input = await prepareArguments(input) || input;
 
       // ── Streaming patch preview ───────────────────────────────
       // When onUpdate is provided and the edits were originally a codex_patch
@@ -1500,8 +1500,8 @@ export default function smartEdit(pi: ExtensionAPI) {
 
           for (let i = 0; i < edits.length; i++) {
             const rawEdit = edits[i] as unknown as Record<string, unknown>;
-            if (localHashlines?.[i] || rawEdit.__hashline) {
-              const hashline = (localHashlines?.[i] || rawEdit.__hashline) as Record<string, unknown>;
+            if (localHashlines?.[i]) {
+              const hashline = localHashlines[i] as Record<string, unknown>;
               const range = hashline.range as { pos?: string; end?: string } | undefined;
               const sortLine = Math.max(
                 getHashlineAnchorLine(range?.pos ?? "", totalLines) ?? 0,

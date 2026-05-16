@@ -65,9 +65,9 @@ Patterns matched against the `oldText` and `newText` content of each edit. Match
 | Constructor chains | `/constructor\s*\([^)]*\)\s*\{/` | Modifying object construction |
 | `process.env` access | `/process\.env\b/` | Environment variable access — may change runtime behavior |
 | `__init__` method | `/def\s+__init__\s*\(/` | Python class initialization |
-| Privileged operations | `/require\(['"]child_process['"]\)/, `/import\s+.*from\s+['"]child_process['"]/` | Process/command execution |
-| File system write | `/fs\.writeFile\b/, `/fs\.appendFile\b/`, `/fsPromises\.writeFile\b/` | Changes to file writing behavior |
-| Network operations | `/\.listen\(/, `/app\.(get|post|put|delete|patch|use)\(/`, `/router\.(get|post|put|delete|patch|use)\(/` | Route/networking changes |
+| Privileged operations | `/require\(['"]child_process['"]\)/`, `/import\s+.*from\s+['"]child_process['"]/` | Process/command execution |
+| File system write | `/fs\.writeFile\b/`, `/fs\.appendFile\b/`, `/fsPromises\.writeFile\b/` | Changes to file writing behavior |
+| Network operations | `/\.listen\(/`, `/app\.(get\|post\|put\|delete\|patch\|use)\(/`, `/router\.(get\|post\|put\|delete\|patch\|use)\(/` | Route/networking changes |
 
 The list is deliberately short and focused on the most common risk categories. Additional patterns can be added via `DANGEROUS_SYMBOL_PATTERNS` constant extension.
 

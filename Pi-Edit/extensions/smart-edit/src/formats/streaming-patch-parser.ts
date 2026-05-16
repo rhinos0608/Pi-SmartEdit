@@ -65,7 +65,12 @@ export class StreamingPatchParser {
       this.emitHunks(newHunks, result);
     } else if (!this.timer) {
       // Schedule a deferred flush — only if no timer is already pending.
-      // This avoids stacking timers on every pushDelta call within the buffer window.
+      // This is a coalescing throttle: multiple rapid pushDelta calls within
+      // bufferIntervalMs result in exactly one deferred flush. The callback
+      // re-parses this.accumulated to include any data that arrived since the
+      // timer was set. Emission may occur later than exactly bufferIntervalMs
+      // after the first delta (timing is not exact), so callers should not
+      // rely on precise timing guarantees.
       this.timer = setTimeout(() => {
         this.timer = null;
         // Re-parse because accumulated may have grown since the timer was set
@@ -103,29 +108,6 @@ export class StreamingPatchParser {
 
     // Emit final completion message (always, even if no new hunks)
     this.emit("finish");
-  }
-
-  /**
-   * Build a deterministic signature for a hunk so we can detect duplicates
-   * across successive re-parses.
-   */
-  private hunkSignature(hunk: CodexHunk): string {
-    switch (hunk.kind) {
-      case "AddFile":
-        return `add:${hunk.path}`;
-      case "DeleteFile":
-        return `delete:${hunk.path}`;
-      case "UpdateFile":
-        // Sign each chunk by its scope chain
-        return hunk.chunks
-          .map((chunk) => `update:${hunk.path}:${chunk.scope.join(" > ")}`)
-          .join("|");
-      default: {
-        // Exhaustive check
-        const _exhaustive: never = hunk;
-        return `unknown:${JSON.stringify(hunk)}`;
-      }
-    }
   }
 
   /**

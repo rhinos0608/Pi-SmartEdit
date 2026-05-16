@@ -314,9 +314,9 @@ if (errors.length > 0) {
 }
 
 // Write report
-const arg0 = dirname(fileURLToPath(import.meta.url));
-const arg1 = "runs";
-const outDir = join(arg0, arg1);
+const baseDir = dirname(fileURLToPath(import.meta.url));
+const runsDirName = "runs";
+const outDir = join(baseDir, runsDirName);
 mkdirSync(outDir, { recursive: true });
 const ts = new Date().toISOString().replace(/[:.]/g, "-");
 const outPath = join(outDir, `benchmark-${ts}.json`);

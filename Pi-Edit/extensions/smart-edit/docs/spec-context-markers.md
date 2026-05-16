@@ -126,7 +126,7 @@ return {
 After integration:
 
 ```typescript
-import { wrapInMarker } from "./src/format/context-markers";
+import { wrapInMarker } from "./src/formats/context-markers";
 
 // Inside the execute handler:
 return {

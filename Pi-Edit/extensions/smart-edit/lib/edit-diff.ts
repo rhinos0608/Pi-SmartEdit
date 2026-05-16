@@ -671,29 +671,22 @@ function tryUnicodeMatch(
   startOffset: number = 0,
   endOffset?: number,
 ): MatchResult | null {
-  // When an end bound is set, constrain the search to the scoped range
+  // Slice only the scoped window to avoid allocating most of the file for late scopes
+  const baseOffset = startOffset || 0;
   const searchContent = endOffset !== undefined
-    ? originalContent.slice(0, endOffset)
-    : originalContent;
+    ? originalContent.slice(baseOffset, endOffset)
+    : originalContent.slice(baseOffset);
 
   const fuzzyContent = normalizeForFuzzyMatch(searchContent);
   const fuzzyOldText = normalizeForFuzzyMatch(oldText);
 
-  // Map startOffset from original to fuzzy content position
-  // normalizeForFuzzyMatch splits line-by-line and trims trailing whitespace,
-  // so we map via segmenting the prefix up to startOffset
-  let fuzzyStartOffset = 0;
-  if (startOffset > 0) {
-    const soFar = originalContent.slice(0, startOffset);
-    fuzzyStartOffset = normalizeForFuzzyMatch(soFar).length;
-  }
-
-  const fuzzyIndex = fuzzyContent.indexOf(fuzzyOldText, fuzzyStartOffset);
+  // Search from the start of the windowed content
+  const fuzzyIndex = fuzzyContent.indexOf(fuzzyOldText);
 
   if (fuzzyIndex === -1) return null;
 
-  // Map back to original content position
-  const originalIndex = mapNormalizedToOriginal(
+  // Map back to positions within the windowed searchContent
+  const windowIndex = mapNormalizedToOriginal(
     searchContent,
     fuzzyContent,
     fuzzyIndex,
@@ -702,11 +695,15 @@ function tryUnicodeMatch(
   // Map the end of the fuzzy match so the replacement span correctly covers
   // multi-line blocks and any trailing whitespace stripped by normalization.
   const fuzzyEndIndex = fuzzyIndex + fuzzyOldText.length;
-  const originalEndIndex = mapNormalizedToOriginal(
+  const windowEndIndex = mapNormalizedToOriginal(
     searchContent,
     fuzzyContent,
     fuzzyEndIndex,
   );
+
+  // Shift window-relative offsets back to originalContent positions by adding baseOffset
+  const originalIndex = windowIndex + baseOffset;
+  const originalEndIndex = windowEndIndex + baseOffset;
   const matchLength = originalEndIndex - originalIndex;
 
   // Guard: zero-length matches indicate normalization drift — refuse

@@ -1,11 +1,11 @@
-import { describe, it } from "node:test";
+import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert";
 import { clearCache, checkRangeCoverage, recordReadSession } from "../lib/read-cache";
 
 describe("checkRangeCoverage read summary", () => {
-  it("lists every recorded read span when coverage is incomplete", () => {
-    clearCache();
+  beforeEach(() => clearCache());
 
+  it("lists every recorded read span when coverage is incomplete", () => {
     const cwd = process.cwd();
     const path = "src/config.ts";
 

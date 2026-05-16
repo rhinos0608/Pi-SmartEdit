@@ -30,5 +30,12 @@ describe("edit mode config", () => {
     assert.strictEqual(parseBooleanEnv("on"), true);
     assert.strictEqual(parseBooleanEnv("0"), false);
     assert.strictEqual(parseBooleanEnv("off"), false);
+
+    // Edge cases
+    assert.strictEqual(parseBooleanEnv(""), false);
+    assert.strictEqual(parseBooleanEnv("  "), false);
+    assert.strictEqual(parseBooleanEnv("TRUE"), true);
+    assert.strictEqual(parseBooleanEnv("Yes"), true);
+    assert.strictEqual(parseBooleanEnv("maybe"), false);
   });
 });

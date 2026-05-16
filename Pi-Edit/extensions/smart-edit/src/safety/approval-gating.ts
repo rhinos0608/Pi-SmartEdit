@@ -102,6 +102,9 @@ export const DANGEROUS_SYMBOL_PATTERNS: ReadonlyArray<{ name: string; regex: Reg
   { name: "route handler", regex: /(?:\b(?:app|router)\.|\.(?:app|router)\.)(?:get|post|put|delete|patch|use)\s*\(/ },
 ];
 
+/** Pre-compiled regexes from DANGEROUS_PATH_PATTERNS for fast matching. */
+const DANGEROUS_PATH_REGEXES: RegExp[] = DANGEROUS_PATH_PATTERNS.map(globToRegex);
+
 // ─── Glob matching ─────────────────────────────────────────────────────
 
 /**
@@ -162,11 +165,12 @@ function globToRegex(pattern: string): RegExp {
 export function matchesDangerousPath(
   filePath: string,
   patterns: readonly string[] = DANGEROUS_PATH_PATTERNS,
+  regexes: readonly RegExp[] = DANGEROUS_PATH_REGEXES,
 ): string | null {
-  for (const pattern of patterns) {
-    const regex = globToRegex(pattern);
-    if (regex.test(filePath)) {
-      return pattern;
+  const effectiveRegexes = patterns === DANGEROUS_PATH_PATTERNS ? regexes : patterns.map(globToRegex);
+  for (let i = 0; i < effectiveRegexes.length; i++) {
+    if (effectiveRegexes[i].test(filePath)) {
+      return patterns[i];
     }
   }
   return null;
@@ -203,6 +207,7 @@ function scanEditsForDangerousSymbols(
         if (pattern.regex.test(text)) {
           seen.add(pattern.name);
           results.push({ name: pattern.name, editIndex: i });
+          if (seen.size === patterns.length) return results;
         }
       }
     }
