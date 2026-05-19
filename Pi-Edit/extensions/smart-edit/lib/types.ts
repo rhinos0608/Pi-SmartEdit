@@ -88,7 +88,7 @@ export interface MatchResult {
   matchedText: string;
   /** Human-readable note about how matching was achieved, if fuzzy */
   matchNote?: string;
-  /** Numeric fuzz: 0=exact, 1=indent, 2=unicode, 3=similarity, 4=dotdotdots, 5=relative_indent */
+  /** Numeric fuzz: 0=exact, 1=indent, 2=unicode, 3=similarity, 4=dotdotdots, 5=relative_indent, -1=no match found */
   numericFuzz: number;
 }
 

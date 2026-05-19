@@ -137,23 +137,30 @@ function matchKnownPath(candidate: string, knownPaths: string[]): string {
 
   // 4. Any known path that ends with the candidate (partial path)
   for (const kp of knownPaths) {
-    if (kp.endsWith('/' + candidate) || kp.endsWith(candidate)) return kp;
+    if (kp.endsWith('/' + candidate)) return kp;
   }
 
   return candidate;
 }
 
-/** Simple character-overlap similarity ratio for filename matching */
+/** Normalized Levenshtein similarity (0–1) for filename matching */
 function filenameSimilarity(a: string, b: string): number {
   if (a === b) return 1;
-  const shorter = a.length < b.length ? a : b;
-  const longer = a.length < b.length ? b : a;
-  if (longer.length === 0) return 1;
-  let matches = 0;
-  for (let i = 0; i < shorter.length; i++) {
-    if (longer.includes(shorter[i])) matches++;
+  const la = a.length, lb = b.length;
+  if (la === 0 || lb === 0) return 0;
+  const maxLen = Math.max(la, lb);
+  const prev = Array.from({ length: lb + 1 }, (_, j) => j);
+  const curr = new Array(lb + 1);
+  for (let i = 1; i <= la; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= lb; j++) {
+      curr[j] = a[i - 1] === b[j - 1]
+        ? prev[j - 1]
+        : 1 + Math.min(prev[j], curr[j - 1], prev[j - 1]);
+    }
+    for (let k = 0; k <= lb; k++) prev[k] = curr[k];
   }
-  return (2 * matches) / (shorter.length + longer.length);
+  return 1 - prev[lb] / maxLen;
 }
 
 function normalizeContent(text: string): string {

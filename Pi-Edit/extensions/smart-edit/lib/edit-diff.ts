@@ -1080,7 +1080,7 @@ function tierPriority(tier: MatchTier): number {
     case MatchTier.INDENTATION: return 2;
     case MatchTier.UNICODE: return 1;
     case MatchTier.SIMILARITY: return 0;
-    case MatchTier.DOTDOTDOTS: return 0;
+    // DOTDOTDOTS is informational only — findTextWithTelemetry never returns it
     case MatchTier.RELATIVE_INDENT: return -1;
     default: return -1;
   }
@@ -1618,9 +1618,23 @@ export async function applyEdits(
       // Find all occurrences
       const match = findText(normalizedContent, edit.oldText, indentationStyle, 0, searchScopes[i]);
       if (!match.found) {
-        // Idempotency: if the replacement is already verbatim in the file, skip
+        // Idempotency (best-effort positional check): if the trimmed
+        // replacement appears where oldText would go, treat as no-op.
         const trimmedNew = edit.newText.trim();
-        if (trimmedNew && normalizedContent.includes(trimmedNew)) {
+        const trimmedOld = edit.oldText.trim();
+        let isNoop = false;
+        if (trimmedNew && trimmedOld) {
+          const idx = normalizedContent.indexOf(trimmedOld);
+          if (idx !== -1) {
+            const end = idx + trimmedOld.length;
+            if (normalizedContent.slice(idx, end) === trimmedNew ||
+                normalizedContent.slice(Math.max(0, idx - trimmedNew.length), idx) === trimmedNew ||
+                normalizedContent.slice(end, end + trimmedNew.length) === trimmedNew) {
+              isNoop = true;
+            }
+          }
+        }
+        if (isNoop) {
           matchNotes.push(
             `edits[${i}]${edit.description ? ` (${edit.description})` : ''}: ` +
             `replacement text already present in ${path} — edit is a no-op.`,
@@ -1692,9 +1706,23 @@ export async function applyEdits(
       const match = findText(normalizedContent, edit.oldText, indentationStyle, 0, searchScopes[i]);
 
       if (!match.found) {
-        // Idempotency: if the replacement is already verbatim in the file, skip
+        // Idempotency (best-effort positional check): if the trimmed
+        // replacement appears where oldText would go, treat as no-op.
         const trimmedNew = edit.newText.trim();
-        if (trimmedNew && normalizedContent.includes(trimmedNew)) {
+        const trimmedOld = edit.oldText.trim();
+        let isNoop = false;
+        if (trimmedNew && trimmedOld) {
+          const idx = normalizedContent.indexOf(trimmedOld);
+          if (idx !== -1) {
+            const end = idx + trimmedOld.length;
+            if (normalizedContent.slice(idx, end) === trimmedNew ||
+                normalizedContent.slice(Math.max(0, idx - trimmedNew.length), idx) === trimmedNew ||
+                normalizedContent.slice(end, end + trimmedNew.length) === trimmedNew) {
+              isNoop = true;
+            }
+          }
+        }
+        if (isNoop) {
           matchNotes.push(
             `edits[${i}]${edit.description ? ` (${edit.description})` : ''}: ` +
             `replacement text already present in ${path} — edit is a no-op.`,

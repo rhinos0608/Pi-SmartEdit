@@ -72,8 +72,8 @@ function mockFindTextFail(
   _indent: { char: "\t" | " "; width: number },
   _startOffset?: number,
   _scope?: { startIndex: number; endIndex: number; description: string },
-): { found: boolean; index: number; matchLength: number; tier: string; usedFuzzyMatch: boolean; matchedText: string } {
-  return { found: false, index: -1, matchLength: 0, tier: "exact", usedFuzzyMatch: false, matchedText: "" };
+): { found: boolean; index: number; matchLength: number; tier: string; usedFuzzyMatch: boolean; matchedText: string; numericFuzz: number } {
+  return { found: false, index: -1, matchLength: 0, tier: "exact", usedFuzzyMatch: false, matchedText: "", numericFuzz: -1 };
 }
 
 /** Mock detectIndentation */
@@ -265,6 +265,7 @@ describe("applyHashlinePath — scoped fallback", () => {
       usedFuzzyMatch: false,
       matchedText: "return user.getName()",
       matchNote: "scoped match",
+      numericFuzz: 0,
     });
 
     const result = await applyHashlinePath(
@@ -321,6 +322,7 @@ describe("applyHashlinePath — scoped fallback", () => {
       tier: "exact",
       usedFuzzyMatch: false,
       matchedText: "return 'world'",
+      numericFuzz: 0,
     });
 
     const result = await applyHashlinePath(
@@ -400,7 +402,7 @@ describe("applyHashlinePath — full fuzzy fallback", () => {
       if (!scopedCalled) {
         scopedCalled = true;
         // Scoped findText fails
-        return { found: false, index: -1, matchLength: 0, tier: "exact", usedFuzzyMatch: false, matchedText: "" };
+        return { found: false, index: -1, matchLength: 0, tier: "exact", usedFuzzyMatch: false, matchedText: "", numericFuzz: -1 };
       }
       // Full findText succeeds
       return {
@@ -411,6 +413,7 @@ describe("applyHashlinePath — full fuzzy fallback", () => {
         usedFuzzyMatch: true,
         matchedText: "return 'world'",
         matchNote: "indentation-normalized",
+        numericFuzz: 1,
       };
     };
 
@@ -574,6 +577,7 @@ describe("fallback chain — end-to-end", () => {
       tier: "exact",
       usedFuzzyMatch: false,
       matchedText: "return 1",
+      numericFuzz: 0,
     });
 
     const result = await applyHashlinePath(
@@ -624,6 +628,7 @@ describe("fallback chain — end-to-end", () => {
       usedFuzzyMatch: true,
       matchedText: "return 1",
       matchNote: "indentation",
+      numericFuzz: 1,
     });
 
     const result = await applyHashlinePath(

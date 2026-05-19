@@ -162,9 +162,8 @@ export function rebaseHunkContext(oldText: string, newText: string, fileContent:
   // Try stripping trailing whitespace from each context line in oldText
   const adjustedOld = oldText.split('\n').map(l => l.trimEnd()).join('\n');
   if (adjustedOld !== oldText && fileContent.includes(adjustedOld)) {
-    // Also apply the same normalization to newText's context lines
-    // (We leave the +/- content lines untouched)
-    return { oldText: adjustedOld, newText };
+    const adjustedNew = newText.split('\n').map(l => l.startsWith('+') || l.startsWith('-') ? l : l.trimEnd()).join('\n');
+    return { oldText: adjustedOld, newText: adjustedNew };
   }
 
   // Try diffLines alignment: compute what the file has vs what hunk expects
@@ -233,8 +232,8 @@ function buildBestHunkEditItem(
   const maxDrop = leadCtx + trailCtx;
 
   for (let drop = 0; drop <= maxDrop; drop++) {
-    const dropLead = Math.min(drop, leadCtx);
-    const dropTrail = Math.min(drop - dropLead, trailCtx);
+    for (let dropLead = Math.min(drop, leadCtx); dropLead >= Math.max(0, drop - trailCtx); dropLead--) {
+      const dropTrail = drop - dropLead;
     const sliced = dropTrail > 0
       ? lines.slice(dropLead, lines.length - dropTrail)
       : lines.slice(dropLead);
@@ -262,6 +261,7 @@ function buildBestHunkEditItem(
     // If this oldText is found in the file, use it
     if (fileContent.includes(oldText)) {
       return { oldText, newText };
+    }
     }
   }
 

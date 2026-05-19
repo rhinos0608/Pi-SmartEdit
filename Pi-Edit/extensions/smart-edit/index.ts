@@ -14,7 +14,7 @@ import { Type } from "typebox";
 
 import { constants, statSync } from "fs";
 import { access as fsAccess, readFile as fsReadFile, stat as fsStat } from "fs/promises";
-import { resolve, dirname } from "path";
+import { resolve, dirname, relative } from "path";
 
 import {
   applyEdits,
@@ -1084,9 +1084,7 @@ async function buildMultiFileFallbackHint(
 
   if (candidates.length === 0) return '';
 
-  const relCandidates = candidates.map(c => {
-    try { return c.replace(cwd + '/', ''); } catch { return c; }
-  });
+  const relCandidates = candidates.map(c => relative(cwd, c) || c);
 
   if (relCandidates.length === 1) {
     return `\n\nNote: The search text was found in a different file: ${relCandidates[0]}\n` +
