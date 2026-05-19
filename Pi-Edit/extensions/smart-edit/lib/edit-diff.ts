@@ -502,6 +502,66 @@ function mapCharInLine(
   return origPos;
 }
 
+// ─── Dotdotdots preprocessing (ellipsis elision) ───────────────────
+
+/**
+ * When oldText contains lines that are just `...`, materialize those gaps
+ * by locating each non-dot segment in the file content and spanning the
+ * actual file text between them. Returns {materializedOld, materializedNew}
+ * suitable for passing to findText as a concrete oldText/newText pair,
+ * or null if no `...` lines exist or if segments cannot be uniquely located.
+ */
+export function materializeDotdotdots(
+  oldText: string,
+  newText: string,
+  content: string,
+): { materializedOld: string; materializedNew: string } | null {
+  const DOT_LINE = /^[ \t]*\.\.\.[ \t]*$/m;
+  if (!DOT_LINE.test(oldText)) return null;
+
+  const oldParts = oldText.split(/^[ \t]*\.\.\.[ \t]*$/m);
+  const newParts = newText.split(/^[ \t]*\.\.\.[ \t]*$/m);
+  if (oldParts.length !== newParts.length) return null; // unpaired dots
+
+  // Locate each non-empty old segment sequentially in content
+  let searchPos = 0;
+  const segs: Array<{ start: number; end: number; newPart: string } | null> = [];
+
+  for (let i = 0; i < oldParts.length; i++) {
+    const oldPart = oldParts[i];
+    const newPart = newParts[i];
+    if (!oldPart.trim()) { segs.push(null); continue; }
+    const idx = content.indexOf(oldPart, searchPos);
+    if (idx === -1) return null;
+    // Ambiguity check: must not appear again
+    if (content.indexOf(oldPart, idx + 1) !== -1) return null;
+    segs.push({ start: idx, end: idx + oldPart.length, newPart });
+    searchPos = idx + oldPart.length;
+  }
+
+  const validSegs = segs.filter((s): s is NonNullable<typeof s> => s !== null);
+  if (validSegs.length === 0) return null;
+
+  const overallStart = validSegs[0].start;
+  const overallEnd = validSegs[validSegs.length - 1].end;
+  const materializedOld = content.slice(overallStart, overallEnd);
+
+  // Build materializedNew by replacing old segments in the materialized span
+  let materializedNew = materializedOld;
+  // Apply in reverse order so offsets remain valid
+  for (let i = validSegs.length - 1; i >= 0; i--) {
+    const seg = validSegs[i];
+    const relStart = seg.start - overallStart;
+    const relEnd = seg.end - overallStart;
+    materializedNew =
+      materializedNew.slice(0, relStart) +
+      seg.newPart +
+      materializedNew.slice(relEnd);
+  }
+
+  return { materializedOld, materializedNew };
+}
+
 // ─── Matching pipeline ──────────────────────────────────────────────
 
 /**
@@ -555,6 +615,7 @@ export function findTextWithTelemetry(
         tier: MatchTier.EXACT,
         usedFuzzyMatch: false,
         matchedText: oldText,
+        numericFuzz: 0,
       },
       telemetry,
     };
@@ -597,6 +658,16 @@ export function findTextWithTelemetry(
   }
   telemetry.push({ tier: MatchTier.SIMILARITY, durationMs: similarityDuration, success: false, matchCount: 0 });
 
+  // Tier 5: Stripped-indent match (handles indent-level shifts)
+  tierStart = performance.now();
+  const relIndentResult = tryStrippedIndentMatch(originalContent, oldText, searchStart, searchEnd);
+  const relIndentDuration = performance.now() - tierStart;
+  if (relIndentResult && (!searchScope || (relIndentResult.index >= searchStart && relIndentResult.index < searchEnd))) {
+    telemetry.push({ tier: MatchTier.RELATIVE_INDENT, durationMs: relIndentDuration, success: true, matchCount: 1 });
+    return { result: relIndentResult, telemetry };
+  }
+  telemetry.push({ tier: MatchTier.RELATIVE_INDENT, durationMs: relIndentDuration, success: false, matchCount: 0 });
+
   // No match found across all tiers
   return {
     result: {
@@ -606,6 +677,7 @@ export function findTextWithTelemetry(
       tier: MatchTier.EXACT,
       usedFuzzyMatch: false,
       matchedText: "",
+      numericFuzz: -1,
     },
     telemetry,
   };
@@ -656,6 +728,7 @@ function tryIndentationMatch(
     tier: MatchTier.INDENTATION,
     usedFuzzyMatch: true,
     matchedText: normalizedOldText,
+    numericFuzz: 1,
     matchNote: `Matched via indentation normalization (file uses ${
       fileStyle.char === "\t" ? "tabs" : `${fileStyle.width}-space`
     }, oldText used different indentation).`,
@@ -729,6 +802,7 @@ function tryUnicodeMatch(
     tier: MatchTier.UNICODE,
     usedFuzzyMatch: true,
     matchedText,
+    numericFuzz: 2,
     matchNote: `Matched via Unicode normalization (file has smart quotes/dashes/spaces, oldText used ASCII equivalents).`,
   };
 }
@@ -814,8 +888,89 @@ function trySimilarityMatch(
     tier: MatchTier.SIMILARITY,
     usedFuzzyMatch: true,
     matchedText,
+    numericFuzz: 3,
     matchNote: `Matched via similarity scoring (${(bestScore * 100).toFixed(1)}% similar) — near-match rescue tier.`,
   };
+}
+
+// ─── Tier 5: Stripped-indent match ────────────────────────────────────
+
+/**
+ * Tier 5: Strip-leading-whitespace match.
+ * Strips all leading whitespace from each line of both oldText and the
+ * search window, then does an exact indexOf. Handles blocks that have been
+ * moved to a deeper or shallower scope (indent shift).
+ */
+function tryStrippedIndentMatch(
+  originalContent: string,
+  oldText: string,
+  startOffset: number = 0,
+  endOffset?: number,
+): MatchResult | null {
+  if (!oldText.trim()) return null;
+
+  const searchEnd = endOffset ?? originalContent.length;
+  const searchContent = originalContent.slice(startOffset, searchEnd);
+
+  const stripIndent = (t: string) =>
+    t.split('\n').map(l => l.trimStart()).join('\n');
+
+  const strippedContent = stripIndent(searchContent);
+  const strippedOld = stripIndent(oldText);
+
+  const strippedIdx = strippedContent.indexOf(strippedOld);
+  if (strippedIdx === -1) return null;
+
+  // Map strippedIdx → original offset within searchContent
+  const origIdx = mapStrippedIndexToOriginal(searchContent, strippedContent, strippedIdx);
+  const strippedEndIdx = strippedIdx + strippedOld.length;
+  const origEndIdx = mapStrippedIndexToOriginal(searchContent, strippedContent, strippedEndIdx);
+  const matchLength = origEndIdx - origIdx;
+  if (matchLength <= 0) return null;
+
+  // Bounds check
+  if (endOffset !== undefined && startOffset + origIdx + matchLength > endOffset) return null;
+
+  return {
+    found: true,
+    index: startOffset + origIdx,
+    matchLength,
+    tier: MatchTier.RELATIVE_INDENT,
+    usedFuzzyMatch: true,
+    matchedText: searchContent.slice(origIdx, origEndIdx),
+    numericFuzz: 5,
+    matchNote: 'Matched via stripped indentation (Tier 5 — block has shifted indent level).',
+  };
+}
+
+/**
+ * Map a character offset in stripped content back to the corresponding
+ * offset in the original (indented) content. Line counts are preserved;
+ * only leading whitespace differs.
+ */
+function mapStrippedIndexToOriginal(
+  original: string,
+  stripped: string,
+  strippedOffset: number,
+): number {
+  const origLines = original.split('\n');
+  const strippedLines = stripped.split('\n');
+
+  let remaining = strippedOffset;
+  let origOffset = 0;
+
+  for (let i = 0; i < strippedLines.length && i < origLines.length; i++) {
+    const sl = strippedLines[i];
+    if (remaining <= sl.length) {
+      // Position is within this line — add back the leading whitespace
+      const leadingWs = origLines[i].length - origLines[i].trimStart().length;
+      return origOffset + leadingWs + remaining;
+    }
+    remaining -= sl.length + 1; // +1 for \n
+    origOffset += origLines[i].length + 1;
+  }
+
+  return original.length;
 }
 
 /**
@@ -925,6 +1080,8 @@ function tierPriority(tier: MatchTier): number {
     case MatchTier.INDENTATION: return 2;
     case MatchTier.UNICODE: return 1;
     case MatchTier.SIMILARITY: return 0;
+    case MatchTier.DOTDOTDOTS: return 0;
+    case MatchTier.RELATIVE_INDENT: return -1;
     default: return -1;
   }
 }
@@ -1173,10 +1330,13 @@ function getNotFoundError(
     msg = `Could not find edits[${editIndex}]${desc} in ${path}.`;
   }
 
+  // Idempotency hint: if the replacement is already in the file, say so
+  // (newText is passed via the options object below, so we check it there)
+
   if (diagnostic) {
-    msg += `\nClosest match at lines ${diagnostic.lineStart}–${diagnostic.lineEnd} (similarity: ${Math.round(diagnostic.similarity * 100)}%):`;
-    msg += `\n  Expected: "${diagnostic.expectedText}"`;
-    msg += `\n  Found:    "${diagnostic.foundText}"`;
+    msg += `\nClosest match at lines ${diagnostic.lineStart}\u2013${diagnostic.lineEnd} (similarity: ${Math.round(diagnostic.similarity * 100)}%):`;
+    msg += `\n\nDid you mean to match these actual lines?\n\`\`\`\n${diagnostic.foundText}\n\`\`\``;
+    msg += `\n\nExpected (your oldText):\n\`\`\`\n${diagnostic.expectedText}\n\`\`\``;
     msg += `\n  Hint: ${diagnostic.hint}`;
   }
 
@@ -1399,7 +1559,25 @@ export async function applyEdits(
   const matchNotes: string[] = [];
 
   for (let i = 0; i < normalizedEdits.length; i++) {
-    const edit = normalizedEdits[i];
+    let edit = normalizedEdits[i];
+
+    // ── EOF context anchor ──
+    // If oldText has trailing blank lines but the file doesn't, trim them.
+    // This handles the `*** End of File` pattern from codex patches.
+    if (edit.oldText.endsWith('\n\n') || edit.oldText.endsWith(' \n')) {
+      const trimmedOld = edit.oldText.trimEnd();
+      if (trimmedOld && !normalizedContent.includes(edit.oldText) && normalizedContent.includes(trimmedOld)) {
+        // Only apply if the match is at/near EOF
+        const potentialIdx = normalizedContent.indexOf(trimmedOld);
+        if (potentialIdx !== -1) {
+          const afterMatch = normalizedContent.slice(potentialIdx + trimmedOld.length);
+          if (!afterMatch.trim()) {
+            edit = { ...edit, oldText: trimmedOld };
+            matchNotes.push(`edits[${i}]: trailing blank lines in oldText stripped (EOF context anchor).`);
+          }
+        }
+      }
+    }
 
     // ── Trailing newline edge case (Phase 8) ──
     // When deleting code (newText === "") and oldText doesn't end with \n
@@ -1417,10 +1595,38 @@ export async function applyEdits(
       }
     }
 
+    // ── Dotdotdots preprocessing ──
+    // Materialize `...` elisions before matching
+    const DOT_LINE_RE = /^[ \t]*\.\.\.[ \t]*$/m;
+    if (DOT_LINE_RE.test(edit.oldText)) {
+      const materialized = materializeDotdotdots(
+        edit.oldText,
+        edit.newText,
+        normalizedContent,
+      );
+      if (materialized) {
+        edit = {
+          ...edit,
+          oldText: materialized.materializedOld,
+          newText: materialized.materializedNew,
+        };
+        matchNotes.push(`edits[${i}]: ... ellipsis materialized (numericFuzz=4, dotdotdots).`);
+      }
+    }
+
     if (edit.replaceAll) {
       // Find all occurrences
       const match = findText(normalizedContent, edit.oldText, indentationStyle, 0, searchScopes[i]);
       if (!match.found) {
+        // Idempotency: if the replacement is already verbatim in the file, skip
+        const trimmedNew = edit.newText.trim();
+        if (trimmedNew && normalizedContent.includes(trimmedNew)) {
+          matchNotes.push(
+            `edits[${i}]${edit.description ? ` (${edit.description})` : ''}: ` +
+            `replacement text already present in ${path} — edit is a no-op.`,
+          );
+          continue;
+        }
         const diagnostic = findClosestMatch(normalizedContent, edit.oldText);
         throw getNotFoundError(
           path, i, normalizedEdits.length, diagnostic, edit.description,
@@ -1486,6 +1692,15 @@ export async function applyEdits(
       const match = findText(normalizedContent, edit.oldText, indentationStyle, 0, searchScopes[i]);
 
       if (!match.found) {
+        // Idempotency: if the replacement is already verbatim in the file, skip
+        const trimmedNew = edit.newText.trim();
+        if (trimmedNew && normalizedContent.includes(trimmedNew)) {
+          matchNotes.push(
+            `edits[${i}]${edit.description ? ` (${edit.description})` : ''}: ` +
+            `replacement text already present in ${path} — edit is a no-op.`,
+          );
+          continue;
+        }
         const diagnostic = findClosestMatch(normalizedContent, edit.oldText);
         throw getNotFoundError(
           path, i, normalizedEdits.length, diagnostic, edit.description,

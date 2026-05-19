@@ -98,6 +98,14 @@ export function getSessionReads(path: string, cwd: string): ReadRange[] {
 }
 
 /**
+ * Get all file paths that have been read this session.
+ * Returns absolute paths stored in the sessionReads map.
+ */
+export function getAllSessionPaths(): string[] {
+  return [...sessionReads.keys()];
+}
+
+/**
  * Get the most recent full-file read, or null.
  */
 export function getLastFullRead(path: string, cwd: string): ReadRange | null {

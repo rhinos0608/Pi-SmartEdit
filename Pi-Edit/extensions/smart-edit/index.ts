@@ -34,7 +34,7 @@ import {
 import { buildSemanticContext } from "./src/lsp/semantic-context";
 import type { SemanticContextInput, AstResolverLike } from "./src/lsp/semantic-context";
 import { detectLanguageFromExtension } from "./src/lsp/language-id";
-import { recordRead, checkStale, recordReadWithStat, recordReadSession, getSessionReads, checkEditAllowed, checkRangeCoverage, getSnapshot } from "./lib/read-cache";
+import { recordRead, checkStale, recordReadWithStat, recordReadSession, getSessionReads, checkEditAllowed, checkRangeCoverage, getSnapshot, getAllSessionPaths } from "./lib/read-cache";
 import { buildHashlineAnchors, initHashline } from "./lib/hashline";
 import type { HashlineEditInput } from "./lib/hashline-edit";
 
@@ -1041,6 +1041,60 @@ async function reReadAfterFailure(
   const enhancedMessage = `${error.message}\n\n📖 Current file content around edit location:\n\n${contextStr}`;
 
   return new Error(enhancedMessage);
+}
+
+/**
+ * Check if any recently-read files in this session contain oldText from the failing edits.
+ * Returns a hint string to append to the error, or empty string if no candidates found.
+ */
+async function buildMultiFileFallbackHint(
+  failingPath: string,
+  edits: EditItem[],
+  cwd: string,
+): Promise<string> {
+  const allPaths = getAllSessionPaths();
+  const candidates: string[] = [];
+  const failingResolved = resolve(failingPath);
+
+  for (const filePath of allPaths) {
+    const resolved = resolve(filePath);
+    if (resolved === failingResolved) continue;
+
+    let content: string;
+    try {
+      content = await fsReadFile(resolved, 'utf-8');
+    } catch {
+      // File not accessible — skip
+      continue;
+    }
+
+    const normalizedContent = normalizeToLF(content);
+
+    for (const edit of edits) {
+      if (!edit.oldText?.trim()) continue;
+
+      if (normalizedContent.includes(edit.oldText) ||
+          normalizedContent.includes(edit.oldText.trim())) {
+        if (!candidates.includes(resolved)) {
+          candidates.push(resolved);
+        }
+      }
+    }
+  }
+
+  if (candidates.length === 0) return '';
+
+  const relCandidates = candidates.map(c => {
+    try { return c.replace(cwd + '/', ''); } catch { return c; }
+  });
+
+  if (relCandidates.length === 1) {
+    return `\n\nNote: The search text was found in a different file: ${relCandidates[0]}\n` +
+           `Did you mean to edit that file instead?`;
+  }
+  return `\n\nNote: The search text was found in ${relCandidates.length} other files:` +
+         relCandidates.map(f => `\n  - ${f}`).join('') +
+         `\nDid you mean to edit one of those files instead?`;
 }
 
 // ─── Extension entry point ──────────────────────────────────────────
@@ -2204,6 +2258,23 @@ export default function smartEdit(pi: ExtensionAPI) {
                 edits,
                 err,
               );
+
+              // Multi-file fallback hint: check if oldText exists in other session-read files.
+              // Only for match-not-found errors (not stale-file, range-coverage, or ambiguity).
+              if (
+                err.message.includes("Could not find") ||
+                err.message.includes("No matches")
+              ) {
+                const multiFileHint = await buildMultiFileFallbackHint(
+                  absolutePath,
+                  edits,
+                  cwd,
+                );
+                if (multiFileHint) {
+                  throw new Error(enhancedError.message + multiFileHint);
+                }
+              }
+
               throw enhancedError;
             }
 

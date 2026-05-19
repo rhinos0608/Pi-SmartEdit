@@ -88,6 +88,8 @@ export interface MatchResult {
   matchedText: string;
   /** Human-readable note about how matching was achieved, if fuzzy */
   matchNote?: string;
+  /** Numeric fuzz: 0=exact, 1=indent, 2=unicode, 3=similarity, 4=dotdotdots, 5=relative_indent */
+  numericFuzz: number;
 }
 
 export enum MatchTier {
@@ -95,6 +97,8 @@ export enum MatchTier {
   INDENTATION = "indentation",
   UNICODE = "unicode",
   SIMILARITY = "similarity",  // deferred
+  DOTDOTDOTS = "dotdotdots",
+  RELATIVE_INDENT = "relative_indent",
 }
 
 export interface MatchSpan {

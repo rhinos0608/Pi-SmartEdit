@@ -30,7 +30,7 @@ export interface SearchReplaceBlock {
  * 
  * @throws If a block is truncated (missing REPLACE marker) or SEARCH section is empty
  */
-export function parseSearchReplace(input: string): SearchReplaceBlock[] {
+export function parseSearchReplace(input: string, knownPaths?: string[]): SearchReplaceBlock[] {
   // Normalize CRLF to LF
   const normalized = input.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
@@ -78,7 +78,10 @@ export function parseSearchReplace(input: string): SearchReplaceBlock[] {
         !lastBeforeLine.includes('<<<<<<') && 
         !lastBeforeLine.includes('>>>>>>') &&
         !lastBeforeLine.includes('=======')) {
-      path = lastBeforeLine;
+      const stripped = stripFilename(lastBeforeLine);
+      if (stripped && (stripped.includes('.') || stripped.includes('/'))) {
+        path = knownPaths ? matchKnownPath(stripped, knownPaths) : stripped;
+      }
     }
     
     result.push({ path, oldText, newText });
@@ -91,6 +94,68 @@ export function parseSearchReplace(input: string): SearchReplaceBlock[] {
 /**
  * Normalize marker content: strip leading/trailing blank lines.
  */
+/**
+ * Strip common artifacts from a potential filename line.
+ * Mirrors aider's strip_filename() function.
+ */
+function stripFilename(line: string): string {
+  let s = line.trim();
+  // Remove leading # markdown header markers
+  s = s.replace(/^#+\s*/, '');
+  // Remove surrounding backticks and asterisks
+  s = s.replace(/^[`*]+/, '').replace(/[`*]+$/, '');
+  // Remove trailing colon
+  s = s.replace(/:$/, '');
+  return s.trim();
+}
+
+/**
+ * Find the best matching known path for a candidate filename.
+ * Returns the matched path or the candidate itself if no good match found.
+ */
+function matchKnownPath(candidate: string, knownPaths: string[]): string {
+  if (knownPaths.length === 0) return candidate;
+
+  // 1. Exact match
+  if (knownPaths.includes(candidate)) return candidate;
+
+  // 2. Basename match
+  const candidateBase = candidate.split('/').pop() ?? candidate;
+  for (const kp of knownPaths) {
+    const kpBase = kp.split('/').pop() ?? kp;
+    if (kpBase === candidateBase) return kp;
+  }
+
+  // 3. Fuzzy: find path with lowest normalized edit distance (cutoff 0.8)
+  let bestPath = candidate;
+  let bestScore = 0;
+  for (const kp of knownPaths) {
+    const score = filenameSimilarity(candidate, kp);
+    if (score > bestScore) { bestScore = score; bestPath = kp; }
+  }
+  if (bestScore >= 0.8) return bestPath;
+
+  // 4. Any known path that ends with the candidate (partial path)
+  for (const kp of knownPaths) {
+    if (kp.endsWith('/' + candidate) || kp.endsWith(candidate)) return kp;
+  }
+
+  return candidate;
+}
+
+/** Simple character-overlap similarity ratio for filename matching */
+function filenameSimilarity(a: string, b: string): number {
+  if (a === b) return 1;
+  const shorter = a.length < b.length ? a : b;
+  const longer = a.length < b.length ? b : a;
+  if (longer.length === 0) return 1;
+  let matches = 0;
+  for (let i = 0; i < shorter.length; i++) {
+    if (longer.includes(shorter[i])) matches++;
+  }
+  return (2 * matches) / (shorter.length + longer.length);
+}
+
 function normalizeContent(text: string): string {
   const lines = text.split('\n');
   while (lines.length > 0 && lines[0].trim().length === 0) lines.shift();
