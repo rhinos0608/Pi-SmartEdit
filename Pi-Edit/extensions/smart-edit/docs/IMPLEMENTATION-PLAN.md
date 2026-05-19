@@ -1,14 +1,16 @@
 # Smart Edit — Feature Implementation Plan
 
+> **Status**: ✅ All three features implemented (May 2026)
+
 ## Overview
 
-Three features to add to the `smart-edit` Pi extension:
+Three features added to the `smart-edit` Pi extension:
 
-| # | Feature | Priority | Complexity |
-|---|---------|----------|------------|
-| 1 | **AST-Aware Targeting (Tree-sitter)** | P0 | High |
-| 2 | **Semantic Conflict Detection** | P0 | Medium |
-| 3 | **Line-Range Targeting** | P1 | Low |
+| # | Feature | Priority | Complexity | Status |
+|---|---------|----------|------------|--------|
+| 1 | **AST-Aware Targeting (Tree-sitter)** | P0 | High | ✅ Done |
+| 2 | **Semantic Conflict Detection** | P0 | Medium | ✅ Done |
+| 3 | **Line-Range Targeting** | P1 | Low | ✅ Done |
 
 These features address the core limitation of text-only `oldText` matching: when two functions have identical opening lines, the tool cannot distinguish them; when separate edits touch the same function body over multiple calls, there's no detection; and there's no fallback when `oldText` matching fails beyond fuzzy tiers.
 
@@ -18,7 +20,7 @@ These features address the core limitation of text-only `oldText` matching: when
 
 ### ADR-001: Tree-sitter via WASM (web-tree-sitter)
 
-**Status**: Proposed
+**Status**: Accepted
 
 **Context**: We need to parse source code into an AST for disambiguation and conflict detection. Tree-sitter is the de-facto standard for incremental parsing in editors (used by Zed, Neovim, Helix). It produces concrete syntax trees (CST) that preserve byte positions for every token.
 
@@ -39,7 +41,7 @@ These features address the core limitation of text-only `oldText` matching: when
 
 ### ADR-002: Lazy Grammar Loading
 
-**Status**: Proposed
+**Status**: Accepted
 
 **Context**: Tree-sitter requires language-specific grammars. We can't bundle all languages.
 
@@ -53,7 +55,7 @@ These features address the core limitation of text-only `oldText` matching: when
 
 ### ADR-003: Edit Operation Model
 
-**Status**: Proposed
+**Status**: Accepted
 
 **Context**: Currently, `EditItem` uses `{oldText, newText}` text matching. We're adding AST-level anchoring and line-range targeting as *disambiguation hints*, not as replacements for text matching. This preserves backward compatibility.
 

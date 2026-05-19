@@ -4,34 +4,36 @@ Smart Edit replaces Pi's built-in `edit` tool with safer matching, richer diagno
 
 ## What it does
 
-- **4-tier matching**: exact → indentation → Unicode → similarity
-- **AST-scoped edits**: target a symbol with `anchor`
+- **6-tier matching**: exact → indentation → Unicode → similarity → dotdotdots ellipsis → relative indent
+- **Symbolic edits**: replaceBody, insertBefore, insertAfter via AST symbol targeting
+- **AST-scoped edits**: target a symbol with `anchor` for disambiguation
 - **Line-range scoping**: constrain matching with `lineRange`
-- **Hashline edits**: freshness-checked anchored edits for zero-text workflows, available only in experimental mode
-- **Multi-format input**: accepts raw JSON edits, search/replace blocks, unified diffs, and OpenAI patch format
+- **Hashline edits**: freshness-checked anchored edits for zero-text workflows (opt-in via `SMART_EDIT_USE_HASHLINE_EDITING=1`)
+- **Multi-format input**: JSON edits, search/replace blocks, unified diffs, OpenAI patch, and Codex apply_patch format
+- **Forgiving JSON parser**: auto-repairs malformed JSON from LLM output
+- **Streaming patch parser**: progressive parse with progress callbacks for large patches
+- **Approval gating**: path/symbol/line-range safety checks, configurable via `SMART_EDIT_APPROVAL_LEVEL`
 - **Stale-file guard**: blocks edits when the file changed since read
 - **Range coverage guard**: blocks edits outside the lines you actually read
-- **Conflict detection**: warns or blocks on overlapping AST-level changes
-- **Atomic writes**: temp-file write + rename, with mode preservation
-- **Mutation queue**: serializes edits per file to avoid races
+- **Conflict detection**: warns or blocks on overlapping AST-level changes across edit calls
+- **Atomic writes**: temp-file write + rename, with mode preservation (undo-safe)
+- **Edit history / undo**: captures pre-edit state to `.smart-edit-undo/` for rollback
+- **Context markers**: XML-style tags around injected semantic context for attribution/filtering
+- **Auto-validation**: retry-aware structural check + validation feedback on failed edits
 - **Closest-match diagnostics**: shows the best near-match when an edit fails
-- **Post-edit diagnostics**: LSP + compiler fallback across multiple languages
+- **Post-edit diagnostics**: LSP + compiler fallback, scoped to changed targets
+- **Verification pipeline**: concurrency detection, traceability analysis, git history context
+- **SmartRead bridge**: records breakage and co-change events to Pi-SmartRead
 
 ## Diagnostics
 
-Smart Edit now uses a multi-tier diagnostics pipeline:
+Smart Edit uses a multi-tier diagnostics pipeline:
 
 1. **LSP diagnostics** when a server is available
-2. **Compiler fallback** when LSP has nothing useful
+2. **Compiler fallback** when LSP has nothing useful (`tsc`, `pyright`, `cargo check`, `go vet`, `rubocop`)
 3. **Language-specific output parsing** to turn CLI results into editor diagnostics
-
-Supported fallback tools include:
-
-- `tsc`
-- `pyright`
-- `cargo check`
-- `go vet`
-- `rubocop`
+4. **Scoped diagnostics**: filters diagnostics to only the symbols/lines actually changed
+5. **Post-edit evidence pipeline**: concurrency verification, test traceability, git history context
 
 ## Supported LSP servers
 
@@ -164,53 +166,108 @@ Only use this after enabling `SMART_EDIT_USE_HASHLINE_EDITING=1`.
 
 ```text
 .pi/extensions/smart-edit/
-├── index.ts                 # Tool registration, stale guard, atomic writes, mutation queue
+├── index.ts                   # Tool registration, stale guard, atomic writes, mutation queue
 ├── lib/
-│   ├── edit-diff.ts         # 4-tier matching pipeline and diff generation
-│   ├── hashline.ts          # Line hashing for hashline anchors
-│   ├── hashline-edit.ts     # Hashline edit application and validation
-│   ├── read-cache.ts        # Snapshot cache and read-range coverage guard
-│   ├── ast-resolver.ts      # Tree-sitter parsing and symbol resolution
-│   ├── conflict-detector.ts  # AST-level conflict detection
-│   └── types.ts             # Shared types
+│   ├── types.ts               # Shared types, FileSnapshot, fastHash, MatchTier
+│   ├── edit-diff.ts           # 6-tier matching pipeline and diff generation
+│   ├── hashline.ts            # Line hashing for hashline anchors (xxhash-wasm)
+│   ├── hashline-edit.ts       # Hashline edit application and validation
+│   ├── read-cache.ts          # Snapshot cache and read-range coverage guard
+│   ├── ast-resolver.ts        # Tree-sitter parsing and symbol resolution
+│   ├── conflict-detector.ts   # AST-level conflict detection between edit calls
+│   ├── grammar-loader.ts      # Lazy-loads tree-sitter WASM grammars
+│   └── path-utils.ts          # Path resolution (resolveToCwd)
 ├── src/
-│   ├── formats/             # Search/replace, unified diff, OpenAI patch parsing
-│   └── lsp/
-│       ├── lsp-connection.ts # JSON-RPC over stdio
-│       ├── lsp-manager.ts    # Lazy server startup and runtime Java config
-│       ├── diagnostics.ts    # Post-edit LSP checks
-│       ├── diagnostic-dispatcher.ts # Compiler fallback diagnostics
-│       ├── semantic-context.ts
-│       └── language-id.ts
-└── test/
+│   ├── edit-mode.ts           # Runtime config (hashline toggle, env vars)
+│   ├── symbolic-edits.ts      # Symbolic edit engine (replaceBody, insertBefore, insertAfter)
+│   ├── smartread-bridge.ts    # Breakage/co-change recording to Pi-SmartRead
+│   ├── safety/
+│   │   └── approval-gating.ts # Path/symbol/line-range safety checks
+│   ├── undo/
+│   │   ├── atomic-write.ts    # Temp-file write + rename with mode preservation
+│   │   └── edit-history.ts    # Per-edit undo capture (base64 JSON in .smart-edit-undo/)
+│   ├── formats/
+│   │   ├── index.ts           # Format detection and dispatch
+│   │   ├── format-detector.ts # Auto-detect input format from raw text
+│   │   ├── search-replace.ts  # Search/replace block parser
+│   │   ├── unified-diff.ts    # Unified diff parser
+│   │   ├── openai-patch.ts    # OpenAI patch format parser
+│   │   ├── codex-patch.ts     # Codex apply_patch grammar parser
+│   │   ├── streaming-patch-parser.ts # Progressive parse with progress callbacks
+│   │   ├── forgiving-parser.ts # JSON repair for malformed LLM output
+│   │   └── context-markers.ts # XML-style markers for injected semantic context
+│   ├── lsp/
+│   │   ├── index.ts           # LSP module public API
+│   │   ├── lsp-connection.ts  # JSON-RPC over stdio
+│   │   ├── lsp-manager.ts     # Lazy server startup and runtime config
+│   │   ├── diagnostics.ts     # Post-edit LSP diagnostic checks
+│   │   ├── diagnostic-dispatcher.ts # Compiler fallback + output parsing
+│   │   ├── semantic-context.ts # Semantic context resolution (definitions, refs)
+│   │   ├── semantic-nav.ts    # LSP-based semantic navigation
+│   │   ├── context-renderer.ts # Render semantic context as markdown
+│   │   ├── symbol-skeleton.ts # Extract symbol outlines from AST
+│   │   ├── target-range.ts    # Resolve symbol targets to byte ranges
+│   │   ├── document-sync.ts   # DidOpen/DidChange/DidClose synchronization
+│   │   └── language-id.ts     # Extension → LSP language ID mapping
+│   └── verification/
+│       ├── types.ts           # Shared verification types
+│       ├── config.ts          # Default verification configuration
+│       ├── auto-validate.ts   # Retry-aware structural validation
+│       ├── post-edit-evidence.ts # Orchestrates full evidence pipeline
+│       ├── change-targets.ts  # Identify what symbols were changed
+│       ├── concurrency-detector.ts # Detect async/thread/lock patterns
+│       ├── concurrency-tools.ts    # Run ecosystem verification tools
+│       ├── traceability.ts    # Test coverage linkage analysis
+│       ├── history-context.ts # Git blame + commit history context
+│       ├── scoped-diagnostics.ts   # Filter diagnostics to changed targets only
+│       ├── command-runner.ts  # Subprocess execution with timeout
+│       └── background-runner.ts    # Background task scheduling
+└── test/                      # 30+ test suites
 ```
 
 ### Flow
 
 1. Read file and populate the snapshot cache
-2. Resolve anchors / line ranges, and hashline anchors only when experimental mode is on
-3. Match with the 4-tier fallback pipeline
-4. Apply the edit atomically
-5. Run LSP diagnostics first
-6. Fall back to compiler diagnostics if needed
-7. Surface warnings and errors in the tool response
+2. Detect input format (JSON, search/replace, unified diff, OpenAI/Codex patch)
+3. Repair malformed JSON if needed (forgiving parser)
+4. Resolve symbolic edits (replaceBody, insertBefore, insertAfter) via AST
+5. Resolve anchors / line ranges / hashline anchors for scoping
+6. Run approval gating checks (path/symbol/line-range safety)
+7. Match with the 6-tier fallback pipeline
+8. Detect semantic conflicts against prior edits
+9. Capture pre-edit undo state (fire-and-forget)
+10. Apply the edit atomically (temp file + rename)
+11. Run post-edit pipeline: LSP diagnostics → compiler fallback → scoped diagnostics → verification evidence
+12. Record breakage/co-change events to SmartRead bridge
+13. Surface warnings, diagnostics, and evidence in the tool response
 
 ## Testing
 
 ```bash
 cd .pi/extensions/smart-edit
-npm run lint
-npm test
+npm run lint                # ESLint strict mode, zero warnings
+npm test                    # Run all test suites (30+)
+npm run test:v              # Run verification-specific tests only
 ```
 
-You can also run a focused test:
+Run a focused test:
 
 ```bash
-npx tsx --test test/diagnostic-dispatcher.test.ts
+npx tsx --test test/<file>  # e.g., test/symbolic-edits.test.ts
 ```
+
+## Configuration
+
+| Env Variable | Values | Default | Effect |
+|---|---|---|---|
+| `SMART_EDIT_USE_HASHLINE_EDITING` | `1`/`true`/`yes`/`on` | off | Enable hashline edit mode |
+| `SMART_EDIT_HASHLINE_EXPERIMENTAL` | same | off | Alias for hashline toggle |
+| `SMART_EDIT_APPROVAL_LEVEL` | `never_prompt` / `prompt_on_dangerous` / `prompt_always` | `never_prompt` | Safety check verbosity |
 
 ## Notes
 
 - Java LSP uses `JDT_LS_JAR` at runtime.
 - Read-range validation only trusts lines you actually read.
 - Fuzzy matches are safe: replacements are always applied to the original file text.
+- Undo data is stored in `.smart-edit-undo/` per project (fire-and-forget, never blocks).
+- Verification pipeline is advisory: warnings are matchNotes, never hard errors by default.

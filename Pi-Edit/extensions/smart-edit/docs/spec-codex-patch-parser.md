@@ -1,6 +1,6 @@
 # Codex apply_patch Grammar Parser — Specification
 
-**Status:** Draft v1.0  
+**Status:** Implemented (May 2026)  
 **Author:** Pi SmartEdit  
 **Date:** 2026-05-16  
 **Codex reference:** `codex-rs/apply-patch/src/parser.rs` (954 lines, Lark grammar)  

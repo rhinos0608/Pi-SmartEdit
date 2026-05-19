@@ -1,10 +1,9 @@
 # Pre-Edit Semantic Retrieval (LSP-RAG) — Implementation Plan
 
-> **Status**: Planning
+> **Status**: Implemented
 > **Spec Reference**: [lsp-rag-spec.md](./lsp-rag-spec.md)
 > **Date**: 2026-05-02
-> **Estimated effort**: 4 phases
-> **Primary risk**: LSP document synchronization and token-budget control
+> **Phases**: 4 (all complete)
 
 ---
 

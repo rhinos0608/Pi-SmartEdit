@@ -9,15 +9,15 @@
 
 | Layer | SmartEdit | Codex |
 |---|---|---|
-| **Input format** | JSON schema + multi-format detection (search/replace, unified diff, OpenAI patch, hashline) | Lark grammar freeform tool (`apply_patch`) |
-| **Matching** | 4-tier fuzzy pipeline (exact → indent → unicode → similarity) | Context-line matching with `@@` disambiguation + `seek_sequence` fuzzy |
-| **Scoping** | tree-sitter AST anchor + lineRange | Multi-level `@@` chaining (`@@ class`, `@@ \t def`) |
-| **Safety** | Stale-file guard, range coverage guard, atomic write | Exec policy rules, sandbox permissions, approval flow |
-| **Validation** | LSP diagnostics + compiler fallback + AST syntax check | Sandbox FS + exec policy + diff tracker |
-| **Read path** | Snapshot cache from `read`/`write` tool results | Fragment injection into message array (`ContextualUserFragment`) |
-| **Streaming** | None | 500ms-buffered streaming patch preview |
+| **Input format** | JSON schema + multi-format detection (search/replace, unified diff, OpenAI patch, Codex patch, hashline) + forgiving parser + streaming parser | Lark grammar freeform tool (`apply_patch`) |
+| **Matching** | 6-tier fuzzy pipeline (exact → indent → unicode → similarity → dotdotdots → relative indent) + symbolic edits | Context-line matching with `@@` disambiguation + `seek_sequence` fuzzy |
+| **Scoping** | tree-sitter AST anchor + lineRange + hashline anchors | Multi-level `@@` chaining (`@@ class`, `@@ \t def`) |
+| **Safety** | Stale-file guard, range coverage guard, approval gating, atomic write | Exec policy rules, sandbox permissions, approval flow |
+| **Validation** | LSP diagnostics + compiler fallback + scoped diagnostics + verification pipeline | Sandbox FS + exec policy + diff tracker |
+| **Read path** | Snapshot cache with readOffset, hashline anchors, APFS VFS retry | Fragment injection into message array (`ContextualUserFragment`) |
+| **Streaming** | Streaming patch parser with progress callbacks | 500ms-buffered streaming patch preview |
 | **Multi-file** | Single-file edit tool with mutation queue | Multi-file patches in one `apply_patch` call |
-| **Undo** | Not implemented | `SharedTurnDiffTracker` records all changes |
+| **Undo** | Per-edit undo capture to `.smart-edit-undo/` (fire-and-forget) | `SharedTurnDiffTracker` records all changes |
 | **Multi-env** | Local only | Environment ID routing (local, container, remote) |
 
 ---

@@ -1,11 +1,10 @@
 # Hashline Edit Mode — Implementation Plan
 
-> **Status**: Planning  
+> **Status**: Implemented  
 > **Spec Reference**: [hashline-spec.md](./hashline-spec.md)  
-> **Codebase**: `/Users/rhinesharar/Pi-SmartEdit/.pi/extensions/smart-edit`  
-> **Total LOC**: ~3,800 (existing), ~1,200 (new + modified)  
-> **Phases**: 5  
-> **Estimated effort**: 5-6 weeks
+> **Codebase**: `Pi-Edit/extensions/smart-edit`  
+> **Actual LOC**: ~5,000+  
+> **Phases**: 5 (all complete)
 
 ---
 

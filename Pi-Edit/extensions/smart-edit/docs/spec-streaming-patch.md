@@ -1,8 +1,8 @@
 # Streaming Patch Preview — SPEC
 
-> **Status:** Draft  
+> **Status:** Implemented  
 > **Priority:** P1  
-> **Effort:** ~250 lines  
+> **Actual:** ~350 lines (including tests)  
 > **Inspired by:** Codex `StreamingPatchParser` (500ms-buffered partial-patch preview)
 
 ---

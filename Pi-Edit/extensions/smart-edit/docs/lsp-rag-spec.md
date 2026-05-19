@@ -1,6 +1,6 @@
 # Pre-Edit Semantic Retrieval (LSP-RAG) — Technical Specification
 
-> **Status**: Proposal
+> **Status**: Implemented (May 2026)
 > **Version**: 0.1
 > **Date**: 2026-05-02
 > **Primary code paths**: `src/lsp/*`, `lib/ast-resolver.ts`, `index.ts`, `lib/read-cache.ts`

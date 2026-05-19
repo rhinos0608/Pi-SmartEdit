@@ -1,6 +1,6 @@
 # Specification: Lightweight Approval Gating for SmartEdit
 
-**Status:** Draft  
+**Status:** Implemented  
 **Date:** 2026-05-16  
 **Author:** SmartEdit  
 **Driven-by:** Codex's `AskForApproval` system (Never/OnFailure/OnRequest/UnlessTrusted/Granular) — a lightweight alternative for SmartEdit's scope.

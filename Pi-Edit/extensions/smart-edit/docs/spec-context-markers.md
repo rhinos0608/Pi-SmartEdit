@@ -1,6 +1,6 @@
 # Context Marker System
 
-**Status:** Draft  
+**Status:** Implemented  
 **Date:** 2026-05-16  
 **Author:** SmartEdit  
 **Inspired by:** Codex `ContextualUserFragment` trait  
