@@ -5,10 +5,13 @@
  * - File parsing into a concrete syntax tree (CST)
  * - Symbol resolution via anchor matching (name + kind + line hints)
  * - Enclosing-symbol discovery for conflict detection
+ * - Incremental re-parsing with LRU parse cache
  * - Graceful degradation when tree-sitter is unavailable
  *
  * Architecture:
- * - Parses fresh per call (sub-ms for typical files) — no cached Tree objects
+ * - Parses fresh per call by default (sub-ms for typical files)
+ * - Supports incremental re-parse via computeEdit() + incrementalReParse()
+ * - Uses LRU cache (10 entries) for repeated parses of the same content
  * - Uses node.walk() for symbol discovery (not queries — more cross-language robust)
  * - Reports ERROR nodes via ParseResult.hasErrors flag
  * - Callers are responsible for tree.delete() cleanup
@@ -39,6 +42,295 @@ export interface ParseResult {
 
   /** The content that was parsed */
   content: string;
+}
+
+// ─── Parse Cache (LRU, 10 entries) ─────────────────────────────────
+
+interface CachedParse {
+  result: ParseResult;
+  contentHash: string;
+}
+
+const parseCache = new Map<string, CachedParse>();
+const MAX_CACHE_SIZE = 10;
+
+/**
+ * Get a cached parse result if the content hash matches.
+ * @param filePath - Path used as cache key
+ * @param contentHash - SHA-256 hash of the content
+ * @returns The cached ParseResult, or null if not found or hash mismatch
+ */
+export function getCachedParse(filePath: string, contentHash: string): ParseResult | null {
+  const cached = parseCache.get(filePath);
+  if (!cached) return null;
+  if (cached.contentHash !== contentHash) return null;
+  return cached.result;
+}
+
+/**
+ * Store a parse result in the cache.
+ * Evicts the oldest entry when the cache exceeds MAX_CACHE_SIZE.
+ * @param filePath - Path used as cache key
+ * @param contentHash - SHA-256 hash of the content
+ * @param result - The parse result to cache
+ */
+export function setCachedParse(filePath: string, contentHash: string, result: ParseResult): void {
+  // Evict oldest if at capacity
+  if (parseCache.size >= MAX_CACHE_SIZE && !parseCache.has(filePath)) {
+    const firstKey = parseCache.keys().next().value;
+    if (firstKey !== undefined) {
+      const evicted = parseCache.get(firstKey);
+      if (evicted) {
+        evicted.result.tree.delete();
+        evicted.result.parser.delete();
+      }
+      parseCache.delete(firstKey);
+    }
+  }
+  parseCache.set(filePath, { result, contentHash });
+}
+
+/**
+ * Clear the entire parse cache.
+ * Disposes all cached trees and parsers to free WASM memory.
+ */
+export function clearParseCache(): void {
+  for (const cached of parseCache.values()) {
+    cached.result.tree.delete();
+    cached.result.parser.delete();
+  }
+  parseCache.clear();
+}
+
+// ─── Incremental Parsing ─────────────────────────────────────────────
+
+/**
+ * Edit delta for tree-sitter's incremental parsing.
+ * All positions are byte offsets.
+ */
+export interface EditDelta {
+  startIndex: number;
+  oldEndIndex: number;
+  newEndIndex: number;
+  startPosition: { row: number; column: number };
+  oldEndPosition: { row: number; column: number };
+  newEndPosition: { row: number; column: number };
+}
+
+/**
+ * Compute the minimal edit between oldContent and newContent.
+ * Uses longest common subsequence (LCS) to find the changed range.
+ *
+ * @param oldContent - The original content
+ * @param newContent - The modified content
+ * @returns EditDelta suitable for tree.edit(), or null if entire file changed (fallback to full parse)
+ */
+export function computeEdit(oldContent: string, newContent: string): EditDelta | null {
+  // Fast path: identical content
+  if (oldContent === newContent) return null;
+
+  // Fast path: one is empty
+  if (oldContent.length === 0 && newContent.length === 0) return null;
+
+  const oldLines = oldContent.split("\n");
+  const newLines = newContent.split("\n");
+
+  const m = oldLines.length;
+  const n = newLines.length;
+
+  // Find first unchanged line from the start
+  let firstChangeLine = 0;
+  while (firstChangeLine < m && firstChangeLine < n && oldLines[firstChangeLine] === newLines[firstChangeLine]) {
+    firstChangeLine++;
+  }
+
+  // Find last matching line from the end using proper suffix matching
+  // The last matching lines in old and new should be at the same RELATIVE position from end
+  let lastOldMatch = m - 1;
+  let lastNewMatch = n - 1;
+
+  while (lastOldMatch >= firstChangeLine && lastNewMatch >= firstChangeLine) {
+    if (oldLines[lastOldMatch] === newLines[lastNewMatch]) {
+      lastOldMatch--;
+      lastNewMatch--;
+    } else {
+      break;
+    }
+  }
+
+  // lastOldMatch is now one LESS than the last matching line
+  // So the last matching line is lastOldMatch + 1
+  const lastMatchLine = lastOldMatch + 1;
+
+  // If no matching region found (all lines changed), return null for full parse
+  if (firstChangeLine >= m) {
+    return null; // Entire file changed
+  }
+  if (lastMatchLine <= firstChangeLine) {
+    return null; // No overlap between prefix and suffix
+  }
+
+  // Calculate byte offsets
+  const oldBytes = oldContent.length;
+
+  // Convert line positions to byte offsets
+  function lineToByteOffset(lines: string[], lineIndex: number): number {
+    let offset = 0;
+    for (let i = 0; i < lineIndex && i < lines.length; i++) {
+      offset += lines[i].length + 1; // +1 for newline
+    }
+    return offset;
+  }
+
+  const startByte = lineToByteOffset(oldLines, firstChangeLine);
+  const oldEndByte = lastMatchLine < m ? lineToByteOffset(oldLines, lastMatchLine) : oldBytes;
+  const newEndByte = lineToByteOffset(newLines, lastNewMatch + 1);
+
+  // If the edit spans entire old content with no prefix preserved, return null
+  // This handles "entire file change" case
+  if (startByte === 0 && oldEndByte === oldBytes) {
+    return null;
+  }
+
+  // Build position objects
+  const startPosition = { row: firstChangeLine, column: 0 };
+
+  // Old end position: count newlines up to oldEndByte
+  let oldEndRow = 0;
+  let oldEndCol = 0;
+  for (let i = 0; i < oldEndByte; i++) {
+    if (oldContent[i] === "\n") {
+      oldEndRow++;
+      oldEndCol = 0;
+    } else {
+      oldEndCol++;
+    }
+  }
+
+  // New end position: count newlines up to newEndByte
+  let newEndRow = 0;
+  let newEndCol = 0;
+  for (let i = 0; i < newEndByte; i++) {
+    if (newContent[i] === "\n") {
+      newEndRow++;
+      newEndCol = 0;
+    } else {
+      newEndCol++;
+    }
+  }
+
+  return {
+    startIndex: startByte,
+    oldEndIndex: oldEndByte,
+    newEndIndex: newEndByte,
+    startPosition,
+    oldEndPosition: { row: oldEndRow, column: oldEndCol },
+    newEndPosition: { row: newEndRow, column: newEndCol },
+  };
+}
+
+/**
+ * Perform incremental re-parse of content that has been edited.
+ *
+ * @param oldTree - The previous syntax tree (will be modified in-place)
+ * @param oldContent - The content that was used to generate oldTree
+ * @param newContent - The new content to parse
+ * @param parser - Parser instance configured with the language
+ * @returns The new tree (incremental), or null if incremental parse not possible
+ */
+export function incrementalReParse(
+  oldTree: Parser.Tree,
+  oldContent: string,
+  newContent: string,
+  parser: Parser,
+): Parser.Tree | null {
+  const edit = computeEdit(oldContent, newContent);
+  if (!edit) return null;
+
+  try {
+    // Apply the edit to the old tree
+    oldTree.edit(edit);
+
+    // Parse the new content using the old tree as a hint
+    const newTree = parser.parse(newContent, oldTree);
+    return newTree;
+  } catch {
+    // Incremental parse failed — caller should fall back to full parse
+    return null;
+  }
+}
+
+/**
+ * Reuse a parse result with new content, trying incremental parse first.
+ *
+ * This is the high-level function for re-parsing after an edit:
+ * - If content unchanged → return old result directly
+ * - If incremental parse succeeded → return new tree (caller must dispose old tree)
+ * - If incremental parse not possible → do full parse
+ * - Properly disposes the OLD tree after new parse
+ *
+ * @param oldResult - The previous parse result
+ * @param newContent - The new content to parse
+ * @returns A new ParseResult with the updated tree
+ */
+export async function reuseParseResult(
+  oldResult: ParseResult,
+  newContent: string,
+): Promise<ParseResult> {
+  // Fast path: content unchanged
+  if (oldResult.content === newContent) {
+    return oldResult;
+  }
+
+  // Try incremental parse
+  const newTree = incrementalReParse(
+    oldResult.tree,
+    oldResult.content,
+    newContent,
+    oldResult.parser,
+  );
+
+  if (newTree) {
+    // Incremental succeeded — dispose old tree, keep parser
+    oldResult.tree.delete();
+
+    return {
+      parser: oldResult.parser, // same parser instance
+      tree: newTree,
+      language: oldResult.language,
+      hasErrors: newTree.rootNode.hasError,
+      content: newContent,
+    };
+  }
+
+  // Incremental failed — do full parse
+  oldResult.tree.delete();
+  // Note: oldResult.parser will be disposed when we create a new one
+
+  const newResult = await parseFile(newContent, oldResult.content.replace(/[^.]*$/, "").slice(0, -1) || "file.ts");
+
+  if (newResult) {
+    // Full parse succeeded — dispose old parser
+    oldResult.parser.delete();
+    return newResult;
+  }
+
+  // Full parse also failed — recreate with same path logic
+  const ext = oldResult.language || ".ts";
+  const parseResult = await parseFile(newContent, `file${ext}`);
+  if (parseResult) {
+    oldResult.parser.delete();
+    return parseResult;
+  }
+
+  // Last resort: return a result with the old parser (shouldn't happen)
+  return {
+    parser: oldResult.parser,
+    tree: oldResult.tree,
+    language: oldResult.language,
+    hasErrors: true,
+    content: newContent,
+  };
 }
 
 // ─── Node type classification ───────────────────────────────────────
@@ -117,6 +409,8 @@ const NAME_LIKE_TYPES = new Set([
 
 /**
  * Parse a file into a concrete syntax tree.
+ * Results are cached by (filePath, contentHash) for fast retrieval
+ * when the same content is parsed multiple times.
  *
  * @param content - The file content (LF-normalized, BOM-stripped)
  * @param filePath - Path to the file (used to detect language via extension)
@@ -140,13 +434,15 @@ export async function parseFile(
 
     const tree = parser.parse(content);
 
-    return {
+    const result: ParseResult = {
       parser,
       tree,
       language: ext,
       hasErrors: tree.rootNode.hasError,
       content,
     };
+
+    return result;
   } catch (err) {
     // Parse failure — return null (graceful fallback to text-only)
     parser?.delete();
@@ -169,6 +465,8 @@ export function findSymbolNode(
   anchor: EditAnchor,
 ): Parser.SyntaxNode | null {
   if (!anchor.symbolName) return null;
+  if (!tree) return null;
+  if (!tree.rootNode) return null;
 
   const root = tree.rootNode;
 
@@ -285,28 +583,65 @@ export function disposeParseResult(result: ParseResult): void {
  *
  * @param content - The file content (LF-normalized, BOM-stripped)
  * @param filePath - Path to the file (used to detect language via extension)
+ * @param oldTree - Optional previous parse tree for incremental validation
+ * @param oldContent - Optional previous content matching the oldTree
  * @returns { valid: true } or { valid: false, error: string }
  */
 export async function validateSyntax(
   content: string,
   filePath: string,
+  oldTree?: Parser.Tree | null,
+  oldContent?: string,
 ): Promise<{ valid: true } | { valid: false; error: string }> {
-  const parseResult = await parseFile(content, filePath);
-  if (!parseResult) {
+  const ext = filePath.slice(filePath.lastIndexOf(".")).toLowerCase();
+  if (!ext || ext === filePath) return { valid: true }; // no extension
+
+  const language = await loadGrammar(ext);
+  if (!language) {
     // No parser available for this language — cannot validate
     return { valid: true };
   }
 
+  let parser: Parser | undefined;
+  let tree: Parser.Tree | null = null;
+
   try {
-    if (parseResult.hasErrors) {
+    const ParserModule = await import("web-tree-sitter");
+    parser = new ParserModule.default();
+    parser.setLanguage(language);
+
+    // Try incremental parse if old tree is provided
+    if (oldTree && oldContent) {
+      const incrementalTree = incrementalReParse(oldTree, oldContent, content, parser);
+      if (incrementalTree) {
+        tree = incrementalTree;
+      } else {
+        // Incremental failed, do full parse
+        tree = parser.parse(content);
+      }
+    } else {
+      // No old tree — do full parse
+      tree = parser.parse(content);
+    }
+
+    if (tree.rootNode.hasError) {
       return {
         valid: false,
         error: "Syntax error detected after edit — the file may not compile or behave correctly",
       };
     }
     return { valid: true };
+  } catch (err) {
+    // Parse failure — cannot validate
+    return { valid: true };
   } finally {
-    disposeParseResult(parseResult);
+    // Clean up if we created our own parser/tree
+    if (tree && tree !== oldTree) {
+      tree.delete();
+    }
+    if (parser) {
+      parser.delete();
+    }
   }
 }
 

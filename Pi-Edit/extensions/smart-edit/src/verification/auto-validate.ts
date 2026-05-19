@@ -17,6 +17,7 @@ import { resolve } from "path";
 import { detectLanguageFromExtension } from "../lsp/language-id";
 import { getCompilerForLanguage } from "../lsp/diagnostic-dispatcher";
 import type { Diagnostic, DiagnosticResult } from "../lsp/diagnostic-dispatcher";
+import type Parser from "web-tree-sitter";
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -49,6 +50,10 @@ export interface AutoValidateOptions {
   maxRetries?: number;
   /** Whether to run the full pipeline (default: true) */
   enabled?: boolean;
+  /** Optional previous parse tree for incremental syntax validation */
+  oldTree?: Parser.Tree | null;
+  /** Optional previous content matching the oldTree */
+  oldContent?: string;
 }
 
 // ─── Per-session retry tracking ──────────────────────────────────────
@@ -164,6 +169,8 @@ export async function runAutoValidation(
     cwd = process.cwd(),
     maxRetries = 3,
     enabled = true,
+    oldTree,
+    oldContent,
   } = options;
 
   if (!enabled) {
@@ -185,6 +192,21 @@ export async function runAutoValidation(
   // Run the structural check (may return errors)
   const structural = checkStructural(content, absolutePath);
 
+  // Run incremental syntax validation if old tree is available
+  let syntaxError: string | null = null;
+  if (oldTree && oldContent) {
+    try {
+      // Dynamic import to avoid circular dependency
+      const { validateSyntax } = await import("../../lib/ast-resolver.js");
+      const syntaxResult = await validateSyntax(content, filePath, oldTree, oldContent);
+      if (!syntaxResult.valid) {
+        syntaxError = syntaxResult.error;
+      }
+    } catch {
+      // Syntax validation failed — continue with other checks
+    }
+  }
+
   // Run compiler/linter diagnostics
   let diagnostics: Diagnostic[] = [];
   let diagnosticSource = "none";
@@ -205,8 +227,9 @@ export async function runAutoValidation(
 
   // Determine if validation passed
   const hasStructuralErrors = !structural.passed;
+  const hasSyntaxErrors = syntaxError !== null;
   const hasCompilerErrors = diagnostics.filter((d) => d.severity === 1).length > 0;
-  const passed = !hasStructuralErrors && !hasCompilerErrors;
+  const passed = !hasStructuralErrors && !hasSyntaxErrors && !hasCompilerErrors;
 
   // Only increment retry count on actual failure (matches index.ts pattern)
   const retryCount = passed
@@ -219,6 +242,9 @@ export async function runAutoValidation(
   const parts: string[] = [];
   if (hasStructuralErrors) {
     parts.push(`Structural: ${structural.errors.join("; ")}`);
+  }
+  if (hasSyntaxErrors && syntaxError) {
+    parts.push(`Syntax: ${syntaxError}`);
   }
   if (diagnostics.length > 0 && diagnosticSource !== "none") {
     const errors = diagnostics.filter((d) => d.severity === 1);

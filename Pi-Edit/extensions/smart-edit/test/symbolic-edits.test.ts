@@ -1,9 +1,13 @@
-import { describe, it } from "node:test";
+import { describe, it, before } from "node:test";
 import assert from "node:assert";
-import { createAstResolver } from "../lib/ast-resolver.js";
+import { createAstResolver, clearParseCache } from "../lib/ast-resolver.js";
 import { applySymbolicEdits, buildSymbolicEditGuidance, resolveSymbolicEditLineRange, isSymbolicEdit } from "../src/symbolic-edits.js";
 
 describe("symbolic edits", () => {
+  before(() => {
+    // Clear parse cache to ensure fresh parses between tests
+    clearParseCache();
+  });
   it("replaces a named symbol definition", async () => {
     const content = "function keep() { return 1; }\nfunction target() { return 1; }\n";
     const result = await applySymbolicEdits({
