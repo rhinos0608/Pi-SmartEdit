@@ -372,6 +372,18 @@ async function prepareArguments(input: Record<string, unknown>): Promise<Record<
       `  path: string   — path to the file to edit (relative or absolute)
 ` +
       `  edits: array   — one or more oldText/newText edit objects
+` +
+      `               OR edits: string — raw text in a supported format:
+` +
+      `                 • search/replace (<<<<<<< SEARCH blocks)
+` +
+      `                 • unified diff (--- a/ +++ b/ with @@ hunks)
+` +
+      `                 • OpenAI patch (*** Begin Patch)
+` +
+      `                 • Codex patch (*** Begin Patch with Add/Delete/Move)
+` +
+      `                 • Atomic Patch (*** Begin Atomic Patch, multi-file)
 
 ` +
       `Example:
@@ -444,7 +456,7 @@ async function prepareArguments(input: Record<string, unknown>): Promise<Record<
 
     // Validate parsed result is an array — clear diagnostic with snippet.
     // If it's not a valid JSON array, try multi-format detection first since
-    // the input could be a search/replace block, unified diff, or OpenAI patch.
+    // the input could be a search/replace block, unified diff, OpenAI/Codex patch, or Atomic Patch.
     if (!Array.isArray(parsed)) {
       const format = detectInputFormat(raw);
 

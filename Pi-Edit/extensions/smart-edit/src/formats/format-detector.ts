@@ -1,6 +1,14 @@
 /**
  * Auto-detection for multi-format input parsing.
  * Identifies which format the input string uses.
+ *
+ * Supported formats (auto-detected from raw text):
+ * - search_replace — `<<<<<<< SEARCH` blocks
+ * - unified_diff   — `--- a/` / `+++ b/` with `@@` hunks
+ * - openai_patch   — `*** Begin Patch` with unified-diff hunks (single-file)
+ * - codex_patch    — `*** Begin Patch` with `*** Add File:`, `*** Delete File:`, `*** Move to:`
+ * - atomic_patch   — `*** Begin Atomic Patch` envelope (multi-file: AddFile, DeleteFile, UpdateFile, RenameFile)
+ * - raw_edits      — fallback (JSON or unrecognized)
  */
 
 export type InputFormat = 'search_replace' | 'unified_diff' | 'openai_patch' | 'codex_patch' | 'atomic_patch' | 'raw_edits';
@@ -10,6 +18,7 @@ export type InputFormat = 'search_replace' | 'unified_diff' | 'openai_patch' | '
  * 
  * Detection rules:
  * - `<<<<<<< SEARCH` → search_replace
+ * - `*** Begin Atomic Patch` or `***Begin Atomic Patch` → atomic_patch
  * - `*** Begin Patch` or `***Begin Patch` (with or without space) →
  *   - `codex_patch` if patch contains `*** Add File:`, `*** Delete File:`, or `*** Move to:`
  *   - `openai_patch` otherwise (simple update-only patches)
