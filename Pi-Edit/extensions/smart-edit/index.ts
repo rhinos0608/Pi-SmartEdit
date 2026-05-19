@@ -494,7 +494,7 @@ async function prepareArguments(input: Record<string, unknown>): Promise<Record<
               // Atomic patches are handled via enqueueAtomicPatch in the edit flow
               // For now, extract path hints from the envelope for multi-file support
               const { envelope } = parseAtomicPatchEnvelope(raw);
-              
+
               // Collect unique paths from the envelope
               const paths = new Set<string>();
               for (const op of envelope.operations) {
@@ -509,15 +509,15 @@ async function prepareArguments(input: Record<string, unknown>): Promise<Record<
                   paths.add(op.newPath);
                 }
               }
-              
+
               // Store parsed envelope for later processing
               (args as Record<string, unknown>).__atomicPatchEnvelope = envelope;
-              
+
               // If no path hint from args, use first path from envelope
               if (paths.size > 0 && !args.path) {
                 args.path = Array.from(paths)[0];
               }
-              
+
               // Extract first UpdateFile's patches as edit items
               for (const op of envelope.operations) {
                 if (op.kind === 'UpdateFile') {

@@ -70,7 +70,7 @@ export const foo = "bar";
 
     const result = parseAtomicPatchEnvelope(input);
     assert.strictEqual(result.envelope.operations.length, 1);
-    
+
     const op = result.envelope.operations[0];
     assert.strictEqual(op.kind, 'AddFile');
     assert.strictEqual(op.path, 'src/new.ts');
@@ -84,7 +84,7 @@ export const foo = "bar";
 
     const result = parseAtomicPatchEnvelope(input);
     assert.strictEqual(result.envelope.operations.length, 1);
-    
+
     const op = result.envelope.operations[0];
     assert.strictEqual(op.kind, 'DeleteFile');
     assert.strictEqual(op.path, 'src/old.ts');
@@ -99,7 +99,7 @@ export const foo = "bar";
 
     const result = parseAtomicPatchEnvelope(input);
     assert.strictEqual(result.envelope.operations.length, 1);
-    
+
     const op = result.envelope.operations[0];
     assert.strictEqual(op.kind, 'UpdateFile');
     assert.strictEqual(op.path, 'src/existing.ts');
@@ -115,7 +115,7 @@ export const foo = "bar";
 
     const result = parseAtomicPatchEnvelope(input);
     assert.strictEqual(result.envelope.operations.length, 1);
-    
+
     const op = result.envelope.operations[0];
     assert.strictEqual(op.kind, 'RenameFile');
     assert.strictEqual(op.oldPath, 'src/old.ts');
@@ -166,7 +166,7 @@ export const foo = "bar";`;
 
     const result = parseAtomicPatchEnvelope(input);
     assert.strictEqual(result.envelope.operations.length, 1);
-    
+
     const op = result.envelope.operations[0] as { kind: 'UpdateFile'; path: string; movePath?: string };
     assert.strictEqual(op.kind, 'UpdateFile');
     assert.strictEqual(op.path, 'src/old.ts');
@@ -557,7 +557,7 @@ describe("malformed envelope handling", () => {
 
   test("handles empty paths in rename", () => {
     const input = `*** Begin Atomic Patch
-*** Rename File: -> 
+*** Rename File: ->
 *** End Atomic Patch`;
 
     const result = parseAtomicPatchEnvelope(input);
