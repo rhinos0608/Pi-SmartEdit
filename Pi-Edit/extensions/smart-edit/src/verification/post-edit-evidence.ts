@@ -24,6 +24,7 @@ import { isVerificationActive } from "./config";
 import type { VerificationConfig } from "./types";
 import type { PostEditEvidenceResult, ConcurrencyEvidence } from "./types";
 import type { ChangedTarget } from "./types";
+import type { RepairLoopResult } from "./repair-loop";
 
 // ─── Public API ─────────────────────────────────────────────────────
 
@@ -63,9 +64,10 @@ export async function runPostEditEvidencePipeline(
   const concurrency: ConcurrencyEvidence[] = [];
   let traceability = null;
   const history: Awaited<ReturnType<typeof retrieveHistory>> = [];
+  let repairResult: RepairLoopResult | null = null;
 
   if (!isVerificationActive(config)) {
-    return { notes, details: { changes, concurrency, traceability, history } };
+    return { notes, details: { changes, concurrency, traceability, history, repair: null } };
   }
 
   // ── Phase A: Build changed targets ──
@@ -225,6 +227,27 @@ export async function runPostEditEvidencePipeline(
     }
   }
 
+  // ── Phase E: Edit Repair Loop (Aider-style lint-fix) ──
+  if (config.repair.enabled && changes.length > 0) {
+    try {
+      const { runRepairLoop: repairLoopFn } = await import("./repair-loop");
+      repairResult = await repairLoopFn(input.path, input.content, {
+        maxRetries: config.repair.maxRetries,
+        retryDelayMs: 0,
+      });
+
+      if (!repairResult.passed) {
+        notes.push(
+          `⚠ Repair loop: edit failed validation after ${repairResult.attempts.length} attempt(s). ${repairResult.finalValidation?.shouldDecompose ? "Consider decomposing the task." : ""}`,
+        );
+      }
+    } catch (err) {
+      notes.push(
+        `ℹ Evidence (repair): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   return {
     notes,
     details: {
@@ -232,6 +255,7 @@ export async function runPostEditEvidencePipeline(
       concurrency,
       traceability,
       history,
+      repair: repairResult,
     },
   };
 }
@@ -258,6 +282,10 @@ function mergeConfig(partial?: Partial<VerificationConfig>): VerificationConfig 
     history: {
       ...defaults.history,
       ...(partial.history ?? {}),
+    },
+    repair: {
+      ...defaults.repair,
+      ...(partial.repair ?? {}),
     },
   };
 }

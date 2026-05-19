@@ -69,6 +69,8 @@ export interface VerificationConfig {
   traceability: TraceabilityConfig;
   /** Historical context retrieval config */
   history: HistoryConfig;
+  /** Edit repair loop config (Aider-style lint-fix pattern) */
+  repair: RepairConfig;
 }
 
 export interface ConcurrencyConfig {
@@ -119,6 +121,26 @@ export interface HistoryConfig {
   maxChars: number;
   /** Include git blame annotations */
   includeBlame: boolean;
+}
+
+/**
+ * Configuration for the edit repair loop (Aider-style lint-fix pattern).
+ *
+ * When enabled, the repair loop:
+ *   1. Validates edits with runAutoValidation
+ *   2. On failure, records the attempt and notifies registered hooks
+ *   3. Retries up to maxRetries with configurable delay
+ *   4. Signals decomposition when retries are exhausted
+ */
+export interface RepairConfig {
+  /** Enable the repair loop */
+  enabled: boolean;
+  /** Max retry attempts before declaring failure (default: 3) */
+  maxRetries: number;
+  /** Whether to attempt automatic repairs on failure (default: true) */
+  autoRepair: boolean;
+  /** Notify registered repair hooks after each attempt (default: true) */
+  notifyOnRetry: boolean;
 }
 
 // ─── Evidence results ───────────────────────────────────────────────
@@ -202,5 +224,7 @@ export interface PostEditEvidenceResult {
     traceability: TraceabilityEvidence | null;
     /** Historical context per target */
     history: HistoryEvidence[];
+    /** Repair loop results (null if repair is disabled or not triggered) */
+    repair: import("./repair-loop").RepairLoopResult | null;
   };
 }

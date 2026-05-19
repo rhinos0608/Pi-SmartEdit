@@ -13,6 +13,7 @@ import type {
   ConcurrencyConfig,
   TraceabilityConfig,
   HistoryConfig,
+  RepairConfig,
 } from "./types";
 
 /**
@@ -28,6 +29,7 @@ export function defaultVerificationConfig(): VerificationConfig {
     concurrency: defaultConcurrencyConfig(),
     traceability: defaultTraceabilityConfig(),
     history: defaultHistoryConfig(),
+    repair: defaultRepairConfig(),
   };
 }
 
@@ -64,6 +66,15 @@ export function defaultHistoryConfig(): HistoryConfig {
   };
 }
 
+export function defaultRepairConfig(): RepairConfig {
+  return {
+    enabled: false, // Opt-in — significant behavior change
+    maxRetries: 3,
+    autoRepair: true,
+    notifyOnRetry: true,
+  };
+}
+
 /**
  * Deep-merge a partial config over the defaults.
  * Only defined fields from `partial` override the corresponding defaults.
@@ -88,6 +99,9 @@ export function mergeVerificationConfig(
     history: partial.history
       ? mergeHistoryConfig(base.history, partial.history)
       : base.history,
+    repair: partial.repair
+      ? mergeRepairConfig(base.repair, partial.repair)
+      : base.repair,
   };
 }
 
@@ -120,6 +134,14 @@ export function mergeHistoryConfig(
   base: HistoryConfig,
   partial?: Partial<HistoryConfig>,
 ): HistoryConfig {
+  if (!partial) return base;
+  return { ...base, ...partial };
+}
+
+export function mergeRepairConfig(
+  base: RepairConfig,
+  partial?: Partial<RepairConfig>,
+): RepairConfig {
   if (!partial) return base;
   return { ...base, ...partial };
 }
