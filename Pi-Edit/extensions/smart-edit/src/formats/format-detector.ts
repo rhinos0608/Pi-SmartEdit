@@ -3,7 +3,7 @@
  * Identifies which format the input string uses.
  */
 
-export type InputFormat = 'search_replace' | 'unified_diff' | 'openai_patch' | 'codex_patch' | 'raw_edits';
+export type InputFormat = 'search_replace' | 'unified_diff' | 'openai_patch' | 'codex_patch' | 'atomic_patch' | 'raw_edits';
 
 /**
  * Detect the input format from the raw input string.
@@ -24,6 +24,11 @@ export function detectInputFormat(input: string): InputFormat {
   const firstLine = trimmed.split('\n')[0].trim();
   if (trimmed.includes('<<<<<<< SEARCH')) {
     return 'search_replace';
+  }
+
+  // Check for atomic patch envelope first (more specific than codex patch)
+  if (firstLine.startsWith('*** Begin Atomic Patch') || firstLine.startsWith('***Begin Atomic Patch')) {
+    return 'atomic_patch';
   }
 
   if (firstLine.startsWith('*** Begin Patch') || firstLine.startsWith('***Begin Patch')) {

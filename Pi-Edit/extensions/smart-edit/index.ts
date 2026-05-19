@@ -43,6 +43,7 @@ import { parseSearchReplace } from "./src/formats/search-replace";
 import { parseUnifiedDiffToEditItems } from "./src/formats/unified-diff";
 import { parseOpenAIPatch, openAIPatchToEditItem } from "./src/formats/openai-patch";
 import { parseCodexPatch, codexHunkToEditItem } from "./src/formats/codex-patch";
+import { enqueueAtomicPatch, parseAtomicPatchEnvelope, type AtomicPatchEnvelope } from "./src/formats/atomic-patch";
 import { StreamingPatchParser } from "./src/formats/streaming-patch-parser";
 
 import { LSPManager } from "./src/lsp/lsp-manager";
@@ -486,6 +487,48 @@ async function prepareArguments(input: Record<string, unknown>): Promise<Record<
                 }
                 const items = codexHunkToEditItem(hunk, fileOldContents);
                 parsedEdits.push(...items);
+              }
+              break;
+            }
+            case 'atomic_patch': {
+              // Atomic patches are handled via enqueueAtomicPatch in the edit flow
+              // For now, extract path hints from the envelope for multi-file support
+              const { envelope } = parseAtomicPatchEnvelope(raw);
+              
+              // Collect unique paths from the envelope
+              const paths = new Set<string>();
+              for (const op of envelope.operations) {
+                if (op.kind === 'AddFile' || op.kind === 'DeleteFile' || op.kind === 'UpdateFile') {
+                  paths.add(op.path);
+                }
+                if (op.kind === 'UpdateFile' && op.movePath) {
+                  paths.add(op.movePath);
+                }
+                if (op.kind === 'RenameFile') {
+                  paths.add(op.oldPath);
+                  paths.add(op.newPath);
+                }
+              }
+              
+              // Store parsed envelope for later processing
+              (args as Record<string, unknown>).__atomicPatchEnvelope = envelope;
+              
+              // If no path hint from args, use first path from envelope
+              if (paths.size > 0 && !args.path) {
+                args.path = Array.from(paths)[0];
+              }
+              
+              // Extract first UpdateFile's patches as edit items
+              for (const op of envelope.operations) {
+                if (op.kind === 'UpdateFile') {
+                  for (const patch of op.patches) {
+                    parsedEdits.push({
+                      path: op.movePath ?? op.path,
+                      oldText: patch.oldText,
+                      newText: patch.newText,
+                    });
+                  }
+                }
               }
               break;
             }
