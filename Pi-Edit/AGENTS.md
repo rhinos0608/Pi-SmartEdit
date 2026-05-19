@@ -5,11 +5,11 @@
 ## 🛡️ Core Operational Mandates
 1.  **Verify First:** No file mutation (`edit`, `write`) is permitted until both the **Stale File Guard** and the **Range Coverage Guard** have been satisfied for that specific file/range in the current session context.
 2.  **Prefer Contextual Search:** Before reading entire files, leverage specialized tools like `semantic_context` to retrieve type definitions, interfaces, and references scoped to a small region of interest. This minimizes token usage and maximizes focus.
-3.  **Prioritize Precision Over Speed:** For any code modification, the agent must prioritize: **Hashline Match $\rightarrow$ AST Scoping $\rightarrow$ Text Match**. Only fall through tiers if higher precision methods fail. Never blindly rely on a full-text search result.
+3.  **Prioritize Precision Over Speed:** For any code modification, the agent must prioritize: **AST Scoping $\rightarrow$ Text Match**. Only fall through tiers if higher precision methods fail. Never blindly rely on a full-text search result.
 4.  **Handle Failure as Information:** An error is not just an interruption; it is a data point. When mutation fails, the agent must analyze the actionable error message (which includes context/corrected anchors) to inform its next action (e.g., retry with corrected parameters, or escalate).
 
 ## 🗂️ Durable Tool Usage Rules
-*   **`edit` Tool:** Use only when high confidence is established via Tiers 1 or 2 of the matching pipeline. If the system detects low coverage or a stale file, *do not proceed*.
+*   **`edit` Tool:** Use only when high confidence is established via AST scoping or text matching. If the system detects low coverage or a stale file, *do not proceed*.
 *   **`todo` Management:** All complex work must be managed by creating a `pending` task. Agents must transition tasks through status changes (`in_progress`, `completed`) to provide an auditable trail of progress and state at any given time.
 *   **Tool Chaining/Subagents:** For large, multi-phase operations (e.g., Feature $\rightarrow$ Test $\rightarrow$ Document), always use a chain or subagent delegation (`pi-subagents`). This isolates context and prevents the main session from becoming overloaded.
 

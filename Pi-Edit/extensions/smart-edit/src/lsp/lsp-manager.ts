@@ -5,47 +5,51 @@
  * and graceful fallback when servers are unavailable.
  */
 
+import { constants } from "fs";
 import { access } from "fs/promises";
+import { delimiter } from "path";
 import { resolve } from "path";
 
 import { LSPConnection } from "./lsp-connection";
 
-interface ServerConfig {
+export interface ServerConfig {
   command: string;
   args: string[];
   languageIds: string[];
 }
 
-/**
- * Manages LSP server connections for multiple language types.
- * Servers are started lazily (on first request) and reused across edits.
- *
- * Usage:
- *   const manager = new LSPManager("/path/to/project");
- *   const server = await manager.getServer("typescript");
- *   // Use server...
- *   await manager.shutdown();
- */
-export class LSPManager {
-  private connections = new Map<string, LSPConnection>();
-  private rootUri: string;
+export interface ManagedLSPConnection {
+  initialize(rootUri: string): Promise<unknown>;
+  shutdown(): Promise<void>;
+  request(method: string, params?: unknown, signal?: AbortSignal): Promise<unknown>;
+  notify(method: string, params?: unknown): Promise<void>;
+  onNotification?(method: string, handler: (params: unknown) => void): () => void;
+  isRunning?(): boolean;
+  serverCapabilities?: unknown;
+}
 
-  /**
-   * Pre-configured LSP servers, discovered via PATH.
-   * Each server handles one or more language IDs.
-   *
-   * NOTE: Multiple configs may target the same languageIds (e.g., both
-   * "typescript-language-server" and "typescriptlangserver" serve
-   * TypeScript/JavaScript). getServer returns the first successfully
-   * connected server and caches it per languageId — the backup config
-   * is never tried once a server is registered. This means if the first
-   * config's binary is found but fails to connect, the second config
-   * will not be attempted (the languageId key is already in the map
-   * at that point). Consider expanding the retry logic if this becomes
-   * an issue in practice.
-   */
+export interface LSPManagerOptions {
+  serverConfigs?: ServerConfig[];
+  connectionFactory?: (command: string, args: string[]) => ManagedLSPConnection;
+  findExecutable?: (command: string) => Promise<string | null>;
+}
+
+export interface LSPServerHealth {
+  languageId: string;
+  active: boolean;
+  running: boolean;
+  command?: string;
+}
+
+export class LSPManager {
+  private connections = new Map<string, ManagedLSPConnection>();
+  private connectionConfigs = new Map<string, ServerConfig>();
+  private rootUri: string;
+  private serverConfigs: ServerConfig[];
+  private connectionFactory: (command: string, args: string[]) => ManagedLSPConnection;
+  private findExecutableOverride?: (command: string) => Promise<string | null>;
+
   private static readonly SERVER_CONFIGS: ServerConfig[] = [
-    // TypeScript / JavaScript
     {
       command: "typescript-language-server",
       args: ["--stdio"],
@@ -56,7 +60,6 @@ export class LSPManager {
       args: ["--stdio"],
       languageIds: ["typescript", "typescriptreact", "javascript", "javascriptreact"],
     },
-    // Python
     {
       command: "pyright",
       args: ["--stdio"],
@@ -77,19 +80,16 @@ export class LSPManager {
       args: ["--stdio"],
       languageIds: ["python"],
     },
-    // Rust
     {
       command: "rust-analyzer",
       args: ["--stdio"],
       languageIds: ["rust"],
     },
-    // Go
     {
       command: "gopls",
       args: [],
       languageIds: ["go"],
     },
-    // Java
     {
       command: "java",
       args: ["-jar", "${JDT_LS_JAR}", "--stdio"],
@@ -100,31 +100,26 @@ export class LSPManager {
       args: [],
       languageIds: ["java"],
     },
-    // Ruby
     {
       command: "solargraph",
       args: ["--stdio"],
       languageIds: ["ruby"],
     },
-    // JSON
     {
       command: "vscode-json-language-server",
       args: ["--stdio"],
       languageIds: ["json"],
     },
-    // HTML
     {
       command: "vscode-html-language-server",
       args: ["--stdio"],
       languageIds: ["html"],
     },
-    // CSS
     {
       command: "vscode-css-language-server",
       args: ["--stdio"],
       languageIds: ["css"],
     },
-    // Markdown
     {
       command: "marksman",
       args: ["--stdio"],
@@ -132,107 +127,132 @@ export class LSPManager {
     },
   ];
 
-  constructor(cwd: string) {
+  constructor(cwd: string, options: LSPManagerOptions = {}) {
     this.rootUri = `file://${resolve(cwd)}`;
+    this.serverConfigs = options.serverConfigs ?? LSPManager.SERVER_CONFIGS;
+    this.connectionFactory = options.connectionFactory ?? ((command, args) => new LSPConnection(command, args));
+    this.findExecutableOverride = options.findExecutable;
   }
 
-  /**
-   * Get or create an LSP server connection for a given language ID.
-   * Returns null if no server is configured for the language or no
-   * configured server can be successfully initialized.
-   *
-   * @param languageId  LSP language ID (e.g., "typescript", "python")
-   * @returns The LSP connection, or null if unavailable
-   */
-  async getServer(languageId: string): Promise<LSPConnection | null> {
-    // Return existing connection if available
+  async getServer(languageId: string): Promise<ManagedLSPConnection | null> {
     const existing = this.connections.get(languageId);
-    if (existing) return existing;
+    if (existing) {
+      if (this.isConnectionRunning(existing)) return existing;
+      await this.removeServer(languageId);
+    }
 
-    // Find all matching server configs
-    const configs = LSPManager.SERVER_CONFIGS.filter((c) =>
-      c.languageIds.includes(languageId)
+    const configs = this.serverConfigs.filter((config) =>
+      config.languageIds.includes(languageId),
     );
     if (configs.length === 0) return null;
 
     for (const config of configs) {
-      // Check if command exists in PATH
-      const commandPath = await this.findInPath(config.command);
-      if (!commandPath) {
-        continue;
-      }
+      const commandPath = await this.findExecutable(config.command);
+      if (!commandPath) continue;
 
-      // Resolve runtime config values (e.g., JDT_LS_JAR for Java)
-      let args = [...config.args];
-      if (config.languageIds.includes("java")) {
-        const jdtLsJar = process.env.JDT_LS_JAR;
-        if (!jdtLsJar) {
-          console.warn("[smart-edit] JDT_LS_JAR environment variable is not set for Java LSP");
-          continue;
-        }
-        // Substitute the jar path
-        args = args.map((arg) =>
-          arg === "${JDT_LS_JAR}" ? jdtLsJar : arg
-        );
-      }
+      const args = this.resolveArgs(config);
+      if (!args) continue;
 
-      // Start and initialize server
-      let conn: LSPConnection | undefined;
+      let conn: ManagedLSPConnection | null = null;
       try {
-        conn = new LSPConnection(commandPath, args);
+        conn = this.connectionFactory(commandPath, args);
         await conn.initialize(this.rootUri);
-        // Only cache after successful initialization
         this.connections.set(languageId, conn);
+        this.connectionConfigs.set(languageId, config);
         return conn;
       } catch (err) {
         console.warn(`[smart-edit] Failed to start LSP server "${config.command}":`, err);
-        // Clean up failed connection attempt
         if (conn) {
-          try {
-            await conn.shutdown();
-          } catch {
-            // Ignore cleanup errors
-          }
+          await conn.shutdown().catch(() => undefined);
         }
-        // Continue to the next config if available
       }
     }
 
     return null;
   }
 
-  /**
-   * Gracefully shut down all active LSP server connections.
-   */
-  async shutdown(): Promise<void> {
-    const shutdowns: Promise<void>[] = [];
-    for (const [, conn] of this.connections) {
-      shutdowns.push(
-        conn
-          .shutdown()
-          .catch(() => {/* ignore shutdown errors */})
-      );
-    }
-    await Promise.all(shutdowns);
-    this.connections.clear();
+  async restartServer(languageId: string): Promise<ManagedLSPConnection | null> {
+    await this.removeServer(languageId);
+    return this.getServer(languageId);
   }
 
-  /**
-   * Search PATH for an executable by name.
-   * Returns the full path if found, or null if not in PATH.
-   *
-   * NOTE: Splits PATH on ":" — this assumes a Unix-like (macOS/Linux)
-   * environment. Windows uses ";" as separator.
-   */
+  async removeServer(languageId: string): Promise<void> {
+    const existing = this.connections.get(languageId);
+    this.connections.delete(languageId);
+    this.connectionConfigs.delete(languageId);
+    if (existing) {
+      await existing.shutdown().catch(() => undefined);
+    }
+  }
+
+  getActiveLanguages(): string[] {
+    return [...this.connections.entries()]
+      .filter(([, connection]) => this.isConnectionRunning(connection))
+      .map(([languageId]) => languageId)
+      .sort();
+  }
+
+  async hasSuitableServer(languageId: string): Promise<boolean> {
+    const configs = this.serverConfigs.filter((config) =>
+      config.languageIds.includes(languageId),
+    );
+
+    for (const config of configs) {
+      if (!this.resolveArgs(config)) continue;
+      if (await this.findExecutable(config.command)) return true;
+    }
+    return false;
+  }
+
+  getServerHealth(languageId: string): LSPServerHealth {
+    const connection = this.connections.get(languageId);
+    const config = this.connectionConfigs.get(languageId);
+    return {
+      languageId,
+      active: Boolean(connection),
+      running: connection ? this.isConnectionRunning(connection) : false,
+      command: config?.command,
+    };
+  }
+
+  async shutdown(): Promise<void> {
+    const shutdowns: Promise<void>[] = [];
+    for (const languageId of this.connections.keys()) {
+      shutdowns.push(this.removeServer(languageId));
+    }
+    await Promise.all(shutdowns);
+  }
+
+  private resolveArgs(config: ServerConfig): string[] | null {
+    if (!config.languageIds.includes("java")) return [...config.args];
+    const jdtLsJar = process.env.JDT_LS_JAR;
+    if (!jdtLsJar && config.args.includes("${JDT_LS_JAR}")) {
+      console.warn("[smart-edit] JDT_LS_JAR environment variable is not set for Java LSP");
+      return null;
+    }
+    return config.args.map((arg) => arg === "${JDT_LS_JAR}" ? jdtLsJar ?? arg : arg);
+  }
+
+  private isConnectionRunning(connection: ManagedLSPConnection): boolean {
+    return connection.isRunning ? connection.isRunning() : true;
+  }
+
+  private async findExecutable(command: string): Promise<string | null> {
+    if (this.findExecutableOverride) {
+      return this.findExecutableOverride(command);
+    }
+    return this.findInPath(command);
+  }
+
   private async findInPath(command: string): Promise<string | null> {
-    const paths = (process.env.PATH || "").split(":");
+    const paths = (process.env.PATH || "").split(delimiter);
     for (const dir of paths) {
       const fullPath = resolve(dir, command);
       try {
-        await access(fullPath);
+        await access(fullPath, constants.X_OK);
         return fullPath;
       } catch {
-        // Not in this directory — try next
+        // Try next PATH entry.
       }
     }
     return null;

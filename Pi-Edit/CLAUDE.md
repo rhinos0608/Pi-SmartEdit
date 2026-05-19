@@ -12,19 +12,15 @@ All edits must pass two initial safety checks before proceeding:
 1.  **Stale File Guard (`read-cache.ts`):** Compares file metadata (mtime, size, hash). If the file has changed since the last session read, the edit is blocked, and an actionable error with current context is provided.
 2.  **Range Coverage Guard:** Ensures that every line targeted by `oldText` actually exists within a section of the file that was explicitly loaded in the current session (preventing edits to unseen code).
 
-If the guards pass, one of these four matching strategies attempts the replacement:
+If the guards pass, one of these matching strategies attempts the replacement:
 
-###  Tier 1: Hashline Anchored Edit (`hashline.ts`, `hashline-edit.ts`)
-*   **Mechanism:** Edits target specific line hashes (`LINE+HASH` e.g., `'42ab'`) rather than reproducing surrounding text.
-*   **Benefit:** Zero-text reproduction, extremely fast matching ($\mu$s/line), and immediate freshness verification via the anchor itself. This is the preferred path for stability.
-
-###  Tier 2: AST Scoping Fallback (`ast-resolver.ts`)
-*   **Mechanism:** If `hashline` fails or is unavailable, the system attempts to scope the search using Tree-sitter AST symbols (name and kind). The search for `oldText` is confined to the byte range of the target symbol (e.g., inside a specific function body).
+###  Tier 1: AST Scoping (`ast-resolver.ts`)
+*   **Mechanism:** The search for `oldText` is confined to the byte range of the target symbol (e.g., inside a specific function body), using Tree-sitter AST symbols (name and kind).
 *   **Benefit:** Provides contextual disambiguation, preventing false positives when identical variable names exist across different scopes.
 
-###  Tier 3: Standard Text Matching (`edit-diff.ts`)
-*   **Mechanism:** The classic 4-tier pipeline (Exact $\rightarrow$ Indentation $\rightarrow$ Unicode $\rightarrow$ Similarity). This is the final fallback for ambiguous cases that survive the higher tiers.
-*   **Limitation:** Inherently susceptible to minor text drift, which is why Tiers 1 and 2 exist.
+###  Tier 2: Standard Text Matching (`edit-diff.ts`)
+*   **Mechanism:** The classic 4-tier pipeline (Exact $\rightarrow$ Indentation $\rightarrow$ Unicode $\rightarrow$ Similarity). This is the final fallback for ambiguous cases that survive AST scoping.
+*   **Limitation:** Inherently susceptible to minor text drift.
 
 ##  Key Engineering Artifacts
 
@@ -33,4 +29,4 @@ If the guards pass, one of these four matching strategies attempts the replaceme
 *   **Actionable Diagnostics:** Errors are not vague. They contain the file path, line range, similarity score (where applicable), and crucially, hints or corrected anchors to facilitate immediate self-correction by the LLM.
 
 ## Usage Guidelines
-Always leverage `semantic_context` before making edits on unfamiliar types/symbols. Use `hashline`-anchored inputs for maximum reliability when available.
+Always leverage `semantic_context` before making edits on unfamiliar types/symbols.

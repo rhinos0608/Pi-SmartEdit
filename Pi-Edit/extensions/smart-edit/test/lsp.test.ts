@@ -9,6 +9,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert";
 import { normalizeLocations, goToDefinitions, getDocumentSymbols } from "../src/lsp/semantic-nav.js";
 import { withOpenDocument } from "../src/lsp/document-sync.js";
+import { LSPManager } from "../src/lsp/lsp-manager.js";
 
 // Mock LSPConnection
 class MockLSPConnection {
@@ -156,6 +157,97 @@ describe("LSP Foundational Components", () => {
         assert.strictEqual(maxActive, 1, "Operations did not serialize");
         // Each op should have done a didOpen and didClose because they are serialized.
         assert.strictEqual(server.notifications.length, 6);
+    });
+  });
+
+  describe("LSPManager lifecycle", () => {
+    it("falls back to the next server config after startup failure", async () => {
+      const started: string[] = [];
+      const manager = new LSPManager("/tmp", {
+        serverConfigs: [
+          { command: "missing", args: [], languageIds: ["typescript"] },
+          { command: "working", args: ["--stdio"], languageIds: ["typescript"] },
+        ],
+        findExecutable: async (command) => `/bin/${command}`,
+        connectionFactory(command) {
+          started.push(command);
+          if (command.endsWith("missing")) {
+            return {
+              async initialize() { throw new Error("boom"); },
+              async shutdown() {},
+              async request() { return null; },
+              async notify() {},
+              isRunning() { return false; },
+            };
+          }
+          return {
+            async initialize() { return {}; },
+            async shutdown() {},
+            async request() { return null; },
+            async notify() {},
+            isRunning() { return true; },
+          };
+        },
+      });
+
+      const server = await manager.getServer("typescript");
+
+      assert.ok(server);
+      assert.deepStrictEqual(started, ["/bin/missing", "/bin/working"]);
+      assert.deepStrictEqual(manager.getActiveLanguages(), ["typescript"]);
+    });
+
+    it("restarts dead cached servers", async () => {
+      let generation = 0;
+      const running = new Map<number, boolean>();
+      const manager = new LSPManager("/tmp", {
+        serverConfigs: [{ command: "server", args: [], languageIds: ["typescript"] }],
+        findExecutable: async (command) => command,
+        connectionFactory() {
+          const id = ++generation;
+          running.set(id, true);
+          return {
+            async initialize() { return {}; },
+            async shutdown() { running.set(id, false); },
+            async request() { return null; },
+            async notify() {},
+            isRunning() { return running.get(id) === true; },
+          };
+        },
+      });
+
+      const first = await manager.getServer("typescript");
+      await first?.shutdown();
+      const second = await manager.getServer("typescript");
+
+      assert.notStrictEqual(first, second);
+      assert.strictEqual(generation, 2);
+    });
+
+    it("reports suitable and active languages", async () => {
+      const manager = new LSPManager("/tmp", {
+        serverConfigs: [{ command: "server", args: [], languageIds: ["go", "typescript"] }],
+        findExecutable: async (command) => command === "server" ? "/bin/server" : null,
+        connectionFactory() {
+          return {
+            async initialize() { return {}; },
+            async shutdown() {},
+            async request() { return null; },
+            async notify() {},
+            isRunning() { return true; },
+          };
+        },
+      });
+
+      assert.strictEqual(await manager.hasSuitableServer("go"), true);
+      assert.strictEqual(await manager.hasSuitableServer("python"), false);
+      assert.deepStrictEqual(manager.getActiveLanguages(), []);
+      await manager.getServer("typescript");
+      assert.deepStrictEqual(manager.getActiveLanguages(), ["typescript"]);
+      await manager.restartServer("typescript");
+      assert.deepStrictEqual(manager.getActiveLanguages(), ["typescript"]);
+      await manager.removeServer("typescript");
+      assert.deepStrictEqual(manager.getActiveLanguages(), []);
     });
   });
 });

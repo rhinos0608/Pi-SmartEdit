@@ -15,9 +15,7 @@ A Pi coding agent extension that overrides the built-in `edit` tool with safer, 
 │   ├── path-utils.ts     # Path resolution (resolveToCwd)
 │   ├── ast-resolver.ts   # Tree-sitter AST parsing, symbol resolution
 │   ├── conflict-detector.ts  # AST-level conflict detection between edits
-│   ├── grammar-loader.ts # Lazy-loads tree-sitter WASM grammars
-│   ├── hashline.ts       # Line hashing for zero-text-reproduction editing
-│   └── hashline-edit.ts  # Hashline-anchored edit application layer
+│   └── grammar-loader.ts # Lazy-loads tree-sitter WASM grammars
 ├── src/
 │   ├── formats/          # Multi-format parsers (search/replace, unified diff, OpenAI patch)
 │   └── lsp/              # LSP integration (connection, diagnostics, semantic nav)
@@ -33,7 +31,6 @@ A Pi coding agent extension that overrides the built-in `edit` tool with safer, 
 5. **Conflict detection** (`conflict-detector.ts`) — cross-edit semantic conflict tracking
 6. **Atomic writes** (`index.ts:atomicWrite`) — temp file + rename with mode preservation
 7. **Post-edit validation** — AST syntax check + LSP diagnostics
-8. **Hashline editing** (`hashline.ts`, `hashline-edit.ts`) — anchor-based editing with freshness checks
 
 ## Conventions
 
@@ -54,6 +51,5 @@ npx tsx --test test/<file>  # Run individual test file
 ## Dependencies
 
 - `web-tree-sitter` + `@vscode/tree-sitter-wasm` — AST parsing
-- `xxhash-wasm` — fast line hashing for hashline anchors
 - `diff` — unified diff generation and parsing
 - `typebox` — JSON schema for tool parameter validation

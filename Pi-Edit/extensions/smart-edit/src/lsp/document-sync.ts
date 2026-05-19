@@ -8,7 +8,9 @@
  * diagnostics, semantic retrieval, and other concurrent LSP operations.
  */
 
-import type { LSPConnection } from "./lsp-connection";
+interface OpenDocumentConnection {
+  notify(method: string, params?: unknown): Promise<void>;
+}
 
 // In-memory locks per document URI to serialize operations
 const locks = new Map<string, Promise<void>>();
@@ -30,7 +32,7 @@ const openDocuments = new Set<string>();
  * 5. Send textDocument/didClose in finally (only if we opened it).
  */
 export async function withOpenDocument<T>(
-  server: LSPConnection,
+  server: OpenDocumentConnection,
   input: {
     uri: string;
     languageId: string;

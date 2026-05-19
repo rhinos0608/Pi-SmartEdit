@@ -15,8 +15,7 @@
 
 import { resolve } from "path";
 
-import type { LSPConnection } from "./lsp-connection";
-import type { LSPManager } from "./lsp-manager";
+import type { LSPManager, ManagedLSPConnection } from "./lsp-manager";
 
 export interface Diagnostic {
   message: string;
@@ -51,7 +50,7 @@ export interface DiagnosticResult {
  * @param timeoutMs Max time to wait (ms)
  */
 function waitForDiagnostics(
-  conn: LSPConnection,
+  conn: ManagedLSPConnection,
   uri: string,
   timeoutMs: number,
 ): Promise<Diagnostic[]> {
@@ -66,7 +65,7 @@ function waitForDiagnostics(
     // Don't let this timer keep Node alive if everything else is done
     timer.unref();
 
-    const unsubscribe = conn.onNotification(
+    const unsubscribe = conn.onNotification?.(
       "textDocument/publishDiagnostics",
       (params) => {
         const typedParams = params as { uri?: string; diagnostics?: Diagnostic[] };
@@ -84,7 +83,7 @@ function waitForDiagnostics(
           done(allDiagnostics);
         }
       },
-    );
+    ) ?? (() => undefined);
 
     function done(diagnostics: Diagnostic[]) {
       if (didResolve) return;

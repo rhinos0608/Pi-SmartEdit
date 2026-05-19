@@ -47,6 +47,9 @@ export class LSPConnection {
   private pending = new Map<number, PendingCallback>();
   private buffer = "";
   private notificationHandlers = new Map<string, Array<(params: unknown) => void>>();
+  private closed = false;
+  private exitCode: number | null = null;
+  private exitSignal: NodeJS.Signals | null = null;
   public serverCapabilities: unknown;
 
   /**
@@ -73,6 +76,9 @@ export class LSPConnection {
 
     // Handle process exit
     this.process.on("exit", (code, signal) => {
+      this.closed = true;
+      this.exitCode = code;
+      this.exitSignal = signal;
       if (code !== 0 && code !== null) {
         // Server exited with error — reject all pending requests
         for (const [, cb] of this.pending) {
@@ -90,6 +96,7 @@ export class LSPConnection {
     });
 
     this.process.on("error", (err) => {
+      this.closed = true;
       // Process spawn failed — reject all pending requests
       for (const [, cb] of this.pending) {
         cb.reject(err);
@@ -99,6 +106,15 @@ export class LSPConnection {
 
     // Allow Node event loop to exit even if this child is still running
     this.process.unref();
+  }
+
+  isRunning(): boolean {
+    return !this.closed;
+  }
+
+  getExitState(): { code: number | null; signal: NodeJS.Signals | null } | null {
+    if (!this.closed) return null;
+    return { code: this.exitCode, signal: this.exitSignal };
   }
 
   /**
@@ -150,6 +166,9 @@ export class LSPConnection {
    * @throws If the request times out (5s) or the server returns an error
    */
   async request(method: string, params?: unknown, signal?: AbortSignal): Promise<unknown> {
+    if (this.closed) {
+      return Promise.reject(new Error(`LSP request "${method}" failed because the server is not running`));
+    }
     if (signal?.aborted) {
       return Promise.reject(new Error(`LSP request "${method}" was aborted`));
     }
@@ -200,6 +219,7 @@ export class LSPConnection {
    * @param params  Notification parameters
    */
   async notify(method: string, params?: unknown): Promise<void> {
+    if (this.closed) return;
     this.write({ jsonrpc: "2.0", method, params });
   }
 
@@ -234,6 +254,11 @@ export class LSPConnection {
    * indexing state, and other in-flight work before termination.
    */
   async shutdown(): Promise<void> {
+    if (this.closed) {
+      this.pending.clear();
+      this.notificationHandlers.clear();
+      return;
+    }
     try {
       await this.request("shutdown");
     } catch {
@@ -248,6 +273,7 @@ export class LSPConnection {
 
     this.process.stdin?.end();
     this.process.kill();
+    this.closed = true;
     this.pending.clear();
     this.notificationHandlers.clear();
   }

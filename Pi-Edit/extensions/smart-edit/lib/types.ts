@@ -20,15 +20,6 @@ export interface EditAnchor {
   symbolLine?: number;
 }
 
-/** Line-range hint to narrow the search scope for oldText matching */
-export interface LineRange {
-  /** 1-based start line (inclusive). Refers to file as last read. */
-  startLine: number;
-
-  /** 1-based end line (inclusive). Defaults to startLine if omitted. */
-  endLine?: number;
-}
-
 /** Search scope that narrows where findText searches for oldText */
 export interface SearchScope {
   /** Byte offset into the content where searching begins */
@@ -41,20 +32,40 @@ export interface SearchScope {
   source: "anchor" | "lineRange" | "intersection";
 }
 
+// ─── Target / Anchor types ────────────────────────────────────────────
+
+/**
+ * Unified anchor for targeting a symbol by name OR name-path.
+ * Discriminated: at least one of `name` or `namePath` must be present.
+ */
+export type SymbolEditTarget =
+  | { readonly name: string; namePath?: string; kind?: string; line?: number }
+  | { readonly name?: string; readonly namePath: string; kind?: string; line?: number };
+
+export type EditCapability =
+  | "oldText"
+  | "replaceAll"
+  | "astAnchor"
+  | "hashline"
+  | "symbolicEdit"
+  | "semanticContext"
+  | "lspDiagnostics"
+  | "compilerDiagnostics"
+  | "scopedDiagnostics";
+
 export interface EditItem {
   oldText: string;
   newText: string;
   replaceAll?: boolean;
   description?: string;
+  symbol?: SymbolEditTarget;
+  replaceBody?: string;
+  insertBefore?: string;
+  insertAfter?: string;
 
   /** AST-based disambiguation hint. If provided, oldText must match
    *  within the byte range of the described AST node. */
   anchor?: EditAnchor;
-
-  /** Line-range hint to narrow the search scope for oldText matching.
-   *  When provided, oldText is only searched within the specified line range.
-   *  If not found, falls back to whole-file search with a matchNote. */
-  lineRange?: LineRange;
 }
 
 export interface EditInput {
@@ -236,6 +247,19 @@ export interface EditResult {
       range: { start: { line: number; character: number }; end: { line: number; character: number } };
       source?: string;
       filePath?: string;
+    }>;
+    editCapabilities?: EditCapability[];
+    scopedDiagnostics?: Array<{
+      diagnostic: {
+        message: string;
+        severity: 1 | 2 | 3 | 4;
+        range: { start: { line: number; character: number }; end: { line: number; character: number } };
+        source?: string;
+        filePath?: string;
+      };
+      scope: "edited-symbol" | "referencing-symbol" | "same-file" | "other-file";
+      targetName?: string;
+      referenceCount?: number;
     }>;
   };
 }

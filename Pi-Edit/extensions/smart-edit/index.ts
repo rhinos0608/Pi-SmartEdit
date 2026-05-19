@@ -20,7 +20,6 @@ import {
   applyEdits,
   detectLineEnding,
   generateDiffString,
-  lineRangeToByteRange,
   normalizeToLF,
   restoreLineEndings,
   stripBom,
@@ -54,18 +53,24 @@ import type { DiagnosticResult } from "./src/lsp/diagnostic-dispatcher";
 import { runPostEditEvidencePipeline } from "./src/verification/post-edit-evidence";
 import { defaultVerificationConfig } from "./src/verification/config";
 import type { PostEditEvidenceResult } from "./src/verification/types";
+import { scopeDiagnosticsToChangedTargets } from "./src/verification/scoped-diagnostics";
+import type { ScopedDiagnostic } from "./src/verification/scoped-diagnostics";
 import { recordBreakage, recordCoChange } from "./src/smartread-bridge";
 import { getSmartEditRuntimeConfig } from "./src/edit-mode";
 import { checkEditSafety } from "./src/safety/approval-gating";
 import { saveUndoState } from "./src/undo/edit-history";
 import { atomicWrite } from "./src/undo/atomic-write";
+import { repairJson } from "./src/formats/forgiving-parser";
+import { runAutoValidation, formatValidationFeedback, resetRetryCounts, checkStructural, incrementRetryCount as incRetryCount } from "./src/verification/auto-validate";
+import { applySymbolicEdits, buildSymbolicEditGuidance, isSymbolicEdit, resolveSymbolicEditLineRange } from "./src/symbolic-edits";
+import type { SymbolicEditRequest } from "./src/symbolic-edits";
 
 import type {
   EditAnchor,
   EditItem,
   EditInput,
   EditResult,
-  LineRange,
+  EditCapability,
   MatchSpan,
   SearchScope,
 } from "./lib/types";
@@ -73,7 +78,7 @@ import type {
 const smartEditRuntimeConfig = getSmartEditRuntimeConfig();
 
 // ─── Schema (must match built-in edit schema exactly) ──────────────
-// Extra properties like `replaceAll`, `anchor`, `lineRange` are stripped
+// Extra properties like `replaceAll`, `anchor` are stripped
 // by prepareArguments before validation, then restored in execute().
 
 const editItemSchema = Type.Object(
@@ -119,111 +124,64 @@ const editItemSchema = Type.Object(
         },
       ),
     ),
-    lineRange: Type.Optional(
+
+    symbol: Type.Optional(
       Type.Object(
         {
-          startLine: Type.Number({
-            description: "1-based start line (inclusive). Refers to file as last read.",
-          }),
-          endLine: Type.Optional(
-            Type.Number({
-              description:
-                "1-based end line (inclusive). Defaults to startLine if omitted.",
-            }),
-          ),
+          name: Type.Optional(Type.String({ description: "Symbol name to edit." })),
+          namePath: Type.Optional(Type.String({ description: "Symbol path; the final component is matched by AST name." })),
+          kind: Type.Optional(Type.String({ description: "AST node kind to require, such as function_declaration or class_declaration." })),
+          line: Type.Optional(Type.Number({ description: "1-based symbol line hint used to disambiguate duplicate names." })),
         },
         {
-          description:
-            "Line-range hint to narrow the search scope for oldText matching. " +
-            "When provided, oldText is only searched within the specified lines. " +
-            "If not found within the range, falls back to whole-file search.",
+          description: "Symbolic edit target. Provide exactly one of replaceBody, insertBefore, or insertAfter with this field.",
         },
       ),
     ),
+    replaceBody: Type.Optional(Type.String({ description: "Replace the entire AST symbol definition with this text." })),
+    insertBefore: Type.Optional(Type.String({ description: "Insert this text immediately before the AST symbol definition." })),
+    insertAfter: Type.Optional(Type.String({ description: "Insert this text immediately after the AST symbol definition." })),
 
-    // ── Hashline-anchored edit variant ──────────────────────
-    // Experimental schema: instead of oldText/newText, use anchor+content.
-    // The anchor is a LINE+ID hash (e.g. "42ab") that the model sees in read output.
-    // This eliminates the need for text reproduction and enables freshness checking.
-    hashline: Type.Optional(
+    // ── Semantic context request ────────────────────────────────
+    // Request semantic context (type definitions, implementations, references)
+    // to be retrieved before applying this edit. The context is returned as part
+    // of the edit result so the model can understand the code being modified.
+    semanticContext: Type.Optional(
       Type.Object(
         {
-          symbol: Type.Optional(
-            Type.Object(
-              {
-                name: Type.String({
-                  description:
-                    "Name of the enclosing symbol (function, class, etc.) " +
-                    "to disambiguate edits within identically-structured code blocks.",
-                }),
-                kind: Type.Optional(
-                  Type.String({
-                    description:
-                      "Kind of symbol (e.g., 'function', 'method', 'class'). " +
-                      "If omitted, all symbol kinds matching the name are considered.",
-                  }),
-                ),
-                line: Type.Optional(
-                  Type.Number({
-                    description:
-                      "1-based line number hint for where the symbol's name appears. " +
-                      "Used to disambiguate symbols with the same name.",
-                  }),
-                ),
-              },
-              {
-                description:
-                  "AST symbol scoping hint. If provided, stale hashline anchors " +
-                  "fall back to scoped fuzzy matching within the symbol's byte range " +
-                  "instead of the full 4-tier pipeline.",
-              },
-            ),
-          ),
-          range: Type.Object(
-            {
-              pos: Type.String({
-                description:
-                  "Start anchor: LINE+HASH of the first line to edit (inclusive). " +
-                  "E.g., '42ab' means line 42 with hash 'ab'. " +
-                  "Use 'EOF' or 'end' to append, 'start' or 'BOF' to prepend. " +
-                  "Append ':after' or ':before' for insert operations.",
-              }),
-              end: Type.String({
-                description:
-                  "End anchor: LINE+HASH of the last line to edit (inclusive). " +
-                  "For single-line edits, same as pos. " +
-                  "For insert after, use pos with ':after' and end=pos.",
-              }),
-            },
-            {
-              description:
-                "Hashline-anchored range for precise, freshness-checked edits. " +
-                "Anchors are computed on read and validated before applying. " +
-                "If the file changed, the edit is rejected with corrected anchors. " +
-                "Experimental: enabled only when SMART_EDIT_USE_HASHLINE_EDITING is on.",
-            },
-          ),
-          content: Type.Optional(
-            Type.Union([
-              Type.Array(Type.String()),
-              Type.String(),
-            ], {
-              description:
-                "Replacement content. Prefer string[] where each element is one logical line. " +
-                "A single multiline string is also accepted and hashline/read prefixes are stripped. " +
-                "Use [] (empty array) to delete the targeted range. " +
-                "Omit or use null to delete.",
+          path: Type.String({
+            description: "Path to the file to inspect semantically",
+          }),
+          lineRange: Type.Optional(
+            Type.Object({
+              startLine: Type.Number({ description: "1-based start line (inclusive)" }),
+              endLine: Type.Optional(Type.Number({ description: "1-based end line (inclusive)" })),
             }),
           ),
+          symbol: Type.Optional(
+            Type.Object({
+              name: Type.String({ description: "Symbol name (function, class, interface, etc.)" }),
+              kind: Type.Optional(Type.String({ description: "Kind hint (e.g., 'function', 'class', 'interface')" })),
+              line: Type.Optional(Type.Number({ description: "1-based line hint" })),
+            }),
+          ),
+          maxTokens: Type.Optional(Type.Number({ default: 3000, description: "Maximum tokens in the response" })),
+          maxDepth: Type.Optional(Type.Number({ default: 1, description: "Max depth for following references" })),
+          includeReferences: Type.Optional(Type.Union([
+            Type.Literal(false),
+            Type.Literal("examples"),
+            Type.Literal("all"),
+          ], { default: "examples" })),
+          includeImplementations: Type.Optional(Type.Boolean({ default: false })),
+          includeTypeDefinitions: Type.Optional(Type.Boolean({ default: true })),
+          includeHover: Type.Optional(Type.Boolean({ default: true })),
         },
         {
           description:
-            "Experimental edit format when hashline anchors are explicitly enabled. " +
-            "References LINE+ID anchors from the read output instead of reproducing text. " +
-            "Format: { hashline: { range: { pos: '42ab', end: '45cd' }, content: ['new lines'] } } " +
-            "Anchors are shown in read output (e.g., '42ab|function hello() {'). " +
-            "This format provides freshness checking and eliminates text reproduction errors. " +
-            "Prefer oldText/newText by default; enable hashline editing only for experimental use.",
+            "Request semantic context (type definitions, implementations, references) " +
+            "for the code being edited. The context is retrieved via LSP and included " +
+            "in the edit result. Use this instead of a separate semantic_context tool call " +
+            "when the code depends on types, interfaces, or symbols the model may not know.",
         },
       ),
     ),
@@ -238,15 +196,8 @@ const editSchema = Type.Object(
     edits: Type.Union([
       Type.Array(editItemSchema, {
         description:
-          "One or more targeted edits using oldText/newText or experimental hashline-anchored format. " +
-          "Each edit may reference LINE+ID anchors from the read output (e.g., '42ab|function hello() {'). " +
+          "One or more targeted edits using oldText/newText or symbol targets. " +
           "Edits are matched against the original file, not incrementally. " +
-          "\nFormat: { hashline: { range: { pos: '42ab', end: '45cd' }, content: ['new lines'] } } " +
-          "\n- Single-line edit: pos and end are the same anchor. " +
-          "\n- Append to file: pos='EOF', end='EOF'. " +
-          "\n- Prepend to file: pos='start', end='start'. " +
-          "\n- Insert after anchor: pos='42ab:after', end='42ab'. " +
-          "\n- Insert before anchor: pos='42ab:before', end='42ab'. " +
           "\nDo not include overlapping or nested edits — merge nearby changes into one edit.",
       }),
       Type.String({
@@ -310,26 +261,18 @@ function formatEditError(message: string, hint?: string): Error {
  * Returns the parsed result if any strategy succeeds, or undefined.
  */
 function tryRepairJSONString(raw: string): unknown {
-  // Strategy 1: escape literal newlines inside quoted string values
-  try {
-    const repaired = raw.replace(
-      /"(?:[^"\\\\]|\\.)*"/gs,
-      (match) => {
-        if (match.includes('\n') || match.includes('\r')) {
-          return match.replace(/\r?\n/g, '\\n').replace(/\r/g, '\\r');
-        }
-        return match;
-      },
-    );
-    if (repaired !== raw) {
-      const result = JSON.parse(repaired) as Record<string, unknown>;
-      if (result !== undefined) return result;
-    }
-  } catch {
-    // fall through to next strategy
+  // Delegate to the forgiving parser (SmallCode-inspired 7-strategy pipeline).
+  // The forgiving parser handles: as-is, trailing comma, wrap braces, strip
+  // markdown fences, extract {...} block, literal newline escape, and
+  // unbalanced brace fix — all with fuzzy key matching built in.
+  const forgivingResult = repairJson(raw, {
+    edit: ["path", "edits", "oldText", "newText", "replaceAll", "anchor", "symbol", "replaceBody", "insertBefore", "insertAfter", "semanticContext"],
+  });
+  if (forgivingResult.value !== undefined) {
+    return forgivingResult.value;
   }
 
-  // Strategy 2: truncated JSON array — extract complete edit objects.
+  // Strategy: truncated JSON array — extract complete edit objects.
   // Only activate when the string actually contains object braces so we
   // don't accidentally treat random non-JSON text (e.g. "[not valid")
   // as a truncated array.
@@ -587,8 +530,7 @@ async function prepareArguments(input: Record<string, unknown>): Promise<Record<
         }
         throw formatEditError(
           `edits was received as a JSON string but parsed into ${typeDesc}, not an array.`,
-          `edits must be an array of oldText/newText edit objects, or experimental hashline edit objects when enabled.\n` +
-          `Format: { oldText: '...', newText: '...' } or { hashline: { range: { pos: '42ab', end: '45cd' }, content: ['lines'] } }\n` +
+          `edits must be an array of edit objects with oldText/newText fields.\n` +
           `Raw value (${raw.length} chars) starts with:\n  ${snippet}\n\n` +
           `This typically happens when the JSON is improperly escaped or truncated.\n` +
           `Automatic repair was attempted but could not recover a valid edits array.\n` +
@@ -598,32 +540,42 @@ async function prepareArguments(input: Record<string, unknown>): Promise<Record<
     }
 
     // Validate each item is an object with required fields.
-    // Hashline edits are optional/experimental and may be disabled at runtime.
     const parsedArr = parsed as unknown[];
     for (let i = 0; i < parsedArr.length; i++) {
       const item = parsedArr[i] as Record<string, unknown>;
       if (item === null || typeof item !== "object") {
         throw formatEditError(
           `edits[${i}] is ${item === null ? "null" : `a ${typeof item}`}, not an object.`,
-          `Each element in edits must be an object with oldText/newText fields, or an experimental hashline field when enabled.`
+          `Each element in edits must be an object with oldText/newText fields.`
         );
       }
       const isHashlineEdit = item.hashline && typeof item.hashline === "object" &&
         (item.hashline as Record<string, unknown>).range;
-      if (!isHashlineEdit) {
+      const isSymbolEdit = isSymbolicEdit(item);
+      if (isSymbolEdit) {
+        const operationCount = [item.replaceBody, item.insertBefore, item.insertAfter]
+          .filter((value) => typeof value === "string")
+          .length;
+        if (operationCount !== 1) {
+          throw formatEditError(
+            `edits[${i}] is a symbol edit but does not provide exactly one symbolic operation.`,
+            `Use { symbol: { name: "myFunction" }, replaceBody: "..." } or insertBefore/insertAfter.`
+          );
+        }
+      }
+      if (!isHashlineEdit && !isSymbolEdit) {
         if (typeof item.oldText !== "string") {
           throw formatEditError(
             `edits[${i}].oldText is ${typeof item.oldText}, but must be a string.`,
             `oldText is the exact text to find in the file for replacement. ` +
-            `Alternatively, use hashline format only when hashline editing is enabled: ` +
-            `{ hashline: { range: { pos: '42ab', end: '45cd' }, content: [...] } }`
+            `Alternatively, use symbol edits.`
           );
         }
         if (typeof item.newText !== "string") {
           throw formatEditError(
             `edits[${i}].newText is ${typeof item.newText}, but must be a string.`,
             `newText is the replacement text to write in place of oldText. ` +
-            `Alternatively, use hashline format with content array when experimental hashline editing is enabled.`
+            `Alternatively, use symbol edits.`
           );
         }
       }
@@ -640,8 +592,7 @@ async function prepareArguments(input: Record<string, unknown>): Promise<Record<
       });
       if (hasHashlineEdits) {
         throw formatEditError(
-          "Hashline edits are disabled by default.",
-          "Use oldText/newText edits for the normal fuzzy-matching path, or set SMART_EDIT_USE_HASHLINE_EDITING=1 to enable the experimental hashline path."
+          "Hashline edits are disabled."
         );
       }
     }
@@ -692,8 +643,8 @@ async function prepareArguments(input: Record<string, unknown>): Promise<Record<
   if (Array.isArray(args.edits)) {
     const flags: boolean[] = [];
     const anchors: (EditAnchor | undefined)[] = [];
-    const ranges: (LineRange | undefined)[] = [];
     const hashlines: (Record<string, unknown> | undefined)[] = [];
+    const symbols: (Record<string, unknown> | undefined)[] = [];
 
     for (const edit of args.edits as Array<Record<string, unknown>>) {
       // replaceAll
@@ -712,14 +663,6 @@ async function prepareArguments(input: Record<string, unknown>): Promise<Record<
         anchors.push(undefined);
       }
 
-      // lineRange
-      if (edit.lineRange && typeof edit.lineRange === 'object') {
-        ranges.push(edit.lineRange as unknown as LineRange);
-        delete edit.lineRange;
-      } else {
-        ranges.push(undefined);
-      }
-
       // hashline
       if (edit.hashline && typeof edit.hashline === 'object') {
         hashlines.push(edit.hashline as Record<string, unknown>);
@@ -727,18 +670,34 @@ async function prepareArguments(input: Record<string, unknown>): Promise<Record<
       } else {
         hashlines.push(undefined);
       }
+
+      if (isSymbolicEdit(edit)) {
+        symbols.push({
+          symbol: edit.symbol,
+          replaceBody: edit.replaceBody,
+          insertBefore: edit.insertBefore,
+          insertAfter: edit.insertAfter,
+          description: edit.description,
+        });
+        delete edit.symbol;
+        delete edit.replaceBody;
+        delete edit.insertBefore;
+        delete edit.insertAfter;
+      } else {
+        symbols.push(undefined);
+      }
     }
 
     const hasFlags = flags.some((f) => f);
     const hasAnchors = anchors.some((a) => a);
-    const hasRanges = ranges.some((r) => r);
     const hasHashlines = hashlines.some((h) => h);
-    if (hasFlags || hasAnchors || hasRanges || hasHashlines) {
+    const hasSymbols = symbols.some((h) => h);
+    if (hasFlags || hasAnchors || hasHashlines || hasSymbols) {
       const extraData = {
         replaceAllFlags: hasFlags ? flags : null,
         anchorData: hasAnchors ? anchors : null,
-        lineRangeData: hasRanges ? ranges : null,
         hashlineData: hasHashlines ? hashlines : null,
+        symbolData: hasSymbols ? symbols : null,
       };
       if (typeof args.path === "string" && !args.path.includes("??smartEditExtra=")) {
         args.path = args.path + "??smartEditExtra=" + Buffer.from(JSON.stringify(extraData)).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -761,8 +720,7 @@ function validateInput(
   ) {
     throw formatEditError(
       "Edit tool input is invalid: edits must contain at least one edit.",
-      "Make sure edits is an array of edit objects using oldText/newText, or experimental hashline format when enabled: " +
-      "{ hashline: { range: { pos: '42ab', end: '45cd' }, content: ['lines'] } }."
+      "Make sure edits is an array of edit objects with oldText/newText fields."
     );
   }
 
@@ -770,8 +728,7 @@ function validateInput(
     const edits = input.edits as Array<Record<string, unknown>>;
     if (edits.some((edit) => Boolean(edit?.hashline && typeof edit.hashline === "object" && (edit.hashline as Record<string, unknown>).range))) {
       throw formatEditError(
-        "Hashline edits are disabled by default.",
-        "Use oldText/newText edits for the normal fuzzy-matching path, or set SMART_EDIT_USE_HASHLINE_EDITING=1 to enable the experimental hashline path."
+        "Hashline edits are disabled."
       );
     }
   }
@@ -864,23 +821,12 @@ async function resolveAnchorToScope(
         }
       }
     } catch {
-      // AST resolution failed — fall through to lineRange
+      // AST resolution failed
     } finally {
       if (parseResult) {
         astResolver?.disposeParseResult(parseResult);
       }
     }
-  }
-
-  // Priority 2: Line range
-  if (edit.lineRange && edit.lineRange.startLine >= 1) {
-    const range = lineRangeToByteRange(content, edit.lineRange);
-    return {
-      startIndex: range.startIndex,
-      endIndex: range.endIndex,
-      description: `lines ${edit.lineRange.startLine}–${edit.lineRange.endLine ?? edit.lineRange.startLine}`,
-      source: "lineRange",
-    };
   }
 
   return null;
@@ -1279,6 +1225,35 @@ export default function smartEdit(pi: ExtensionAPI) {
           // Track write as a read (write-then-edit flow bypasses stale guard)
           const lines = content.split("\n");
           recordReadSession(writePath, process.cwd(), 1, -1, lines.length, "write");
+
+          // ── Auto-validation hook (SmallCode-inspired) ──
+          // After a write, run structural + compiler/linter validation.
+          // Feed errors back as structured data on the event for the model to see.
+          //
+          // VALIDATION IS ADVISORY: runAutoValidation runs asynchronously and may
+          // complete after this handler returns. Consumers MUST NOT rely on
+          // event.validationFeedback being present synchronously. The promise is
+          // intentionally fire-and-forget so write results are not blocked by
+          // validation overhead — the model receives diagnostics as a later signal
+          // rather than a blocking response. See formatValidationFeedback for the
+          // shape of validation feedback that gets attached to the event object.
+          runAutoValidation(writePath, content, {
+            cwd: process.cwd(),
+            maxRetries: 3,
+            enabled: true,
+          }).then((validationResult) => {
+            if (!validationResult.passed) {
+              const feedback = formatValidationFeedback(validationResult);
+              if (feedback) {
+                const ev = event as unknown as Record<string, unknown>;
+                ev.validationFeedback = feedback;
+                ev.validationRetries = validationResult.retryCount;
+                ev.shouldDecompose = validationResult.shouldDecompose;
+              }
+            }
+          }).catch(() => {
+            // Validation is advisory — silent degradation
+          });
         }
       } catch {
         // File might not exist yet or can't be read — skip silently
@@ -1297,10 +1272,11 @@ export default function smartEdit(pi: ExtensionAPI) {
     // Create LSP manager for semantic intelligence
     lspManager = new LSPManager(process.cwd());
 
-    // Clear conflict history on session start
+    // Clear conflict history and retry counts on session start
     if (conflictDetector) {
       conflictDetector.clearAll();
     }
+    resetRetryCounts();
   });
 
   // ── Shutdown on session end ──
@@ -1317,17 +1293,16 @@ export default function smartEdit(pi: ExtensionAPI) {
     name: "edit",
     label: "edit",
     description:
-      "Edit a single file using oldText/newText fuzzy matching by default. Experimental hashline-anchored edits are available only when explicitly enabled. " +
+      "Edit a single file. Proactively use symbol edits for whole function/class/method replacements or insertions; use oldText/newText for small local changes. " +
       "If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. " +
       "Do not include large unchanged regions just to connect distant changes.",
 
     promptSnippet:
-      "Make precise file edits using oldText/newText fuzzy matching by default. Use experimental hashline anchors only when explicitly enabled.",
+      "Make precise file edits. Prefer symbol edits for whole-symbol changes, oldText/newText for narrow local edits.",
 
     promptGuidelines: [
-      "Use oldText/newText edits as the default path. They keep the normal fuzzy-matching flow and work with the current LSP and AST helpers.",
-      "Use hashline anchors only when SMART_EDIT_USE_HASHLINE_EDITING is enabled. Each line in the read output has a LINE+ID prefix (e.g., '42ab|function hello() {').",
-      "Format hashline edits as: { hashline: { range: { pos: '42ab', end: '45cd' }, content: ['new line 1', 'new line 2'] } }. For single-line edits, pos and end are the same anchor. Use 'EOF' or 'end' to append, 'start' or 'BOF' to prepend. Append ':after' or ':before' to an anchor for insert operations.",
+      "Proactively use symbol edits for whole function/class/method replacements or insertions: { symbol: { name: 'handleRequest' }, replaceBody: 'function handleRequest(...) { ... }' }. This avoids reproducing oldText for large semantic units.",
+      "Use oldText/newText for small, exact local changes inside a symbol, import tweaks, config values, or other non-symbol edits.",
       "Use multiple edits in one call for independent changes to the same file. All edits are matched against the original file content, not incrementally.",
       "Do not emit overlapping edits — merge nearby changes into one edit. Keep content arrays concise — only include lines that change.",
       "Before editing code that depends on custom types, imported factories, interfaces, or unfamiliar symbols, call semantic_context for the target range instead of reading whole dependency files.",
@@ -1472,6 +1447,26 @@ export default function smartEdit(pi: ExtensionAPI) {
             }
           }
 
+          if (!editLineRange && extraData?.symbolData) {
+            let minStart = Infinity;
+            let maxEnd = -Infinity;
+            for (const symbolEdit of extraData.symbolData as unknown[]) {
+              if (!symbolEdit) continue;
+              const range = await resolveSymbolicEditLineRange({
+                content: normalizeToLF(stripBom(rawContent).text),
+                filePath: path,
+                astResolver,
+                edit: symbolEdit as Omit<SymbolicEditRequest, "editIdx">,
+              });
+              if (!range) continue;
+              if (range[0] < minStart) minStart = range[0];
+              if (range[1] > maxEnd) maxEnd = range[1];
+            }
+            if (minStart !== Infinity && maxEnd !== -Infinity) {
+              editLineRange = [minStart, maxEnd];
+            }
+          }
+
           if (editLineRange) {
             const coverageResult = checkRangeCoverage(path, cwd, editLineRange[0], editLineRange[1]);
             if (!coverageResult.covered) {
@@ -1490,12 +1485,13 @@ export default function smartEdit(pi: ExtensionAPI) {
           // ── Re-inject replaceAll/anchor/lineRange from extracted extra data ──
           const localFlags = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).replaceAllFlags as unknown[] ?? null : null;
           const localAnchors = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).anchorData as unknown[] ?? null : null;
-          const localRanges = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).lineRangeData as unknown[] ?? null : null;
           const localHashlines = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).hashlineData as unknown[] ?? null : null;
+          const localSymbols = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).symbolData as unknown[] ?? null : null;
 
           // Separate hashline edits from legacy edits
           const totalLines = rawContent.split("\n").length;
           const hashlineEdits: Array<{ editIdx: number; sortLine: number; hashline: Record<string, unknown> }> = [];
+          const symbolicEdits: SymbolicEditRequest[] = [];
           const legacyEdits: Array<{ editIdx: number; edit: EditItem }> = [];
 
           for (let i = 0; i < edits.length; i++) {
@@ -1508,20 +1504,24 @@ export default function smartEdit(pi: ExtensionAPI) {
                 getHashlineAnchorLine(range?.end ?? "", totalLines) ?? 0,
               );
               hashlineEdits.push({ editIdx: i, sortLine, hashline });
+            } else if (localSymbols?.[i]) {
+              symbolicEdits.push({
+                ...(localSymbols[i] as Omit<SymbolicEditRequest, "editIdx">),
+                editIdx: i,
+              });
             } else {
               // Guard: hashline-only edit with no oldText can't go through legacy pipeline
               // This happens when the hashline side-channel (path-encoded extraData) fails to decode.
               if (typeof rawEdit.oldText !== "string") {
                 throw new Error(
-                  `edits[${i}] has no oldText and no recoverable hashline data. ` +
-                  `This edit was sent as hashline format but the anchor data was lost during tool parameter processing. ` +
+                  `edits[${i}] has no oldText and no recoverable hashline or symbol data. ` +
+                  `This edit was sent as hashline or symbol format but the side-channel data was lost during tool parameter processing. ` +
                   `Re-read the file and retry the edit.`
                 );
               }
               // Restore replaceAll/anchor/lineRange
               if (localFlags?.[i]) (edits[i] as unknown as Record<string, unknown>).replaceAll = true;
               if (localAnchors?.[i]) (edits[i] as unknown as Record<string, unknown>).anchor = localAnchors[i];
-              if (localRanges?.[i]) (edits[i] as unknown as Record<string, unknown>).lineRange = localRanges[i];
               legacyEdits.push({ editIdx: i, edit: edits[i] });
             }
           }
@@ -1532,7 +1532,14 @@ export default function smartEdit(pi: ExtensionAPI) {
           // ── Collect match notes and conflict warnings ──
           const matchNotes: string[] = [];
           const conflictWarnings: string[] = [];
-          let resultMatchSpans: MatchSpan[] = [];
+          const editCapabilities = new Set<EditCapability>();
+          if (hashlineEdits.length > 0) editCapabilities.add("hashline");
+          if (symbolicEdits.length > 0) editCapabilities.add("symbolicEdit");
+          if (legacyEdits.length > 0) editCapabilities.add("oldText");
+          if (legacyEdits.some(({ edit }) => edit.replaceAll)) editCapabilities.add("replaceAll");
+          if (legacyEdits.some(({ edit }) => edit.anchor)) editCapabilities.add("astAnchor");
+          if (edits.some((edit) => (edit as unknown as Record<string, unknown>).semanticContext !== undefined)) editCapabilities.add("semanticContext");
+          const resultMatchSpans: MatchSpan[] = [];
           let replacementCount = 0;
 
           // ── Soft hashline feedback ──
@@ -1541,7 +1548,7 @@ export default function smartEdit(pi: ExtensionAPI) {
             const snapshot = getSnapshot(path, cwd);
             if (snapshot?.hashline?.anchors && snapshot.hashline.anchors.size > 0) {
               const needsLegacy = legacyEdits.some(
-                ({ edit }) => edit.replaceAll || edit.anchor || edit.lineRange
+                ({ edit }) => edit.replaceAll || edit.anchor
               );
               if (!needsLegacy) {
                 const anchorExamples: string[] = [];
@@ -1652,12 +1659,51 @@ export default function smartEdit(pi: ExtensionAPI) {
             }
           }
 
-          // ── Phase B: Apply legacy edits (if any) ──
+          // ── Phase B: Apply symbolic AST edits (if any) ──
+          if (symbolicEdits.length > 0) {
+            const symbolicPreview = await applySymbolicEdits({
+              content: normalizedContent,
+              filePath: path,
+              astResolver,
+              edits: symbolicEdits,
+            });
+
+            const symbolicSpans = symbolicPreview.matchSpans.map((s) => ({
+              startIndex: s.matchIndex,
+              endIndex: s.matchIndex + s.matchLength,
+            }));
+
+            if (conflictDetector && symbolicSpans.length > 0) {
+              conflictDetector.captureBaseline(path);
+              const conflicts = await conflictDetector.checkDeltaConflicts(path, normalizedContent, symbolicSpans);
+              if (conflicts.length > 0) {
+                const conflictMessages = conflicts.map(
+                  (c) => `  - "${c.previousSymbol.name}" (${c.previousSymbol.kind}): ${c.suggestion}`,
+                );
+                const warningMsg =
+                  `⚠ Conflict detected with previous edit:\n` +
+                  conflictMessages.join("\n") +
+                  `\nConsider re-reading the file to get updated content.`;
+
+                if (defaultConflictConfig.onConflict === "error") {
+                  throw new Error(warningMsg);
+                }
+                conflictWarnings.push(warningMsg);
+              }
+            }
+
+            normalizedContent = symbolicPreview.newContent;
+            resultMatchSpans.push(...symbolicPreview.matchSpans);
+            replacementCount += symbolicPreview.applied.length;
+            matchNotes.push(...symbolicPreview.applied.map((edit) => `symbolic ${edit.operation}: ${edit.symbolName}`));
+          }
+
+          // ── Phase C: Apply legacy edits (if any) ──
           if (legacyEdits.length > 0) {
             // Resolve anchors to search scopes
             const resolvedScopes: (SearchScope | undefined)[] = [];
             for (const { edit } of legacyEdits) {
-              if (edit.anchor || edit.lineRange) {
+              if (edit.anchor) {
                 const scope = await resolveAnchorToScope(edit, normalizedContent, path);
                 resolvedScopes.push(scope ?? undefined);
               } else {
@@ -1712,8 +1758,18 @@ export default function smartEdit(pi: ExtensionAPI) {
 
             normalizedContent = legacyResult.newContent;
             matchNotes.push(...(legacyResult.matchNotes || []));
-            resultMatchSpans = legacyResult.matchSpans;
-            replacementCount = legacyResult.replacementCount;
+            const symbolicGuidance = await buildSymbolicEditGuidance({
+              content: baseContent,
+              filePath: path,
+              astResolver,
+              spans: legacyResult.matchSpans.map((s) => ({
+                startIndex: s.matchIndex,
+                endIndex: s.matchIndex + s.matchLength,
+              })),
+            });
+            matchNotes.push(...symbolicGuidance);
+            resultMatchSpans.push(...legacyResult.matchSpans);
+            replacementCount += legacyResult.replacementCount;
           }
 
           // ── Guard: no-op check ──
@@ -1735,6 +1791,73 @@ export default function smartEdit(pi: ExtensionAPI) {
           if (safetyResult.warnings.length > 0) {
             matchNotes.push(...safetyResult.warnings);
           }
+
+          // ── Semantic context retrieval (inline) ─────────────────────
+          // If any edit item requests semantic context, retrieve it before
+          // modifying the file. The context is included in the result so the
+          // model understands the code being modified without a separate call.
+          const semanticContextRequests = edits.filter(
+            (e) => (e as unknown as Record<string, unknown>).semanticContext !== undefined,
+          );
+          if (semanticContextRequests.length > 0 && lspManager) {
+            try {
+              for (const edit of semanticContextRequests) {
+                const semCtx = (edit as unknown as Record<string, unknown>).semanticContext as Record<string, unknown>;
+                const semPath = (semCtx.path as string) || path;
+                const semCwd = cwd;
+                const semAbsolutePath = resolve(semCwd, semPath);
+
+                // Check if file has been read (Safety guard)
+                const snapshot = getSnapshot(semPath, semCwd);
+                if (!snapshot) {
+                  matchNotes.push(
+                    `⚠ Cannot retrieve semantic context for ${semPath} — file has not been read in this session. Read it first, then retry.`
+                  );
+                  continue;
+                }
+
+                const semInput: SemanticContextInput = {
+                  path: semAbsolutePath,
+                  lineRange: semCtx.lineRange as { startLine: number; endLine?: number } | undefined,
+                  symbol: semCtx.symbol as { name: string; kind?: string; line?: number } | undefined,
+                  maxTokens: (semCtx.maxTokens as number) || 3000,
+                  maxDepth: (semCtx.maxDepth as number) || 1,
+                  includeReferences: (semCtx.includeReferences as "examples" | "all" | false) || "examples",
+                  includeImplementations: (semCtx.includeImplementations as boolean) || false,
+                  includeTypeDefinitions: (semCtx.includeTypeDefinitions as boolean) ?? true,
+                  includeHover: (semCtx.includeHover as boolean) ?? true,
+                };
+
+                const semResult = await buildSemanticContext(semInput, {
+                  cwd: semCwd,
+                  lspManager,
+                  astResolver: astResolver as unknown as AstResolverLike | null,
+                  async readFile(p: string) {
+                    return (await fsReadFile(resolve(semCwd, p))).toString('utf-8');
+                  },
+                  getSnapshot(p: string, c: string) {
+                    return getSnapshot(p, c);
+                  },
+                  recordRead(p: string, c: string, content: string, partial?: boolean) {
+                    recordRead(p, c, content, partial);
+                  },
+                  recordReadSession(p: string, c: string, lineRanges: Array<{ startLine: number; endLine: number }>) {
+                    for (const range of lineRanges) {
+                      recordReadSession(p, c, range.startLine, range.endLine - range.startLine + 1, 0, "semantic_context_inline");
+                    }
+                  },
+                });
+
+                // Include semantic context in match notes for display
+                matchNotes.push(`📋 Semantic context for ${semPath}:\n${semResult.markdown}`);
+              }
+            } catch (semError) {
+              // Semantic context is advisory — don't block the edit
+              const err = semError instanceof Error ? semError : new Error(String(semError));
+              matchNotes.push(`⚠ Semantic context retrieval failed: ${err.message}`);
+            }
+          }
+
 
           // ── Save undo state before write (non-blocking, fire-and-forget) ──
           saveUndoState(cwd, absolutePath, baseContent, edits.length).catch(() => {});
@@ -1818,7 +1941,10 @@ export default function smartEdit(pi: ExtensionAPI) {
             severity: 1 | 2 | 3 | 4;
             range: { start: { line: number; character: number }; end: { line: number; character: number } };
             source?: string;
+            filePath?: string;
           }> = [];
+          let scopedDiagnostics: ScopedDiagnostic[] = [];
+          let postEditEvidence: PostEditEvidenceResult | null = null;
           if (lspManager) {
             const languageId = detectLanguageFromExtension(path);
             if (languageId) {
@@ -1839,8 +1965,10 @@ export default function smartEdit(pi: ExtensionAPI) {
 
               // Aggregate results from both phases
               allDiagnostics = [...diagResult.diagnostics];
+              if (diagResult.source === "lsp") editCapabilities.add("lspDiagnostics");
               if (compilerResult.diagnostics.length > 0) {
                 allDiagnostics.push(...compilerResult.diagnostics);
+                editCapabilities.add("compilerDiagnostics");
               }
 
               // ── Record cross-file breakage edges (Smart-Edit → Pi-SmartRead bridge) ──
@@ -1884,6 +2012,34 @@ export default function smartEdit(pi: ExtensionAPI) {
                 // LSP is active and found no issues
                 matchNotes.push("✓ LSP validated: no issues found");
               }
+
+              // ── Auto-validation with retry tracking (SmallCode-inspired) ──
+              // Run structural check in addition to compiler diagnostics.
+              // Track retries: after N failed attempts, signal decomposition.
+              try {
+                const structural = checkStructural(normalizedContent, absolutePath);
+                if (!structural.passed) {
+                  matchNotes.push(`⚠ Structural: ${structural.errors.join("; ")}`);
+                }
+
+                // Only count as a retry if validation found issues
+                const hasErrors = !structural.passed || allDiagnostics.filter(d => d.severity === 1).length > 0;
+                if (hasErrors) {
+                  const retryCount = incRetryCount(cwd, path);
+                  const MAX_RETRIES = 3;
+                  if (retryCount > MAX_RETRIES) {
+                    matchNotes.push(
+                      `⚠ Decomposition suggested: ${retryCount} retries for ${path} (max ${MAX_RETRIES}). ` +
+                      `Break this task into smaller, independently-validatable steps. ` +
+                      `Consider: 1) write one function/section at a time, 2) validate each, 3) combine only after all pass.`
+                    );
+                  } else if (retryCount > 1) {
+                    matchNotes.push(`ℹ Retry ${retryCount}/${MAX_RETRIES} — validation still shows issues in ${path}.`);
+                  }
+                }
+              } catch {
+                // Auto-validation is advisory — silent degradation
+              }
             }
           }
 
@@ -1905,6 +2061,7 @@ export default function smartEdit(pi: ExtensionAPI) {
                 editedPaths: [absolutePath],
                 lspManager,
               });
+              postEditEvidence = evidence;
 
               // Record co-change edges from git history analysis
               // Each history entry tells us a file/symbol was changed alongside
@@ -1927,6 +2084,30 @@ export default function smartEdit(pi: ExtensionAPI) {
               }
             } catch {
               // Evidence pipeline failure is advisory — don't block the edit result
+            }
+          }
+
+          if (allDiagnostics.length > 0 && postEditEvidence) {
+            try {
+              scopedDiagnostics = await scopeDiagnosticsToChangedTargets({
+                cwd,
+                path: absolutePath,
+                content: normalizedContent,
+                languageId: detectLanguageFromExtension(path) ?? "unknown",
+                diagnostics: allDiagnostics,
+                changedTargets: postEditEvidence.details.changes,
+                lspManager,
+              });
+              if (scopedDiagnostics.length > 0) {
+                editCapabilities.add("scopedDiagnostics");
+                const editedCount = scopedDiagnostics.filter((d) => d.scope === "edited-symbol").length;
+                const referenceCount = scopedDiagnostics.filter((d) => d.scope === "referencing-symbol").length;
+                if (editedCount > 0 || referenceCount > 0) {
+                  matchNotes.push(`ℹ Scoped diagnostics: ${editedCount} inside edited symbol(s), ${referenceCount} at reference site(s).`);
+                }
+              }
+            } catch {
+              // Scoped diagnostics are advisory.
             }
           }
 
@@ -1954,6 +2135,8 @@ export default function smartEdit(pi: ExtensionAPI) {
               source?: string;
               filePath?: string;
             }>;
+            editCapabilities?: EditCapability[];
+            scopedDiagnostics?: ScopedDiagnostic[];
           } = {
             diff: diffResult.diff,
             firstChangedLine: diffResult.firstChangedLine,
@@ -1982,8 +2165,14 @@ export default function smartEdit(pi: ExtensionAPI) {
               severity: d.severity,
               range: d.range,
               source: d.source,
-              filePath: (d as Record<string, unknown>).filePath as string | undefined,
+              filePath: d.filePath,
             }));
+          }
+          if (editCapabilities.size > 0) {
+            details.editCapabilities = [...editCapabilities].sort();
+          }
+          if (scopedDiagnostics.length > 0) {
+            details.scopedDiagnostics = scopedDiagnostics;
           }
 
           return {
@@ -2028,86 +2217,6 @@ export default function smartEdit(pi: ExtensionAPI) {
     // ── TUI rendering (delegates to same diff rendering as built-in) ──
     // renderCall and renderResult are optional; Pi's built-in rendering
     // provides sensible defaults for tools with text results.
-  } as unknown));
-
-  // ── Register the semantic_context retrieval tool ──
-  (pi.registerTool as (t: unknown) => void)(({
-    name: "semantic_context",
-    label: "semantic_context",
-    description: `Retrieve semantic context (type definitions, interfaces, implementations, and examples) for a code range without reading whole files.
-
-Before editing code that depends on custom types, imported factories, interfaces, or unfamiliar symbols, call semantic_context for the target range instead of reading whole dependency files.
-
-Examples:
-  semantic_context({ path: "src/service.ts", lineRange: { startLine: 42, endLine: 78 }, maxTokens: 3000 })
-  semantic_context({ path: "src/types.ts", symbol: { name: "CreateOrderInput" } })
-  semantic_context({ path: "src/service.ts", lineRange: { startLine: 10, endLine: 30 }, includeReferences: "examples", includeTypeDefinitions: true, maxTokens: 1500 })`,
-
-    promptSnippet: "Retrieve type definitions, implementations, and examples for symbols in a range.",
-
-    parameters: semanticContextSchema as unknown as Record<string, unknown>,
-    renderShell: "self" as const,
-
-    async execute(
-      _toolCallId: string,
-      input: Record<string, unknown>,
-      signal: AbortSignal | undefined,
-      _onUpdate: ((update: { content: Array<{ type: "text"; text: string }> }) => void) | undefined,
-      _ctx: unknown,
-    ): Promise<{ content: Array<{ type: "text"; text: string }>; details?: Record<string, unknown> }> {
-      const cwd = process.cwd();
-      const path = input.path as string;
-      const absolutePath = resolve(cwd, path);
-
-      // Check if file has been read (Safety guard)
-      const snapshot = getSnapshot(path, cwd);
-      if (!snapshot) {
-        return {
-          content: [{
-            type: "text",
-            text: `Cannot retrieve semantic context for ${path} — this file has not been read in the current session. Read the file first, then retry semantic_context.`
-          }]
-        };
-      }
-
-      // Check if aborted
-      if (signal?.aborted) {
-        throw new Error("Operation aborted");
-      }
-
-      try {
-        const result = await buildSemanticContext(input as unknown as SemanticContextInput, {
-          cwd,
-          lspManager,
-          astResolver: astResolver as unknown as AstResolverLike | null,
-          async readFile(p: string) {
-            return (await fsReadFile(resolve(cwd, p))).toString("utf-8");
-          },
-          getSnapshot(p: string, c: string) {
-            return getSnapshot(p, c);
-          },
-          recordRead(p: string, c: string, content: string, partial?: boolean) {
-            recordRead(p, c, content, partial);
-          },
-          recordReadSession(p: string, c: string, lineRanges: Array<{ startLine: number; endLine: number }>) {
-            // Map snippets back to session read ranges so the edit tool validates coverage
-            for (const range of lineRanges) {
-              recordReadSession(p, c, range.startLine, range.endLine - range.startLine + 1, 0, "semantic_context");
-            }
-          }
-        });
-
-        return {
-          content: [{ type: "text", text: result.markdown }],
-          details: result.details as unknown as Record<string, unknown>,
-        };
-      } catch (error) {
-        const err = error instanceof Error ? error : new Error(String(error));
-        return {
-          content: [{ type: "text", text: `❌ Semantic context retrieval failed: ${err.message}` }]
-        };
-      }
-    }
   } as unknown));
 }
 
