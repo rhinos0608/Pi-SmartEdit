@@ -494,8 +494,8 @@ function mapCharInLine(
       origPos += 1;
       normPos += 1;
     } else {
-      origPos += 1;
-      normPos += 1;
+      // Characters differ under NFKC — drift detected, return current position
+      return origPos;
     }
   }
 
@@ -599,9 +599,13 @@ export function findTextWithTelemetry(
   let tierStart = performance.now();
   let exactIndex = -1;
   if (searchScope) {
+    // searchScope is present: searchContent is sliced [searchStart, searchEnd).
+    // Use indexOf without explicit start offset (searches from position 0 of searchContent).
+    // The global index = searchStart + local position within searchContent.
     const localIndex = searchContent.indexOf(oldText);
     if (localIndex !== -1) exactIndex = searchStart + localIndex;
   } else {
+    // No searchScope: search from searchStart position in originalContent.
     exactIndex = searchContent.indexOf(oldText, searchStart);
   }
   const exactDuration = performance.now() - tierStart;
@@ -846,12 +850,22 @@ function trySimilarityMatch(
   let bestStartLine = 0;
   let bestWindowSize = oldLines.length;
 
+  // Wall-clock timeout: abort if search takes too long
+  const startTime = Date.now();
+  const TIMEOUT_MS = 100;
+
   // Try different window sizes (allowing for some line count variance)
   const minWindowSize = Math.max(1, oldLines.length - 2);
   const maxWindowSize = Math.min(oldLines.length + 2, contentLines.length);
 
   for (let windowSize = minWindowSize; windowSize <= maxWindowSize; windowSize++) {
+    // Check timeout before each window size iteration
+    if (Date.now() - startTime > TIMEOUT_MS) break;
+
     for (let startLine = 0; startLine <= contentLines.length - windowSize; startLine++) {
+      // Check timeout per inner loop iteration
+      if (Date.now() - startTime > TIMEOUT_MS) break;
+
       const windowLines = contentLines.slice(startLine, startLine + windowSize);
       const score = computeSimilarityScore(oldLines, windowLines);
 
@@ -859,8 +873,13 @@ function trySimilarityMatch(
         bestScore = score;
         bestStartLine = startLine;
         bestWindowSize = windowSize;
+
+        // Early termination: perfect match found
+        if (bestScore >= 1.0) break;
       }
     }
+    // Early termination: perfect match found
+    if (bestScore >= 1.0) break;
   }
 
   // If best match doesn't meet threshold, return null
@@ -1060,8 +1079,8 @@ export function findAllMatches(
 
     // Accept matches at or above (at least as strict as) the minimum tier
     if (tierPriority(match.tier) < tierPriority(minTier)) {
-      // Lower priority than min — skip to next position
-      searchStart += 1;
+      // Lower priority than min — advance past the rejected match span
+      searchStart = match.index + match.matchLength;
       continue;
     }
 
@@ -1477,6 +1496,45 @@ export function validateLineRange(
   return null;
 }
 
+// ─── Idempotency helper ────────────────────────────────────────────
+
+/**
+ * Check if an edit would be a no-op (oldText already replaced by newText).
+ * Returns true if the replacement is already in place at the match position.
+ */
+function checkIdempotency(
+  content: string,
+  oldText: string,
+  newText: string,
+  path: string,
+  editIndex: number,
+  description?: string,
+): boolean {
+  const trimmedNew = newText.trim();
+  const trimmedOld = oldText.trim();
+
+  if (!trimmedNew || !trimmedOld) return false;
+
+  const idx = content.indexOf(trimmedOld);
+  if (idx === -1) return false;
+
+  const end = idx + trimmedOld.length;
+  const beforeText = content.slice(Math.max(0, idx - trimmedNew.length), idx);
+  const afterText = content.slice(end, end + trimmedNew.length);
+
+  // Check if trimmedNew already exists in any adjacent position
+  const isAlreadyReplaced =
+    content.slice(idx, end) === trimmedNew ||
+    beforeText === trimmedNew ||
+    afterText === trimmedNew;
+
+  if (isAlreadyReplaced) {
+    return true;
+  }
+
+  return false;
+}
+
 // ─── Main application function ──────────────────────────────────────
 
 /**
@@ -1618,23 +1676,8 @@ export async function applyEdits(
       // Find all occurrences
       const match = findText(normalizedContent, edit.oldText, indentationStyle, 0, searchScopes[i]);
       if (!match.found) {
-        // Idempotency (best-effort positional check): if the trimmed
-        // replacement appears where oldText would go, treat as no-op.
-        const trimmedNew = edit.newText.trim();
-        const trimmedOld = edit.oldText.trim();
-        let isNoop = false;
-        if (trimmedNew && trimmedOld) {
-          const idx = normalizedContent.indexOf(trimmedOld);
-          if (idx !== -1) {
-            const end = idx + trimmedOld.length;
-            if (normalizedContent.slice(idx, end) === trimmedNew ||
-                normalizedContent.slice(Math.max(0, idx - trimmedNew.length), idx) === trimmedNew ||
-                normalizedContent.slice(end, end + trimmedNew.length) === trimmedNew) {
-              isNoop = true;
-            }
-          }
-        }
-        if (isNoop) {
+        // Idempotency: if the replacement is already in place, treat as no-op
+        if (checkIdempotency(normalizedContent, edit.oldText, edit.newText, path, i, edit.description)) {
           matchNotes.push(
             `edits[${i}]${edit.description ? ` (${edit.description})` : ''}: ` +
             `replacement text already present in ${path} — edit is a no-op.`,
@@ -1706,23 +1749,8 @@ export async function applyEdits(
       const match = findText(normalizedContent, edit.oldText, indentationStyle, 0, searchScopes[i]);
 
       if (!match.found) {
-        // Idempotency (best-effort positional check): if the trimmed
-        // replacement appears where oldText would go, treat as no-op.
-        const trimmedNew = edit.newText.trim();
-        const trimmedOld = edit.oldText.trim();
-        let isNoop = false;
-        if (trimmedNew && trimmedOld) {
-          const idx = normalizedContent.indexOf(trimmedOld);
-          if (idx !== -1) {
-            const end = idx + trimmedOld.length;
-            if (normalizedContent.slice(idx, end) === trimmedNew ||
-                normalizedContent.slice(Math.max(0, idx - trimmedNew.length), idx) === trimmedNew ||
-                normalizedContent.slice(end, end + trimmedNew.length) === trimmedNew) {
-              isNoop = true;
-            }
-          }
-        }
-        if (isNoop) {
+        // Idempotency: if the replacement is already in place, treat as no-op
+        if (checkIdempotency(normalizedContent, edit.oldText, edit.newText, path, i, edit.description)) {
           matchNotes.push(
             `edits[${i}]${edit.description ? ` (${edit.description})` : ''}: ` +
             `replacement text already present in ${path} — edit is a no-op.`,
@@ -1764,13 +1792,11 @@ export async function applyEdits(
           );
         }
       } else {
-        // Exact and indentation tiers: count occurrences in original content
-        const exactCount = countOccurrences(
-          normalizedContent,
-          match.tier === MatchTier.EXACT
-            ? edit.oldText
-            : normalizeIndentation(edit.oldText, indentationStyle),
-        );
+        // Exact and indentation tiers: count occurrences using stripped text
+        // (remove leading whitespace to handle indent-level shifts)
+        const strippedOld = edit.oldText.replace(/^[\t ]+/gm, '');
+        const strippedContent = normalizedContent.replace(/^[\t ]+/gm, '');
+        const exactCount = countOccurrences(strippedContent, strippedOld);
         if (exactCount > 1) {
           throw getAmbiguousError(
             path, i, normalizedEdits.length, exactCount, edit.description,

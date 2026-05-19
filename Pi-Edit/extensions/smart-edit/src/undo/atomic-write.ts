@@ -45,6 +45,7 @@ export async function atomicWrite(
   const tmpPath = resolve(dir, tmpName);
 
   let mode: number | undefined = options?.mode;
+  let effectiveMode: number | undefined = undefined;
 
   try {
     // Determine mode to preserve
@@ -66,12 +67,24 @@ export async function atomicWrite(
       }
     }
 
-    // Write to temp
-    await fsWriteFile(tmpPath, content, "utf-8");
+    // Write to temp with restrictive mode (0o600) for security
+    await fsWriteFile(tmpPath, content, { encoding: "utf-8", mode: 0o600 });
 
-    // Restore mode
+    // Read mode immediately before chmod (after write, in case file was replaced)
     if (mode !== undefined) {
-      await fsChmod(tmpPath, mode);
+      effectiveMode = mode;
+    } else {
+      try {
+        const stat = await fsStat(tmpPath);
+        effectiveMode = stat.mode;
+      } catch {
+        // Could not read mode — use whatever was set
+      }
+    }
+
+    // Restore original mode if we have one
+    if (effectiveMode !== undefined) {
+      await fsChmod(tmpPath, effectiveMode);
     }
 
     // Atomic rename
@@ -84,12 +97,39 @@ export async function atomicWrite(
       /* ignore cleanup errors */
     }
 
-    // If rename failed (e.g., cross-device), fall back to direct write
+    // If rename failed (e.g., cross-device), fall back to atomic write on target filesystem
     if (
       err instanceof Error &&
       (err as NodeJS.ErrnoException).code === "EXDEV"
     ) {
-      await fsWriteFile(filePath, content, { encoding: "utf-8", mode });
+      // Write to a temp file on the TARGET filesystem first, then rename
+      const targetTmpName = `.${base}.smart_edit_exdev_${randomBytes(6).toString("hex")}`;
+      const targetTmpPath = resolve(dir, targetTmpName);
+
+      // Write with restrictive mode
+      await fsWriteFile(targetTmpPath, content, { encoding: "utf-8", mode: 0o600 });
+
+      // Apply mode if we determined one earlier
+      if (effectiveMode !== undefined) {
+        try {
+          await fsChmod(targetTmpPath, effectiveMode);
+        } catch {
+          // Mode application failed — proceed anyway with default mode
+        }
+      }
+
+      // Rename on the same device (this should succeed since we're on target filesystem)
+      try {
+        await fsRename(targetTmpPath, filePath);
+      } catch (renameErr) {
+        // Clean up temp file
+        try {
+          await fsUnlink(targetTmpPath);
+        } catch {
+          /* ignore cleanup errors */
+        }
+        throw renameErr;
+      }
       return;
     }
 

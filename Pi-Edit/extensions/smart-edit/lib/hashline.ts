@@ -149,22 +149,27 @@ async function ensureXXHash32(): Promise<(input: string, seed?: number) => numbe
   }
 
   _initPromise = (async () => {
-    // xxhash-wasm is reliable across Bun, Node.js, and other runtimes.
-    // Bun's native Bun.hash() appears to be a stub in some versions (returns
-    // constant values regardless of input/seed), so we always use xxhash-wasm
-    // for correctness. xxhash-wasm is fast enough (~2 GB/s, <0.1ms for 10KB).
-    const xxhashModule = (await import("xxhash-wasm")) as {
-      default: () => Promise<{
-        h32: (input: string, seed?: number) => number;
-        h32ToString: (input: string, seed?: number) => string;
-        create32: (seed?: number) => { update: (data: string) => { digest: () => number } };
-        h64: (input: string, seed?: bigint) => bigint;
-        h64ToString: (input: string, seed?: bigint) => string;
-        create64: (seed?: bigint) => { update: (data: string) => { digest: () => bigint } };
-      }>;
-    };
-    const xxhash = await xxhashModule.default();
-    _xxhash32 = (input: string, seed = 0) => xxhash.h32(input, seed);
+    try {
+      // xxhash-wasm is reliable across Bun, Node.js, and other runtimes.
+      // Bun's native Bun.hash() appears to be a stub in some versions (returns
+      // constant values regardless of input/seed), so we always use xxhash-wasm
+      // for correctness. xxhash-wasm is fast enough (~2 GB/s, <0.1ms for 10KB).
+      const xxhashModule = (await import("xxhash-wasm")) as {
+        default: () => Promise<{
+          h32: (input: string, seed?: number) => number;
+          h32ToString: (input: string, seed?: number) => string;
+          create32: (seed?: number) => { update: (data: string) => { digest: () => number } };
+          h64: (input: string, seed?: bigint) => bigint;
+          h64ToString: (input: string, seed?: bigint) => string;
+          create64: (seed?: bigint) => { update: (data: string) => { digest: () => bigint } };
+        }>;
+      };
+      const xxhash = await xxhashModule.default();
+      _xxhash32 = (input: string, seed = 0) => xxhash.h32(input, seed);
+    } catch (e) {
+      _initPromise = null;  // Allow retry on next call
+      throw e;
+    }
   })();
 
   await _initPromise;
@@ -174,33 +179,14 @@ async function ensureXXHash32(): Promise<(input: string, seed?: number) => numbe
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+/** Unicode-aware letter-or-digit regex (covers all scripts via Unicode property escapes) */
+const LETTER_OR_DIGIT_RE = /[\p{L}\p{N}]/u;
+
 /**
- * Returns true if c is a letter or digit (Unicode-aware, fast ASCII path).
+ * Returns true if line contains at least one letter or digit (Unicode-aware).
  */
 function hasSignificantChar(line: string): boolean {
-  // Fast path: ASCII check (covers 99.9% of source code)
-  for (let i = 0; i < line.length; i++) {
-    const c = line.charCodeAt(i);
-    if (
-      (c >= 48 && c <= 57)  // 0-9
-      || (c >= 65 && c <= 90)  // A-Z
-      || (c >= 97 && c <= 122) // a-z
-    ) {
-      return true;
-    }
-    // Unicode letter check for non-ASCII (rare in code, but handle it)
-    if (
-      (c >= 0x80 && (
-        // Unicode categories: Lu, Ll, Lt, Lm, Lo (letters), Nd (digit numbers)
-        (c >= 0x100 && c <= 0x217F) || // Latin Extended-A and beyond
-        (c >= 0x3040 && c <= 0x9FFF) || // CJK
-        (c >= 0xAC00 && c <= 0xD7AF)    // Korean Hangul
-      ))
-    ) {
-      return true;
-    }
-  }
-  return false;
+  return LETTER_OR_DIGIT_RE.test(line);
 }
 
 /**
@@ -259,8 +245,8 @@ export async function computeLineHash(
   lineNumber: number,
   line: string,
 ): Promise<string> {
-  // Step 1: normalize
-  const normalized = line.replace(/\r/g, "").trimEnd();
+  // Step 1: normalize (strip BOM, \\r, trailing whitespace)
+  const normalized = line.replace(/\uFEFF/g, "").replace(/\r/g, "").trimEnd();
 
   // Step 2: structural lines → ordinal bigram
   if (isStructural(normalized)) {
@@ -298,7 +284,7 @@ export function computeLineHashSync(
     );
   }
 
-  const normalized = line.replace(/\r/g, "").trimEnd();
+  const normalized = line.replace(/\uFEFF/g, "").replace(/\r/g, "").trimEnd();
 
   if (isStructural(normalized)) {
     return structuralBigram(lineNumber);
@@ -306,7 +292,7 @@ export function computeLineHashSync(
 
   let seed = 0;
   if (!hasSignificantChar(normalized)) {
-    seed = lineNumber;
+    mf: seed = lineNumber;
   }
 
   const hash = _xxhash32(normalized, seed) % HASHLINE_BIGRAMS_COUNT;

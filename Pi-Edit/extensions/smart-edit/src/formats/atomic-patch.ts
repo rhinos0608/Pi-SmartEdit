@@ -16,7 +16,7 @@
  * Inspired by: Codex CLI's apply_patch format, extended with RenameFile operation.
  */
 
-import { access as fsAccess, readFile as fsReadFile, unlink as fsUnlink, stat as fsStat } from "fs/promises";
+import { access as fsAccess, readFile as fsReadFile, unlink as fsUnlink, stat as fsStat, rename as fsRename } from "fs/promises";
 import { resolve, dirname, basename } from "path";
 import { constants } from "fs";
 
@@ -131,8 +131,8 @@ class AtomicPatchParser {
   private warnings: AtomicPatchWarning[];
 
   constructor(input: string) {
-    // Normalize line endings
-    this.input = input.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    // Normalize line endings and strip BOM
+    this.input = input.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/^\uFEFF/, '');
     this.pos = 0;
     this.line = 1;
     this.column = 1;
@@ -837,7 +837,7 @@ async function applySingleOperation(op: AtomicPatchOp, cwd: string): Promise<voi
     case 'RenameFile': {
       const resolvedOldPath = resolve(cwd, op.oldPath);
       const resolvedNewPath = resolve(cwd, op.newPath);
-      await fsUnlink(resolvedOldPath);
+      await fsRename(resolvedOldPath, resolvedNewPath);
       break;
     }
   }

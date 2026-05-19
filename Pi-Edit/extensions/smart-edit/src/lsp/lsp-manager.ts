@@ -48,6 +48,7 @@ export class LSPManager {
   private serverConfigs: ServerConfig[];
   private connectionFactory: (command: string, args: string[]) => ManagedLSPConnection;
   private findExecutableOverride?: (command: string) => Promise<string | null>;
+  private pendingServers = new Map<string, Promise<ManagedLSPConnection | null>>();
 
   private static readonly SERVER_CONFIGS: ServerConfig[] = [
     {
@@ -135,6 +136,15 @@ export class LSPManager {
   }
 
   async getServer(languageId: string): Promise<ManagedLSPConnection | null> {
+    const pending = this.pendingServers.get(languageId);
+    if (pending) return pending;
+    const promise = this.getServerInner(languageId);
+    this.pendingServers.set(languageId, promise);
+    try { return await promise; }
+    finally { this.pendingServers.delete(languageId); }
+  }
+
+  private async getServerInner(languageId: string): Promise<ManagedLSPConnection | null> {
     const existing = this.connections.get(languageId);
     if (existing) {
       if (this.isConnectionRunning(existing)) return existing;

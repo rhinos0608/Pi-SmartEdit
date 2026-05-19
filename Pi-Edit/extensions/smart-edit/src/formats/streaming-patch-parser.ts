@@ -39,6 +39,8 @@ export class StreamingPatchParser {
   ) {
     this.onUpdate = onUpdate;
     this.bufferIntervalMs = bufferIntervalMs;
+    // Initialize accumulated buffer
+    this.accumulated = '';
   }
 
   /**
@@ -49,7 +51,9 @@ export class StreamingPatchParser {
   pushDelta(delta: string): void {
     if (!this.onUpdate) return; // Graceful degradation
 
-    this.accumulated += delta;
+    // Normalize line endings and strip BOM from the delta
+    const normalizedDelta = delta.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/^\uFEFF/, '');
+    this.accumulated += normalizedDelta;
 
     // Re-parse with lenient mode (tolerates partial text)
     const result = parseCodexPatch(this.accumulated, "lenient");

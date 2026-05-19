@@ -93,7 +93,7 @@ function normalizeHunkLines(lines: string[]): string[] {
  * - /dev/null → empty path (handle as new file or deletion)
  */
 export function parseUnifiedDiffToEditItems(input: string): EditItemOutput[] {
-  const normalized = input.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const normalized = input.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/^\uFEFF/, '');
   const patches = parsePatch(normalized);
 
   const results: EditItemOutput[] = [];
@@ -107,6 +107,9 @@ export function parseUnifiedDiffToEditItems(input: string): EditItemOutput[] {
       path = patch.newFileName.replace(/^[ab]\//, '');
     } else if (patch.oldFileName && patch.oldFileName !== '/dev/null') {
       path = patch.oldFileName.replace(/^[ab]\//, '');
+    } else if (patch.oldFileName === '/dev/null' && patch.newFileName === '/dev/null') {
+      // Both are /dev/null — this is a malformed diff, skip with warning
+      continue;
     }
 
     // Process each hunk

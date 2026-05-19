@@ -133,14 +133,10 @@ describe("edit-history", () => {
     const filePath = await writeTestFile(cwd, "test3.ts", "original content");
     await saveUndoState(cwd, filePath, "original content", 1);
 
-    // Overwrite the file
-    await fsWriteFile(filePath, "modified content", "utf-8");
-    const afterMod = await fsReadFile(filePath, "utf-8");
-    assert.equal(afterMod, "modified content");
-
-    // Restore
+    // Restore without modifying the file
+    // (FIX 4: restore only succeeds if file hasn't been modified since undo was saved)
     const restored = await restoreUndoState(cwd, filePath);
-    assert.equal(restored, true, "restore should succeed");
+    assert.equal(restored, true, "restore should succeed when file is unchanged");
 
     const afterRestore = await fsReadFile(filePath, "utf-8");
     assert.equal(afterRestore, "original content");
@@ -159,8 +155,7 @@ describe("edit-history", () => {
 
     const countBefore = await undoFileCount(undoDir);
 
-    // Overwrite and restore
-    await fsWriteFile(filePath, "different content", "utf-8");
+    // Restore without modifying the file
     await restoreUndoState(cwd, filePath);
 
     const countAfter = await undoFileCount(undoDir);
@@ -212,16 +207,30 @@ describe("edit-history", () => {
     await new Promise((r) => setTimeout(r, 10)); // ensure different timestamp
     await saveUndoState(cwd, filePath, "original", 1);
 
-    // Overwrite
-    await fsWriteFile(filePath, "modified", "utf-8");
-
-    // Restore — should use the most recent
+    // Restore without modifying the file
     const restored = await restoreUndoState(cwd, filePath);
     assert.equal(restored, true);
 
     // Only the most recent undo file should be consumed; the older one remains
     const count = await undoFileCount(undoDir);
     assert.equal(count, 1, "one undo file should remain (the older entry)");
+  });
+
+  it("restoreUndoState fails when file was modified", async () => {
+    const { cwd } = freshCwd();
+    const filePath = await writeTestFile(cwd, "test_modified.ts", "original content");
+    await saveUndoState(cwd, filePath, "original content", 1);
+
+    // Overwrite the file (simulating user changes)
+    await fsWriteFile(filePath, "user modified content", "utf-8");
+
+    // Restore should fail because file was modified since undo was saved
+    const restored = await restoreUndoState(cwd, filePath);
+    assert.equal(restored, false, "restore should fail when file was modified");
+
+    // File should retain the user's modifications
+    const content = await fsReadFile(filePath, "utf-8");
+    assert.equal(content, "user modified content", "user changes should be preserved");
   });
 
   it("restoreUndoState verifies snapshot hash", async () => {

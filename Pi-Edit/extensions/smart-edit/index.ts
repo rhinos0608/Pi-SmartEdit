@@ -31,8 +31,6 @@ import {
   defaultConflictConfig,
 } from "./lib/conflict-detector";
 
-import { buildSemanticContext } from "./src/lsp/semantic-context";
-import type { SemanticContextInput, AstResolverLike } from "./src/lsp/semantic-context";
 import { detectLanguageFromExtension } from "./src/lsp/language-id";
 import { recordRead, checkStale, recordReadWithStat, recordReadSession, getSessionReads, checkEditAllowed, checkRangeCoverage, getSnapshot, getAllSessionPaths } from "./lib/read-cache";
 import { buildHashlineAnchors, initHashline } from "./lib/hashline";
@@ -67,6 +65,7 @@ import { applySymbolicEdits, buildSymbolicEditGuidance, isSymbolicEdit, resolveS
 import type { SymbolicEditRequest } from "./src/symbolic-edits";
 
 import type {
+  EditTarget,
   EditAnchor,
   EditItem,
   EditInput,
@@ -79,113 +78,32 @@ import type {
 const smartEditRuntimeConfig = getSmartEditRuntimeConfig();
 
 // ─── Schema (must match built-in edit schema exactly) ──────────────
-// Extra properties like `replaceAll`, `anchor` are stripped
+// Extra properties like `replaceAll`, `target` are stripped
 // by prepareArguments before validation, then restored in execute().
+
 
 const editItemSchema = Type.Object(
   {
     oldText: Type.Optional(Type.String()),
     newText: Type.Optional(Type.String()),
-    replaceAll: Type.Optional(
-      Type.Boolean({
+    description: Type.Optional(Type.String({ description: "Optional label echoed in diagnostics for self-reference." })),
+    target: Type.Optional(Type.Object(
+      {
+        name: Type.Optional(Type.String({ description: "Symbol name to target (e.g., function name, class name)." })),
+        namePath: Type.Optional(Type.String({ description: "Qualified symbol path; the final component is matched by AST name (e.g., 'MyClass.myMethod')." })),
+        kind: Type.Optional(Type.String({ description: "AST node kind hint (e.g., 'function_declaration', 'class_declaration')." })),
+        line: Type.Optional(Type.Number({ description: "1-based line hint for disambiguation when multiple symbols share a name." })),
+        replaceBody: Type.Optional(Type.String({ description: "Replace the entire AST symbol definition with this text." })),
+        insertBefore: Type.Optional(Type.String({ description: "Insert this text immediately before the AST symbol definition." })),
+        insertAfter: Type.Optional(Type.String({ description: "Insert this text immediately after the AST symbol definition." })),
+      },
+      {
         description:
-          "When true, replaces every non-overlapping occurrence of oldText. " +
-          "Useful for renaming variables or updating boilerplate patterns. " +
-          "Default: false (requires unique match).",
-      }),
-    ),
-    anchor: Type.Optional(
-      Type.Object(
-        {
-          symbolName: Type.Optional(
-            Type.String({
-              description:
-                "Name of the enclosing symbol to scope the edit within (e.g., function name, class name).",
-            }),
-          ),
-          symbolKind: Type.Optional(
-            Type.String({
-              description:
-                "Kind of symbol to filter by (e.g., 'function_declaration', 'class_declaration'). " +
-                "If omitted, all symbol kinds with the matching name are considered.",
-            }),
-          ),
-          symbolLine: Type.Optional(
-            Type.Number({
-              description:
-                "1-based line number hint for where the symbol's name appears. " +
-                "Used to disambiguate symbols with the same name.",
-            }),
-          ),
-        },
-        {
-          description:
-            "AST-based disambiguation hint. If provided, oldText is matched only within " +
-            "the byte range of the described AST node (function body, class, etc.).",
-        },
-      ),
-    ),
-
-    symbol: Type.Optional(
-      Type.Object(
-        {
-          name: Type.Optional(Type.String({ description: "Symbol name to edit." })),
-          namePath: Type.Optional(Type.String({ description: "Symbol path; the final component is matched by AST name." })),
-          kind: Type.Optional(Type.String({ description: "AST node kind to require, such as function_declaration or class_declaration." })),
-          line: Type.Optional(Type.Number({ description: "1-based symbol line hint used to disambiguate duplicate names." })),
-        },
-        {
-          description: "Symbolic edit target. Provide exactly one of replaceBody, insertBefore, or insertAfter with this field.",
-        },
-      ),
-    ),
-    replaceBody: Type.Optional(Type.String({ description: "Replace the entire AST symbol definition with this text." })),
-    insertBefore: Type.Optional(Type.String({ description: "Insert this text immediately before the AST symbol definition." })),
-    insertAfter: Type.Optional(Type.String({ description: "Insert this text immediately after the AST symbol definition." })),
-
-    // ── Semantic context request ────────────────────────────────
-    // Request semantic context (type definitions, implementations, references)
-    // to be retrieved before applying this edit. The context is returned as part
-    // of the edit result so the model can understand the code being modified.
-    semanticContext: Type.Optional(
-      Type.Object(
-        {
-          path: Type.String({
-            description: "Path to the file to inspect semantically",
-          }),
-          lineRange: Type.Optional(
-            Type.Object({
-              startLine: Type.Number({ description: "1-based start line (inclusive)" }),
-              endLine: Type.Optional(Type.Number({ description: "1-based end line (inclusive)" })),
-            }),
-          ),
-          symbol: Type.Optional(
-            Type.Object({
-              name: Type.String({ description: "Symbol name (function, class, interface, etc.)" }),
-              kind: Type.Optional(Type.String({ description: "Kind hint (e.g., 'function', 'class', 'interface')" })),
-              line: Type.Optional(Type.Number({ description: "1-based line hint" })),
-            }),
-          ),
-          maxTokens: Type.Optional(Type.Number({ default: 3000, description: "Maximum tokens in the response" })),
-          maxDepth: Type.Optional(Type.Number({ default: 1, description: "Max depth for following references" })),
-          includeReferences: Type.Optional(Type.Union([
-            Type.Literal(false),
-            Type.Literal("examples"),
-            Type.Literal("all"),
-          ], { default: "examples" })),
-          includeImplementations: Type.Optional(Type.Boolean({ default: false })),
-          includeTypeDefinitions: Type.Optional(Type.Boolean({ default: true })),
-          includeHover: Type.Optional(Type.Boolean({ default: true })),
-        },
-        {
-          description:
-            "Request semantic context (type definitions, implementations, references) " +
-            "for the code being edited. The context is retrieved via LSP and included " +
-            "in the edit result. Use this instead of a separate semantic_context tool call " +
-            "when the code depends on types, interfaces, or symbols the model may not know.",
-        },
-      ),
-    ),
+          "AST symbol target. When used with oldText/newText, scopes the text search within the symbol's byte range. " +
+          "When used with replaceBody/insertBefore/insertAfter, operates on the whole symbol. " +
+          "Provide at most one of replaceBody, insertBefore, or insertAfter.",
+      },
+    )),
   },
 );
 
@@ -194,6 +112,13 @@ const editSchema = Type.Object(
     path: Type.String({
       description: "Path to the file to edit (relative or absolute)",
     }),
+    replaceAll: Type.Optional(
+      Type.Boolean({
+        description:
+          "When true, replaces every non-overlapping occurrence of oldText in each edit. " +
+          "Default: false (requires unique match).",
+      }),
+    ),
     edits: Type.Union([
       Type.Array(editItemSchema, {
         description:
@@ -209,29 +134,6 @@ const editSchema = Type.Object(
     ]),
   },
 );
-
-const semanticContextSchema = Type.Object({
-  path: Type.String({ description: "Path to the file to inspect semantically" }),
-  lineRange: Type.Optional(Type.Object({
-    startLine: Type.Number({ description: "1-based start line (inclusive)" }),
-    endLine: Type.Optional(Type.Number({ description: "1-based end line (inclusive)" })),
-  })),
-  symbol: Type.Optional(Type.Object({
-    name: Type.String({ description: "Symbol name (function, class, interface, etc.)" }),
-    kind: Type.Optional(Type.String({ description: "Kind hint (e.g., 'function', 'class', 'interface')" })),
-    line: Type.Optional(Type.Number({ description: "1-based line hint" })),
-  })),
-  maxTokens: Type.Optional(Type.Number({ default: 3000, description: "Maximum tokens in the response" })),
-  maxDepth: Type.Optional(Type.Number({ default: 1, description: "Max depth for following references" })),
-  includeReferences: Type.Optional(Type.Union([
-    Type.Literal(false),
-    Type.Literal("examples"),
-    Type.Literal("all"),
-  ], { default: "examples" })),
-  includeImplementations: Type.Optional(Type.Boolean({ default: false })),
-  includeTypeDefinitions: Type.Optional(Type.Boolean({ default: true })),
-  includeHover: Type.Optional(Type.Boolean({ default: true })),
-});
 
 // ─── Error formatting (actionable client-facing errors) ─────────────
 
@@ -267,7 +169,7 @@ function tryRepairJSONString(raw: string): unknown {
   // markdown fences, extract {...} block, literal newline escape, and
   // unbalanced brace fix — all with fuzzy key matching built in.
   const forgivingResult = repairJson(raw, {
-    edit: ["path", "edits", "oldText", "newText", "replaceAll", "anchor", "symbol", "replaceBody", "insertBefore", "insertAfter", "semanticContext"],
+    edit: ["path", "edits", "oldText", "newText", "replaceAll", "target"],
   });
   if (forgivingResult.value !== undefined) {
     return forgivingResult.value;
@@ -608,13 +510,14 @@ async function prepareArguments(input: Record<string, unknown>): Promise<Record<
         (item.hashline as Record<string, unknown>).range;
       const isSymbolEdit = isSymbolicEdit(item);
       if (isSymbolEdit) {
-        const operationCount = [item.replaceBody, item.insertBefore, item.insertAfter]
+        const t = item.target as Record<string, unknown> | undefined;
+        const operationCount = [t?.replaceBody, t?.insertBefore, t?.insertAfter]
           .filter((value) => typeof value === "string")
           .length;
         if (operationCount !== 1) {
           throw formatEditError(
-            `edits[${i}] is a symbol edit but does not provide exactly one symbolic operation.`,
-            `Use { symbol: { name: "myFunction" }, replaceBody: "..." } or insertBefore/insertAfter.`
+            `edits[${i}] is a target edit but does not provide exactly one symbolic operation.`,
+            `Use { target: { name: "myFunction" }, replaceBody: "..." } or insertBefore/insertAfter.`
           );
         }
       }
@@ -693,15 +596,57 @@ async function prepareArguments(input: Record<string, unknown>): Promise<Record<
     );
   }
 
-  // Strip replaceAll/anchor/lineRange from edits so built-in schema validation
+  // Strip replaceAll/target/lineRange from edits so built-in schema validation
   // passes. The values are restored in execute() before calling applyEdits().
+  // For backwards compat, we convert old-style anchor/symbol to new target shape.
   if (Array.isArray(args.edits)) {
     const flags: boolean[] = [];
-    const anchors: (EditAnchor | undefined)[] = [];
+    const targets: (Record<string, unknown> | undefined)[] = [];
     const hashlines: (Record<string, unknown> | undefined)[] = [];
-    const symbols: (Record<string, unknown> | undefined)[] = [];
 
     for (const edit of args.edits as Array<Record<string, unknown>>) {
+      // ── Backwards compat: convert old-style anchor/symbol to target ──
+      let target: Record<string, unknown> | undefined;
+
+      // Convert old anchor { symbolName, symbolKind, symbolLine } to target
+      if (edit.anchor && typeof edit.anchor === 'object') {
+        const anchor = edit.anchor as Record<string, unknown>;
+        target = {
+          name: anchor.symbolName,
+          kind: anchor.symbolKind,
+          line: anchor.symbolLine,
+        };
+        delete edit.anchor;
+      }
+
+      // Convert old symbol + operation to target
+      if (edit.symbol && typeof edit.symbol === 'object') {
+        const symbol = edit.symbol as Record<string, unknown>;
+        if (!target) target = {};
+        target.name = symbol.name ?? target.name;
+        target.namePath = symbol.namePath ?? target.namePath;
+        target.kind = symbol.kind ?? target.kind;
+        target.line = symbol.line ?? target.line;
+        delete edit.symbol;
+      }
+
+      // Move operation fields into target if present
+      if (edit.replaceBody !== undefined) {
+        if (!target) target = {};
+        target.replaceBody = edit.replaceBody;
+        delete edit.replaceBody;
+      }
+      if (edit.insertBefore !== undefined) {
+        if (!target) target = {};
+        target.insertBefore = edit.insertBefore;
+        delete edit.insertBefore;
+      }
+      if (edit.insertAfter !== undefined) {
+        if (!target) target = {};
+        target.insertAfter = edit.insertAfter;
+        delete edit.insertAfter;
+      }
+
       // replaceAll
       if (typeof edit.replaceAll === 'boolean') {
         flags.push(edit.replaceAll);
@@ -710,12 +655,11 @@ async function prepareArguments(input: Record<string, unknown>): Promise<Record<
         flags.push(false);
       }
 
-      // anchor
-      if (edit.anchor && typeof edit.anchor === 'object') {
-        anchors.push(edit.anchor as unknown as EditAnchor);
-        delete edit.anchor;
+      // target (new unified form, or converted from old-style)
+      if (target && Object.keys(target).length > 0) {
+        targets.push(target);
       } else {
-        anchors.push(undefined);
+        targets.push(undefined);
       }
 
       // hashline
@@ -725,34 +669,16 @@ async function prepareArguments(input: Record<string, unknown>): Promise<Record<
       } else {
         hashlines.push(undefined);
       }
-
-      if (isSymbolicEdit(edit)) {
-        symbols.push({
-          symbol: edit.symbol,
-          replaceBody: edit.replaceBody,
-          insertBefore: edit.insertBefore,
-          insertAfter: edit.insertAfter,
-          description: edit.description,
-        });
-        delete edit.symbol;
-        delete edit.replaceBody;
-        delete edit.insertBefore;
-        delete edit.insertAfter;
-      } else {
-        symbols.push(undefined);
-      }
     }
 
     const hasFlags = flags.some((f) => f);
-    const hasAnchors = anchors.some((a) => a);
+    const hasTargets = targets.some((t) => t);
     const hasHashlines = hashlines.some((h) => h);
-    const hasSymbols = symbols.some((h) => h);
-    if (hasFlags || hasAnchors || hasHashlines || hasSymbols) {
+    if (hasFlags || hasTargets || hasHashlines) {
       const extraData = {
         replaceAllFlags: hasFlags ? flags : null,
-        anchorData: hasAnchors ? anchors : null,
+        targetData: hasTargets ? targets : null,
         hashlineData: hasHashlines ? hashlines : null,
-        symbolData: hasSymbols ? symbols : null,
       };
       if (typeof args.path === "string" && !args.path.includes("??smartEditExtra=")) {
         args.path = args.path + "??smartEditExtra=" + Buffer.from(JSON.stringify(extraData)).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -855,21 +781,26 @@ async function resolveAnchorToScope(
   content: string,
   filePath: string,
 ): Promise<SearchScope | null> {
-  // Priority 1: AST anchor by symbol name
-  if (edit.anchor?.symbolName && astResolver) {
+  // Priority 1: AST anchor by symbol name (from target.name)
+  if (edit.target?.name && astResolver) {
     let parseResult: Awaited<ReturnType<typeof astResolver.parseFile>> = null;
     try {
       parseResult = await astResolver.parseFile(content, filePath);
       if (parseResult) {
+        const anchor = {
+          symbolName: edit.target.name,
+          symbolKind: edit.target.kind,
+          symbolLine: edit.target.line,
+        };
         const targetNode = astResolver.findSymbolNode(
           parseResult.tree,
-          edit.anchor,
+          anchor,
         );
         if (targetNode) {
           const scope: SearchScope = {
             startIndex: targetNode.startIndex,
             endIndex: targetNode.endIndex,
-            description: `${targetNode.type} "${edit.anchor.symbolName}"`,
+            description: `${targetNode.type} "${edit.target.name}"`,
             source: "anchor",
           };
           return scope;
@@ -1554,16 +1485,19 @@ export default function smartEdit(pi: ExtensionAPI) {
             }
           }
 
-          if (!editLineRange && extraData?.symbolData) {
+          if (!editLineRange && extraData?.targetData) {
             let minStart = Infinity;
             let maxEnd = -Infinity;
-            for (const symbolEdit of extraData.symbolData as unknown[]) {
-              if (!symbolEdit) continue;
+            for (const target of extraData.targetData as unknown[]) {
+              if (!target) continue;
+              // Only check targets with operation fields (symbolic edits)
+              const t = target as Record<string, unknown>;
+              if (!t.replaceBody && !t.insertBefore && !t.insertAfter) continue;
               const range = await resolveSymbolicEditLineRange({
                 content: normalizeToLF(stripBom(rawContent).text),
                 filePath: path,
                 astResolver,
-                edit: symbolEdit as Omit<SymbolicEditRequest, "editIdx">,
+                edit: { target: target as import("./lib/types").EditTarget },
               });
               if (!range) continue;
               if (range[0] < minStart) minStart = range[0];
@@ -1591,9 +1525,8 @@ export default function smartEdit(pi: ExtensionAPI) {
 
           // ── Re-inject replaceAll/anchor/lineRange from extracted extra data ──
           const localFlags = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).replaceAllFlags as unknown[] ?? null : null;
-          const localAnchors = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).anchorData as unknown[] ?? null : null;
+          const localTargets = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).targetData as unknown[] ?? null : null;
           const localHashlines = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).hashlineData as unknown[] ?? null : null;
-          const localSymbols = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).symbolData as unknown[] ?? null : null;
 
           // Separate hashline edits from legacy edits
           const totalLines = rawContent.split("\n").length;
@@ -1611,24 +1544,32 @@ export default function smartEdit(pi: ExtensionAPI) {
                 getHashlineAnchorLine(range?.end ?? "", totalLines) ?? 0,
               );
               hashlineEdits.push({ editIdx: i, sortLine, hashline });
-            } else if (localSymbols?.[i]) {
-              symbolicEdits.push({
-                ...(localSymbols[i] as Omit<SymbolicEditRequest, "editIdx">),
-                editIdx: i,
-              });
+            } else if (localTargets?.[i]) {
+              const targetData = localTargets[i] as Record<string, unknown>;
+              // A target with an operation field is a symbolic edit
+              if (targetData.replaceBody || targetData.insertBefore || targetData.insertAfter) {
+                symbolicEdits.push({
+                  target: targetData as import("./lib/types").EditTarget,
+                  editIdx: i,
+                });
+              } else {
+                // Anchor-only target: restore to edit for legacy path
+                (edits[i] as unknown as Record<string, unknown>).target = targetData;
+                if (localFlags?.[i]) (edits[i] as unknown as Record<string, unknown>).replaceAll = true;
+                legacyEdits.push({ editIdx: i, edit: edits[i] });
+              }
             } else {
               // Guard: hashline-only edit with no oldText can't go through legacy pipeline
               // This happens when the hashline side-channel (path-encoded extraData) fails to decode.
               if (typeof rawEdit.oldText !== "string") {
                 throw new Error(
-                  `edits[${i}] has no oldText and no recoverable hashline or symbol data. ` +
+                  `edits[${i}] has no oldText and no recoverable hashline or target data. ` +
                   `This edit was sent as hashline or symbol format but the side-channel data was lost during tool parameter processing. ` +
                   `Re-read the file and retry the edit.`
                 );
               }
               // Restore replaceAll/anchor/lineRange
               if (localFlags?.[i]) (edits[i] as unknown as Record<string, unknown>).replaceAll = true;
-              if (localAnchors?.[i]) (edits[i] as unknown as Record<string, unknown>).anchor = localAnchors[i];
               legacyEdits.push({ editIdx: i, edit: edits[i] });
             }
           }
@@ -1644,8 +1585,7 @@ export default function smartEdit(pi: ExtensionAPI) {
           if (symbolicEdits.length > 0) editCapabilities.add("symbolicEdit");
           if (legacyEdits.length > 0) editCapabilities.add("oldText");
           if (legacyEdits.some(({ edit }) => edit.replaceAll)) editCapabilities.add("replaceAll");
-          if (legacyEdits.some(({ edit }) => edit.anchor)) editCapabilities.add("astAnchor");
-          if (edits.some((edit) => (edit as unknown as Record<string, unknown>).semanticContext !== undefined)) editCapabilities.add("semanticContext");
+          if (legacyEdits.some(({ edit }) => edit.target)) editCapabilities.add("astAnchor");
           const resultMatchSpans: MatchSpan[] = [];
           let replacementCount = 0;
 
@@ -1655,7 +1595,7 @@ export default function smartEdit(pi: ExtensionAPI) {
             const snapshot = getSnapshot(path, cwd);
             if (snapshot?.hashline?.anchors && snapshot.hashline.anchors.size > 0) {
               const needsLegacy = legacyEdits.some(
-                ({ edit }) => edit.replaceAll || edit.anchor
+                ({ edit }) => edit.replaceAll || edit.target
               );
               if (!needsLegacy) {
                 const anchorExamples: string[] = [];
@@ -1691,7 +1631,7 @@ export default function smartEdit(pi: ExtensionAPI) {
               _filePath: string,
             ) => {
               const scope = await resolveAnchorToScope(
-                { oldText: "", newText: "", anchor } as EditItem,
+                { oldText: "", newText: "", target: { name: anchor.symbolName, kind: anchor.symbolKind, line: anchor.symbolLine } } as EditItem,
                 content,
                 path,
               );
@@ -1810,7 +1750,7 @@ export default function smartEdit(pi: ExtensionAPI) {
             // Resolve anchors to search scopes
             const resolvedScopes: (SearchScope | undefined)[] = [];
             for (const { edit } of legacyEdits) {
-              if (edit.anchor) {
+              if (edit.target) {
                 const scope = await resolveAnchorToScope(edit, normalizedContent, path);
                 resolvedScopes.push(scope ?? undefined);
               } else {
@@ -1898,73 +1838,6 @@ export default function smartEdit(pi: ExtensionAPI) {
           if (safetyResult.warnings.length > 0) {
             matchNotes.push(...safetyResult.warnings);
           }
-
-          // ── Semantic context retrieval (inline) ─────────────────────
-          // If any edit item requests semantic context, retrieve it before
-          // modifying the file. The context is included in the result so the
-          // model understands the code being modified without a separate call.
-          const semanticContextRequests = edits.filter(
-            (e) => (e as unknown as Record<string, unknown>).semanticContext !== undefined,
-          );
-          if (semanticContextRequests.length > 0 && lspManager) {
-            try {
-              for (const edit of semanticContextRequests) {
-                const semCtx = (edit as unknown as Record<string, unknown>).semanticContext as Record<string, unknown>;
-                const semPath = (semCtx.path as string) || path;
-                const semCwd = cwd;
-                const semAbsolutePath = resolve(semCwd, semPath);
-
-                // Check if file has been read (Safety guard)
-                const snapshot = getSnapshot(semPath, semCwd);
-                if (!snapshot) {
-                  matchNotes.push(
-                    `⚠ Cannot retrieve semantic context for ${semPath} — file has not been read in this session. Read it first, then retry.`
-                  );
-                  continue;
-                }
-
-                const semInput: SemanticContextInput = {
-                  path: semAbsolutePath,
-                  lineRange: semCtx.lineRange as { startLine: number; endLine?: number } | undefined,
-                  symbol: semCtx.symbol as { name: string; kind?: string; line?: number } | undefined,
-                  maxTokens: (semCtx.maxTokens as number) || 3000,
-                  maxDepth: (semCtx.maxDepth as number) || 1,
-                  includeReferences: (semCtx.includeReferences as "examples" | "all" | false) || "examples",
-                  includeImplementations: (semCtx.includeImplementations as boolean) || false,
-                  includeTypeDefinitions: (semCtx.includeTypeDefinitions as boolean) ?? true,
-                  includeHover: (semCtx.includeHover as boolean) ?? true,
-                };
-
-                const semResult = await buildSemanticContext(semInput, {
-                  cwd: semCwd,
-                  lspManager,
-                  astResolver: astResolver as unknown as AstResolverLike | null,
-                  async readFile(p: string) {
-                    return (await fsReadFile(resolve(semCwd, p))).toString('utf-8');
-                  },
-                  getSnapshot(p: string, c: string) {
-                    return getSnapshot(p, c);
-                  },
-                  recordRead(p: string, c: string, content: string, partial?: boolean) {
-                    recordRead(p, c, content, partial);
-                  },
-                  recordReadSession(p: string, c: string, lineRanges: Array<{ startLine: number; endLine: number }>) {
-                    for (const range of lineRanges) {
-                      recordReadSession(p, c, range.startLine, range.endLine - range.startLine + 1, 0, "semantic_context_inline");
-                    }
-                  },
-                });
-
-                // Include semantic context in match notes for display
-                matchNotes.push(`📋 Semantic context for ${semPath}:\n${semResult.markdown}`);
-              }
-            } catch (semError) {
-              // Semantic context is advisory — don't block the edit
-              const err = semError instanceof Error ? semError : new Error(String(semError));
-              matchNotes.push(`⚠ Semantic context retrieval failed: ${err.message}`);
-            }
-          }
-
 
           // ── Save undo state before write (non-blocking, fire-and-forget) ──
           saveUndoState(cwd, absolutePath, baseContent, edits.length).catch(() => {});

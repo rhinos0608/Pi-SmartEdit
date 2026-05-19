@@ -16,6 +16,7 @@
 import { resolve } from "path";
 
 import type { LSPManager, ManagedLSPConnection } from "./lsp-manager";
+import { withOpenDocument } from "./document-sync";
 
 export interface Diagnostic {
   message: string;
@@ -124,42 +125,37 @@ export async function checkPostEditDiagnostics(
   const uri = `file://${resolve(filePath)}`;
 
   try {
-    // Open document with current (post-edit) content
-    await server.notify("textDocument/didOpen", {
-      textDocument: {
-        uri,
-        languageId,
-        version: 1,
-        text: content,
-      },
-    });
+    // Open document with current (post-edit) content using withOpenDocument
+    const diagnostics = await withOpenDocument(server, {
+      uri,
+      languageId,
+      content,
+      version: 1,
+    }, async () => {
+      // Phase 1: Wait for push-based diagnostics notification (up to 3s).
+      // TypeScript language servers typically push diagnostics within 1-2s
+      // for files that are part of a tsconfig.json project.
+      let diags = await waitForDiagnostics(server, uri, 3000);
 
-    // Phase 1: Wait for push-based diagnostics notification (up to 3s).
-    // TypeScript language servers typically push diagnostics within 1-2s
-    // for files that are part of a tsconfig.json project.
-    let diagnostics = await waitForDiagnostics(server, uri, 3000);
+      // Phase 2: If no diagnostics received via notification, try the
+      // pull-based `textDocument/diagnostic` request (LSP 3.17).
+      // This is needed for standalone files or servers that don't auto-push.
+      if (diags.length === 0) {
+        try {
+          const pullResult = await server.request("textDocument/diagnostic", {
+            textDocument: { uri },
+          }) as { items?: Diagnostic[]; kind?: string } | null;
 
-    // Phase 2: If no diagnostics received via notification, try the
-    // pull-based `textDocument/diagnostic` request (LSP 3.17).
-    // This is needed for standalone files or servers that don't auto-push.
-    if (diagnostics.length === 0) {
-      try {
-        const pullResult = await server.request("textDocument/diagnostic", {
-          textDocument: { uri },
-        }) as { items?: Diagnostic[]; kind?: string } | null;
-
-        if (pullResult?.items) {
-          diagnostics = pullResult.items;
+          if (pullResult?.items) {
+            diags = pullResult.items;
+          }
+        } catch {
+          // textDocument/diagnostic not supported (pre-LSP 3.17 servers)
+          // or request failed — diagnostics remains empty, which is fine.
         }
-      } catch {
-        // textDocument/diagnostic not supported (pre-LSP 3.17 servers)
-        // or request failed — diagnostics remains empty, which is fine.
       }
-    }
 
-    // Close the document — keep server alive for future edits
-    await server.notify("textDocument/didClose", {
-      textDocument: { uri },
+      return diags;
     });
 
     return { diagnostics, source: "lsp" };

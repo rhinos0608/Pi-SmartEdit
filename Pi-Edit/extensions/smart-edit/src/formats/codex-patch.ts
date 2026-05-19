@@ -709,22 +709,19 @@ class CodexPatchParser {
       const normalizedPrefix = prefix.toLowerCase().replace(/\*\*\* */g, '***');
 
       if (normalizedLine.startsWith(normalizedPrefix) && normalizedLine.length > normalizedPrefix.length) {
-        const path = line.slice(
-          prefix.length, // Use original prefix length to get path offset correctly
-        ).trim();
         this.warnings.push({
           message: `Lenient spelling: "${line.slice(0, 40)}..." accepted as "${prefix}"`,
           line: this.line,
           kind: 'lenient_spelling',
         });
         this.consumeLine();
-        // Fix: if the path part is extracted correctly from the original line
         // The path is everything after the actual matched prefix text in the original line
         const matchedText = this.findActualPrefixMatch(line, prefix);
         if (matchedText !== null) {
           return line.slice(matchedText.length).trim();
         }
-        return path || 'unknown';
+        // Fallback: use original prefix length
+        return line.slice(prefix.length).trim() || 'unknown';
       }
 
       // Also try without space after ***: e.g. ***Add File:
@@ -756,7 +753,7 @@ class CodexPatchParser {
     // Try to match the normalised prefix at the start of the normalised line
     // We need to find the longest prefix of lineNorm that, when normalised, matches canonicalNorm
     const re = new RegExp(`^${this.escapeRegex(canonicalNorm)}`, 'i');
-    const match = line.match(re);
+    const match = lineNorm.match(re);
     return match ? match[0] : null;
   }
 

@@ -79,20 +79,13 @@ export class LSPConnection {
       this.closed = true;
       this.exitCode = code;
       this.exitSignal = signal;
-      if (code !== 0 && code !== null) {
-        // Server exited with error — reject all pending requests
-        for (const [, cb] of this.pending) {
-          cb.reject(
-            new Error(`LSP server exited with code ${code} (signal: ${signal})`)
-          );
-        }
-      } else if (code === 0) {
-        // Server exited cleanly — resolve any remaining requests
-        for (const [, cb] of this.pending) {
-          cb.resolve(null);
-        }
+      const err = new Error(`LSP server exited: code=${code} signal=${signal}`);
+      for (const [, cb] of this.pending) {
+        if (code === 0) cb.resolve(null);
+        else cb.reject(err);
       }
       this.pending.clear();
+      this.notificationHandlers.clear();
     });
 
     this.process.on("error", (err) => {
@@ -102,6 +95,7 @@ export class LSPConnection {
         cb.reject(err);
       }
       this.pending.clear();
+      this.notificationHandlers.clear();
     });
 
     // Allow Node event loop to exit even if this child is still running

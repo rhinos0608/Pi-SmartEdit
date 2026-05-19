@@ -48,17 +48,6 @@ const EXT_TO_WASM: Record<string, string | null> = {
   ".html": null,  // not in @vscode/tree-sitter-wasm
 };
 
-/**
- * Cached package.json data from @vscode/tree-sitter-wasm.
- * Populated lazily on first load attempt.
- */
-interface PackageJson {
-  dependencies?: Record<string, string>;
-  optionalDependencies?: Record<string, string>;
-}
-
-let discoveredGrammars: Map<string, string> | null = null;
-const packageJsonCache: PackageJson | null = null;
 
 let ParserModule: typeof Parser | null = null;
 let parserInitPromise: Promise<typeof Parser> | null = null;
@@ -102,66 +91,6 @@ function resolveWasmPath(wasmFile: string): string | null {
   }
 }
 
-/**
- * Discover available grammars from the @vscode/tree-sitter-wasm package.
- * Reads package.json to find which grammars are actually installed.
- * Caches the result for subsequent calls.
- */
-async function discoverAvailableGrammars(): Promise<Map<string, string>> {
-  if (discoveredGrammars) {
-    return discoveredGrammars;
-  }
-
-  discoveredGrammars = new Map();
-
-  try {
-    // Read package.json from the installed package
-    const packageJsonPath = _require.resolve(
-      `${VSCODE_WASM_PACKAGE}/package.json`
-    );
-    const content = await readFile(packageJsonPath, "utf-8");
-    const pkg = JSON.parse(content) as PackageJson;
-
-    // The package lists grammars in dependencies (e.g., "tree-sitter-typescript": "*")
-    // We infer WASM files from the grammar name (tree-sitter-typescript -> tree-sitter-typescript.wasm)
-    const allDeps = {
-      ...(pkg.dependencies ?? {}),
-      ...(pkg.optionalDependencies ?? {}),
-    };
-
-    for (const [name, version] of Object.entries(allDeps)) {
-      if (name.startsWith("tree-sitter-")) {
-        // tree-sitter-typescript -> tree-sitter-typescript.wasm
-        const wasmFile = `${name}.wasm`;
-        discoveredGrammars.set(wasmFile, version); // Note: version stored for debugging
-      }
-    }
-  } catch {
-    // Package not installed — will rely on hardcoded fallback
-  }
-
-  return discoveredGrammars;
-}
-
-/**
- * Resolve a WASM file for an extension, checking if it's actually
- * available in the installed package.
- */
-async function resolveGrammarFile(ext: string): Promise<string | null> {
-  const fallbackName = EXT_TO_WASM[ext.toLowerCase()];
-  if (!fallbackName) return null;
-
-  // Get available grammars from package.json
-  const available = await discoverAvailableGrammars();
-
-  // Check if the grammar is installed
-  if (available.has(fallbackName)) {
-    return fallbackName;
-  }
-
-  // Not installed — try to find alternatives or return null
-  return null;
-}
 
 /**
  * Load a grammar for the given file extension.
@@ -202,9 +131,8 @@ export async function loadGrammar(
       return null;
     }
 
-    // Load WASM file via fs.readFile + Language.load
-    const fs = await import("fs/promises");
-    const wasmBuffer = await fs.readFile(wasmPath);
+    // Load WASM file via readFile + Language.load
+    const wasmBuffer = await readFile(wasmPath);
 
     const language = await Parser.Language.load(wasmBuffer);
 

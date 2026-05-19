@@ -127,7 +127,7 @@ async function retrieveHistoryForTarget(
   ) {
     logOutput = await runGitLog(
       gitDir,
-      ["-L", `:${escapeGitPath(target.name)}:${escapeGitPath(target.path)}`],
+      ["-L", `:${escapeGitPath(target.name)}:${target.path}`],
       maxCommits,
     );
   }
@@ -136,7 +136,7 @@ async function retrieveHistoryForTarget(
   if (!logOutput.trim()) {
     logOutput = await runGitLog(
       gitDir,
-      ["-L", `${target.lineRange.startLine},${target.lineRange.endLine}:${escapeGitPath(target.path)}`],
+      ["-L", `${target.lineRange.startLine},${target.lineRange.endLine}:${target.path}`],
       maxCommits,
     );
   }

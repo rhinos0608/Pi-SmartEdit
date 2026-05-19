@@ -28,11 +28,27 @@ export type InputFormat = 'search_replace' | 'unified_diff' | 'openai_patch' | '
 export function detectInputFormat(input: string): InputFormat {
   const trimmed = input.trim();
 
-  // Search with leading filename: "src/foo.ts\n<<<<<<< SEARCH"
-  // Search without filename: "<<<<<<< SEARCH"
-  const firstLine = trimmed.split('\n')[0].trim();
-  if (trimmed.includes('<<<<<<< SEARCH')) {
+  // Strip BOM for detection
+  const normalized = trimmed.replace(/^\uFEFF/, '');
+
+  // Skip blank lines to find the first meaningful line
+  const lines = normalized.split('\n');
+  let firstLine = '';
+  for (const line of lines) {
+    const trimmedLine = line.trim();
+    if (trimmedLine.length > 0) {
+      firstLine = trimmedLine;
+      break;
+    }
+  }
+
+  if (normalized.includes('<<<<<<< SEARCH')) {
     return 'search_replace';
+  }
+
+  // Check for atomic patch envelope first (more specific than codex patch)
+  if (firstLine.startsWith('*** Begin Atomic Patch') || firstLine.startsWith('***Begin Atomic Patch')) {
+    return 'atomic_patch';
   }
 
   // Check for atomic patch envelope first (more specific than codex patch)
@@ -56,7 +72,8 @@ export function detectInputFormat(input: string): InputFormat {
     return 'openai_patch';
   }
 
-  if (firstLine.startsWith('--- ') && trimmed.includes('@@ ')) {
+  // Unified diff detection: can start with either --- a/ or +++ b/
+  if ((firstLine.startsWith('--- ') || firstLine.startsWith('+++ ')) && normalized.includes('@@ ')) {
     return 'unified_diff';
   }
 

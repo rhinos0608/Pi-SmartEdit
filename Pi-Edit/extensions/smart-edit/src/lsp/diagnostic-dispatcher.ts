@@ -36,7 +36,7 @@ export function parseTscOutput(output: string): Diagnostic[] {
   while ((match = regex.exec(output)) !== null) {
     const [, file, line, col, severity, _code, message] = match;
     diagnostics.push({
-      message: `${file}:${message}`,
+      message: message,
       severity: severity === "error" ? 1 : 2,
       range: {
         start: { line: parseInt(line) - 1, character: parseInt(col) - 1 },
@@ -209,7 +209,7 @@ export async function checkTscDiagnostics(
     ? ["tsc", "--noEmit", "--pretty", "false", "-p", tsconfigPath]
     : ["tsc", "--noEmit", "--pretty", "false", filePath];
 
-  const result = await safeSpawnAsync("npx", args, {
+  const result = await safeSpawnAsync("npx", ["--no-install", ...args], {
     cwd,
     timeout: 60000,
   });

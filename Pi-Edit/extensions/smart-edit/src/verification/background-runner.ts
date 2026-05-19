@@ -91,6 +91,7 @@ export class BackgroundRunRegistry {
     const actualTimeout = timeoutMs ?? this.defaultTimeoutMs;
 
     const promise = new Promise<VerificationRunStatus>((resolve, reject) => {
+      let child: ChildProcess | undefined;
       const run: ManagedRun = { runId, startedAt, command, resolve, reject };
 
       // Timeout guard
@@ -119,12 +120,21 @@ export class BackgroundRunRegistry {
 
       // Spawn the child process
       const [cmd, ...args] = command;
-      const child = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"] });
+      child = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"] });
       run.child = child;
       let stdout = "";
       let stderr = "";
-      child.stdout.on("data", (data: Buffer) => { stdout += data.toString(); });
-      child.stderr.on("data", (data: Buffer) => { stderr += data.toString(); });
+      const MAX_OUTPUT_CHARS = 10000;
+      child.stdout?.on("data", (data: Buffer) => {
+        if (stdout.length < MAX_OUTPUT_CHARS) {
+          stdout += data.toString();
+        }
+      });
+      child.stderr?.on("data", (data: Buffer) => {
+        if (stderr.length < MAX_OUTPUT_CHARS) {
+          stderr += data.toString();
+        }
+      });
 
       child.on("close", (code) => {
         // If already finalized (timeout/cancel), skip
@@ -174,10 +184,10 @@ export class BackgroundRunRegistry {
     this.runs.delete(runId);
     this.activeCount--;
 
-      const finalized = { ...status, finishedAt: status.finishedAt ?? Date.now() };
-      this.completedRuns.set(runId, finalized);
+    const finalized = { ...status, finishedAt: status.finishedAt ?? Date.now() };
+    this.completedRuns.set(runId, finalized);
 
-      run.resolve(finalized);
+    run.resolve(finalized);
 
     // Schedule eviction of old completed runs
     setTimeout(() => {

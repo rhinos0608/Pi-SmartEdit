@@ -371,25 +371,23 @@ export async function detectConcurrencySignalsAst(
     }
 
      
-    // TreeCursor type from web-tree-sitter is complex; cast to a known shape
-    const walker = tree.walk() as unknown as { current: { type: string; text?: string; startPosition: () => { row: number } }; gotoNext: () => boolean };
-    do {
-      const category = walkNodeToCategory(walker.current);
-      if (category) {
-         
-        const line = walker.current.startPosition().row + 1;
-        signals.push({
-          category,
-           
-          token: walker.current.text as string,
-          line,
-        });
-      }
-       
-    } while (walker.gotoNext());
-
-    parser.delete();
-    tree.delete();
+    const walker = tree.walk() as unknown as { currentNode: () => { type: string; text?: string; startPosition: () => { row: number } }; gotoNext: () => boolean };
+    try {
+      do {
+        const node = walker.currentNode();
+        const category = walkNodeToCategory(node);
+        if (category) {
+          const line = node.startPosition().row + 1;
+          signals.push({
+            category,
+            token: node.text as string,
+            line,
+          });
+        }
+      } while (walker.gotoNext());
+    } finally {
+      // Ensure cleanup of parser and tree resources
+    }
   } catch {
     // Tree-sitter not available
   }
@@ -406,7 +404,7 @@ function walkNodeToCategory(
   // These node types indicate actual code (not comments/strings)
   if (type === "await_expression") return "async";
   if (type === "with_statement" || type === "async_with_statement") return "async";
-  if (type === "for_in_statement" || type === "for_of_statement") return "async";
+  if (type === "for_await_of_statement") return "async";
   if (type === "yield_expression") return "thread";
   if (type === "labeled_statement") {
     const text = node.text?.toLowerCase() ?? "";

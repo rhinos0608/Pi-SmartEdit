@@ -64,6 +64,9 @@ export function getCachedParse(filePath: string, contentHash: string): ParseResu
   const cached = parseCache.get(filePath);
   if (!cached) return null;
   if (cached.contentHash !== contentHash) return null;
+  // Bump to end (LRU promotion)
+  parseCache.delete(filePath);
+  parseCache.set(filePath, cached);
   return cached.result;
 }
 
@@ -177,7 +180,7 @@ export function computeEdit(oldContent: string, newContent: string): EditDelta |
   function lineToByteOffset(lines: string[], lineIndex: number): number {
     let offset = 0;
     for (let i = 0; i < lineIndex && i < lines.length; i++) {
-      offset += lines[i].length + 1; // +1 for newline
+      offset += Buffer.byteLength(lines[i], "utf8") + 1;
     }
     return offset;
   }
@@ -307,7 +310,8 @@ export async function reuseParseResult(
   oldResult.tree.delete();
   // Note: oldResult.parser will be disposed when we create a new one
 
-  const newResult = await parseFile(newContent, oldResult.content.replace(/[^.]*$/, "").slice(0, -1) || "file.ts");
+  const ext = oldResult.language || ".ts";
+  const newResult = await parseFile(newContent, `file${ext}`);
 
   if (newResult) {
     // Full parse succeeded — dispose old parser
@@ -316,21 +320,14 @@ export async function reuseParseResult(
   }
 
   // Full parse also failed — recreate with same path logic
-  const ext = oldResult.language || ".ts";
   const parseResult = await parseFile(newContent, `file${ext}`);
   if (parseResult) {
     oldResult.parser.delete();
     return parseResult;
   }
 
-  // Last resort: return a result with the old parser (shouldn't happen)
-  return {
-    parser: oldResult.parser,
-    tree: oldResult.tree,
-    language: oldResult.language,
-    hasErrors: true,
-    content: newContent,
-  };
+  // All re-parse strategies failed — cannot recover
+  throw new Error("reuseParseResult: all re-parse strategies failed -- cannot recover parse tree");
 }
 
 // ─── Node type classification ───────────────────────────────────────
@@ -530,43 +527,47 @@ export function findEnclosingSymbols(
   // Use cursor-based descent for better performance on deep trees
   const cursor = root.walk();
 
-  const visit = (): boolean => {
-    const node = cursor.currentNode;
+  try {
+    const visit = (): boolean => {
+      const node = cursor.currentNode;
 
-    // Check if this node contains the byte range
-    if (node.startIndex <= startByte && node.endIndex >= endByte) {
-      if (isSymbolNode(node)) {
-        const nameNode = findNameChild(node);
-        symbols.push({
-          name: nameNode ? nameNode.text : `<anonymous ${node.type}>`,
-          kind: node.type,
-          lineStart: node.startPosition.row + 1,
-          lineEnd: node.endPosition.row + 1,
-          startByte: node.startIndex,
-          endByte: node.endIndex,
-        });
+      // Check if this node contains the byte range
+      if (node.startIndex <= startByte && node.endIndex >= endByte) {
+        if (isSymbolNode(node)) {
+          const nameNode = findNameChild(node);
+          symbols.push({
+            name: nameNode ? nameNode.text : `<anonymous ${node.type}>`,
+            kind: node.type,
+            lineStart: node.startPosition.row + 1,
+            lineEnd: node.endPosition.row + 1,
+            startByte: node.startIndex,
+            endByte: node.endIndex,
+          });
+        }
+
+        // Descend into children
+        if (cursor.gotoFirstChild()) {
+          do {
+            if (!visit()) break;
+          } while (cursor.gotoNextSibling());
+          cursor.gotoParent();
+        }
       }
 
-      // Descend into children
-      if (cursor.gotoFirstChild()) {
-        do {
-          if (!visit()) break;
-        } while (cursor.gotoNextSibling());
-        cursor.gotoParent();
-      }
+      return true; // continue
+    };
+
+    // Don't start at root (it's the program node), go to first child
+    if (cursor.gotoFirstChild()) {
+      do {
+        visit();
+      } while (cursor.gotoNextSibling());
     }
 
-    return true; // continue
-  };
-
-  // Don't start at root (it's the program node), go to first child
-  if (cursor.gotoFirstChild()) {
-    do {
-      visit();
-    } while (cursor.gotoNextSibling());
+    return symbols.reverse();
+  } finally {
+    cursor.delete();
   }
-
-  return symbols.reverse();
 }
 
 /**

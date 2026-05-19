@@ -140,11 +140,9 @@ export async function buildSemanticContext(
       start: { line: target.lineRange.startLine - 1, character: 0 },
       end: { line: target.lineRange.endLine - 1, character: 9999 }
     };
-    // Use withOpenDocument for semantic tokens too? 
-    // Usually it's already open from the block above but withOpenDocument handles nesting/locks.
-    const tokens = await withOpenDocument(server, { uri: `file://${resolve(input.path)}`, languageId, content }, async () => {
-      return await getSemanticTokensForRange(input.path, lspRange, languageId, deps.lspManager);
-    });
+    // Semantic tokens are already fetched inside the withOpenDocument block above.
+    // We just need to get them here using the same server connection.
+    const tokens = await getSemanticTokensForRange(input.path, lspRange, languageId, deps.lspManager);
     
     keyTokens = tokens
       .map(t => {
@@ -218,13 +216,19 @@ export async function buildSemanticContext(
     // References
     if (input.includeReferences) {
       const refs = await findReferences(input.path, token.line, token.character, languageId, deps.lspManager);
-      for (const ref of refs.slice(0, 2)) {
+      const limit = input.includeReferences === "all" ? Infinity : 2;
+      for (const ref of refs.slice(0, limit)) {
         await processLocation({ location: ref }, "reference", token.name, token.score - 20);
       }
     }
   });
 
-  await Promise.all(definitionTasks);
+  // Concurrency limit: process tokens in batches of 5 to avoid overwhelming the LSP server
+  const SEMAPHORE_LIMIT = 5;
+  for (let i = 0; i < definitionTasks.length; i += SEMAPHORE_LIMIT) {
+    const batch = definitionTasks.slice(i, i + SEMAPHORE_LIMIT);
+    await Promise.all(batch);
+  }
 
   async function processLocation(resolved: ResolvedLocation, relationship: ContextItem["relationship"], symbolName: string, score: number) {
     const loc = resolved.location;

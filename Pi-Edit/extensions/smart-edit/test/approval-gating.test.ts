@@ -19,80 +19,80 @@ function makeEdit(oldText?: string, newText?: string): EditItem {
 // ─── DANGEROUS_PATH_PATTERNS ──────────────────────────────────────────
 
 describe("DANGEROUS_PATH_PATTERNS", () => {
-  it("matches main.ts at any depth", () => {
-    assert.strictEqual(matchesDangerousPath("src/main.ts"), "**/main.ts");
-    assert.strictEqual(matchesDangerousPath("main.ts"), "**/main.ts");
-    assert.strictEqual(matchesDangerousPath("foo/bar/main.ts"), "**/main.ts");
+  it("matches main.ts at any depth", async () => {
+    assert.strictEqual(await matchesDangerousPath("src/main.ts"), "**/main.ts");
+    assert.strictEqual(await matchesDangerousPath("main.ts"), "**/main.ts");
+    assert.strictEqual(await matchesDangerousPath("foo/bar/main.ts"), "**/main.ts");
   });
 
-  it("matches main.js at any depth", () => {
-    assert.strictEqual(matchesDangerousPath("cli/main.js"), "**/main.js");
+  it("matches main.js at any depth", async () => {
+    assert.strictEqual(await matchesDangerousPath("cli/main.js"), "**/main.js");
   });
 
-  it("matches index.ts at any depth", () => {
-    assert.strictEqual(matchesDangerousPath("src/index.ts"), "**/index.ts");
-    assert.strictEqual(matchesDangerousPath("index.ts"), "**/index.ts");
+  it("matches index.ts at any depth", async () => {
+    assert.strictEqual(await matchesDangerousPath("src/index.ts"), "**/index.ts");
+    assert.strictEqual(await matchesDangerousPath("index.ts"), "**/index.ts");
   });
 
-  it("matches index.js at any depth", () => {
-    assert.strictEqual(matchesDangerousPath("api/index.js"), "**/index.js");
+  it("matches index.js at any depth", async () => {
+    assert.strictEqual(await matchesDangerousPath("api/index.js"), "**/index.js");
   });
 
-  it("matches config files", () => {
-    assert.strictEqual(matchesDangerousPath("config"), "**/config*");
-    assert.strictEqual(matchesDangerousPath("src/config.ts"), "**/config*");
+  it("matches config files", async () => {
+    assert.strictEqual(await matchesDangerousPath("config"), "**/config*");
+    assert.strictEqual(await matchesDangerousPath("src/config.ts"), "**/config*");
   });
 
-  it("matches *config* files", () => {
-    assert.strictEqual(matchesDangerousPath("eslint.config.js"), "**/*config*");
-    assert.strictEqual(matchesDangerousPath("webpack.config.ts"), "**/*config*");
+  it("matches *config* files", async () => {
+    assert.strictEqual(await matchesDangerousPath("eslint.config.js"), "**/*config*");
+    assert.strictEqual(await matchesDangerousPath("webpack.config.ts"), "**/*config*");
   });
 
-  it("matches .env files", () => {
-    assert.strictEqual(matchesDangerousPath(".env"), "**/.env*");
-    assert.strictEqual(matchesDangerousPath(".env.production"), "**/.env.*");
+  it("matches .env files", async () => {
+    assert.strictEqual(await matchesDangerousPath(".env"), "**/.env*");
+    assert.strictEqual(await matchesDangerousPath(".env.production"), "**/.env.*");
   });
 
-  it("matches __init__ files", () => {
-    assert.strictEqual(matchesDangerousPath("src/__init__.py"), "**/__init__*");
-    assert.strictEqual(matchesDangerousPath("__init__.py"), "**/__init__*");
+  it("matches __init__ files", async () => {
+    assert.strictEqual(await matchesDangerousPath("src/__init__.py"), "**/__init__*");
+    assert.strictEqual(await matchesDangerousPath("__init__.py"), "**/__init__*");
   });
 
-  it("matches Dockerfile", () => {
-    assert.strictEqual(matchesDangerousPath("Dockerfile"), "**/Dockerfile*");
-    assert.strictEqual(matchesDangerousPath("deploy/Dockerfile.prod"), "**/Dockerfile*");
+  it("matches Dockerfile", async () => {
+    assert.strictEqual(await matchesDangerousPath("Dockerfile"), "**/Dockerfile*");
+    assert.strictEqual(await matchesDangerousPath("deploy/Dockerfile.prod"), "**/Dockerfile*");
   });
 
-  it("matches CI configs", () => {
-    assert.strictEqual(matchesDangerousPath(".github/workflows/test.yml"), "**/.github/**");
-    assert.strictEqual(matchesDangerousPath(".gitlab-ci.yml"), "**/.gitlab-ci.yml");
+  it("matches CI configs", async () => {
+    assert.strictEqual(await matchesDangerousPath(".github/workflows/test.yml"), "**/.github/**");
+    assert.strictEqual(await matchesDangerousPath(".gitlab-ci.yml"), "**/.gitlab-ci.yml");
   });
 
-  it("matches YAML files", () => {
-    assert.strictEqual(matchesDangerousPath("deploy.yaml"), "**/*.yaml");
-    assert.strictEqual(matchesDangerousPath("values.yml"), "**/*.yml");
+  it("matches YAML files", async () => {
+    assert.strictEqual(await matchesDangerousPath("deploy.yaml"), "**/*.yaml");
+    assert.strictEqual(await matchesDangerousPath("values.yml"), "**/*.yml");
   });
 
-  it("matches k8s/terraform/infra paths", () => {
-    assert.strictEqual(matchesDangerousPath("k8s/deployment.yaml"), "**/k8s/**");
-    assert.strictEqual(matchesDangerousPath("terraform/main.tf"), "**/terraform/**");
-    assert.strictEqual(matchesDangerousPath("tf/variables.tf"), "**/tf/**");
+  it("matches k8s/terraform/infra paths", async () => {
+    assert.strictEqual(await matchesDangerousPath("k8s/deployment.yaml"), "**/k8s/**");
+    assert.strictEqual(await matchesDangerousPath("terraform/main.tf"), "**/terraform/**");
+    assert.strictEqual(await matchesDangerousPath("tf/variables.tf"), "**/tf/**");
   });
 
-  it("does NOT match safe paths", () => {
-    assert.strictEqual(matchesDangerousPath("src/service.ts"), null);
-    assert.strictEqual(matchesDangerousPath("src/components/Button.tsx"), null);
-    assert.strictEqual(matchesDangerousPath("README.md"), null);
-    assert.strictEqual(matchesDangerousPath("test/fixtures/index.html"), null);
-    assert.strictEqual(matchesDangerousPath("src/utils/helpers.ts"), null);
+  it("does NOT match safe paths", async () => {
+    assert.strictEqual(await matchesDangerousPath("src/service.ts"), null);
+    assert.strictEqual(await matchesDangerousPath("src/components/Button.tsx"), null);
+    assert.strictEqual(await matchesDangerousPath("README.md"), null);
+    assert.strictEqual(await matchesDangerousPath("test/fixtures/index.html"), null);
+    assert.strictEqual(await matchesDangerousPath("src/utils/helpers.ts"), null);
   });
 });
 
 // ─── DANGEROUS_SYMBOL_PATTERNS (approval-gating) ─────────────────────
 
 describe("checkEditSafety — symbol patterns", () => {
-  it("detects main() function in edits", () => {
-    const result = checkEditSafety(
+  it("detects main() function in edits", async () => {
+    const result = await checkEditSafety(
       "src/worker.ts",
       [makeEdit("function main() {", "function main() { console.log('start'); }")],
       { level: "prompt_on_dangerous" },
@@ -101,8 +101,8 @@ describe("checkEditSafety — symbol patterns", () => {
     assert.ok(result.warnings.some((w) => w.includes("main() function")));
   });
 
-  it("detects init() function in edits", () => {
-    const result = checkEditSafety(
+  it("detects init() function in edits", async () => {
+    const result = await checkEditSafety(
       "src/setup.ts",
       [makeEdit(), makeEdit("function init() {", "function init() { return true; }")],
       { level: "prompt_on_dangerous" },
@@ -111,8 +111,8 @@ describe("checkEditSafety — symbol patterns", () => {
     assert.ok(result.warnings.some((w) => w.includes("init() function")));
   });
 
-  it("detects process.env in edits", () => {
-    const result = checkEditSafety(
+  it("detects process.env in edits", async () => {
+    const result = await checkEditSafety(
       "config/db.ts",
       [makeEdit("process.env.DB_URL", "process.env.DB_URL_NEW")],
       { level: "prompt_on_dangerous" },
@@ -121,8 +121,8 @@ describe("checkEditSafety — symbol patterns", () => {
     assert.ok(result.warnings.some((w) => w.includes("process.env")));
   });
 
-  it("detects constructor method in edits", () => {
-    const result = checkEditSafety(
+  it("detects constructor method in edits", async () => {
+    const result = await checkEditSafety(
       "src/service.ts",
       [makeEdit("constructor(name: string) {", "constructor(name: string, age: number) {")],
       { level: "prompt_on_dangerous" },
@@ -131,8 +131,8 @@ describe("checkEditSafety — symbol patterns", () => {
     assert.ok(result.warnings.some((w) => w.includes("constructor")));
   });
 
-  it("detects Python __init__ in edits", () => {
-    const result = checkEditSafety(
+  it("detects Python __init__ in edits", async () => {
+    const result = await checkEditSafety(
       "src/models.py",
       [makeEdit("def __init__(self):", "def __init__(self, name: str):")],
       { level: "prompt_on_dangerous" },
@@ -141,8 +141,8 @@ describe("checkEditSafety — symbol patterns", () => {
     assert.ok(result.warnings.some((w) => w.includes("__init__")));
   });
 
-  it("detects child_process require in edits", () => {
-    const result = checkEditSafety(
+  it("detects child_process require in edits", async () => {
+    const result = await checkEditSafety(
       "src/exec.ts",
       [makeEdit('const cp = require("child_process")', 'const { exec } = require("child_process")')],
       { level: "prompt_on_dangerous" },
@@ -151,8 +151,8 @@ describe("checkEditSafety — symbol patterns", () => {
     assert.ok(result.warnings.some((w) => w.includes("child_process")));
   });
 
-  it("detects fs.writeFile in edits", () => {
-    const result = checkEditSafety(
+  it("detects fs.writeFile in edits", async () => {
+    const result = await checkEditSafety(
       "src/fs.ts",
       [makeEdit("fs.writeFile", "fs.writeFileSync")],
       { level: "prompt_on_dangerous" },
@@ -161,8 +161,8 @@ describe("checkEditSafety — symbol patterns", () => {
     assert.ok(result.warnings.some((w) => w.includes("writeFile")));
   });
 
-  it("detects .listen() in edits", () => {
-    const result = checkEditSafety(
+  it("detects .listen() in edits", async () => {
+    const result = await checkEditSafety(
       "src/server.ts",
       [makeEdit("app.listen(3000)", "app.listen(8080)")],
       { level: "prompt_on_dangerous" },
@@ -171,8 +171,8 @@ describe("checkEditSafety — symbol patterns", () => {
     assert.ok(result.warnings.some((w) => w.includes("listen")));
   });
 
-  it("detects route handlers in edits", () => {
-    const result = checkEditSafety(
+  it("detects route handlers in edits", async () => {
+    const result = await checkEditSafety(
       "src/routes.ts",
       [makeEdit("router.get('/api/users', handler)", "router.use('/api/users', authMiddleware)")],
       { level: "prompt_on_dangerous" },
@@ -185,8 +185,8 @@ describe("checkEditSafety — symbol patterns", () => {
 // ─── Approval levels ─────────────────────────────────────────────────
 
 describe("checkEditSafety — approval levels", () => {
-  it("never_prompt returns safe with no warnings", () => {
-    const result = checkEditSafety(
+  it("never_prompt returns safe with no warnings", async () => {
+    const result = await checkEditSafety(
       "src/main.ts",
       [makeEdit("function main() {", "function main() { return 1; }")],
       { level: "never_prompt" },
@@ -196,8 +196,8 @@ describe("checkEditSafety — approval levels", () => {
     assert.strictEqual(result.level, "never_prompt");
   });
 
-  it("prompt_on_dangerous warns on dangerous path but safe edits", () => {
-    const result = checkEditSafety(
+  it("prompt_on_dangerous warns on dangerous path but safe edits", async () => {
+    const result = await checkEditSafety(
       "src/main.ts",
       [makeEdit("hello", "world")],
       { level: "prompt_on_dangerous" },
@@ -207,8 +207,8 @@ describe("checkEditSafety — approval levels", () => {
     assert.ok(result.warnings.some((w) => w.includes("main.ts")));
   });
 
-  it("prompt_on_dangerous is safe for safe path and safe edits", () => {
-    const result = checkEditSafety(
+  it("prompt_on_dangerous is safe for safe path and safe edits", async () => {
+    const result = await checkEditSafety(
       "src/service.ts",
       [makeEdit("hello", "world")],
       { level: "prompt_on_dangerous" },
@@ -217,8 +217,8 @@ describe("checkEditSafety — approval levels", () => {
     assert.strictEqual(result.warnings.length, 0);
   });
 
-  it("prompt_always emits warning even for safe edits", () => {
-    const result = checkEditSafety(
+  it("prompt_always emits warning even for safe edits", async () => {
+    const result = await checkEditSafety(
       "src/service.ts",
       [makeEdit("hello", "world")],
       { level: "prompt_always" },
@@ -228,8 +228,8 @@ describe("checkEditSafety — approval levels", () => {
     assert.ok(result.warnings.some((w) => w.includes("no dangerous patterns")));
   });
 
-  it("prompt_always also catches dangerous patterns", () => {
-    const result = checkEditSafety(
+  it("prompt_always also catches dangerous patterns", async () => {
+    const result = await checkEditSafety(
       ".env",
       [makeEdit("API_KEY=old", "API_KEY=new")],
       { level: "prompt_always" },
@@ -239,11 +239,9 @@ describe("checkEditSafety — approval levels", () => {
   });
 });
 
-// ─── Empty / edge cases ─────────────────────────────────────────────
-
 describe("checkEditSafety — edge cases", () => {
-  it("handles empty edits array", () => {
-    const result = checkEditSafety(
+  it("handles empty edits array", async () => {
+    const result = await checkEditSafety(
       "config/deploy.yml",
       [],
       { level: "prompt_on_dangerous" },
@@ -252,8 +250,8 @@ describe("checkEditSafety — edge cases", () => {
     assert.ok(result.warnings.some((w) => w.includes("deploy.yml")));
   });
 
-  it("handles edits with no oldText/newText", () => {
-    const result = checkEditSafety(
+  it("handles edits with no oldText/newText", async () => {
+    const result = await checkEditSafety(
       "src/util.ts",
       [{ oldText: "", newText: "" }] as EditItem[],
       { level: "prompt_on_dangerous" },
@@ -262,16 +260,16 @@ describe("checkEditSafety — edge cases", () => {
     assert.strictEqual(result.warnings.length, 0);
   });
 
-  it("defaults to never_prompt when no config given", () => {
+  it("defaults to never_prompt when no config given", async () => {
     // Without setting SMART_EDIT_APPROVAL_LEVEL, defaults to never_prompt
-    const result = checkEditSafety("src/main.ts", [makeEdit("function main()", "function main() {}")]);
+    const result = await checkEditSafety("src/main.ts", [makeEdit("function main()", "function main() {}")]);
     assert.strictEqual(result.safe, true);
     assert.strictEqual(result.warnings.length, 0);
     assert.strictEqual(result.level, "never_prompt");
   });
 
-  it("combines path warning and symbol warning", () => {
-    const result = checkEditSafety(
+  it("combines path warning and symbol warning", async () => {
+    const result = await checkEditSafety(
       "src/main.ts",
       [makeEdit("function main() {", "function main() { return 0; }")],
       { level: "prompt_on_dangerous" },
@@ -283,8 +281,8 @@ describe("checkEditSafety — edge cases", () => {
     assert.ok(symbolWarnings.length > 0, "expected symbol warning");
   });
 
-  it("deduplicates same symbol across edits", () => {
-    const result = checkEditSafety(
+  it("deduplicates same symbol across edits", async () => {
+    const result = await checkEditSafety(
       "src/service.ts",
       [
         makeEdit("function main() { return 1; }", "function main() { return 2; }"),

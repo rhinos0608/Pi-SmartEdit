@@ -109,6 +109,7 @@ export async function runRepairLoop(
   let currentContent = content;
   let finalValidation: ValidationResult | null = null;
   let passed = false;
+  let repairedContent: string | null = null;
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     // ── Run validation ──
@@ -119,6 +120,17 @@ export async function runRepairLoop(
     });
 
     passed = finalValidation.passed;
+    repairedContent = null;
+
+    // ── On failure, attempt auto-repair ──
+    if (!passed) {
+      const repairResult = await autoRepair(content, currentContent, filePath, options, cwd);
+      if (repairResult.repaired && repairResult.validation?.passed) {
+        currentContent = repairResult.content;
+        repairedContent = repairResult.content;
+        passed = true;
+      }
+    }
 
     const feedbackMessage = formatValidationFeedback(finalValidation);
     const structuralErrors = finalValidation.structural.errors;
@@ -144,7 +156,7 @@ export async function runRepairLoop(
     await notifyHooks(repairAttempt, {
       filePath: resolve(cwd, filePath),
       originalContent: content,
-      repairedContent: null,
+      repairedContent,
     });
 
     // ── Wait before retry (skip on last attempt) ──

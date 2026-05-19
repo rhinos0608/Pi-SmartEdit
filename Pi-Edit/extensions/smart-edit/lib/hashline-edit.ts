@@ -377,11 +377,12 @@ function collectLinePrefixStats(lines: string[]): LinePrefixStats {
 
 function stripLeadingHashlinePrefixes(line: string): string {
   let result = line;
-  let previous: string;
-  do {
-    previous = result;
+  // Safety counter to prevent infinite loops on malformed input
+  for (let i = 0; i < 10; i++) {
+    const prev = result;
     result = result.replace(HASHLINE_PREFIX_RE, "");
-  } while (result !== previous);
+    if (result === prev) break;
+  }
   return result;
 }
 
@@ -627,6 +628,9 @@ export function applyHashlineEdits(
 ): ApplyResult {
   const fileLines = text.split(/\r?\n/);
 
+  // Detect line ending style from original text
+  const lineEnding = /\r\n/.test(text) ? "\r\n" : "\n";
+
   // Sort bottom-up: highest line first
   const sortedEdits = [...edits].sort((a, b) => {
     const aLine = getEditEndLine(a, fileLines.length);
@@ -656,7 +660,7 @@ export function applyHashlineEdits(
   }
 
   return {
-    lines: fileLines.join("\n"),
+    lines: fileLines.join(lineEnding),
     firstChangedLine: firstChanged,
     warnings: warnings.length > 0 ? warnings : undefined,
     noopEdits: noopEdits.length > 0 ? noopEdits : undefined,

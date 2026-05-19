@@ -93,9 +93,12 @@ function findFuzzyKey(
   }
 
   // Pass 2: substring containment (only if no exact match)
+  // Require substring match to be at least 50% of the longer string
   for (const key of keys) {
     const keyLower = key.toLowerCase().replace(/[_-]/g, "");
-    if (keyLower.includes(targetLower) || targetLower.includes(keyLower)) {
+    const longer = keyLower.length > targetLower.length ? keyLower : targetLower;
+    const shorter = keyLower.length > targetLower.length ? targetLower : keyLower;
+    if (longer.includes(shorter) && shorter.length >= longer.length * 0.5) {
       return key;
     }
   }
@@ -128,9 +131,12 @@ export function repairJson(
   const renames: Record<string, string> = {};
   let fuzzyApplied = false;
 
+  // Strip BOM at the start
+  const input = raw.replace(/^\uFEFF/, '');
+
   // Strategy 1: As-is
   try {
-    const value = JSON.parse(raw);
+    const value = JSON.parse(input);
     return { value: applyFuzzyKeys(value, knownSchema, renames), strategy: 0, fuzzyKeysApplied: Object.keys(renames).length > 0, fuzzyRenames: renames };
   } catch { /* fall through */ }
 

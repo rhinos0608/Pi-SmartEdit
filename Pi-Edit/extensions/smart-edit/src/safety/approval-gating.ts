@@ -10,6 +10,8 @@
  */
 
 import type { EditItem } from "../../lib/types";
+import { resolve } from "path";
+import { realpath } from "fs/promises";
 
 // ─── Types ─────────────────────────────────────────────────────────────
 
@@ -161,15 +163,17 @@ function globToRegex(pattern: string): RegExp {
 
 /**
  * Check if a file path matches any of the dangerous patterns.
+ * Normalizes the path using path.resolve() before matching.
  */
-export function matchesDangerousPath(
+export async function matchesDangerousPath(
   filePath: string,
   patterns: readonly string[] = DANGEROUS_PATH_PATTERNS,
   regexes: readonly RegExp[] = DANGEROUS_PATH_REGEXES,
-): string | null {
+): Promise<string | null> {
+  const normalizedPath = resolve(filePath);
   const effectiveRegexes = patterns === DANGEROUS_PATH_PATTERNS ? regexes : patterns.map(globToRegex);
   for (let i = 0; i < effectiveRegexes.length; i++) {
-    if (effectiveRegexes[i].test(filePath)) {
+    if (effectiveRegexes[i].test(normalizedPath)) {
       return patterns[i];
     }
   }
@@ -200,6 +204,9 @@ function scanEditsForDangerousSymbols(
 
     if (edit.oldText) textsToCheck.push(edit.oldText);
     if (edit.newText) textsToCheck.push(edit.newText);
+    if ((edit as any).replaceBody) textsToCheck.push((edit as any).replaceBody);
+    if ((edit as any).insertBefore) textsToCheck.push((edit as any).insertBefore);
+    if ((edit as any).insertAfter) textsToCheck.push((edit as any).insertAfter);
 
     for (const text of textsToCheck) {
       for (const pattern of patterns) {
@@ -239,7 +246,7 @@ function defaultConfig(): ApprovalConfig {
  *
  * Returns a SafetyCheckResult with warnings (never throws for danger).
  */
-export function checkEditSafety(
+export async function checkEditSafety(
   filePath: string,
   edits: readonly EditItem[],
   config?: Partial<ApprovalConfig>,
@@ -253,7 +260,15 @@ export function checkEditSafety(
   const warnings: string[] = [];
 
   // ── 1. Check file path against dangerous patterns ─────────────
-  const matchedPath = matchesDangerousPath(filePath, cfg.dangerousPathPatterns);
+  // Resolve symlinks and normalize path before checking
+  let resolvedPath = filePath;
+  try {
+    resolvedPath = await realpath(filePath);
+  } catch {
+    // Fall back to resolved path if realpath fails
+    resolvedPath = resolve(filePath);
+  }
+  const matchedPath = await matchesDangerousPath(resolvedPath, cfg.dangerousPathPatterns);
   if (matchedPath) {
     warnings.push(
       `⚠️ Danger: editing "${filePath}" matches dangerous path pattern "${matchedPath}". ` +

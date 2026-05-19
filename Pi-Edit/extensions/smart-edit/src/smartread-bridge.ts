@@ -60,7 +60,7 @@ export function recordBreakage(
 ): void {
   const event: MutationEvent = {
     type: "breakage",
-    data: { from, to, context, confidence, source: "diagnostics" },
+    data: { from, to, context, confidence: confidence ?? 1.0, source: "diagnostics" },
     timestamp: Date.now(),
   };
   appendEvent(root, event);
@@ -93,6 +93,10 @@ export function recordCoChange(
 
 // ─── Helpers ───────────────────────────────────────────────────────
 
+// NOTE: This function uses synchronous appendFileSync which is safe for single-process
+// execution (JavaScript is single-threaded). For multi-process scenarios (e.g.,
+// multiple Pi instances editing the same project), consider using a file lock or
+// switching to an async queue with proper synchronization.
 function appendEvent(root: string, event: MutationEvent): void {
   const logPath = resolve(root, EDGE_LOG_RELPATH);
   const dir = dirname(logPath);

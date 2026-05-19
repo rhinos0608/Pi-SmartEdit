@@ -502,7 +502,9 @@ function parseGoRaceLine(
   output: string,
 ): { start: { line: number; character: number }; end: { line: number; character: number } } | undefined {
   // Match patterns like: pkg/sub/file.go:42:10: data race
-  const match = output.match(/((?:[^\s:]+\\)*[^\s:\\/]+\.go):(\d+)(?::(\d+))?/);
+  const unixMatch = output.match(/((?:[^\s:]+\/)*[^\s:\\/]+\.go):(\d+)(?::(\d+))?/);
+  const winMatch = output.match(/((?:[^\s:]+\\\\)*[^\s:\\/]+\.go):(\d+)(?::(\d+))?/);
+  const match = unixMatch ?? winMatch;
   if (match) {
     const line = parseInt(match[2], 10) - 1;
     const col = match[3] ? parseInt(match[3], 10) - 1 : 0;

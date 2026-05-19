@@ -648,7 +648,8 @@ describe("applyHashlineEdits", () => {
       lines: ["line 2 modified"],
     }];
     const result = applyHashlineEdits(content, edits);
-    assert.strictEqual(result.lines, "line 1\nline 2 modified\nline 3");
+    // CRLF line endings are preserved
+    assert.strictEqual(result.lines, "line 1\r\nline 2 modified\r\nline 3");
   });
 
   it("throws on out-of-bounds range", () => {

@@ -244,9 +244,8 @@ export async function checkStale(path: string, cwd: string): Promise<string | nu
 
           if (retryHash === snapshot.contentHash) {
             // Content matches — the miss was transient VFS inconsistency.
-            // Update snapshot with settled metadata and proceed.
-            snapshot.mtimeMs = retryStat.mtimeMs;
-            snapshot.size = retryStat.size;
+            // Atomically replace snapshot with settled metadata and proceed.
+            snapshotCache.set(normalized, { ...snapshot, mtimeMs: retryStat.mtimeMs, size: retryStat.size });
             return null;
           }
         }
@@ -255,8 +254,9 @@ export async function checkStale(path: string, cwd: string): Promise<string | nu
         return staleError(path, snapshot.mtimeMs, stat.mtimeMs);
       }
 
-      // mtime changed but content is the same — update snapshot mtime
+      // mtime changed but content is the same — update snapshot mtime and size
       snapshot.mtimeMs = stat.mtimeMs;
+      snapshot.size = stat.size;
     }
 
     // Full snapshots only: verify size hasn't changed

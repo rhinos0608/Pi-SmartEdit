@@ -17,8 +17,9 @@ import {
   mkdir as fsMkdir,
   rmdir as fsRmdir,
 } from "fs/promises";
-import { resolve, dirname, join } from "path";
+import { resolve as pathResolve, dirname, join } from "path";
 import { createHash } from "crypto";
+import { randomBytes } from "crypto";
 
 import { atomicWrite } from "./atomic-write";
 import type { AtomicWriteOptions } from "./atomic-write";
@@ -64,7 +65,7 @@ function fastHash(content: string): string {
 }
 
 function getUndoDir(cwd: string): string {
-  return resolve(cwd, UNDO_DIR);
+  return pathResolve(cwd, UNDO_DIR);
 }
 
 /**
@@ -107,7 +108,7 @@ export async function saveUndoState(
     const now = new Date();
     const contentHash = fastHash(content);
     const timestamp = now.toISOString();
-    const filename = buildEntryFilename(contentHash, formatTimestamp(now));
+    const filename = buildEntryFilename(contentHash, formatTimestamp(now) + "-" + randomBytes(4).toString("hex"));
 
     const entry: UndoEntry = {
       path,
@@ -123,8 +124,9 @@ export async function saveUndoState(
       JSON.stringify(entry, null, 2),
       "utf-8",
     );
-  } catch {
-    // Fire-and-forget: never block the edit hot path
+  } catch (err) {
+    // Fire-and-forget: never block the edit hot path, but log the error
+    console.warn("[smart-edit] Failed to save undo state:", err);
   }
 }
 
@@ -162,7 +164,9 @@ export async function restoreUndoState(
       try {
         const raw = await fsReadFile(join(undoDir, filename), "utf-8");
         const entry = JSON.parse(raw) as UndoEntry;
-        if (entry.path === filePath) {
+      const resolvedEntryPath = pathResolve(entry.path);
+      const resolvedFilePath = pathResolve(filePath);
+      if (resolvedEntryPath === resolvedFilePath) {
           matching.push({ entry, filename });
         }
       } catch {
@@ -182,20 +186,30 @@ export async function restoreUndoState(
     const { entry, filename } = matching[0];
 
     // Decode original content
-    const originalContent = Buffer.from(
+    const storedOriginalContent = Buffer.from(
       entry.originalContent,
       "base64",
     ).toString("utf-8");
 
-    // Verify snapshot hash
-    const currentHash = fastHash(originalContent);
+    // Read the CURRENT file from disk to verify user hasn't modified it since undo was saved
+    let currentFileContent: string;
+    try {
+      currentFileContent = await fsReadFile(pathResolve(filePath), "utf-8");
+    } catch {
+      // File may have been deleted — cannot verify, skip restore
+      return false;
+    }
+
+    // Compare current file hash against stored snapshot hash
+    // If they match, the file is unchanged and we can safely restore
+    const currentHash = fastHash(currentFileContent);
     if (currentHash !== entry.snapshotHash) {
-      // Content hash mismatch — data may be corrupted
+      // File has been modified since undo was saved — user may have intentionally changed it
       return false;
     }
 
     // Write original content back via atomicWrite
-    await atomicWrite(filePath, originalContent, options);
+    await atomicWrite(filePath, storedOriginalContent, options);
 
     // Delete the undo file after successful restore
     try {

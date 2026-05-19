@@ -212,9 +212,17 @@ function parseAttrs(openTag: string): ContextMarkerAttrs {
 
   while ((match = attrRegex.exec(openTag)) !== null) {
     const [, key, rawValue] = match;
-    const value = key === "path"
-      ? decodeURIComponent(rawValue)
-      : decodeHTMLEntities(rawValue);
+    let value: string;
+    if (key === "path") {
+      // Wrap decodeURIComponent in try-catch, fall back to rawValue on URIError
+      try {
+        value = decodeURIComponent(rawValue);
+      } catch {
+        value = rawValue;
+      }
+    } else {
+      value = decodeHTMLEntities(rawValue);
+    }
 
     switch (key) {
       case "type":

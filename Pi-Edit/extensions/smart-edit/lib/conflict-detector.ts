@@ -190,21 +190,20 @@ export function createConflictDetector(
     try {
       for (const span of editSpans) {
         // Try AST-based checking with the shared parse result
-        if (hasResolver && sharedParseResult && !sharedParseResult.tree.rootNode.hasError) {
-          const localReports = checkAstConflictsFromTree(
-            resolver,
-            filePath,
-            content,
-            span,
-            sharedParseResult,
-          );
-          reports.push(...localReports);
-        }
+        const astResults = checkAstConflictsFromTree(
+          resolver,
+          filePath,
+          content,
+          span,
+          sharedParseResult,
+        );
+        reports.push(...astResults);
 
-        // Also check line-range conflicts (complementary — catches
-        // things AST might miss when parse fails)
-        const localReports = checkLineRangeConflicts(filePath, span);
-        reports.push(...localReports);
+        // Short-circuit: only check line-range if AST found nothing
+        if (astResults.length === 0) {
+          const lrResults = checkLineRangeConflicts(filePath, span);
+          reports.push(...lrResults);
+        }
       }
     } finally {
       if (sharedParseResult) {
@@ -412,7 +411,7 @@ export function createConflictDetector(
     const lineHistory = lineRangeHistory.get(filePath);
     if (lineHistory) {
       for (const record of lineHistory) {
-        baseline.add(`byte-range:${record.turn}`);
+        baseline.add(`${record.startByte}:${record.endByte}`);
       }
     }
 

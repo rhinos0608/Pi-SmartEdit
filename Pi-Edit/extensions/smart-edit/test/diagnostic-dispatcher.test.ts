@@ -29,7 +29,7 @@ describe("Diagnostic Dispatcher", () => {
       const diagnostics = parseTscOutput(output);
       
       assert.strictEqual(diagnostics.length, 1);
-      assert.strictEqual(diagnostics[0].message, "file.ts:Type 'number' is not assignable to type 'string'.");
+      assert.strictEqual(diagnostics[0].message, "Type 'number' is not assignable to type 'string'.");
       assert.strictEqual(diagnostics[0].severity, 1);
       assert.strictEqual(diagnostics[0].range.start.line, 9);
       assert.strictEqual(diagnostics[0].range.start.character, 4);
@@ -138,7 +138,7 @@ describe("Diagnostic Dispatcher", () => {
 
       assert.ok(
         messages.some((message) =>
-          message.includes("bad.ts:Parameter 'value' implicitly has an 'any' type.")
+          message.includes("Parameter 'value' implicitly has an 'any' type.")
         ),
         messages.join("\n"),
       );

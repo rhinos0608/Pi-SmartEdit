@@ -236,7 +236,7 @@ export async function runAutoValidation(
     ? currentCount
     : incrementRetryCount(cwd, filePath);
 
-  const shouldDecompose = retryCount > maxRetries;
+  const shouldDecompose = retryCount >= maxRetries;
 
   // Build summary
   const parts: string[] = [];

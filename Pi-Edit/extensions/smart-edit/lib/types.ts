@@ -6,20 +6,6 @@
  * - description: echoed in error messages for model self-reference
  */
 
-/** AST-based disambiguation hint for the edit */
-export interface EditAnchor {
-  /** Name of the enclosing symbol (e.g., "handleRequest", "MyClass") */
-  symbolName?: string;
-
-  /** Kind of symbol to filter by (e.g., "function_declaration", "class_declaration")
-   *  If omitted, all symbol kinds matching the name are considered. */
-  symbolKind?: string;
-
-  /** 1-based line number hint for where the symbol's NAME appears.
-   *  Requires symbolName to be set. Used to disambiguate symbols with the same name. */
-  symbolLine?: number;
-}
-
 /** Search scope that narrows where findText searches for oldText */
 export interface SearchScope {
   /** Byte offset into the content where searching begins */
@@ -35,8 +21,41 @@ export interface SearchScope {
 // ─── Target / Anchor types ────────────────────────────────────────────
 
 /**
- * Unified anchor for targeting a symbol by name OR name-path.
- * Discriminated: at least one of `name` or `namePath` must be present.
+ * Unified edit target combining anchor scoping and symbolic edit operations.
+ * When used with oldText/newText: scopes the text search within the symbol's byte range.
+ * When used with replaceBody/insertBefore/insertAfter: operates on the whole symbol.
+ * Provide at most one of replaceBody, insertBefore, or insertAfter.
+ */
+export interface EditTarget {
+  /** Symbol name to target (e.g., function name, class name). */
+  name?: string;
+
+  /** Qualified symbol path; the final component is matched by AST name
+   * (e.g., 'MyClass.myMethod'). */
+  namePath?: string;
+
+  /** AST node kind hint (e.g., 'function_declaration', 'class_declaration'). */
+  kind?: string;
+
+  /** 1-based line hint for disambiguation when multiple symbols share a name. */
+  line?: number;
+
+  /** Replace the entire AST symbol definition with this text. */
+  replaceBody?: string;
+
+  /** Insert this text immediately before the AST symbol definition. */
+  insertBefore?: string;
+
+  /** Insert this text immediately after the AST symbol definition. */
+  insertAfter?: string;
+
+  /** Optional label echoed in diagnostics for model self-reference. */
+  description?: string;
+}
+
+/**
+ * Target for symbolic edits only (replaceBody/insertBefore/insertAfter).
+ * Kept for internal use by symbolic-edits.ts pipeline.
  */
 export type SymbolEditTarget =
   | { readonly name: string; namePath?: string; kind?: string; line?: number }
@@ -48,7 +67,6 @@ export type EditCapability =
   | "astAnchor"
   | "hashline"
   | "symbolicEdit"
-  | "semanticContext"
   | "lspDiagnostics"
   | "compilerDiagnostics"
   | "scopedDiagnostics";
@@ -58,14 +76,12 @@ export interface EditItem {
   newText: string;
   replaceAll?: boolean;
   description?: string;
-  symbol?: SymbolEditTarget;
-  replaceBody?: string;
-  insertBefore?: string;
-  insertAfter?: string;
 
-  /** AST-based disambiguation hint. If provided, oldText must match
-   *  within the byte range of the described AST node. */
-  anchor?: EditAnchor;
+  /** Unified target: anchor scoping (name/kind/line) + optional symbolic operation.
+   *  Anchor: oldText/newText matched within the symbol's byte range.
+   *  Symbolic: replaceBody/insertBefore/insertAfter operate on the whole symbol.
+   *  Backwards compat: old anchor/symbol fields are converted to target in prepareArguments(). */
+  target?: EditTarget;
 }
 
 export interface EditInput {
@@ -268,14 +284,21 @@ export interface EditResult {
   };
 }
 
+import { createHash } from "crypto";
+
 /**
  * Fast content hash using SHA-256 truncated to 16 hex chars.
  * Provides sub-ms hashing for typical source files.
  * Uses crypto SHA-256 for portability (no native addon dependency).
  * Truncation makes it suitable for content comparison, not cryptographic use.
  */
-import { createHash } from "crypto";
 
 export function fastHash(content: string): string {
   return createHash("sha256").update(content).digest("hex").slice(0, 16);
+}
+/** @deprecated Use EditTarget instead - kept for backwards compat with internal use */
+export interface EditAnchor {
+  symbolName?: string;
+  symbolKind?: string;
+  symbolLine?: number;
 }

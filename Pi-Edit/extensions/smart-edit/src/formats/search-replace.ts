@@ -27,12 +27,13 @@ export interface SearchReplaceBlock {
  * - Optional filename on first line
  * - Nested markers (only top-level triggers split)
  * - CRLF line endings normalized to LF
+ * - BOM stripping at the start of input
  * 
  * @throws If a block is truncated (missing REPLACE marker) or SEARCH section is empty
  */
 export function parseSearchReplace(input: string, knownPaths?: string[]): SearchReplaceBlock[] {
-  // Normalize CRLF to LF
-  const normalized = input.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  // Normalize CRLF to LF and strip BOM
+  const normalized = input.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/^\uFEFF/, '');
 
   const result: SearchReplaceBlock[] = [];
   let searchPos = 0;
@@ -47,9 +48,50 @@ export function parseSearchReplace(input: string, knownPaths?: string[]): Search
     const beforeLines = beforeSearch.split('\n');
     const lastBeforeLine = beforeLines.length > 0 ? beforeLines[beforeLines.length - 1].trim() : '';
     
-    // Find separator
+    // Find separator — search for ======= that is on its own line (not inside SEARCH content)
+    // The ======= must be preceded by newline to distinguish from ===== in SEARCH content
     const afterSearchStart = searchIdx + '<<<<<<< SEARCH'.length;
-    const sepIdx = normalized.indexOf('=======', afterSearchStart);
+    let sepIdx = -1;
+    
+    // Find the next ======= that follows a newline (separator on its own line)
+    let candidateIdx = normalized.indexOf('\n=======', afterSearchStart);
+    while (candidateIdx !== -1) {
+      // Check if it's followed by newline (proper separator line)
+      const afterSepIdx = candidateIdx + '\n======='.length;
+      const nextChar = afterSepIdx < normalized.length ? normalized[afterSepIdx] : '';
+      
+      if (nextChar === '\n' || nextChar === '\r') {
+        sepIdx = candidateIdx + 1; // Skip the leading newline
+        break;
+      }
+      
+      // Not a proper separator — look for the next one
+      candidateIdx = normalized.indexOf('\n=======', candidateIdx + 1);
+      
+      // Length ratio check: if we've scanned more content than SEARCH marker length, bail
+      // This prevents matching ===== inside SEARCH content
+      if (candidateIdx !== -1) {
+        const scannedLen = candidateIdx - afterSearchStart;
+        const markerLen = candidateIdx - searchIdx;
+        if (scannedLen > markerLen * 0.5) {
+          sepIdx = candidateIdx + 1;
+          break;
+        }
+      }
+    }
+    
+    // Fallback: check if the first ======= in the block is on its own line
+    if (sepIdx === -1) {
+      const firstSepCandidate = normalized.indexOf('=======', afterSearchStart);
+      if (firstSepCandidate !== -1) {
+        // Check if it's preceded by newline (start of line)
+        const beforeFirst = firstSepCandidate > 0 ? normalized[firstSepCandidate - 1] : '\n';
+        if (beforeFirst === '\n' || beforeFirst === '\r') {
+          sepIdx = firstSepCandidate;
+        }
+      }
+    }
+    
     if (sepIdx === -1) {
       throw new Error(`Unclosed SEARCH block at position ${searchIdx}: missing ======= separator`);
     }
@@ -94,6 +136,13 @@ export function parseSearchReplace(input: string, knownPaths?: string[]): Search
 /**
  * Normalize marker content: strip leading/trailing blank lines.
  */
+function normalizeContent(text: string): string {
+  const lines = text.split('\n');
+  while (lines.length > 0 && lines[0].trim().length === 0) lines.shift();
+  while (lines.length > 0 && lines[lines.length - 1].trim().length === 0) lines.pop();
+  return lines.join('\n');
+}
+
 /**
  * Strip common artifacts from a potential filename line.
  * Mirrors aider's strip_filename() function.
@@ -161,11 +210,4 @@ function filenameSimilarity(a: string, b: string): number {
     for (let k = 0; k <= lb; k++) prev[k] = curr[k];
   }
   return 1 - prev[lb] / maxLen;
-}
-
-function normalizeContent(text: string): string {
-  const lines = text.split('\n');
-  while (lines.length > 0 && lines[0].trim().length === 0) lines.shift();
-  while (lines.length > 0 && lines[lines.length - 1].trim().length === 0) lines.pop();
-  return lines.join('\n');
 }

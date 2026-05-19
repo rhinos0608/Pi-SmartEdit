@@ -1,17 +1,13 @@
 import type Parser from "web-tree-sitter";
-import type { EditAnchor, MatchSpan, SymbolEditTarget, SymbolRef } from "../lib/types";
+import type { EditTarget, MatchSpan, SymbolRef } from "../lib/types";
 import type { ParseResult } from "../lib/ast-resolver";
 import { MatchTier } from "../lib/types";
 
-export type { SymbolEditTarget };
+export type { SymbolEditTarget } from "../lib/types";
 
 export interface SymbolicEditRequest {
   editIdx: number;
-  symbol: SymbolEditTarget;
-  replaceBody?: string;
-  insertBefore?: string;
-  insertAfter?: string;
-  description?: string;
+  target: EditTarget;
 }
 
 export interface AppliedSymbolicEdit {
@@ -52,7 +48,7 @@ export interface SymbolicGuidanceInput {
 
 interface AstResolverForSymbolic {
   parseFile(content: string, filePath: string): Promise<ParseResult | null>;
-  findSymbolNode(tree: Parser.Tree, anchor: EditAnchor): Parser.SyntaxNode | null;
+  findSymbolNode(tree: Parser.Tree, anchor: { symbolName?: string; symbolKind?: string; symbolLine?: number }): Parser.SyntaxNode | null;
   findEnclosingSymbols?(tree: Parser.Tree, startByte: number, endByte: number): SymbolRef[];
   disposeParseResult(result: ParseResult): void;
 }
@@ -67,14 +63,14 @@ interface ResolvedSymbolicEdit extends SymbolicEditRequest {
 }
 
 export function isSymbolicEdit(value: Record<string, unknown>): boolean {
-  const symbol = value.symbol;
-  if (!symbol || typeof symbol !== "object") return false;
-  const s = symbol as Record<string, unknown>;
+  const target = value.target;
+  if (!target || typeof target !== "object") return false;
+  const t = target as Record<string, unknown>;
+  // A target is symbolic if it has an operation field
   return (
-    typeof s.name === "string" ||
-    (Array.isArray(s.namePath) &&
-      (s.namePath as unknown[]).length > 0 &&
-      (s.namePath as unknown[]).every((p) => typeof p === "string"))
+    typeof t.replaceBody === "string" ||
+    typeof t.insertBefore === "string" ||
+    typeof t.insertAfter === "string"
   );
 }
 
@@ -108,10 +104,6 @@ export async function buildSymbolicEditGuidance(
       const symbols = input.astResolver.findEnclosingSymbols(parseResult.tree, startIndex, endIndex);
       const symbol = symbols[0];
       if (!symbol) continue;
-      // symbolLength uses Math.max(..., 1) to guard against division-by-zero when
-      // a symbol has zero length (e.g. empty function body). editLength uses Math.max(..., 0)
-      // to avoid negative lengths but allow zero-width edits. The subsequent coverage
-      // calculation (editLength / symbolLength) relies on symbolLength being non-zero.
       const symbolLength = Math.max(symbol.endByte - symbol.startByte, 1);
       const editLength = Math.max(endIndex - startIndex, 0);
       const coverage = editLength / symbolLength;
@@ -120,7 +112,7 @@ export async function buildSymbolicEditGuidance(
       if (seen.has(key)) continue;
       seen.add(key);
       notes.push(
-        `⚠ Symbol edit preferred: this oldText/newText edit covers ${Math.round(coverage * 100)}% of ${symbol.kind} \`${symbol.name}\`. Use { symbol: { name: "${symbol.name}", kind: "${symbol.kind}", line: ${symbol.lineStart} }, replaceBody: "..." } for whole-symbol changes.`,
+        `⚠ Symbol edit preferred: this oldText/newText edit covers ${Math.round(coverage * 100)}% of ${symbol.kind} \`${symbol.name}\`. Use { target: { name: "${symbol.name}", kind: "${symbol.kind}", line: ${symbol.lineStart} }, replaceBody: "..." } for whole-symbol changes.`,
       );
     }
   } finally {
@@ -138,24 +130,57 @@ export async function applySymbolicEdits(
   let newContent = input.content;
   const resolved: ResolvedSymbolicEdit[] = [];
 
+  // Validate all targets have name or namePath before attempting resolution
+  for (const edit of input.edits) {
+    if (!edit.target.name && !edit.target.namePath) {
+      throw new Error("Symbol edit requires target.name or target.namePath.");
+    }
+  }
+
   for (const edit of input.edits) {
     const item = await resolveSymbolicEdit(edit, newContent, input.filePath, input.astResolver);
     if (!item) {
-      throw new Error(`Could not resolve symbol edit #${edit.editIdx + 1}: ${formatSymbolTarget(edit.symbol)}`);
+      throw new Error(`Could not resolve symbol edit #${edit.editIdx + 1}: ${formatTarget(edit.target)}`);
     }
     resolved.push(item);
   }
 
   // Sort in descending order (highest index first) so edits are applied from
   // highest to lowest to prevent earlier edits from shifting subsequent indices
-  // when mutating the string. Tie-breaker uses editIdx to deterministically order
-  // edits with the same operationIndex. See resolved.sort, operationIndex, editIdx.
+  // when mutating the string.
   resolved.sort((a, b) => {
     const aIndex = operationIndex(a);
     const bIndex = operationIndex(b);
     const delta = bIndex - aIndex;
     return delta !== 0 ? delta : a.editIdx - b.editIdx;
   });
+
+  // Check for overlapping ranges and reject if any overlaps detected
+  const overlaps: Array<{ a: ResolvedSymbolicEdit; b: ResolvedSymbolicEdit }> = [];
+  for (let i = 0; i < resolved.length; i++) {
+    for (let j = i + 1; j < resolved.length; j++) {
+      const a = resolved[i];
+      const b = resolved[j];
+      const aStart = a.startIndex;
+      const aEnd = a.endIndex;
+      const bStart = b.startIndex;
+      const bEnd = b.endIndex;
+      if (aStart < bEnd && aEnd > bStart) {
+        overlaps.push({ a, b });
+      }
+    }
+  }
+  if (overlaps.length > 0) {
+    const details = overlaps
+      .map(
+        ({ a, b }) =>
+          `  - ${formatTarget(a.target)} (${a.startIndex}-${a.endIndex}) overlaps with ${formatTarget(b.target)} (${b.startIndex}-${b.endIndex})`,
+      )
+      .join("\n");
+    throw new Error(
+      `applySymbolicEdits: overlapping symbol edits detected:\n${details}`,
+    );
+  }
 
   const matchSpans: MatchSpan[] = [];
   const applied: AppliedSymbolicEdit[] = [];
@@ -178,13 +203,13 @@ export async function applySymbolicEdits(
       newText: edit.body,
       tier: MatchTier.EXACT,
       replaceAll: false,
-      description: edit.description,
-      matchNote: `symbolic ${edit.operation} on ${formatSymbolTarget(edit.symbol)}`,
+      description: edit.target.description,
+      matchNote: `symbolic ${edit.operation} on ${formatTarget(edit.target)}`,
     });
     applied.push({
       editIdx: edit.editIdx,
       operation: edit.operation,
-      symbolName: symbolNameFromTarget(edit.symbol),
+      symbolName: targetNameFromEditTarget(edit.target),
       startIndex,
       endIndex,
     });
@@ -203,9 +228,9 @@ async function resolveSymbolicEdit(
     throw new Error("Symbol edit requires AST support for this session.");
   }
 
-  const operation = getOperation(edit);
-  const body = getOperationBody(edit, operation);
-  const anchor = symbolTargetToAnchor(edit.symbol);
+  const operation = getOperation(edit.target);
+  const body = getOperationBody(edit.target, operation);
+  const anchor = targetToAnchor(edit.target);
   let parseResult: ParseResult | null = null;
 
   try {
@@ -229,11 +254,11 @@ async function resolveSymbolicEdit(
   }
 }
 
-function getOperation(edit: SymbolicEditRequest): AppliedSymbolicEdit["operation"] {
+function getOperation(target: EditTarget): AppliedSymbolicEdit["operation"] {
   const operations = [
-    edit.replaceBody !== undefined ? "replaceBody" : null,
-    edit.insertBefore !== undefined ? "insertBefore" : null,
-    edit.insertAfter !== undefined ? "insertAfter" : null,
+    target.replaceBody !== undefined ? "replaceBody" : null,
+    target.insertBefore !== undefined ? "insertBefore" : null,
+    target.insertAfter !== undefined ? "insertAfter" : null,
   ].filter((value): value is AppliedSymbolicEdit["operation"] => value !== null);
 
   if (operations.length !== 1) {
@@ -242,33 +267,33 @@ function getOperation(edit: SymbolicEditRequest): AppliedSymbolicEdit["operation
   return operations[0];
 }
 
-function getOperationBody(edit: SymbolicEditRequest, operation: AppliedSymbolicEdit["operation"]): string {
-  const body = edit[operation];
+function getOperationBody(target: EditTarget, operation: AppliedSymbolicEdit["operation"]): string {
+  const body = target[operation];
   if (typeof body !== "string") {
     throw new Error(`${operation} must be a string.`);
   }
   return body;
 }
 
-function symbolTargetToAnchor(target: SymbolEditTarget): EditAnchor {
+function targetToAnchor(target: EditTarget): { symbolName?: string; symbolKind?: string; symbolLine?: number } {
   return {
-    symbolName: symbolNameFromTarget(target),
+    symbolName: target.name,
     symbolKind: target.kind,
     symbolLine: target.line,
   };
 }
 
-function symbolNameFromTarget(target: SymbolEditTarget): string {
-  if ("name" in target && target.name !== undefined) return target.name;
-  if ("namePath" in target && target.namePath) {
+function targetNameFromEditTarget(target: EditTarget): string {
+  if (target.name !== undefined) return target.name;
+  if (target.namePath) {
     const parts = target.namePath.split(/[/.#]/).filter(Boolean);
     const last = parts[parts.length - 1];
     if (last) return last;
   }
-  throw new Error("Symbol edit requires symbol.name or symbol.namePath.");
+  throw new Error("Symbol edit requires target.name or target.namePath.");
 }
 
-function formatSymbolTarget(target: SymbolEditTarget): string {
+function formatTarget(target: EditTarget): string {
   return target.namePath ?? target.name ?? "<unnamed>";
 }
 

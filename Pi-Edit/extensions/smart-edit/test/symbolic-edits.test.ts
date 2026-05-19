@@ -8,6 +8,7 @@ describe("symbolic edits", () => {
     // Clear parse cache to ensure fresh parses between tests
     clearParseCache();
   });
+
   it("replaces a named symbol definition", async () => {
     const content = "function keep() { return 1; }\nfunction target() { return 1; }\n";
     const result = await applySymbolicEdits({
@@ -16,8 +17,7 @@ describe("symbolic edits", () => {
       astResolver: createAstResolver(),
       edits: [{
         editIdx: 0,
-        symbol: { name: "target" },
-        replaceBody: "function target() { return 2; }",
+        target: { name: "target", replaceBody: "function target() { return 2; }" },
       }],
     });
 
@@ -33,8 +33,8 @@ describe("symbolic edits", () => {
       filePath: "example.ts",
       astResolver: createAstResolver(),
       edits: [
-        { editIdx: 0, symbol: { name: "alpha" }, insertBefore: "const before = true;\n" },
-        { editIdx: 1, symbol: { name: "beta" }, insertAfter: "\nconst after = true;" },
+        { editIdx: 0, target: { name: "alpha", insertBefore: "const before = true;\n" } },
+        { editIdx: 1, target: { name: "beta", insertAfter: "\nconst after = true;" } },
       ],
     });
 
@@ -50,7 +50,7 @@ describe("symbolic edits", () => {
       content,
       filePath: "example.ts",
       astResolver: createAstResolver(),
-      edit: { symbol: { name: "target" }, replaceBody: "function target() { return 2; }" },
+      edit: { target: { name: "target", replaceBody: "function target() { return 2; }" } },
     });
 
     assert.deepStrictEqual(range, [2, 4]);
@@ -73,13 +73,18 @@ describe("symbolic edits", () => {
     assert.match(notes[0], /target/);
   });
 
-  it("isSymbolicEdit rejects symbol with no name or namePath", () => {
-    assert.strictEqual(isSymbolicEdit({ symbol: {} as any }), false);
-    assert.strictEqual(isSymbolicEdit({ symbol: { name: 123 } as any }), false);
-    assert.strictEqual(isSymbolicEdit({ symbol: { name: "foo" } as any }), true);
-    assert.strictEqual(isSymbolicEdit({ symbol: { namePath: ["a", "b"] } as any }), true);
-    assert.strictEqual(isSymbolicEdit({ symbol: { namePath: [] } as any }), false);
-    assert.strictEqual(isSymbolicEdit({ symbol: { namePath: ["a", 123] } as any }), false);
+  it("isSymbolicEdit rejects target with no operation fields", () => {
+    // A target without replaceBody/insertBefore/insertAfter is NOT symbolic
+    assert.strictEqual(isSymbolicEdit({ target: {} as any }), false);
+    assert.strictEqual(isSymbolicEdit({ target: { name: "foo" } as any }), false);
+    assert.strictEqual(isSymbolicEdit({ target: { name: "foo", replaceBody: "..." } as any }), true);
+    assert.strictEqual(isSymbolicEdit({ target: { name: "foo", insertBefore: "..." } as any }), true);
+    assert.strictEqual(isSymbolicEdit({ target: { name: "foo", insertAfter: "..." } as any }), true);
+  });
+
+  it("isSymbolicEdit accepts target with name or namePath + operation", () => {
+    assert.strictEqual(isSymbolicEdit({ target: { name: "foo", replaceBody: "..." } as any }), true);
+    assert.strictEqual(isSymbolicEdit({ target: { namePath: "a.b", replaceBody: "..." } as any }), true);
   });
 
   it("applySymbolicEdits throws when both name and namePath are absent", async () => {
@@ -88,9 +93,9 @@ describe("symbolic edits", () => {
         content: "function target() { return 1; }\n",
         filePath: "example.ts",
         astResolver: createAstResolver(),
-        edits: [{ editIdx: 0, symbol: {} as any, replaceBody: "function target() { return 2; }" }],
+        edits: [{ editIdx: 0, target: { replaceBody: "function target() { return 2; }" } as any }],
       }),
-      /symbol\.name or symbol\.namePath/,
+      /target\.name or target\.namePath/,
     );
   });
 
@@ -102,9 +107,7 @@ describe("symbolic edits", () => {
         astResolver: createAstResolver(),
         edits: [{
           editIdx: 0,
-          symbol: { name: "target" },
-          replaceBody: "function target() { return 2; }",
-          insertBefore: "// before",
+          target: { name: "target", replaceBody: "function target() { return 2; }", insertBefore: "// before" },
         }],
       }),
       /exactly one of replaceBody, insertBefore, or insertAfter/,
@@ -117,7 +120,7 @@ describe("symbolic edits", () => {
         content: "function target() { return 1; }\n",
         filePath: "example.ts",
         astResolver: null,
-        edits: [{ editIdx: 0, symbol: { name: "target" }, replaceBody: "function target() { return 2; }" }],
+        edits: [{ editIdx: 0, target: { name: "target", replaceBody: "function target() { return 2; }" } }],
       }),
       /AST support/,
     );
@@ -129,7 +132,7 @@ describe("symbolic edits", () => {
         content: "function keep() { return 1; }\n",
         filePath: "example.ts",
         astResolver: createAstResolver(),
-        edits: [{ editIdx: 0, symbol: { name: "nonexistent" }, replaceBody: "function target() { return 2; }" }],
+        edits: [{ editIdx: 0, target: { name: "nonexistent", replaceBody: "function target() { return 2; }" } }],
       }),
       /Could not resolve symbol edit/,
     );
@@ -140,7 +143,7 @@ describe("symbolic edits", () => {
       content: "function keep() { return 1; }\n",
       filePath: "example.ts",
       astResolver: createAstResolver(),
-      edit: { symbol: { name: "nonexistent" }, replaceBody: "function target() { return 2; }" },
+      edit: { target: { name: "nonexistent", replaceBody: "function target() { return 2; }" } },
     });
     assert.strictEqual(range, null);
   });
