@@ -1097,7 +1097,8 @@ export default function smartEdit(pi: ExtensionAPI) {
           event.input?.offset != null || event.input?.limit != null;
 
         // Build full content from result blocks
-        const fullText = event.content
+        const contentBlocks = Array.isArray(event.content) ? event.content : [];
+        const fullText = contentBlocks
           .filter((c): c is { type: "text"; text: string } => c.type === "text")
           .map((c) => c.text || "")
           .join("");
@@ -1175,7 +1176,8 @@ export default function smartEdit(pi: ExtensionAPI) {
       !event.isError
     ) {
       try {
-        const inputFiles = (event.input as { files?: Array<{ path: string; offset?: number; limit?: number }> } | undefined)?.files;
+        const rawInputFiles = (event.input as { files?: Array<{ path: string; offset?: number; limit?: number }> } | undefined)?.files;
+        const inputFiles = Array.isArray(rawInputFiles) ? rawInputFiles : undefined;
         if (inputFiles && inputFiles.length > 0) {
           for (const file of inputFiles) {
             try {
@@ -1213,7 +1215,8 @@ export default function smartEdit(pi: ExtensionAPI) {
       !event.isError
     ) {
       try {
-        const detailFiles = (event.details as { files?: Array<{ path: string; ok: boolean; inclusion?: string }> } | undefined)?.files;
+        const rawDetailFiles = (event.details as { files?: Array<{ path: string; ok: boolean; inclusion?: string }> } | undefined)?.files;
+        const detailFiles = Array.isArray(rawDetailFiles) ? rawDetailFiles : undefined;
         if (detailFiles && detailFiles.length > 0) {
           for (const file of detailFiles) {
             if (!file.ok) continue;
