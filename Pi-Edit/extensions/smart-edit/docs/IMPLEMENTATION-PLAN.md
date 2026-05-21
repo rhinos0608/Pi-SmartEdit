@@ -1,26 +1,51 @@
-# Smart Edit — Feature Implementation Plan
+# Smart Edit — Feature Implementation Plan (Archive)
 
-> **Status**: ✅ All three features implemented (May 2026)
+> **Original Status**: ✅ All three features implemented (May 2026)
+> **Document purpose**: Historical record of the planning phase. The features described below have all shipped, along with additional features from subsequent sprints.
 
-## Overview
+The original plan scoped three features. All were completed, followed by a second wave of features based on Codex pattern analysis (see [codex-borrowed-patterns.md](./codex-borrowed-patterns.md)).
 
-Three features added to the `smart-edit` Pi extension:
+## What was built
 
-| # | Feature | Priority | Complexity | Status |
-|---|---------|----------|------------|--------|
-| 1 | **AST-Aware Targeting (Tree-sitter)** | P0 | High | ✅ Done |
-| 2 | **Semantic Conflict Detection** | P0 | Medium | ✅ Done |
-| 3 | **Line-Range Targeting** | P1 | Low | ✅ Done |
+### Wave 1 (Original Plan)
 
-These features address the core limitation of text-only `oldText` matching: when two functions have identical opening lines, the tool cannot distinguish them; when separate edits touch the same function body over multiple calls, there's no detection; and there's no fallback when `oldText` matching fails beyond fuzzy tiers.
+1. **AST-Aware Targeting (Tree-sitter)** — P0, High complexity
+   - Tree-sitter WASM parsing via `web-tree-sitter`
+   - Lazy grammar loading
+   - Symbol lookup (name, kind, line hint)
+   - Anchor-based disambiguation
+   - Incremental re-parse with LRU parse cache
+
+2. **Semantic Conflict Detection** — P0, Medium complexity
+   - Same-symbol, contains, contained-by, sibling-overlap conflict detection
+   - Per-file baseline capture
+   - Configurable on-conflict behavior (warn/error)
+
+3. **Line-Range Targeting** — P1, Low complexity
+   - Read-range coverage validation
+   - Edit range scoping for hashline, symbolic, and legacy edits
+
+### Wave 2 (Codex-inspired, see codex-borrowed-patterns.md)
+
+4. **Codex apply_patch grammar parser** — `src/formats/codex-patch.ts`
+5. **Multi-level `@@` hunk disambiguation** — built into codex-patch parser
+6. **Streaming patch preview** — `src/formats/streaming-patch-parser.ts`
+7. **Context marker tags** — `src/formats/context-markers.ts`
+8. **Edit history / undo** — `src/undo/edit-history.ts`
+9. **Approval gating** — `src/safety/approval-gating.ts`
+10. **Multi-file atomic patches** — `src/formats/atomic-patch.ts`
+11. **Forgiving JSON parser** — `src/formats/forgiving-parser.ts`
+12. **Verification pipeline** — concurrency detection, traceability, history context, repair loop
+13. **Scoped diagnostics + auto-validation** — filter diagnostics to changed targets
+14. **SmartRead bridge** — breakage and co-change event recording
 
 ---
 
-## Architecture Decision Records
+## Architecture Decision Records (Historical)
 
 ### ADR-001: Tree-sitter via WASM (web-tree-sitter)
 
-**Status**: Accepted
+**Status**: Accepted (May 2026)
 
 **Context**: We need to parse source code into an AST for disambiguation and conflict detection. Tree-sitter is the de-facto standard for incremental parsing in editors (used by Zed, Neovim, Helix). It produces concrete syntax trees (CST) that preserve byte positions for every token.
 
@@ -30,7 +55,7 @@ These features address the core limitation of text-only `oldText` matching: when
 3. **Language Server Protocol** — Connect to an LSP server for semantic info. Adds an external process dependency. Overkill for our needs.
 4. **Regex-based heuristics** — Fast but unreliable for nested structures. Already partially what we do (line-by-line indentation detection).
 
-**Decision**: Use `web-tree-sitter` (WASM) for Phase 1. It's zero-native-dep, works in any Node 18+ environment, and parsing a 10K-line file takes <5ms. If performance becomes a concern for very large files (>50K lines), we can add a `tree-sitter` (native) fallback.
+**Decision**: Use `web-tree-sitter` (WASM). It's zero-native-dep, works in any Node 18+ environment, and parsing a 10K-line file takes <5ms.
 
 **Consequences**:
 - +Zero native build complexity
@@ -82,28 +107,12 @@ If `anchor` or `lineRange` is provided, they **narrow the search scope** within 
 
 ---
 
-## Implementation Phases
-
-### Phase 1: AST-Aware Targeting (Weeks 1-3)
-
-See [docs/FEATURE-AST-TARGETING.md](./FEATURE-AST-TARGETING.md) for full design.
-
-### Phase 2: Semantic Conflict Detection (Weeks 3-5)
-
-See [docs/FEATURE-CONFLICT-DETECTION.md](./FEATURE-CONFLICT-DETECTION.md) for full design.
-
-### Phase 3: Line-Range Targeting (Weeks 5-6)
-
-See [docs/FEATURE-LINE-RANGE.md](./FEATURE-LINE-RANGE.md) for full design.
-
----
-
-## Research Sources
+## Research Sources (Archive)
 
 ### Primary References
 
 | Source | Key Insight |
-|--------|-------------|
+|---|---|
 | **Zed Blog: Syntax-Aware Editing** (Max Brunsfeld, tree-sitter creator) | Tree-sitter produces concrete syntax trees preserving byte positions. Queries enable pattern matching against AST structure. Incremental parsing enables efficient re-parse after edits. |
 | **Serena MCP Toolkit** (oraios/serena) | Symbolic editing via LSP: `replace_symbol_body`, `insert_after_symbol`, `insert_before_symbol`, `safe_delete`. Uses language server protocol for semantic understanding. |
 | **Kiro Blog: Refactoring Made Right** | Semantic rename via VSCode's `prepareRename` + `executeDocumentRenameProvider`. Language servers handle cross-file refactoring. Key insight: "refactoring demands precision over plausibility." |
@@ -114,8 +123,8 @@ See [docs/FEATURE-LINE-RANGE.md](./FEATURE-LINE-RANGE.md) for full design.
 ### Edit Tool Comparisons
 
 | Tool | Matching Strategy | Disambiguation | Conflict Detection |
-|------|-------------------|----------------|-------------------|
-| **Pi smart-edit (current)** | 4-tier: exact → indentation → unicode → similarity | `replaceAll` flag only | Byte-overlap detection within single call |
+|---|---|---|---|
+| **Pi smart-edit (current)** | 6-tier: exact → indentation → unicode → similarity → dotdotdots → relative indent + symbolic edits | `replaceAll`, `anchor`, `lineRange`, `target` | AST-level conflict detection |
 | **Claude text_editor** | `str_replace` (exact) + `insert` (line-based) | Line numbers via `view_range` | Read-before-write guard |
 | **Aider** | 4-layer: exact → whitespace-insensitive → indentation-preserving → difflib fuzzy | Search/Replace blocks | Per-block failure reporting |
 | **Codex CLI** | 3-layer: exact → trimmed-line-endings → trimmed-whitespace | `@@` context anchors | Context-line mismatch error |

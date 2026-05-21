@@ -1,10 +1,10 @@
-# Codex apply_patch Grammar Parser — Specification
+# Codex apply_patch Grammar Parser — Implementation
 
-**Status:** Implemented (May 2026)  
-**Author:** Pi SmartEdit  
-**Date:** 2026-05-16  
-**Codex reference:** `codex-rs/apply-patch/src/parser.rs` (954 lines, Lark grammar)  
-**SmartEdit target:** `src/formats/codex-patch.ts`
+**Status:** Implemented (May 2026)
+**Author:** Pi SmartEdit
+**Date:** 2026-05-16
+**Codex reference:** `codex-rs/apply-patch/src/parser.rs` (954 lines, Lark grammar)
+**SmartEdit file:** `src/formats/codex-patch.ts` (~800 lines)
 
 ---
 
@@ -85,9 +85,9 @@ In lenient mode, these marker variants are accepted:
 
 ---
 
-## 3. AST Types
+## 3. Types
 
-### 3.1 CodexHunk (representing the three Hunk variants)
+### 3.1 CodexHunk
 
 ```typescript
 /**
@@ -119,7 +119,7 @@ export interface UpdateFileChunk {
 }
 ```
 
-### 3.3 ParserResult
+### 3.3 Parser result types
 
 ```typescript
 export interface CodexPatchResult {
@@ -134,21 +134,52 @@ export interface PatchWarning {
   line: number;
   kind: 'missing_end_patch' | 'empty_hunk' | 'unknown_marker' | 'lenient_spelling' | 'preamble_skipped';
 }
+
+export type ParseMode = 'strict' | 'lenient';
 ```
 
-### 3.4 Mode enumeration
+### 3.4 Error type
 
 ```typescript
-export type ParseMode = 'strict' | 'lenient';
+export class PatchParseError extends Error {
+  constructor(message: string, public readonly line: number, public readonly column: number) {
+    super(`❌ Codex patch parse error at line ${line}, col ${column}: ${message}`);
+    this.name = 'PatchParseError';
+  }
+}
 ```
 
 ---
 
-## 4. Error Recovery Rules
+## 4. Public API
+
+```typescript
+/**
+ * Parse Codex apply_patch format into structured hunks.
+ * @param input Raw patch text
+ * @param mode  Parse mode (default: lenient)
+ * @returns     Parsed hunks and warnings
+ */
+export function parseCodexPatch(input: string, mode: ParseMode = 'lenient'): CodexPatchResult;
+
+/**
+ * Convert multiple CodexHunks to EditItem-compatible format.
+ */
+export function codexHunkToEditItem(
+  hunk: CodexHunk,
+  fileOldContents?: string,
+): Array<{ path: string; oldText: string; newText: string; anchor?: { symbolName?: string; symbolKind?: string } }>;
+```
+
+The `parseCodexPatch()` function creates an internal `CodexPatchParser` instance (non-exported class) and returns the parse result. All cursor management and grammar rule methods are private.
+
+---
+
+## 5. Error Recovery Rules
 
 The parser operates in two modes. Strict mode fails on the first deviation. Lenient mode attempts recovery for common model malformations.
 
-### 4.1 Recovery table (lenient mode)
+### 5.1 Recovery table (lenient mode)
 
 | Model mistake | Behaviour | Produces warning? |
 |---|---|---|
@@ -165,7 +196,7 @@ The parser operates in two modes. Strict mode fails on the first deviation. Leni
 | Multiple file operations in a single patch | All parsed sequentially | No |
 | Hunk lines with missing prefix | Treated as context lines | Yes (kind: `unknown_marker`) |
 
-### 4.2 Recovery behaviour for unrecoverable errors
+### 5.2 Recovery behaviour for unrecoverable errors
 
 Some errors cannot be recovered from even in lenient mode:
 
@@ -178,11 +209,11 @@ Some errors cannot be recovered from even in lenient mode:
 
 ---
 
-## 5. Mapping to SmartEdit's EditItem Format
+## 6. Mapping to SmartEdit's EditItem Format
 
 Each `CodexHunk` maps to one or more objects compatible with SmartEdit's `EditItem` interface.
 
-### 5.1 AddFile → EditItem
+### 6.1 AddFile → EditItem
 
 | CodexHunk | EditItem |
 |---|---|
@@ -190,15 +221,15 @@ Each `CodexHunk` maps to one or more objects compatible with SmartEdit's `EditIt
 
 The empty `oldText` signals a new file. SmartEdit's matching pipeline should treat `oldText === ""` as a new-file operation.
 
-### 5.2 DeleteFile → EditItem
+### 6.2 DeleteFile → EditItem
 
 | CodexHunk | EditItem |
 |---|---|
 | `DeleteFile { path }` | `{ path, oldText: "<full file contents>", newText: "" }` |
 
-SmartEdit needs to read the current file to populate `oldText`. The parser provides `codexHunkToEditItem()` which for `DeleteFile` reads the file at `path` from disk and sets that as `oldText`, or throws if the file doesn't exist (the model asked to delete something that's already gone — silently succeed).
+The `codexHunkToEditItem()` function accepts optional `fileOldContents` for DeleteFile. If no file contents are provided, a sentinel string (`\0__DELETE_FILE__\0`) is used as `oldText`. The caller is responsible for resolving the actual file contents before applying.
 
-### 5.3 UpdateFile → EditItem[]
+### 6.3 UpdateFile → EditItem[]
 
 | CodexHunk | EditItem |
 |---|---|
@@ -226,50 +257,19 @@ The multi-level `@@` scope chain is passed as `anchor` hints:
 }
 ```
 
-### 5.4 Move to: within UpdateFile
+Scope strings are further processed by `extractSymbolFromScope()` which strips known kind prefixes (`function `, `class `, `def `, `const `, etc.) so the AST resolver can find the bare symbol name.
 
-When `movePath` is set, the file at `path` should be renamed to `movePath` after applying the edit. SmartEdit's current pipeline doesn't support renames natively; the `codexHunkToEditItem()` function emits a `movePath` property on the EditInput for downstream consumers that understand it.
+### 6.4 Move to: within UpdateFile
 
----
-
-## 6. Integration Points
-
-### 6.1 `src/formats/format-detector.ts`
-
-Add `'codex_patch'` to the `InputFormat` union. Detection logic:
-
-1. Check for `*** Begin Patch` or `***Begin Patch` (current detection for `openai_patch`).
-2. If detected, check whether the patch contains **any** of the following markers *after* `*** Begin Patch`:
-   - `*** Add File:`
-   - `*** Delete File:`
-   - `*** Move to:`
-3. If yes → return `'codex_patch'` (the full grammar parser handles it).
-4. If no (only `*** Update File:` sections) → return `'openai_patch'` (existing regex parser handles it — simpler for simple cases).
-
-This allows the codex-patch parser to handle the full grammar while the existing openai-patch parser continues to handle simple update-only patches, avoiding unnecessary overhead.
-
-### 6.2 `src/formats/openai-patch.ts`
-
-When `parseOpenAIPatch()` receives input that contains `*** Add File:`, `*** Delete File:`, or `*** Move to:`, it should delegate to `parseCodexPatch()` from codex-patch.ts and convert the result back via `codexHunkToEditItem()`. This backward compatibility ensures existing callers don't break.
-
-### 6.3 `src/formats/index.ts`
-
-Add to barrel export:
-```typescript
-export * from './codex-patch';
-```
-
-### 6.4 `index.ts` (main dispatcher)
-
-Add `'codex_patch'` to the format dispatch switch statement, mapping it to `parseCodexPatch()` → `codexHunkToEditItem()`.
+When `movePath` is set, the file at `path` should be renamed to `movePath` after applying the edit. The `UpdateFile` hunk type includes an optional `movePath` field, and `codexHunkToEditItem()` sets `result.path` to `hunk.movePath || hunk.path`.
 
 ---
 
 ## 7. Parser Architecture
 
-### 7.1 Recursive-descent design
+### 7.1 Internal design
 
-The parser uses a cursor-based recursive-descent approach with character-level tracking for error messages:
+The parser uses a cursor-based recursive-descent approach implemented as a private class:
 
 ```typescript
 class CodexPatchParser {
@@ -280,30 +280,24 @@ class CodexPatchParser {
   private mode: ParseMode;
   private warnings: PatchWarning[];
 
-  constructor(input: string, mode: ParseMode)
+  constructor(input: string, mode: ParseMode) {
+    // Normalize CRLF to LF, then CR to LF
+    this.input = input.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    this.pos = 0;
+    this.line = 1;
+    this.column = 1;
+    this.mode = mode;
+    this.warnings = [];
+  }
 
-  // Entry point
+  // Entry point — called by parseCodexPatch()
   parse(): CodexPatchResult
 
-  // Cursor management
+  // Cursor management (all private)
+  private done(): boolean
   private peek(): string
   private advance(): string
-  private skipWhitespace(): void
-  private skipLine(): string
-  private expect(expected: string): boolean
-
-  // Grammar rules
-  private parsePatch(): CodexHunk[]
-  private tryParseMarker(): MarkerType | null
-  private parseAddSection(path: string): CodexHunk
-  private parseDeleteSection(path: string): CodexHunk
-  private parseUpdateSection(path: string): CodexHunk
-  private parseHunk(): UpdateFileChunk | null
-  private tryParseNewline(): boolean
-
-  // Error recovery
-  private skipToNextMarker(): void
-  private tryParseLenientMarker(expected: string): boolean
+  ...
 }
 ```
 
@@ -353,7 +347,7 @@ When a `@@` marker is found within an `UpdateFile` section:
 
 ## 9. Example: Codex Patch
 
-```text
+```
 *** Begin Patch
 *** Add File: src/new-feature.ts
 export function add(a: number, b: number): number {
@@ -382,8 +376,12 @@ The parser produces 4 `CodexHunk` values: 1 `AddFile`, 1 `UpdateFile` (with 2 ch
 
 ---
 
-## 10. Future Considerations
+## 10. Integration Points
 
-- **Streaming parser**: A `StreamingCodexPatchParser` that emits completed hunks as the model streams patch text (500ms buffer). See `codex-rs/apply-patch/src/streaming_parser.rs`.
-- **Multi-file atomic transactions**: When a single patch contains Add/Delete/Update operations across multiple files, SmartEdit could apply them atomically with rollback support.
-- **Approval gating**: Path-based approval rules for specific file operations (e.g., prompt before deleting files).
+### 10.1 `src/formats/format-detector.ts`
+
+Detects `codex_patch` format by checking for `*** Begin Patch` followed by `*** Add File:`, `*** Delete File:`, or `*** Move to:` markers. Simple update-only patches are classified as `openai_patch`.
+
+### 10.2 `index.ts` (main dispatcher)
+
+The `codex_patch` format is dispatched to `parseCodexPatch()` → `codexHunkToEditItem()` in `prepareArguments()`.

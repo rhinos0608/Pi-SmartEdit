@@ -1,9 +1,10 @@
-# Pre-Edit Semantic Retrieval (LSP-RAG) — Technical Specification
+# Pre-Edit Semantic Retrieval (LSP-RAG) — Implementation
 
 > **Status**: Implemented (May 2026)
-> **Version**: 0.1
+> **Version**: 1.0
 > **Date**: 2026-05-02
-> **Primary code paths**: `src/lsp/*`, `lib/ast-resolver.ts`, `index.ts`, `lib/read-cache.ts`
+> **Implementation files**: `src/lsp/semantic-context.ts`, `src/lsp/semantic-nav.ts`, `src/lsp/context-renderer.ts`, `src/lsp/symbol-skeleton.ts`, `src/lsp/target-range.ts`
+> **Spec review**: The feature is built and shipped. This document is preserved as the original design reference.
 > **Related docs**: [hashline-spec.md](./hashline-spec.md), [FEATURE-AST-TARGETING.md](./FEATURE-AST-TARGETING.md)
 
 ---
@@ -61,6 +62,10 @@ Relevant LSP 3.17 methods:
 
 ## 5. User Experience
 
+The `semantic_context` tool is implemented and registered in `index.ts`. The model calls it explicitly before editing.
+
+### 5.1 Explicit semantic context tool
+
 ### 5.1 MVP: explicit semantic context tool
 
 Register a new tool, tentatively named `semantic_context`, that the model can call before editing.
@@ -106,9 +111,9 @@ The edit tool prompt guidelines should then recommend:
 
 > Before editing code that touches custom types, imported functions, factories, or framework APIs, call `semantic_context` for the target range.
 
-### 5.2 Later: read-time suggestions or automatic augmentation
+### 5.2 Read-time text augmentation (future)
 
-Smart Edit currently observes read results to populate caches. It does not yet prove that `tool_result` handlers can safely mutate read output. If the Pi extension API supports result transformation, a later phase can add a short footer to reads:
+Smart Edit currently observes read results to populate caches. Automatic augmentation of read output with semantic context suggestions is deferred. If the Pi extension API supports result transformation, a future phase can add a short footer to reads:
 
 ```text
 Semantic context available: call semantic_context path="..." lineRange={...}
@@ -194,7 +199,7 @@ semantic_context request
 
 ## 8. Key Token Selection
 
-The first version should keep heuristics simple and auditable.
+The implementation uses tree-sitter AST identifier extraction combined with LSP semantic tokens when available. The heuristics are:
 
 Include:
 
@@ -296,7 +301,18 @@ interface SemanticContextDetails {
 
 This makes the feature testable and lets future prompt tuning compare retrieval quality with edit success.
 
-## 13. Open Questions
+## 13. Implementation Notes
+
+The following spec items were implemented in full:
+
+- `semantic_context` tool: `semantic-context.ts` builds the context, `context-renderer.ts` renders it as markdown with context markers
+- LSP navigation: `semantic-nav.ts` wraps definition, typeDefinition, implementation, references, hover
+- Symbol skeleton extraction: `symbol-skeleton.ts` extracts compact outlines from document symbols
+- Target range resolution: `target-range.ts` resolves hashline/anchor/lineRange to byte ranges
+- Context markers: `context-markers.ts` wraps output in `<smartedit:context>` XML tags
+- Session read recording: every dependency file snippet read by retrieval is recorded as a session read
+
+### Residual Open Questions
 
 1. Can Pi extension `tool_result` handlers mutate read output, or should automatic injection remain a separate tool forever?
 2. Should retrieval be allowed to read files that the model has not explicitly read, if it returns those snippets to the model first?

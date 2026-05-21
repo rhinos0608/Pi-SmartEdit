@@ -1,9 +1,9 @@
 # Hashline Edit Mode — Implementation Plan
 
-> **Status**: Implemented  
-> **Spec Reference**: [hashline-spec.md](./hashline-spec.md)  
-> **Codebase**: `Pi-Edit/extensions/smart-edit`  
-> **Actual LOC**: ~5,000+  
+> **Status**: Implemented
+> **Spec Reference**: [hashline-spec.md](./hashline-spec.md)
+> **Codebase**: `Pi-Edit/extensions/smart-edit`
+> **Actual LOC**: ~5,000+
 > **Phases**: 5 (all complete)
 
 ---
@@ -57,23 +57,23 @@ function structuralBigram(line: number): string {
   }
 }
 
-/** 
+/**
  * Compute a short BPE-bigram hash of a single line.
  * Uses xxHash32 on normalized line text, modulo 647.
  * The line should NOT include a trailing newline.
  */
 export function computeLineHash(idx: number, line: string): string {
   line = line.replace(/\r/g, "").trimEnd();
-  
+
   if (line.replace(RE_STRUCTURAL_STRIP, "").length === 0) {
     return structuralBigram(idx);
   }
-  
+
   let seed = 0;
   if (!RE_SIGNIFICANT.test(line)) {
     seed = idx;
   }
-  
+
   return HASHLINE_BIGRAMS[xxHash32(line, seed) % HASHLINE_BIGRAMS_COUNT];
 }
 
@@ -113,7 +113,7 @@ Add hashline data to `FileSnapshot`:
 // lib/types.ts — add to FileSnapshot interface
 export interface FileSnapshot {
   // ... existing fields ...
-  
+
   /** Hashline anchor data, populated on read */
   hashline?: {
     /** LINE+ID → { text, line } for all lines */
@@ -132,12 +132,12 @@ Augment the `tool_result` handler for `read`:
 // In the read hook at ~line 735
 if (fullText && inputPath) {
   // ... existing logic ...
-  
+
   // NEW: Compute hashline anchors
   const lines = fullText.split("\n");
   const anchorMap = new Map<string, { text: string; line: number }>();
   const formattedLines: string[] = [];
-  
+
   for (let i = 0; i < lines.length; i++) {
     const lineNum = i + 1;
     const hash = computeLineHash(lineNum, lines[i]);
@@ -145,7 +145,7 @@ if (fullText && inputPath) {
     anchorMap.set(anchor, { text: lines[i], line: lineNum });
     formattedLines.push(`${anchor}${HASHLINE_CONTENT_SEPARATOR}${lines[i]}`);
   }
-  
+
   recordRead(inputPath, process.cwd(), fullText, isTruncated, {
     hashline: {
       anchors: anchorMap,
@@ -259,7 +259,7 @@ export function tryRebaseAnchor(
   const lo = Math.max(1, anchor.line - window);
   const hi = Math.min(fileLines.length, anchor.line + window);
   let found: number | null = null;
-  
+
   for (let line = lo; line <= hi; line++) {
     if (line === anchor.line) continue;
     if (computeLineHash(line, fileLines[line - 1]) !== anchor.hash) continue;
@@ -312,13 +312,13 @@ export function resolveHashlineEdits(
     const lines = hashlineParseText(edit.content);
     const pos = parseTag(edit.anchor.range.pos);
     const end = parseTag(edit.anchor.range.end);
-    
+
     if (pos.line > end.line) {
       throw new Error(
         `Range start line ${pos.line} must be <= end line ${end.line}`
       );
     }
-    
+
     return { op: "replace_range", pos, end, lines };
   });
 }
@@ -354,7 +354,7 @@ Add hashline detection and routing in `execute()`:
 // In execute(), after prepareArguments and validateInput
 for (const edit of edits) {
   const rawEdit = edit as Record<string, unknown>;
-  
+
   // Detect hashline format
   if (rawEdit.hashline && typeof rawEdit.hashline === "object") {
     // Route to hashline apply path
@@ -459,24 +459,24 @@ async function applyHashlinePath(
 ): Promise<HashlineApplyResult> {
   const edits = resolveHashlineEdits([input]);
   const fileLines = normalizedContent.split("\n");
-  
+
   // Validate all hashes
   const allValid = validateAllHashlineHashes(edits, fileLines);
-  
+
   if (allValid.valid) {
     // FAST PATH: direct apply
     return { result: applyHashlineEdits(normalizedContent, edits), tier: "hashline" };
   }
-  
+
   // Try rebase for each mismatch
   const rebased = tryRebaseAll(edits, fileLines, allValid.mismatches);
   if (rebased.allResolved) {
     // Apply with rebased positions + warning
-    return { result: applyHashlineEdits(normalizedContent, rebased.edits), 
+    return { result: applyHashlineEdits(normalizedContent, rebased.edits),
              tier: "hashline-rebased",
              warnings: rebased.warnings };
   }
-  
+
   // Hashline failed — try symbol-scoped fallback
   if (input.anchor.symbol && astResolver) {
     const symbolScope = await resolveSymbolToScope(
@@ -485,18 +485,18 @@ async function applyHashlinePath(
       path,
       astResolver,
     );
-    
+
     if (symbolScope) {
       // Reconstruct oldText from hashline cache
       const oldText = reconstructOldTextFromCache(input.anchor.range);
-      
-      // 4-tier match within symbol scope
+
+      // 6-tier match within symbol scope
       const match = findText(
-        normalizedContent, oldText, 
+        normalizedContent, oldText,
         detectIndentation(normalizedContent),
         0, symbolScope,
       );
-      
+
       if (match.found) {
         return { result: applyMatch(normalizedContent, match, edits[0].lines),
                  tier: "scoped-fallback",
@@ -504,7 +504,7 @@ async function applyHashlinePath(
       }
     }
   }
-  
+
   // All hashline attempts failed — escalate to full fuzzy
   return { result: await fullFuzzyApply(input, normalizedContent, path),
            tier: "full-fuzzy-fallback" };
@@ -546,30 +546,30 @@ async function fullFuzzyApply(
   // Reconstruct oldText from hashline anchors in read cache
   const snapshot = getSnapshot(path, process.cwd());
   const oldText = reconstructOldText(snapshot, input.anchor.range);
-  
+
   if (!oldText) {
     throw new Error(
       `Cannot reconstruct oldText from hashline anchors. ` +
       `File may have been modified since last read. Re-read and try again.`
     );
   }
-  
-  // Run through existing 4-tier pipeline
+
+  // Run through existing 6-tier pipeline
   const match = findText(
     normalizedContent,
     oldText,
     detectIndentation(normalizedContent),
   );
-  
+
   if (!match.found) {
     const diagnostic = findClosestMatch(normalizedContent, oldText);
     throw getNotFoundError(path, 0, 1, diagnostic, undefined);
   }
-  
+
   // Apply the match
   const content = hashlineParseText(input.content);
   const result = applySingleMatch(normalizedContent, match, content);
-  
+
   return {
     result,
     tier: "full-fuzzy-fallback",
@@ -590,7 +590,7 @@ interface HashlineMetrics {
   hashlineDirect: number;      // Fast path
   hashlineRebased: number;     // ±5 window rebase
   scopedFallback: number;      // AST-scoped fuzzy
-  fullFuzzyFallback: number;   // Full 4-tier safety net
+  fullFuzzyFallback: number;   // Full 6-tier safety net
   hashMismatchRejects: number; // Genuine rejections
 }
 ```
@@ -613,7 +613,7 @@ describe("Fallback chain", () => {
   it("hashline direct: hashes match → applied immediately", () => { /* */ });
   it("hashline rebase: file shifted by 3 lines → auto-corrected", () => { /* */ });
   it("scoped fallback: hashes stale, symbol resolves → scoped match", () => { /* */ });
-  it("full fuzzy: hashes stale, no symbol → 4-tier pipeline", () => { /* */ });
+  it("full fuzzy: hashes stale, no symbol → 6-tier pipeline", () => { /* */ });
   it("rejection: hashes stale, no symbol, no match → clear error", () => { /* */ });
 });
 ```
@@ -654,7 +654,7 @@ bun run benchmark/compare.ts \
 
 ### 5.2 Metrics to Compare
 
-| Metric | Baseline (4-tier) | New (hashline hybrid) |
+| Metric | Baseline (6-tier) | New (hashline hybrid) |
 |--------|-------------------|----------------------|
 | Overall success rate | ? | ? |
 | Tokens in / out per task | ? | ? |
@@ -668,12 +668,12 @@ Current prompt guidelines at ~line 944:
 
 ```
 Current:
-"Use edit for precise file modifications. Copy exact snippets from the latest 
+"Use edit for precise file modifications. Copy exact snippets from the latest
 file read as oldText."
 
 Proposed addition:
 "Prefer hashline-anchored edits when the file was read with LINE+ID anchors.
-Reference anchors as '42ab' instead of reproducing text — this is faster, more 
+Reference anchors as '42ab' instead of reproducing text — this is faster, more
 reliable, and avoids whitespace errors."
 ```
 
@@ -736,7 +736,7 @@ reliable, and avoids whitespace errors."
 1. **xxhash-wasm over native**: Portability trumps 2x speed for a μs-level operation.
 2. **Structural bigrams**: Worth the complexity — brace lines are ~20% of source code.
 3. **Rebase window of ±5**: Wide enough for typical line shifts, narrow enough to avoid ambiguity.
-4. **Keep 4-tier pipeline**: As safety net, not primary. Never remove it.
+4. **Keep 6-tier pipeline**: As safety net, not primary. Never remove it.
 5. **Hashline in read hook, not schema**: Transparent to the model — reduces prompt complexity.
 6. **Symbol kind as string, not enum**: Compatible with tree-sitter's node type strings.
 

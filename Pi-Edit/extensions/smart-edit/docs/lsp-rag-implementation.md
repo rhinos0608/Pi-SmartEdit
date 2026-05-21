@@ -1,9 +1,11 @@
-# Pre-Edit Semantic Retrieval (LSP-RAG) — Implementation Plan
+# Pre-Edit Semantic Retrieval (LSP-RAG) — Implementation Record
 
-> **Status**: Implemented
+> **Status**: Implemented (May 2026) — all 4 phases complete
 > **Spec Reference**: [lsp-rag-spec.md](./lsp-rag-spec.md)
 > **Date**: 2026-05-02
 > **Phases**: 4 (all complete)
+> **Implementation files**: `src/lsp/semantic-context.ts`, `src/lsp/semantic-nav.ts`, `src/lsp/context-renderer.ts`, `src/lsp/symbol-skeleton.ts`, `src/lsp/target-range.ts`, `src/lsp/deferred-diagnostics.ts`
+> This document describes the implementation as-built. Each phase was completed sequentially.
 
 ---
 
@@ -16,7 +18,7 @@
 | 3 | `semantic_context` tool integration | Low/Medium | Phase 2, read cache |
 | 4 | Tests, prompt tuning, docs | Low | Phase 3 |
 
-The MVP should add an explicit retrieval tool first. Automatic read augmentation should wait until the Pi extension API confirms safe result transformation.
+The MVP added an explicit `semantic_context` tool first. Automatic read augmentation is deferred pending Pi extension API confirmation of safe result transformation.
 
 ---
 

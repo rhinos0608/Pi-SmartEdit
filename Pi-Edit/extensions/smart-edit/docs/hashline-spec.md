@@ -1,16 +1,16 @@
 # Hashline Edit Mode — Technical Specification
 
-> **Status**: Implemented (May 2026) — available via `SMART_EDIT_USE_HASHLINE_EDITING=1`  
-> **Version**: 1.0  
-> **Date**: 2026-05-01  
-> **Author**: Smart Edit Architecture Analysis  
+> **Status**: Implemented (May 2026) — available via `SMART_EDIT_USE_HASHLINE_EDITING=1`
+> **Version**: 1.0
+> **Date**: 2026-05-01
+> **Author**: Smart Edit Architecture Analysis
 > **Reference**: oh-my-pi hashline mode (can1357/oh-my-pi, packages/coding-agent/src/edit/modes/hashline.ts)
 
 ---
 
 ## 1. Problem Statement
 
-Smart Edit's current edit tool asks the model to reproduce `oldText` exactly, then applies a 4-tier fuzzy matching pipeline (Exact → Indentation → Unicode → Similarity) when that reproduction inevitably fails. This approach:
+Smart Edit's current edit tool asks the model to reproduce `oldText` exactly, then applies a 6-tier fuzzy matching pipeline (exact → indentation → unicode → similarity → dotdotdots ellipsis → relative indent) when that reproduction inevitably fails. This approach:
 
 - Burns output tokens on retry loops when whitespace/formatting drift prevents matching
 - Fails disproportionately on weak models (Grok Code Fast 1: 6.7% success)
@@ -24,7 +24,7 @@ The hashline approach eliminates the root cause: it never asks the model to repr
 2. **Hash-as-freshness-check.** If the file changed since the last read, hashes won't match and the edit is rejected before any mutation.
 3. **Hard rejection, not silent relocation.** Unlike similarity-based matching, a hash mismatch is a hard error with clear diagnostics — no silently editing the wrong location.
 4. **AST scoping as complement, not replacement.** Hashline anchors handle precision and freshness; AST symbol targeting handles disambiguation across identically-hashed structural lines.
-5. **Preserve existing investment.** The 4-tier pipeline remains as a safety net, not the primary mechanism.
+5. **Preserve existing investment.** The 6-tier pipeline remains as a safety net, not the primary mechanism.
 
 ## 3. Architecture Overview
 
@@ -443,7 +443,7 @@ The existing conflict detector (`lib/conflict-detector.ts`) operates on byte ran
 // After successful hashline edit application:
 const spans = editSpans.map(edit => ({
   startIndex: lineToByteOffset(fileContent, edit.pos.line),
-  endIndex: lineToByteOffset(fileContent, edit.end.line) 
+  endIndex: lineToByteOffset(fileContent, edit.end.line)
            + fileContent.split("\n")[edit.end.line - 1].length,
 }));
 
@@ -469,7 +469,7 @@ The 61% output token reduction on Grok 4 Fast comes from eliminating:
 
 ```
 Turn 1: Model emits oldText with whitespace bugs → match fails
-Turn 2: LLM retries with "corrected" oldText → still slightly wrong → match fails  
+Turn 2: LLM retries with "corrected" oldText → still slightly wrong → match fails
 Turn 3: Fuzzy matching finally accepts → edit applied, but 2 turns of tokens wasted
 ```
 

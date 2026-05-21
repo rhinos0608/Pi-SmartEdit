@@ -760,6 +760,13 @@ function validateInput(
 
 // ─── File mutation queue (prevents concurrent edits to same file) ──
 
+/** Maximum time a single edit operation can hold the mutation queue.
+ *  Prevents a hung LSP diagnostic call (e.g. unresponsive language server,
+ *  orphaned document-sync in flight) from blocking all subsequent edits
+ *  to the same file. The timed-out operation continues executing in the
+ *  background but its result is discarded. */
+const MUTATION_QUEUE_TIMEOUT_MS = 60_000;
+
 const fileMutationQueues = new Map<string, Promise<void>>();
 
 function getMutationKey(filePath: string): string {
@@ -790,7 +797,24 @@ async function withFileMutationQueue<T>(
   await currentQueue.catch(() => {});
 
   try {
-    return await fn();
+    // Race the edit against a timeout so a hung LSP diagnostic call (or any
+    // other async stall) can't block the queue indefinitely. The losing
+    // promise is abandoned (fire-and-forget) — the next queued operation
+    // may edit the file concurrently, which is acceptable over a dead queue.
+    return await Promise.race([
+      fn(),
+      new Promise<T>((_, reject) => {
+        const timer = setTimeout(() => {
+          reject(
+            new Error(
+              `Mutation queue timeout after ${MUTATION_QUEUE_TIMEOUT_MS}ms for ${filePath}. ` +
+              `The edit may still be completing in the background.`,
+            ),
+          );
+        }, MUTATION_QUEUE_TIMEOUT_MS);
+        timer.unref();
+      }),
+    ]);
   } finally {
     releaseNext();
     if (fileMutationQueues.get(key) === chainedQueue) {

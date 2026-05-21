@@ -282,7 +282,7 @@ function findText(
 
   const searchStartOffset = searchScope?.startIndex ?? startOffset;
 
-  // ... existing 4-tier matching logic, scoped to searchContent ...
+  // ... existing 6-tier matching logic, scoped to searchContent ...
 
   // If match found in scoped content, map back to original offsets
   if (result.found) {

@@ -299,8 +299,10 @@ npx tsx --test test/<file>  # e.g., test/symbolic-edits.test.ts
 | `SMART_EDIT_USE_HASHLINE_EDITING` | `1`/`true`/`yes`/`on` | off | Enable hashline edit mode |
 | `SMART_EDIT_HASHLINE_EXPERIMENTAL` | same | off | Alias for hashline toggle |
 | `SMART_EDIT_APPROVAL_LEVEL` | `never_prompt` / `prompt_on_dangerous` / `prompt_always` | `never_prompt` | Safety check verbosity |
-| `SMART_EDIT_REPAIR_ENABLED` | `1`/`true`/`yes`/`on` | off | Enable edit repair loop (Aider-style retry) |
+| `SMART_EDIT_REPAIR_ENABLED` | `1`/`true`/`yes`/`on` | **on** | Enable edit repair loop (Aider-style retry) |
+| `SMART_EDIT_REPAIR_ENABLED=0`/`false` | disable | — | Disable the repair loop (defaults to on) |
 | `SMART_EDIT_REPAIR_MAX_RETRIES` | integer | `3` | Max retry attempts in the repair loop |
+| `SMART_EDIT_VERIFICATION_COMMANDS` | JSON array | `[]` | Concurrency/verification commands as `[{"name":"...","command":"...","args":["..."]}]` |
 
 ## Notes
 
@@ -309,5 +311,5 @@ npx tsx --test test/<file>  # e.g., test/symbolic-edits.test.ts
 - Fuzzy matches are safe: replacements are always applied to the original file text.
 - Undo data is stored in `.smart-edit-undo/` per project (fire-and-forget, never blocks).
 - Verification pipeline is advisory: warnings are matchNotes, never hard errors by default.
-- Repair loop is opt-in and non-critical: repair failures produce notes but never block the pipeline.
+- Repair loop is on by default (opt out with `SMART_EDIT_REPAIR_ENABLED=0` or `false`): repair failures produce notes but never block the pipeline.
 - Incremental syntax validation uses tree-sitter computeEdit + re-parse; falls back to full parse when the edit delta is too large.

@@ -1,31 +1,61 @@
-# Codex Patterns Borrowable by SmartEdit
+# Codex Patterns Borrowed by SmartEdit — Retrospective
 
-> Analysis based on reading `github.com/openai/codex` source (May 2026) and
-> the SmartEdit extension at `.pi/extensions/smart-edit/`.
+> **Status**: All 7 patterns implemented (May 2026)
+> Original analysis based on reading `github.com/openai/codex` source (May 2026)
+> and the SmartEdit extension at `.pi/extensions/smart-edit/`.
+
+All patterns identified in the original analysis were implemented across two sprints. This document serves as a retrospective: what was borrowed, how it was implemented, and what the actual cost was.
 
 ---
 
-## Architecture Comparison
+## Implementation Summary
+
+| # | Pattern | Priority (original) | Actual LOC | Status |
+|---|---------|---------------------|-----------|--------|
+| 1 | Grammar-based freeform tool (Codex apply_patch parser) | P0 | ~800 | ✅ `src/formats/codex-patch.ts` |
+| 2 | Multi-level `@@` hunk disambiguation | P0 | (included above) | ✅ Built into codex-patch parser |
+| 3 | Streaming patch preview | P1 | ~450 | ✅ `src/formats/streaming-patch-parser.ts` |
+| 4 | ContextualUserFragment markers | P1 | ~200 | ✅ `src/formats/context-markers.ts` |
+| 5 | Edit history / undo | P2 | ~300 | ✅ `src/undo/edit-history.ts` + `atomic-write.ts` |
+| 6 | Approval gating | P2 | ~400 | ✅ `src/safety/approval-gating.ts` |
+| 7 | Multi-file atomic patches | P3 | ~950 | ✅ `src/formats/atomic-patch.ts` |
+
+---
+
+## Architecture Comparison (current)
 
 | Layer | SmartEdit | Codex |
 |---|---|---|
-| **Input format** | JSON schema + multi-format detection (search/replace, unified diff, OpenAI patch, Codex patch, hashline) + forgiving parser + streaming parser | Lark grammar freeform tool (`apply_patch`) |
+| **Input format** | JSON schema + multi-format detection (search/replace, unified diff, OpenAI patch, Codex patch, Atomic Patch, hashline) + forgiving parser + streaming parser | Lark grammar freeform tool (`apply_patch`) |
 | **Matching** | 6-tier fuzzy pipeline (exact → indent → unicode → similarity → dotdotdots → relative indent) + symbolic edits | Context-line matching with `@@` disambiguation + `seek_sequence` fuzzy |
 | **Scoping** | tree-sitter AST anchor + lineRange + hashline anchors | Multi-level `@@` chaining (`@@ class`, `@@ \t def`) |
-| **Safety** | Stale-file guard, range coverage guard, approval gating, atomic write | Exec policy rules, sandbox permissions, approval flow |
-| **Validation** | LSP diagnostics + compiler fallback + scoped diagnostics + verification pipeline | Sandbox FS + exec policy + diff tracker |
+| **Safety** | Stale-file guard, range coverage guard, approval gating (path/symbol/auto-generated detection), atomic write | Exec policy rules, sandbox permissions, approval flow |
+| **Validation** | LSP diagnostics + compiler fallback + scoped diagnostics + incremental syntax validation + verification pipeline (concurrency, traceability, history) | Sandbox FS + exec policy + diff tracker |
 | **Read path** | Snapshot cache with readOffset, hashline anchors, APFS VFS retry | Fragment injection into message array (`ContextualUserFragment`) |
 | **Streaming** | Streaming patch parser with progress callbacks | 500ms-buffered streaming patch preview |
-| **Multi-file** | Single-file edit tool with mutation queue | Multi-file patches in one `apply_patch` call |
+| **Multi-file** | Atomic Patch envelope (AddFile, DeleteFile, UpdateFile, RenameFile) | Multi-file patches in one `apply_patch` call |
 | **Undo** | Per-edit undo capture to `.smart-edit-undo/` (fire-and-forget) | `SharedTurnDiffTracker` records all changes |
 | **Multi-env** | Local only | Environment ID routing (local, container, remote) |
 
 ---
 
-## Pattern #1: Grammar-Based Freeform Tool (HIGH IMPACT / LOW EFFORT)
+## Pattern #1: Grammar-Based Freeform Tool ✅
 
-### What Codex Does
-Codex defines `apply_patch` as a **Lark grammar** freeform tool. The model outputs raw text matching the grammar, not JSON. The parser (`parser.rs`, 954 lines) validates the grammar, extracts hunks, and produces structured `Hunk` enums:
+### Files
+- `src/formats/codex-patch.ts` (~800 lines) — recursive-descent parser
+- `src/formats/format-detector.ts` — detection logic for `codex_patch` format
+
+### What was built
+A proper recursive-descent parser for the Codex `apply_patch` format that:
+1. Validates the full `*** Begin Patch` / `*** End Patch` envelope
+2. Supports `*** Add File:`, `*** Delete File:`, `*** Update File:`, `*** Move to:`
+3. Parses multi-level `@@` chaining
+4. Produces structured `CodexHunk` types with context-line metadata
+5. Has lenient mode error recovery for common model mistakes
+6. Maps hunks to SmartEdit's `EditItem` format via `codexHunkToEditItem()`
+
+### What Codex Does (reference)
+Codex defines `apply_patch` as a **Lark grammar** freeform tool. The model outputs raw text matching the grammar. The parser (`parser.rs`, 954 lines) validates the grammar, extracts hunks, and produces structured `Hunk` enums:
 
 ```rust
 pub enum Hunk {
@@ -35,27 +65,12 @@ pub enum Hunk {
 }
 ```
 
-### What SmartEdit Should Borrow
-SmartEdit already supports OpenAI patch format via `src/formats/openai-patch.ts`, but the parser is **regex-based and fragile**. It doesn't validate the envelope, doesn't handle error recovery well, and doesn't support all Codex features (multi-level `@@`, `*** Move to:`, file creation/deletion in one patch).
-
-**Concrete improvement:** Add a **proper grammar parser** for the Codex apply_patch format that:
-1. Validates the full `*** Begin Patch` / `*** End Patch` envelope
-2. Supports `*** Add File:`, `*** Delete File:`, `*** Update File:`, `*** Move to:`
-3. Parses multi-level `@@` chaining (`@@ class BaseClass`, `@@ \t def method():`)
-4. Produces structured hunks with context-line metadata
-5. Has error recovery for common model mistakes (Codex has a "lenient mode" for gpt-4.1)
-
-**Implementation:** ~200-300 lines in `src/formats/codex-patch.ts` with a recursive-descent parser.
-
-**Benefit:** Models that are trained on Codex's apply_patch format (GPT-5, GPT-4.1, etc.) can use their native output format directly, reducing JSON serialization errors and improving edit precision.
-
 ---
 
-## Pattern #2: Multi-Level `@@` Hunk Disambiguation (HIGH IMPACT / LOW EFFORT)
+## Pattern #2: Multi-Level `@@` Hunk Disambiguation ✅
 
-### What Codex Does
+### What Codex Does (reference)
 Codex disambiguates hunks by chaining `@@` statements:
-
 ```
 @@ class BaseClass
 @@   def method():
@@ -65,182 +80,113 @@ Codex disambiguates hunks by chaining `@@` statements:
   [3 lines of post-context]
 ```
 
-The parser walks the `@@` chain to narrow scope, then uses context lines for precise positioning.
-
-### What SmartEdit Should Borrow
-SmartEdit has `anchor` and `lineRange` for scoping, but these require the model to understand tree-sitter symbol kinds and line numbers. Codex's `@@` chaining is more natural — the model just writes code it can see.
-
-**Concrete improvement:** Enhance `src/formats/openai-patch.ts` to:
-1. Parse multi-level `@@` chains (currently only handles single `@@`)
-2. Generate `anchor` hints from `@@` chains for the matching pipeline
-3. Use `@@` context lines as fuzzy-search anchors when the primary match fails
-
-**Implementation:** ~100-150 lines modifying `extractSections()` and `extractAnchorLine()` in `openai-patch.ts`.
-
-**Benefit:** Fewer ambiguous matches; model can disambiguate naturally by naming surrounding context.
+### Implementation
+Built into the codex-patch parser. Each `UpdateFileChunk` has a `scope: string[]` field that captures the multi-level `@@` chain. The scope is used as `anchor` hints when converting to `EditItem`.
 
 ---
 
-## Pattern #3: Streaming Patch Preview (MEDIUM IMPACT / MEDIUM EFFORT)
+## Pattern #3: Streaming Patch Preview ✅
 
-### What Codex Does
-Codex implements a `StreamingPatchParser` that processes partial patch text as the model streams it. Every 500ms, completed hunks are emitted as `PatchApplyUpdatedEvent` to update the TUI's diff view in real-time.
+### Files
+- `src/formats/streaming-patch-parser.ts` (~450 lines) — progressive parse with progress callbacks
 
-```rust
-struct ApplyPatchArgumentDiffConsumer {
-    parser: StreamingPatchParser,
-    last_sent_at: Option<Instant>,
-    pending: Option<PatchApplyUpdatedEvent>,
-}
-```
-
-### What SmartEdit Should Borrow
-SmartEdit's `edit` tool receives a complete edits array and processes it synchronously. For large patches (many files, many hunks), there's no progress feedback.
-
-**Concrete improvement:** If Pi's tool infrastructure supports `onUpdate` callbacks during execution:
-1. Create a `StreamingPatchParser` that processes hunk-by-hunk
-2. Emit partial diffs as each hunk is applied
-3. Buffer updates at 500ms intervals to avoid flooding
-
-**Implementation:** Depends on Pi's streaming tool support. ~200-250 lines if supported.
-
-**Benefit:** Real-time feedback during large edits; reduced user anxiety about "is this still working?"
+### What was built
+A `StreamingPatchParser` that processes partial patch text as it's received:
+1. Re-parses accumulated text every 500ms using `parseCodexPatch(text, 'lenient')`
+2. Emits completed hunks via `onUpdate` callback
+3. Calculates live diffs using the `diff` library
+4. Integrates with `index.ts execute()` when `onUpdate` is provided and format is `codex_patch`
 
 ---
 
-## Pattern #4: `ContextualUserFragment` Pattern for Read Path (MEDIUM IMPACT / MEDIUM EFFORT)
+## Pattern #4: ContextualUserFragment Markers ✅
 
-### What Codex Does
-Codex injects all context as **fragments** with XML-like markers:
+### Files
+- `src/formats/context-markers.ts` (~200 lines) — XML-style marker wrapping
 
-```rust
-pub trait ContextualUserFragment {
-    const ROLE: &'static str;          // "user"
-    const START_MARKER: &'static str;  // "<environment>"
-    const END_MARKER: &'static str;    // "</environment>"
-    fn body(&self) -> String;
-    fn render(&self) -> String;        // MARKER + body + MARKER
-}
-```
+### What was built
+A lightweight XML-style marker system that:
+1. Wraps `semantic_context` output in `<smartedit:context>` / `</smartedit:context>` tags
+2. Carries metadata as attributes (`path`, `range`, `source`, `tokens`, `language`)
+3. Provides `wrapInMarker()`, `isMarkedFragment()`, `parseMarkerMetadata()`, `stripMarkers()` functions
+4. Uses percent-encoding for path attributes to avoid XML parsing issues
 
-Markers serve dual purpose: delimit injected context for filtering, and preserve attribution so the model knows where information came from. `is_contextual_user_fragment()` can identify and remove injected text during compaction.
-
-### What SmartEdit Should Borrow
-SmartEdit's `semantic_context` tool returns markdown. The `read` cache records snapshots. There's no marker-based context injection.
-
-**Concrete improvement:**
-1. Wrap `semantic_context` output in `<semantic_context path="...">` / `</semantic_context>` markers
-2. Add markers to read cache entries when the file context is injected
-3. Provide a marker-aware filter for context compaction
-
-**Implementation:** ~100-150 lines across `semantic-context.ts` and a new `context-markers.ts`.
-
-**Benefit:** Cleaner context attribution; enables downstream filtering and smarter compaction.
+### What Codex Does (reference)
+Codex injects all context as **fragments** with XML-like markers via the `ContextualUserFragment` trait. Markers serve dual purpose: delimit injected context for filtering, and preserve attribution.
 
 ---
 
-## Pattern #5: Edit History / Undo (MEDIUM IMPACT / MEDIUM EFFORT)
+## Pattern #5: Edit History / Undo ✅
 
-### What Codex Does
-Codex's `SharedTurnDiffTracker` records every file change as structured data during a turn. The handler emits diffs that can be rendered in the TUI and used for undo operations.
+### Files
+- `src/undo/edit-history.ts` (~300 lines) — undo state capture and restore
+- `src/undo/atomic-write.ts` (~140 lines) — temp-file write + rename
 
-### What SmartEdit Should Borrow
-SmartEdit generates diffs but doesn't persist them for undo. Each `atomicWrite` replaces the file; there's no rollback.
-
-**Concrete improvement:**
-1. Before `atomicWrite`, save the original file content to a `.smart-edit-undo/` directory
-2. Record diff metadata (timestamp, edit count, symbols changed)
-3. Provide an `undo_edit` tool (or integrate with Pi's undo)
-4. Auto-clean old undo data on session end
-
-**Implementation:** ~200-300 lines, mostly in `index.ts` execute() before atomicWrite.
-
-**Benefit:** Safety net for mistaken edits; aligns with Codex's "record everything" philosophy.
+### What was built
+A lightweight, file-based undo system:
+1. Captures pre-edit content before every `atomicWrite` call (base64-encoded JSON)
+2. Stores undo data in `.smart-edit-undo/` per project
+3. Provides `saveUndoState()`, `restoreUndoState()`, `getUndoHistory()`, `clearUndoHistory()`
+4. Fire-and-forget — never blocks the edit hot path
+5. Atomically writes using temp-file + rename pattern
 
 ---
 
-## Pattern #6: Approval Gating (LOW-MEDIUM IMPACT / MEDIUM EFFORT)
+## Pattern #6: Approval Gating ✅
 
-### What Codex Does
-Codex has a comprehensive approval system:
-- `AskForApproval::Never` — always run
-- `AskForApproval::OnFailure` — ask on errors
-- `AskForApproval::OnRequest` — ask when model requests it
-- `AskForApproval::UnlessTrusted` — skip for trusted commands
-- `AskForApproval::Granular` — per-rule/per-sandbox config
-- Exec policy rules (allow/prompt/forbid) in `.codex/rules/`
+### Files
+- `src/safety/approval-gating.ts` (~400 lines) — path/symbol/line-range safety checks
+- Plus auto-generated file detection
 
-### What SmartEdit Should Borrow
-SmartEdit has **no approval gating**. All edits go through automatically if they pass stale-file and range coverage guards.
-
-**Concrete improvement (lightweight):**
-1. Add a `VERIFICATION_REQUIRED_PATHS` config (glob patterns) for files that need approval
-2. Add a `DANGEROUS_PATTERNS` list (editing `__init__`, `main`, entry points, config files)
-3. Emit a warning note for dangerous edits rather than blocking
-4. Support a "review mode" where diffs are shown before applying
-
-**Implementation:** ~150-200 lines. Mostly configuration + pre-edit check in execute().
-
-**Benefit:** Prevents accidental edits to critical infrastructure; aligns with Codex's safety-first approach.
+### What was built
+A lightweight approval gating system with:
+1. Three levels: `never_prompt`, `prompt_on_dangerous`, `prompt_always`
+2. Glob-based dangerous file path patterns
+3. Regex-based dangerous symbol patterns (`main()`, `init()`, `process.env`, etc.)
+4. Critical line range checks
+5. **Auto-generated file detection** — identifies files with markers like `@generated`, `auto-generated`, `Do not edit`
+6. Warnings only, never blocks edits
+7. Controlled via `SMART_EDIT_APPROVAL_LEVEL` env var
 
 ---
 
-## Pattern #7: Multi-File Patches in One Call (MEDIUM IMPACT / HIGH EFFORT)
+## Pattern #7: Multi-File Atomic Patches ✅
 
-### What Codex Does
-A single `apply_patch` call can modify multiple files:
+### Files
+- `src/formats/atomic-patch.ts` (~950 lines) — multi-file atomic patch envelope parser and applicator
+
+### What was built
+An atomic patch envelope format that groups operations on multiple files into a single transaction:
+1. **AddFile** — create a new file with contents
+2. **DeleteFile** — remove a file
+3. **UpdateFile** — apply search/replace hunks (optionally with move to new path)
+4. **RenameFile** — rename a file
+5. Operations validated before application; entire envelope rolls back on failure
+6. Supports `force` mode for overwriting existing files
 
 ```
-*** Begin Patch
-*** Add File: src/new.ts
-+export function hello() {}
-*** Update File: src/main.ts
-@@ import
-+import { hello } from "./new";
-*** End Patch
+*** Begin Atomic Patch
+*** Update File: src/foo.ts
+--- a/src/foo.ts
++++ b/src/foo.ts
+@@ -1,3 +1,3 @@
+-const oldName = 1;
++const newName = 1;
+*** Add File: src/bar.ts
+@@ -0,0 +1,1 @@
++const bar = 2;
+*** End Atomic Patch
 ```
-
-### What SmartEdit Should Borrow
-SmartEdit's `edit` tool operates on **one file per call**. Multi-file changes require multiple tool calls, which introduces ordering dependencies and stale-file risks between calls.
-
-**Concrete improvement:**
-1. Add a `multi_edit` tool that accepts an array of file edits
-2. Each entry has `{ path, edits }` 
-3. Process all files in a single atomic transaction (or report which succeeded/failed)
-4. Generate a unified multi-file diff summary
-
-**Implementation:** ~400-500 lines. New tool registration + batch processing logic.
-
-**Benefit:** Atomic multi-file edits; reduced tool-call overhead; better model throughput.
-
----
-
-## Priority Ranking
-
-| # | Pattern | Impact | Effort | Lines | Priority |
-|---|---|---|---|---|---|
-| 1 | Grammar-based freeform tool | 🔴 High | 🟢 Low | ~250 | **P0 — Do first** |
-| 2 | Multi-level `@@` disambiguation | 🔴 High | 🟢 Low | ~150 | **P0 — Do first** |
-| 3 | Streaming patch preview | 🟡 Medium | 🟡 Medium | ~250 | P1 |
-| 4 | ContextualUserFragment markers | 🟡 Medium | 🟡 Medium | ~150 | P1 |
-| 5 | Edit history / undo | 🟡 Medium | 🟡 Medium | ~300 | P2 |
-| 6 | Approval gating | 🟢 Low-Med | 🟡 Medium | ~200 | P2 |
-| 7 | Multi-file patches | 🟡 Medium | 🔴 High | ~500 | P3 |
-
-### Recommended Implementation Order
-
-1. **P0 (this sprint):** Patterns #1 and #2 — they directly improve edit precision for models trained on Codex's format. Low effort, high payoff.
-2. **P1 (next sprint):** Patterns #3 and #4 — streaming preview and context markers improve UX and observability.
-3. **P2 (later):** Patterns #5 and #6 — undo and approval add safety layers.
-4. **P3 (future):** Pattern #7 — multi-file patches require significant architectural changes but would be transformative.
 
 ---
 
 ## What NOT to Borrow (and Why)
 
+This list remains valid — these Codex features were intentionally skipped:
+
 | Codex Feature | Why Skip |
 |---|---|
-| **Full exec policy engine** (37k lines) | Overengineered for SmartEdit's scope. Lightweight path-based approval (Pattern #6) is sufficient. |
+| **Full exec policy engine** (37k lines) | Overengineered for SmartEdit's scope. Lightweight path-based approval is sufficient. |
 | **Multi-environment routing** | SmartEdit runs in a single local Pi session. Container/remote support is an orthogonal concern. |
 | **Virtual filesystem abstraction** | SmartEdit does direct fs ops. The VFS abstraction would add complexity without clear benefit. |
 | **Remote compaction** (`compact_remote_v2.rs`, 16k lines) | Pi handles its own context window management. SmartEdit shouldn't get involved. |

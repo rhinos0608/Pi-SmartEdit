@@ -3,7 +3,7 @@
  *
  * Defaults are conservative:
  * - Warnings only (no hard failures).
- * - No external commands unless explicitly configured.
+ * - No external commands unless explicitly configured via SMART_EDIT_VERIFICATION_COMMANDS.
  * - Short timeouts for inline operations.
  * - Traceability and history enabled with safe defaults.
  */
@@ -14,30 +14,46 @@ import type {
   TraceabilityConfig,
   HistoryConfig,
   RepairConfig,
+  VerificationCommand,
 } from "./types";
 
 /**
  * Provide a default VerificationConfig with safe, conservative values.
- * External commands are intentionally empty — users must opt in.
+ * Repair loop is on by default (opt out via SMART_EDIT_REPAIR_ENABLED=0).
+ * External commands are read from SMART_EDIT_VERIFICATION_COMMANDS (JSON).
  */
-export function defaultVerificationConfig(): VerificationConfig {
+export function defaultVerificationConfig(
+  env?: Record<string, string | undefined>,
+): VerificationConfig {
   return {
     enabled: true,
     maxInlineMs: 5_000,
     maxBackgroundMs: 120_000,
     policy: "warn",
-    concurrency: defaultConcurrencyConfig(),
+    concurrency: defaultConcurrencyConfig(env),
     traceability: defaultTraceabilityConfig(),
     history: defaultHistoryConfig(),
-    repair: defaultRepairConfig(),
+    repair: defaultRepairConfig(env),
   };
 }
 
-export function defaultConcurrencyConfig(): ConcurrencyConfig {
+export function defaultConcurrencyConfig(
+  env?: Record<string, string | undefined>,
+): ConcurrencyConfig {
+  let commands: VerificationCommand[] = [];
+  const raw = (env ?? process.env)[VALIDATION_COMMANDS_ENV_VAR];
+  if (raw != null && raw.trim().length > 0) {
+    try {
+      commands = JSON.parse(raw) as VerificationCommand[];
+    } catch {
+      // silently ignore malformed JSON — fall back to empty
+    }
+  }
+
   return {
     enabled: true,
     runMode: "inline",
-    commands: [],
+    commands,
     autoDetectKnownTools: true,
   };
 }
@@ -66,10 +82,40 @@ export function defaultHistoryConfig(): HistoryConfig {
   };
 }
 
-export function defaultRepairConfig(): RepairConfig {
+const REPAIR_ENABLED_ENV_VAR = "SMART_EDIT_REPAIR_ENABLED";
+
+
+const REPAIR_MAX_RETRIES_ENV_VAR = "SMART_EDIT_REPAIR_MAX_RETRIES";
+
+const VALIDATION_COMMANDS_ENV_VAR = "SMART_EDIT_VERIFICATION_COMMANDS";
+
+/**
+ * Read an env var as a boolean. Returns true for "1", "true", "yes", "on".
+ */
+function parseBooleanEnv(value: string): boolean {
+  return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+}
+
+
+export function defaultRepairConfig(
+  env?: Record<string, string | undefined>,
+): RepairConfig {
+  let enabled = true;
+  const raw = (env ?? process.env)[REPAIR_ENABLED_ENV_VAR];
+  if (raw != null) {
+    enabled = parseBooleanEnv(raw);
+  }
+
+  let maxRetries = 3;
+  const retryRaw = (env ?? process.env)[REPAIR_MAX_RETRIES_ENV_VAR];
+  if (retryRaw != null) {
+    const parsed = parseInt(retryRaw.trim(), 10);
+    if (!isNaN(parsed) && parsed >= 0) maxRetries = parsed;
+  }
+
   return {
-    enabled: false, // Opt-in — significant behavior change
-    maxRetries: 3,
+    enabled,
+    maxRetries,
     autoRepair: true,
     notifyOnRetry: true,
   };
