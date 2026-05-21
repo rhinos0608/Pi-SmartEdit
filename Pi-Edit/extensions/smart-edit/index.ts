@@ -77,6 +77,19 @@ import type {
 
 const smartEditRuntimeConfig = getSmartEditRuntimeConfig();
 
+function coerceText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined) return "";
+  if (typeof value === "object") {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
 // ─── Schema (must match built-in edit schema exactly) ──────────────
 // Extra properties like `replaceAll`, `target` are stripped
 // by prepareArguments before validation, then restored in execute().
@@ -1099,8 +1112,8 @@ export default function smartEdit(pi: ExtensionAPI) {
         // Build full content from result blocks
         const contentBlocks = Array.isArray(event.content) ? event.content : [];
         const fullText = contentBlocks
-          .filter((c): c is { type: "text"; text: string } => c.type === "text")
-          .map((c) => c.text || "")
+          .filter((c) => c.type === "text")
+          .map((c) => coerceText((c as { text?: unknown }).text))
           .join("");
 
         const inputPath = (event.input as { path?: string } | undefined)?.path;
@@ -1169,22 +1182,40 @@ export default function smartEdit(pi: ExtensionAPI) {
       }
     }
 
-    // ── Track read_multiple_files results ──
+    // ── Track read_files results ──
     // Populates the snapshot cache for each file read, so edits are allowed.
+    // Accepts both "read_files" (current Pi-SmartRead name) and "read_multiple_files"
+    // (legacy ToolDefinition.name) for backward compatibility.
     if (
-      event.toolName === "read_multiple_files" &&
+      (event.toolName === "read_files" || event.toolName === "read_multiple_files") &&
       !event.isError
     ) {
       try {
+        // Prefer event.details.files (has ok status from read-many) over event.input.files
+        const rawDetailFiles = (event.details as { files?: Array<{ path: string; ok?: boolean }> } | undefined)?.files;
+        const detailFiles = Array.isArray(rawDetailFiles) ? rawDetailFiles : undefined;
         const rawInputFiles = (event.input as { files?: Array<{ path: string; offset?: number; limit?: number }> } | undefined)?.files;
         const inputFiles = Array.isArray(rawInputFiles) ? rawInputFiles : undefined;
-        if (inputFiles && inputFiles.length > 0) {
-          for (const file of inputFiles) {
+
+        // Merge detail status with input params (offset/limit)
+        const filesToProcess = (detailFiles ?? inputFiles) ?? [];
+        if (filesToProcess.length > 0) {
+          // Build lookup from input files for offset/limit info
+          const inputMap = new Map<string, { offset?: number; limit?: number }>();
+          if (inputFiles) {
+            for (const f of inputFiles) inputMap.set(f.path, { offset: f.offset, limit: f.limit });
+          }
+
+          for (const file of filesToProcess) {
+            // Skip files that failed to read
+            if ('ok' in file && file.ok === false) continue;
+
             try {
               const resolvedPath = resolve(process.cwd(), file.path);
               const content = (await fsReadFile(resolvedPath)).toString("utf-8");
               if (content) {
-                const isPartial = file.offset != null || file.limit != null;
+                const inputInfo = inputMap.get(file.path);
+                const isPartial = inputInfo?.offset != null || inputInfo?.limit != null;
                 const lines = content.split("\n");
                 const hashline = smartEditRuntimeConfig.useHashlineEditing
                   ? await buildHashlineAnchors(lines)
@@ -1192,9 +1223,9 @@ export default function smartEdit(pi: ExtensionAPI) {
                 recordRead(file.path, process.cwd(), content, isPartial, hashline);
 
                 // Track read range for coverage validation
-                const readOffset = file.offset ?? 1;
-                const readLimit = file.limit ?? -1;
-                recordReadSession(file.path, process.cwd(), readOffset, readLimit, lines.length, "read_multiple_files");
+                const readOffset = inputInfo?.offset ?? 1;
+                const readLimit = inputInfo?.limit ?? -1;
+                recordReadSession(file.path, process.cwd(), readOffset, readLimit, lines.length, "read_files");
               }
             } catch {
               // File may not exist or can't be read — skip silently
@@ -1837,7 +1868,7 @@ export default function smartEdit(pi: ExtensionAPI) {
             bom + restoreLineEndings(normalizedContent, originalEnding);
 
           // ── Approval gating check (warnings only — never blocks) ──
-          const safetyResult = checkEditSafety(path, edits);
+          const safetyResult = await checkEditSafety(path, edits);
           if (safetyResult.warnings.length > 0) {
             matchNotes.push(...safetyResult.warnings);
           }
@@ -1876,6 +1907,7 @@ export default function smartEdit(pi: ExtensionAPI) {
             ? await buildHashlineAnchors(postEditLines)
             : undefined;
           recordReadWithStat(path, cwd, finalContent, settledMtimeMs, expectedSize, postEditHashline);
+          recordReadSession(path, cwd, 1, -1, postEditLines.length, "edit");
 
           if (aborted) throw new Error("Operation aborted");
 

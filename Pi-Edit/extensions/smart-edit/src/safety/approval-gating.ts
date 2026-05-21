@@ -250,7 +250,7 @@ export async function checkEditSafety(
   filePath: string,
   edits: readonly EditItem[],
   config?: Partial<ApprovalConfig>,
-): SafetyCheckResult {
+): Promise<SafetyCheckResult> {
   const cfg: ApprovalConfig = { ...defaultConfig(), ...config };
 
   if (cfg.level === "never_prompt") {

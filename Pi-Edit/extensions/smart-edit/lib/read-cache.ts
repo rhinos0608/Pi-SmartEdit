@@ -60,7 +60,7 @@ export interface ReadRange {
   totalLines: number;
   /** Timestamp of the read. */
   timestamp: number;
-  /** Which tool performed the read ("read", "read_multiple_files", "intent_read"). */
+  /** Which tool performed the read ("read", "read_files", "intent_read"). */
   source: string;
 }
 

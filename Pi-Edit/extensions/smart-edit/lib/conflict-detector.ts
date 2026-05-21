@@ -190,17 +190,22 @@ export function createConflictDetector(
     try {
       for (const span of editSpans) {
         // Try AST-based checking with the shared parse result
-        const astResults = checkAstConflictsFromTree(
-          resolver,
-          filePath,
-          content,
-          span,
-          sharedParseResult,
-        );
-        reports.push(...astResults);
+        if (hasResolver && resolver && sharedParseResult) {
+          const astResults = checkAstConflictsFromTree(
+            resolver,
+            filePath,
+            content,
+            span,
+            sharedParseResult,
+          );
+          reports.push(...astResults);
 
-        // Short-circuit: only check line-range if AST found nothing
-        if (astResults.length === 0) {
+          // Short-circuit: only check line-range if AST found nothing
+          if (astResults.length === 0) {
+            const lrResults = checkLineRangeConflicts(filePath, span);
+            reports.push(...lrResults);
+          }
+        } else {
           const lrResults = checkLineRangeConflicts(filePath, span);
           reports.push(...lrResults);
         }
