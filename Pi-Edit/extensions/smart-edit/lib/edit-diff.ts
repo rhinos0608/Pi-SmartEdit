@@ -41,6 +41,27 @@ import { resolveToCwd } from "./path-utils";
 const SIMILARITY_MATCH_THRESHOLD = 0.85;
 const SIMILARITY_REPORT_THRESHOLD = 0.3; // for findClosestMatch hints only
 
+/**
+ * Fuzzy-dominant auto-accept thresholds.
+ * When one similarity match is >= DOMINANT_FUZZY_MIN_CONFIDENCE (97%)
+ * AND the next-best match is >= DOMINANT_FUZZY_DELTA (8%) behind,
+ * auto-accept the dominant match to reduce spurious ambiguity errors.
+ */
+const DOMINANT_FUZZY_MIN_CONFIDENCE = 0.97;
+const DOMINANT_FUZZY_DELTA = 0.08;
+
+
+/**
+ * Check if a best similarity score is dominant over the next-best match.
+ * Dominance means: best >= DOMINANT_FUZZY_MIN_CONFIDENCE AND
+ * (best - secondBest) >= DOMINANT_FUZZY_DELTA.
+ * This allows auto-accepting a clear winner when the next-best is far behind,
+ * reducing spurious "multiple matches" failures for near-identical text.
+ */
+function isDominantFuzzyMatch(bestScore: number, secondBestScore: number): boolean {
+  return bestScore >= DOMINANT_FUZZY_MIN_CONFIDENCE &&
+    (bestScore - secondBestScore) >= DOMINANT_FUZZY_DELTA;
+}
 // ─── Pipeline telemetry (P2) ────────────────────────────────────
 
 /**
@@ -502,6 +523,143 @@ function mapCharInLine(
   return origPos;
 }
 
+// ─── Comment-prefix utilities (Tier 4) ─────────────────────────────
+
+/**
+ * Result from detecting a comment style in a file.
+ */
+export interface CommentStyleResult {
+  /** The comment prefix ('//', '#', or '--') */
+  prefix: string;
+  /** Number of lines in the sample that used this prefix */
+  count: number;
+}
+
+/**
+ * Detect the comment style used in a file by examining the first N non-empty lines.
+ * Returns null if no consistent comment style is found.
+ *
+ * @param content - The file content to analyze
+ * @returns {prefix: string, count: number} or null
+ */
+export function detectCommentStyle(content: string): CommentStyleResult | null {
+  const lines = content.split("\n");
+  const nonEmptyLines: string[] = [];
+
+  // Collect first 20 non-empty lines
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.length > 0) {
+      nonEmptyLines.push(trimmed);
+      if (nonEmptyLines.length >= 20) break;
+    }
+  }
+
+  if (nonEmptyLines.length === 0) return null;
+
+  // Count occurrences of each comment style
+  let doubleSlashCount = 0;
+  let hashCount = 0;
+  let doubleDashCount = 0;
+
+  for (const line of nonEmptyLines) {
+    if (line.startsWith("//")) {
+      doubleSlashCount++;
+    } else if (line.startsWith("#")) {
+      hashCount++;
+    } else if (line.startsWith("--")) {
+      doubleDashCount++;
+    }
+  }
+
+  // Determine consistent style (at least 60% of lines must match)
+  const threshold = Math.ceil(nonEmptyLines.length * 0.6);
+
+  if (doubleSlashCount >= threshold) {
+    return { prefix: "//", count: doubleSlashCount };
+  }
+  if (hashCount >= threshold) {
+    return { prefix: "#", count: hashCount };
+  }
+  if (doubleDashCount >= threshold) {
+    return { prefix: "--", count: doubleDashCount };
+  }
+
+  return null;
+}
+
+/**
+ * Strip comment prefixes from text, preserving line structure.
+ *
+ * @param text - The text to process
+ * @param prefix - The comment prefix to strip ('//', '#', or '--')
+ * @returns The text with comment prefixes removed from each line
+ */
+export function stripCommentPrefixes(text: string, prefix: string): string {
+  return text
+    .split("\n")
+    .map((line) => {
+      const leadingWs = line.match(/^[\t ]*/);
+      const ws = leadingWs ? leadingWs[0] : "";
+      const rest = line.slice(ws.length);
+      if (rest.startsWith(prefix)) {
+        return ws + rest.slice(prefix.length);
+      }
+      return line;
+    })
+    .join("\n");
+}
+
+/**
+ * Map a character offset in stripped (comment-prefix-removed) content back to
+ * the corresponding offset in the original content.
+ *
+ * @param original - Original content with comment prefixes
+ * @param stripped - Content with comment prefixes removed
+ * @param strippedOffset - Character offset in stripped content
+ * @returns Character offset in original content
+ */
+function mapStrippedToOriginal(
+  original: string,
+  stripped: string,
+  strippedOffset: number,
+): number {
+  const origLines = original.split("\n");
+  const strippedLines = stripped.split("\n");
+
+  let remaining = strippedOffset;
+  let origOffset = 0;
+
+  for (let i = 0; i < strippedLines.length && i < origLines.length; i++) {
+    const sl = strippedLines[i];
+    if (remaining <= sl.length) {
+      // Position is within this line — add back the comment prefix if it existed
+      const origLine = origLines[i];
+      const leadingWs = origLine.match(/^[\t ]*/);
+      const ws = leadingWs ? leadingWs[0] : "";
+      const afterWs = origLine.slice(ws.length);
+
+      // Check if this line had a comment prefix
+      if (afterWs.startsWith("//") && strippedLines[i].startsWith(ws)) {
+        return origOffset + ws.length + 2 + remaining; // +2 for "//"
+      }
+      if (afterWs.startsWith("#") && strippedLines[i].startsWith(ws)) {
+        return origOffset + ws.length + 1 + remaining; // +1 for "#"
+      }
+      if (afterWs.startsWith("--") && strippedLines[i].startsWith(ws)) {
+        return origOffset + ws.length + 2 + remaining; // +2 for "--"
+      }
+
+      // No comment prefix on this line, position maps directly
+      return origOffset + remaining;
+    }
+    remaining -= sl.length + 1; // +1 for \n
+    origOffset += origLines[i].length + 1;
+  }
+
+  return original.length;
+}
+
 // ─── Dotdotdots preprocessing (ellipsis elision) ───────────────────
 
 /**
@@ -652,7 +810,17 @@ export function findTextWithTelemetry(
   }
   telemetry.push({ tier: MatchTier.UNICODE, durationMs: unicodeDuration, success: false, matchCount: 0 });
 
-  // Tier 4: Similarity-scored match (safety net for near-matches)
+  // Tier 4: Comment-prefix match (handles // vs uncommented inconsistencies)
+  tierStart = performance.now();
+  const commentPrefixResult = tryCommentPrefixMatch(originalContent, oldText, searchStart, searchEnd);
+  const commentPrefixDuration = performance.now() - tierStart;
+  if (commentPrefixResult && (!searchScope || (commentPrefixResult.index >= searchStart && commentPrefixResult.index < searchEnd))) {
+    telemetry.push({ tier: MatchTier.COMMENT_PREFIX, durationMs: commentPrefixDuration, success: true, matchCount: 1 });
+    return { result: commentPrefixResult, telemetry };
+  }
+  telemetry.push({ tier: MatchTier.COMMENT_PREFIX, durationMs: commentPrefixDuration, success: false, matchCount: 0 });
+
+  // Tier 5: Similarity-scored match (safety net for near-matches)
   tierStart = performance.now();
   const similarityResult = trySimilarityMatch(originalContent, oldText, searchStart, searchEnd);
   const similarityDuration = performance.now() - tierStart;
@@ -812,11 +980,69 @@ function tryUnicodeMatch(
 }
 
 /**
- * Tier 4: Similarity-based match — the safety net for near-matches.
+ * Tier 4: Comment-prefix match.
+ * Strips comment prefixes (//, #, --) from both oldText and content,
+ * then searches for a match. Handles cases where models inconsistently
+ * include or exclude comment prefixes.
+ */
+function tryCommentPrefixMatch(
+  originalContent: string,
+  oldText: string,
+  startOffset: number = 0,
+  endOffset?: number,
+): MatchResult | null {
+  // Empty or whitespace-only oldText cannot be matched meaningfully
+  if (!oldText.trim()) return null;
+
+  // Detect comment style from original content
+  const style = detectCommentStyle(originalContent);
+  if (!style) return null;
+
+  const { prefix } = style;
+
+  // Slice the search window
+  const searchEnd = endOffset ?? originalContent.length;
+  const searchContent = originalContent.slice(startOffset, searchEnd);
+
+  // Strip comment prefixes from both
+  const strippedContent = stripCommentPrefixes(searchContent, prefix);
+  const strippedOld = stripCommentPrefixes(oldText, prefix);
+
+  // Search for stripped oldText in stripped content
+  const strippedIdx = strippedContent.indexOf(strippedOld);
+  if (strippedIdx === -1) return null;
+
+  // Map stripped index back to original content
+  const origIdx = mapStrippedToOriginal(searchContent, strippedContent, strippedIdx);
+  const strippedEndIdx = strippedIdx + strippedOld.length;
+  const origEndIdx = mapStrippedToOriginal(searchContent, strippedContent, strippedEndIdx);
+  const matchLength = origEndIdx - origIdx;
+
+  if (matchLength <= 0) return null;
+
+  // Bounds check: match must be within [startOffset, searchEnd)
+  if (startOffset + origIdx + matchLength > searchEnd) return null;
+
+  const matchedText = searchContent.slice(origIdx, origEndIdx);
+
+  return {
+    found: true,
+    index: startOffset + origIdx,
+    matchLength,
+    tier: MatchTier.COMMENT_PREFIX,
+  usedFuzzyMatch: true,
+  matchedText,
+  numericFuzz: 2.5,
+  matchNote: `Matched after stripping ${prefix} comment prefixes.`,
+  };
+}
+
+/**
+ * Tier 5: Similarity-based match — the safety net for near-matches.
  *
- * When Tiers 1–3 fail, this uses a sliding window similarity search to find
+ * When Tiers 1–4 fail, this uses a sliding window similarity search to find
  * the closest matching block. If the similarity exceeds the threshold
- * (default 0.65), it returns as a valid match.
+ * (default 0.85), it returns as a valid match.
  *
  * This is the equivalent of Aider's difflib tier — it rescues edits where
  * the text is "close enough" to the original.
@@ -1094,15 +1320,16 @@ export function findAllMatches(
 }
 
 function tierPriority(tier: MatchTier): number {
-  switch (tier) {
-    case MatchTier.EXACT: return 3;
-    case MatchTier.INDENTATION: return 2;
-    case MatchTier.UNICODE: return 1;
-    case MatchTier.SIMILARITY: return 0;
-    // DOTDOTDOTS is informational only — findTextWithTelemetry never returns it
-    case MatchTier.RELATIVE_INDENT: return -1;
-    default: return -1;
-  }
+ switch (tier) {
+  case MatchTier.EXACT: return 4;
+  case MatchTier.INDENTATION: return 3;
+  case MatchTier.UNICODE: return 2;
+  case MatchTier.COMMENT_PREFIX: return 1;
+  case MatchTier.SIMILARITY: return 0;
+  // DOTDOTDOTS is informational only — findTextWithTelemetry never returns it
+  case MatchTier.RELATIVE_INDENT: return -1;
+  default: return -1;
+ }
 }
 
 // ─── Count occurrences ──────────────────────────────────────────────
@@ -1121,24 +1348,33 @@ function countOccurrences(content: string, oldText: string): number {
  * Count how many windows in content meet the similarity threshold
  * for oldText. Uses the same sliding-window approach as trySimilarityMatch
  * so the count is authoritative for ambiguity detection.
+ *
+ * Returns an object with the count plus the best and second-best similarity
+ * scores found. The scores enable fuzzy-dominant auto-accept logic.
  */
 function countSimilarityOccurrences(
   content: string,
   oldText: string,
   threshold: number = SIMILARITY_MATCH_THRESHOLD,
-): number {
+): { count: number; bestScore: number; secondBestScore: number } {
   const contentLines = content.split("\n");
   const oldLines = oldText.split("\n");
-  if (contentLines.length === 0 || oldLines.length === 0) return 0;
+  if (contentLines.length === 0 || oldLines.length === 0) {
+    return { count: 0, bestScore: 0, secondBestScore: 0 };
+  }
 
   // Performance guard (same thresholds as trySimilarityMatch).
-  if (contentLines.length > 3000 || oldLines.length > 200) return 1; // treat as unique
+  if (contentLines.length > 3000 || oldLines.length > 200) {
+    return { count: 1, bestScore: 1, secondBestScore: 0 };
+  }
 
   const minWindowSize = Math.max(1, oldLines.length - 2);
   const maxWindowSize = Math.min(oldLines.length + 2, contentLines.length);
 
   const countedRanges: Array<{ start: number; end: number }> = [];
   let count = 0;
+  let bestScore = 0;
+  let secondBestScore = 0;
 
   for (let windowSize = minWindowSize; windowSize <= maxWindowSize; windowSize++) {
     for (let startLine = 0; startLine <= contentLines.length - windowSize; startLine++) {
@@ -1152,13 +1388,21 @@ function countSimilarityOccurrences(
         if (!overlaps) {
           countedRanges.push({ start: startLine, end: endLine });
           count++;
-          if (count >= 2) return count;
+          if (count >= 2) return { count, bestScore, secondBestScore };
+        }
+      } else {
+        // Track scores for dominant-fuzzy check
+        if (score > bestScore) {
+          secondBestScore = bestScore;
+          bestScore = score;
+        } else if (score > secondBestScore) {
+          secondBestScore = score;
         }
       }
     }
   }
 
-  return count;
+  return { count, bestScore, secondBestScore };
 }
 
 // ─── Closest-match diagnostics ──────────────────────────────────────
@@ -1331,6 +1575,43 @@ function generateHint(expected: string, found: string, _similarity: number): str
   return "Content differs — consider re-reading the file for the exact text.";
 }
 
+// ─── Line diff helper ──────────────────────────────────────────────
+
+function findFirstDifferentLine(
+  oldText: string,
+  foundText: string,
+): { oldLine: string; newLine: string } | null {
+  const oldLines = oldText.split("\n");
+  const foundLines = foundText.split("\n");
+  const maxLen = Math.max(oldLines.length, foundLines.length);
+  for (let i = 0; i < maxLen; i++) {
+    const oldLine = i < oldLines.length ? oldLines[i] : "(empty)";
+    const newLine = i < foundLines.length ? foundLines[i] : "(empty)";
+    if (oldLine !== newLine) return { oldLine, newLine };
+  }
+  return null;
+}
+
+function formatClosestMatchHint(
+  diagnostic: ClosestMatchDiagnostic,
+  allowFuzzy: boolean,
+): string {
+  const simPct = Math.round(diagnostic.similarity * 100);
+  let msg = `\nClosest match (${simPct}% similar) at lines ${diagnostic.lineStart}\u2013${diagnostic.lineEnd}:`;
+  const diff = findFirstDifferentLine(diagnostic.expectedText, diagnostic.foundText);
+  if (diff) {
+    const truncate = (s: string, maxLen = 80): string =>
+      s.length > maxLen ? s.slice(0, maxLen) + "\u2026" : s;
+    msg += `\n  - ${truncate(diff.oldLine)}`;
+    msg += `\n  + ${truncate(diff.newLine)}`;
+  }
+  msg += `\n  Hint: ${diagnostic.hint}`;
+  if (!allowFuzzy) {
+    msg += `\n\nFuzzy matching is disabled. Enable Smart Edit fuzzy match settings to accept similarity-based matches.`;
+  }
+  return msg;
+}
+
 // ─── Error message helpers ──────────────────────────────────────────
 
 function getNotFoundError(
@@ -1339,6 +1620,7 @@ function getNotFoundError(
   totalEdits: number,
   diagnostic?: ClosestMatchDiagnostic | null,
   description?: string,
+  allowFuzzy?: boolean,
 ): Error {
   let msg: string;
   const desc = description ? ` (${description})` : "";
@@ -1353,10 +1635,8 @@ function getNotFoundError(
   // (newText is passed via the options object below, so we check it there)
 
   if (diagnostic) {
-    msg += `\nClosest match at lines ${diagnostic.lineStart}\u2013${diagnostic.lineEnd} (similarity: ${Math.round(diagnostic.similarity * 100)}%):`;
-    msg += `\n\nDid you mean to match these actual lines?\n\`\`\`\n${diagnostic.foundText}\n\`\`\``;
-    msg += `\n\nExpected (your oldText):\n\`\`\`\n${diagnostic.expectedText}\n\`\`\``;
-    msg += `\n  Hint: ${diagnostic.hint}`;
+    const fuzzyHint = formatClosestMatchHint(diagnostic, allowFuzzy ?? false);
+    msg += fuzzyHint;
   }
 
   return new Error(msg);
@@ -1367,19 +1647,28 @@ function getAmbiguousError(
   editIndex: number,
   totalEdits: number,
   occurrences: number,
+  lineIndices?: number[],
   description?: string,
 ): Error {
   const desc = description ? ` (${description})` : "";
+  let lineInfo = "";
+  if (lineIndices && lineIndices.length > 0) {
+    const preview = lineIndices.slice(0, 5);
+    const suffix = lineIndices.length > 5 ? `, and ${lineIndices.length - 5} more` : "";
+    lineInfo = ` Found ${occurrences} occurrences at lines: ${preview.join(", ")}${suffix}.`;
+  } else {
+    lineInfo = ` Found ${occurrences} occurrences.`;
+  }
   if (totalEdits === 1) {
     return new Error(
-      `Found ${occurrences} occurrences of the text${desc} in ${path}. ` +
-      `The text must be unique. Please provide more surrounding context to make it unique, ` +
+      `Could not find unique text${desc} in ${path}.${lineInfo}` +
+      ` Please provide more surrounding context to make it unique, ` +
       `or use replaceAll: true if you intend to replace all occurrences.`,
     );
   }
   return new Error(
-    `Found ${occurrences} occurrences of edits[${editIndex}]${desc} in ${path}. ` +
-    `Each oldText must be unique. Please provide more surrounding context to make it unique, ` +
+    `Could not find unique text for edits[${editIndex}]${desc} in ${path}.${lineInfo}` +
+    ` Each oldText must be unique. Please provide more surrounding context to make it unique, ` +
     `or use replaceAll: true if you intend to replace all occurrences.`,
   );
 }
@@ -1776,20 +2065,32 @@ export async function applyEdits(
         }
         if (fuzzyCount > 1) {
           throw getAmbiguousError(
-            path, i, normalizedEdits.length, fuzzyCount, edit.description,
+            path, i, normalizedEdits.length, fuzzyCount, undefined, edit.description,
           );
         }
       } else if (match.tier === MatchTier.SIMILARITY) {
         // Similarity tier: count how many windows meet the threshold
         // using the same sliding-window approach as trySimilarityMatch.
-        const similarityCount = countSimilarityOccurrences(
+        // Also track best/second-best scores for dominant-fuzzy auto-accept.
+        const { count: similarityCount, bestScore, secondBestScore } = countSimilarityOccurrences(
           normalizedContent,
           edit.oldText,
         );
         if (similarityCount > 1) {
-          throw getAmbiguousError(
-            path, i, normalizedEdits.length, similarityCount, edit.description,
-          );
+          // Fuzzy-dominant auto-accept: if one match is clearly better,
+          // accept it instead of throwing an ambiguity error.
+          if (isDominantFuzzyMatch(bestScore, secondBestScore)) {
+            matchNotes.push(
+              `edits[${i}]${edit.description ? ` (${edit.description})` : ''}: ` +
+              `fuzzy-dominant auto-accepted (best=${(bestScore * 100).toFixed(1)}%, ` +
+              `delta=${((bestScore - secondBestScore) * 100).toFixed(1)}% > ` +
+              `${(DOMINANT_FUZZY_DELTA * 100).toFixed(0)}% threshold).`,
+            );
+          } else {
+            throw getAmbiguousError(
+              path, i, normalizedEdits.length, similarityCount, undefined, edit.description,
+            );
+          }
         }
       } else {
         // Exact and indentation tiers: count occurrences using stripped text
@@ -1799,7 +2100,7 @@ export async function applyEdits(
         const exactCount = countOccurrences(strippedContent, strippedOld);
         if (exactCount > 1) {
           throw getAmbiguousError(
-            path, i, normalizedEdits.length, exactCount, edit.description,
+            path, i, normalizedEdits.length, exactCount, undefined, edit.description,
           );
         }
       }

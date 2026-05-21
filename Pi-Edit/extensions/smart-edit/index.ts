@@ -33,7 +33,7 @@ import {
 
 import { detectLanguageFromExtension } from "./src/lsp/language-id";
 import { recordRead, checkStale, recordReadWithStat, recordReadSession, getSessionReads, checkEditAllowed, checkRangeCoverage, getSnapshot, getAllSessionPaths } from "./lib/read-cache";
-import { buildHashlineAnchors, initHashline } from "./lib/hashline";
+import { buildHashlineAnchors, initHashline, HASHLINE_CONTENT_SEPARATOR } from "./lib/hashline";
 import type { HashlineEditInput } from "./lib/hashline-edit";
 
 import { detectInputFormat } from "./src/formats/format-detector";
@@ -46,6 +46,7 @@ import { StreamingPatchParser } from "./src/formats/streaming-patch-parser";
 
 import { LSPManager } from "./src/lsp/lsp-manager";
 import { checkPostEditDiagnostics } from "./src/lsp/diagnostics";
+import { deferredDiagnostics } from "./src/lsp/deferred-diagnostics";
 import { getCompilerForLanguage } from "./src/lsp/diagnostic-dispatcher";
 import type { DiagnosticResult } from "./src/lsp/diagnostic-dispatcher";
 
@@ -76,6 +77,20 @@ import type {
 } from "./lib/types";
 
 const smartEditRuntimeConfig = getSmartEditRuntimeConfig();
+
+const HASHLINE_PREFIX_RE = new RegExp(`^\\d+[a-z]{2}\\${HASHLINE_CONTENT_SEPARATOR}`);
+
+function stripHashlineDisplayPrefixes(content: string): { text: string; stripped: boolean } {
+  if (!smartEditRuntimeConfig.useHashlineEditing) return { text: content, stripped: false };
+  if (!content || !content.includes(HASHLINE_CONTENT_SEPARATOR)) return { text: content, stripped: false };
+  const lines = content.split('\n');
+  let anyStripped = false;
+  const strippedLines = lines.map((line) => {
+    if (HASHLINE_PREFIX_RE.test(line)) { anyStripped = true; return line.replace(HASHLINE_PREFIX_RE, ''); }
+    return line;
+  });
+  return { text: strippedLines.join('\n'), stripped: anyStripped };
+}
 
 function coerceText(value: unknown): string {
   if (typeof value === "string") return value;
@@ -579,13 +594,12 @@ async function prepareArguments(input: Record<string, unknown>): Promise<Record<
     typeof legacy.oldText === "string" &&
     typeof legacy.newText === "string"
   ) {
+    const { text: oldText, stripped: oldStripped } = stripHashlineDisplayPrefixes(legacy.oldText);
+    const { text: newText, stripped: newStripped } = stripHashlineDisplayPrefixes(legacy.newText);
     const edits: EditItem[] = Array.isArray(legacy.edits)
       ? [...(legacy.edits as EditItem[])]
       : [];
-    edits.push({
-      oldText: legacy.oldText,
-      newText: legacy.newText,
-    });
+    edits.push({ oldText, newText });
     const { oldText: _, newText: __, ...rest } = legacy;
     return { ...rest, edits };
   }
@@ -616,8 +630,17 @@ async function prepareArguments(input: Record<string, unknown>): Promise<Record<
     const flags: boolean[] = [];
     const targets: (Record<string, unknown> | undefined)[] = [];
     const hashlines: (Record<string, unknown> | undefined)[] = [];
+    const editNotes: string[] = [];
 
     for (const edit of args.edits as Array<Record<string, unknown>>) {
+      if (edit.oldText && typeof edit.oldText === "string") {
+        const { text, stripped } = stripHashlineDisplayPrefixes(edit.oldText);
+        if (stripped) { edit.oldText = text; editNotes.push("Auto-stripped hashline display prefixes from edit content."); }
+      }
+      if (edit.newText && typeof edit.newText === "string") {
+        const { text, stripped } = stripHashlineDisplayPrefixes(edit.newText);
+        if (stripped) edit.newText = text;
+      }
       // ── Backwards compat: convert old-style anchor/symbol to target ──
       let target: Record<string, unknown> | undefined;
 
@@ -687,11 +710,13 @@ async function prepareArguments(input: Record<string, unknown>): Promise<Record<
     const hasFlags = flags.some((f) => f);
     const hasTargets = targets.some((t) => t);
     const hasHashlines = hashlines.some((h) => h);
-    if (hasFlags || hasTargets || hasHashlines) {
+    const hasEditNotes = editNotes.length > 0;
+    if (hasFlags || hasTargets || hasHashlines || hasEditNotes) {
       const extraData = {
         replaceAllFlags: hasFlags ? flags : null,
         targetData: hasTargets ? targets : null,
         hashlineData: hasHashlines ? hashlines : null,
+        editNotes: hasEditNotes ? [...new Set(editNotes)] : null,
       };
       if (typeof args.path === "string" && !args.path.includes("??smartEditExtra=")) {
         args.path = args.path + "??smartEditExtra=" + Buffer.from(JSON.stringify(extraData)).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
@@ -1960,6 +1985,15 @@ export default function smartEdit(pi: ExtensionAPI) {
           }> = [];
           let scopedDiagnostics: ScopedDiagnostic[] = [];
           let postEditEvidence: PostEditEvidenceResult | null = null;
+
+          // ── Begin deferred diagnostics capture ──
+          // Signal the LSP manager to collect diagnostics that arrive after the
+          // initial response. The LSP server may produce diagnostics with a delay
+          // after the document is synced.
+          const deferralController = lspManager
+            ? deferredDiagnostics.beginDeferred(absolutePath)
+            : undefined;
+
           if (lspManager) {
             const languageId = detectLanguageFromExtension(path);
             if (languageId) {
@@ -2129,6 +2163,86 @@ export default function smartEdit(pi: ExtensionAPI) {
           // Add match notes for transparency
           if (matchNotes.length > 0) {
             text += "\nNote: " + matchNotes.join(" ");
+          }
+
+          // ── Collect late/deferred diagnostics ──
+          // After the initial response is built, wait briefly (2s) for any diagnostics
+          // that the LSP server produces with a delay (e.g., type-checking after
+          // document sync). If late diagnostics arrive, append them as follow-up
+          // feedback so the model receives the full picture.
+          if (deferralController) {
+            const languageId = detectLanguageFromExtension(path) ?? "unknown";
+            const lspServer = await lspManager!.getServer(languageId);
+
+            await new Promise<void>((promiseResolve) => {
+              // Safety: always resolve after timeout
+              const timer = setTimeout(() => promiseResolve(), 2000);
+              timer.unref();
+
+              if (!lspServer) return;
+
+              const uri = `file://${resolve(absolutePath)}`;
+              const unsubscribe = lspServer.onNotification?.(
+                "textDocument/publishDiagnostics",
+                (params: unknown) => {
+                  const p = params as {
+                    uri?: string;
+                    diagnostics?: Array<{
+                      message: string;
+                      severity?: number;
+                      range?: {
+                        start?: { line?: number; character?: number };
+                        end?: { line?: number; character?: number };
+                      };
+                      source?: string;
+                    }>;
+                  };
+
+                  if (p.uri !== uri) return;
+                  if (!p.diagnostics) return;
+                  for (const d of p.diagnostics) {
+                    deferredDiagnostics.collect(absolutePath, {
+                      message: d.message,
+                      severity: (d.severity ?? 1) as 1 | 2 | 3 | 4,
+                      range: {
+                        start: {
+                          line: d.range?.start?.line ?? 0,
+                          character: d.range?.start?.character ?? 0,
+                        },
+                        end: {
+                          line: d.range?.end?.line ?? 0,
+                          character: d.range?.end?.character ?? 0,
+                        },
+                      },
+                      source: d.source ?? "lsp",
+                    });
+                  }
+                },
+              );
+
+              // Clean up listener when controller is aborted
+              deferralController.signal.addEventListener("abort", () => {
+                clearTimeout(timer);
+                unsubscribe?.();
+                promiseResolve();
+              });
+            });
+
+            // Flush any deferred diagnostics and append to result
+            const late = deferredDiagnostics.flush(absolutePath);
+            if (late.length > 0) {
+              const errors = late.filter((ld) => ld.diagnostic.severity === 1);
+              const warnings = late.filter((ld) => ld.diagnostic.severity === 2);
+
+              if (errors.length > 0) {
+                text += "\nLate diagnostic (error): " +
+                  errors.map((e) => `line ${e.diagnostic.range.start.line + 1}: ${e.diagnostic.message}`).join("; ");
+              }
+              if (warnings.length > 0) {
+                text += "\nLate diagnostic (warning): " +
+                  warnings.map((w) => w.diagnostic.message).join("; ");
+              }
+            }
           }
 
           // Append conflict warnings

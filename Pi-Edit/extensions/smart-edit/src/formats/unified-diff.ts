@@ -12,6 +12,9 @@
 
 import { parsePatch } from 'diff';
 
+import { lineRangeToByteRange } from '../../lib/edit-diff';
+import type { SearchScope } from '../../lib/types';
+
 export interface UnifiedDiffHunk {
   oldStart: number;
   oldLines: number;
@@ -19,6 +22,8 @@ export interface UnifiedDiffHunk {
   newLines: number;
   /** Each line with prefix: ' ' unchanged, '-' removed, '+' added */
   lines: string[];
+  /** Verbatim anchor text from @@ header, e.g. "function greet(name) {" */
+  anchor?: string;
 }
 
 export interface UnifiedDiff {
@@ -34,12 +39,14 @@ export function parseUnifiedDiff(input: string): UnifiedDiff[] {
   const patches = parsePatch(input);
   
   return patches.map(patch => {
-    const hunks: UnifiedDiffHunk[] = patch.hunks.map(hunk => {
+    const hunks: UnifiedDiffHunk[] = patch.hunks.map((hunk, idx) => {
       // Use direct hunk properties instead of parsing header string
       const oldStart = hunk.oldStart;
       const oldLines = hunk.oldLines;
       const newStart = hunk.newStart;
       const newLines = hunk.newLines;
+      // Extract anchor text from the hunk header (e.g. @@ ... @@ function greet)
+      const anchor = extractHunkAnchor(hunk, idx, input);
 
       return {
         oldStart,
@@ -47,6 +54,7 @@ export function parseUnifiedDiff(input: string): UnifiedDiff[] {
         newStart,
         newLines,
         lines: hunk.lines,
+        anchor,
       };
     });
 
@@ -56,6 +64,89 @@ export function parseUnifiedDiff(input: string): UnifiedDiff[] {
       hunks,
     };
   });
+}
+
+/**
+ * Extract anchor text from a hunk's header line.
+ * Looks for text after the final `@@` in the hunk header.
+ */
+function extractHunkAnchor(
+  hunk: { oldStart: number; oldLines: number; newStart: number; newLines: number },
+  _hunkIndex: number,
+  input: string,
+): string | undefined {
+  // The diff package may expose the raw header; check for it
+  const headerProp = (hunk as Record<string, unknown>).header;
+  if (typeof headerProp === 'string') {
+    return parseAnchorFromHeader(headerProp);
+  }
+
+  // Fallback: search for the hunk header in the raw input
+  const headerPattern = `@@ -${hunk.oldStart},?\\d* \\+${hunk.newStart},?\\d* @@`;
+  const pattern = new RegExp(`${headerPattern}\\s*(.*?)(?=\\n@@|\\n---|\\n\\+\\+\\+|\\z)`, 'm');
+
+  const matches = input.match(pattern);
+  if (matches && matches[1] !== undefined) {
+    const anchor = matches[1].trim();
+    return anchor || undefined;
+  }
+
+  return undefined;
+}
+
+/**
+ * Parse anchor text from a raw hunk header line.
+ * Format: @@ -oldStart,oldLines +newStart,newLines @@ optional anchor text
+ */
+function parseAnchorFromHeader(header: string): string | undefined {
+  const match = header.match(/^@@[^@]*@@\s*(.*)$/);
+  if (match && match[1]) {
+    const anchor = match[1].trim();
+    return anchor || undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Search for anchor text in file content using exact substring match.
+ * Returns 1-based line number of first match, or null if not found.
+ */
+export function resolveAnchorToLine(content: string, anchor: string): number | null {
+  const idx = content.indexOf(anchor);
+  if (idx === -1) return null;
+  // Count newlines before idx to get line number
+  const prefix = content.slice(0, idx);
+  const lineCount = prefix.split('\n').length;
+  return lineCount;
+}
+
+/**
+ * Compute a search window around a hunk's anchor line.
+ * Returns SearchScope narrowing the search to anchor ± padding lines,
+ * or undefined if the hunk has no anchor (full-file search).
+ */
+export function computeHunkSearchWindow(
+  content: string,
+  hunk: UnifiedDiffHunk,
+  fuzzyPadding = 20,
+): SearchScope | undefined {
+  if (!hunk.anchor) return undefined;
+
+  const anchorLine = resolveAnchorToLine(content, hunk.anchor);
+  if (anchorLine === null) return undefined;
+
+  const startLine = Math.max(1, anchorLine - fuzzyPadding);
+  const endLine = anchorLine + fuzzyPadding;
+
+  const { startIndex, endIndex } = lineRangeToByteRange(content, { startLine, endLine });
+
+  const truncated = hunk.anchor.length > 30 ? hunk.anchor.slice(0, 30) + '...' : hunk.anchor;
+  return {
+    startIndex,
+    endIndex,
+    description: `anchor "${truncated}" at line ${anchorLine} ±${fuzzyPadding}`,
+    source: 'anchor',
+  };
 }
 
 export interface EditItemOutput {

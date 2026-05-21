@@ -112,6 +112,7 @@ export enum MatchTier {
   EXACT = "exact",
   INDENTATION = "indentation",
   UNICODE = "unicode",
+  COMMENT_PREFIX = "comment_prefix",
   SIMILARITY = "similarity",  // deferred
   DOTDOTDOTS = "dotdotdots",
   RELATIVE_INDENT = "relative_indent",
