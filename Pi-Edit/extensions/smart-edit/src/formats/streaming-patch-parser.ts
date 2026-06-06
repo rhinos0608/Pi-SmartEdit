@@ -111,6 +111,7 @@ export class StreamingPatchParser {
           this.emitHunks(latestNew, latestResult);
         }
       }, this.bufferIntervalMs - elapsed);
+      this.timer.unref();
     }
   }
 

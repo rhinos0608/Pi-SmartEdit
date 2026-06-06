@@ -71,7 +71,23 @@ export interface AutoValidateOptions {
 
 // ─── Per-session retry tracking ──────────────────────────────────────
 
-const retryCounts = new Map<string, number>();
+interface RetryEntry {
+  count: number;
+  lastUpdate: number;
+}
+
+const retryCounts = new Map<string, RetryEntry>();
+const RETRY_COUNTS_MAX = 200;
+
+function evictStaleRetryCounts(): void {
+  if (retryCounts.size <= RETRY_COUNTS_MAX) return;
+  const entries = [...retryCounts.entries()];
+  entries.sort((a, b) => a[1].lastUpdate - b[1].lastUpdate);
+  const toRemove = entries.slice(0, retryCounts.size - RETRY_COUNTS_MAX);
+  for (const [key] of toRemove) {
+    retryCounts.delete(key);
+  }
+}
 
 function getRetryKey(cwd: string, filePath: string): string {
   return resolve(cwd, filePath);
@@ -79,13 +95,15 @@ function getRetryKey(cwd: string, filePath: string): string {
 
 export function incrementRetryCount(cwd: string, filePath: string): number {
   const key = getRetryKey(cwd, filePath);
-  const count = (retryCounts.get(key) ?? 0) + 1;
-  retryCounts.set(key, count);
+  const entry = retryCounts.get(key);
+  const count = (entry?.count ?? 0) + 1;
+  retryCounts.set(key, { count, lastUpdate: Date.now() });
+  evictStaleRetryCounts();
   return count;
 }
 
 function getRetryCount(cwd: string, filePath: string): number {
-  return retryCounts.get(getRetryKey(cwd, filePath)) ?? 0;
+  return retryCounts.get(getRetryKey(cwd, filePath))?.count ?? 0;
 }
 
 /**

@@ -41,6 +41,60 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// ─── Cache capacity limits ─────────────────────────────────────────────
+
+/** Maximum number of file snapshots in the cache (LRU eviction). */
+const SNAPSHOT_CACHE_MAX = 200;
+
+/** Maximum number of unique files in sessionReads (LRU eviction). */
+const SESSION_READS_MAX = 500;
+
+/**
+ * Evict oldest entries from snapshotCache when it exceeds max size.
+ * Uses readAt timestamp to determine LRU ordering.
+ */
+function evictStaleSnapshots(): void {
+  if (snapshotCache.size <= SNAPSHOT_CACHE_MAX) return;
+
+  // Sort entries by readAt timestamp (oldest first)
+  const entries = [...snapshotCache.entries()].sort((a, b) => a[1].readAt - b[1].readAt);
+
+  // Remove oldest entries until we're under the limit
+  const toRemove = entries.slice(0, snapshotCache.size - SNAPSHOT_CACHE_MAX);
+  for (const [key] of toRemove) {
+    snapshotCache.delete(key);
+  }
+}
+
+/**
+ * Evict entries with oldest timestamps from sessionReads when it exceeds max size.
+ * For each file, finds the oldest read timestamp and removes that file entry.
+ */
+function evictStaleSessionReads(): void {
+  if (sessionReads.size <= SESSION_READS_MAX) return;
+
+  // Find entries with oldest minimum timestamp
+  const entries: Array<{ key: string; oldestTimestamp: number }> = [];
+  for (const [key, reads] of sessionReads) {
+    let oldestTimestamp = Infinity;
+    for (const read of reads) {
+      if (read.timestamp < oldestTimestamp) {
+        oldestTimestamp = read.timestamp;
+      }
+    }
+    entries.push({ key, oldestTimestamp });
+  }
+
+  // Sort by oldest timestamp (oldest first)
+  entries.sort((a, b) => a.oldestTimestamp - b.oldestTimestamp);
+
+  // Remove oldest entries until we're under the limit
+  const toRemove = entries.slice(0, sessionReads.size - SESSION_READS_MAX);
+  for (const { key } of toRemove) {
+    sessionReads.delete(key);
+  }
+}
+
 /** In-memory cache of file snapshots */
 const snapshotCache = new Map<string, FileSnapshot>();
 
@@ -67,6 +121,8 @@ export interface ReadRange {
 /** Track ALL reads across the session for range coverage checks. */
 const sessionReads = new Map<string, ReadRange[]>();
 
+const MAX_READS_PER_FILE = 100;
+
 /**
  * Record a file read in the session map.
  * Called from index.ts when any read tool succeeds.
@@ -86,7 +142,16 @@ export function recordReadSession(
   const normalized = normalizePath(path, cwd);
   const reads = sessionReads.get(normalized) ?? [];
   reads.push({ offset, limit, totalLines, timestamp: Date.now(), source });
+
+  // Cap per-file reads to prevent unbounded array growth
+  if (reads.length > MAX_READS_PER_FILE) {
+    reads.splice(0, reads.length - MAX_READS_PER_FILE);
+  }
+
   sessionReads.set(normalized, reads);
+
+  // Evict oldest entries if cache exceeds max size
+  evictStaleSessionReads();
 }
 
 /**
@@ -165,6 +230,9 @@ export function recordRead(
   }
 
   snapshotCache.set(normalized, snapshot);
+
+  // Evict oldest entries if cache exceeds max size
+  evictStaleSnapshots();
 }
 
 /**
@@ -319,6 +387,9 @@ export function recordReadWithStat(
   }
 
   snapshotCache.set(normalized, snapshot);
+
+  // Evict oldest entries if cache exceeds max size
+  evictStaleSnapshots();
 }
 
 /**

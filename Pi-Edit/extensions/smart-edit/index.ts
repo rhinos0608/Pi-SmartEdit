@@ -1104,7 +1104,13 @@ async function buildMultiFileFallbackHint(
   const candidates: string[] = [];
   const failingResolved = resolve(failingPath);
 
-  for (const filePath of allPaths) {
+  // Limit search to first 30 session files to avoid O(n) disk reads on every failure
+  const MAX_SEARCH_FILES = 30;
+  const searchPaths = allPaths.length > MAX_SEARCH_FILES
+    ? allPaths.filter(p => p !== failingPath).slice(0, MAX_SEARCH_FILES)
+    : allPaths;
+
+  for (const filePath of searchPaths) {
     const resolved = resolve(filePath);
     if (resolved === failingResolved) continue;
 
@@ -1497,6 +1503,8 @@ export default function smartEdit(pi: ExtensionAPI) {
         if (signal) {
           signal.addEventListener("abort", onAbort, { once: true });
         }
+
+        let deferralController: AbortController | undefined;
 
         try {
           // Check file exists
@@ -2014,7 +2022,7 @@ export default function smartEdit(pi: ExtensionAPI) {
           // Signal the LSP manager to collect diagnostics that arrive after the
           // initial response. The LSP server may produce diagnostics with a delay
           // after the document is synced.
-          const deferralController = lspManager
+          deferralController = lspManager
             ? deferredDiagnostics.beginDeferred(absolutePath)
             : undefined;
 
@@ -2199,14 +2207,27 @@ export default function smartEdit(pi: ExtensionAPI) {
             const lspServer = await lspManager!.getServer(languageId);
 
             await new Promise<void>((promiseResolve) => {
-              // Safety: always resolve after timeout
-              const timer = setTimeout(() => promiseResolve(), 2000);
+              let didResolve = false;
+              let unsub: (() => void) | undefined;
+
+              function done() {
+                if (didResolve) return;
+                didResolve = true;
+                clearTimeout(timer);
+                unsub?.();
+                promiseResolve();
+              }
+
+              const timer = setTimeout(() => done(), 2000);
               timer.unref();
 
-              if (!lspServer) return;
+              if (!lspServer) {
+                done();
+                return;
+              }
 
               const uri = `file://${resolve(absolutePath)}`;
-              const unsubscribe = lspServer.onNotification?.(
+              unsub = lspServer.onNotification?.(
                 "textDocument/publishDiagnostics",
                 (params: unknown) => {
                   const p = params as {
@@ -2244,12 +2265,8 @@ export default function smartEdit(pi: ExtensionAPI) {
                 },
               );
 
-              // Clean up listener when controller is aborted
-              deferralController.signal.addEventListener("abort", () => {
-                clearTimeout(timer);
-                unsubscribe?.();
-                promiseResolve();
-              });
+              // Clean up listener when controller is aborted or timer fires
+              deferralController!.signal.addEventListener("abort", () => done());
             });
 
             // Flush any deferred diagnostics and append to result
@@ -2334,6 +2351,10 @@ export default function smartEdit(pi: ExtensionAPI) {
           };
         } catch (error) {
           if (signal) signal.removeEventListener("abort", onAbort);
+          // Clean up deferred diagnostics collector on failure
+          if (deferralController) {
+            deferredDiagnostics.cancel(absolutePath);
+          }
 
           if (!aborted) {
             const err = error instanceof Error ? error : new Error(String(error));
