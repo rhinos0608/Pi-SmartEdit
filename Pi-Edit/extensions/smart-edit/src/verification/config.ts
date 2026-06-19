@@ -16,6 +16,7 @@ import type {
   RepairConfig,
   VerificationCommand,
 } from "./types";
+import { loadConfig } from "../config/schema.js";
 
 /**
  * Provide a default VerificationConfig with safe, conservative values.
@@ -41,7 +42,7 @@ export function defaultConcurrencyConfig(
   env?: Record<string, string | undefined>,
 ): ConcurrencyConfig {
   let commands: VerificationCommand[] = [];
-  const raw = (env ?? process.env)[VALIDATION_COMMANDS_ENV_VAR];
+  const raw = (env ? loadConfig(env).verificationCommands : loadConfig().verificationCommands);
   if (raw != null && raw.trim().length > 0) {
     try {
       commands = JSON.parse(raw) as VerificationCommand[];
@@ -82,36 +83,12 @@ export function defaultHistoryConfig(): HistoryConfig {
   };
 }
 
-const REPAIR_ENABLED_ENV_VAR = "SMART_EDIT_REPAIR_ENABLED";
-
-
-const REPAIR_MAX_RETRIES_ENV_VAR = "SMART_EDIT_REPAIR_MAX_RETRIES";
-
-const VALIDATION_COMMANDS_ENV_VAR = "SMART_EDIT_VERIFICATION_COMMANDS";
-
-/**
- * Read an env var as a boolean. Returns true for "1", "true", "yes", "on".
- */
-function parseBooleanEnv(value: string): boolean {
-  return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
-}
-
-
 export function defaultRepairConfig(
   env?: Record<string, string | undefined>,
 ): RepairConfig {
-  let enabled = true;
-  const raw = (env ?? process.env)[REPAIR_ENABLED_ENV_VAR];
-  if (raw != null) {
-    enabled = parseBooleanEnv(raw);
-  }
-
-  let maxRetries = 3;
-  const retryRaw = (env ?? process.env)[REPAIR_MAX_RETRIES_ENV_VAR];
-  if (retryRaw != null) {
-    const parsed = parseInt(retryRaw.trim(), 10);
-    if (!isNaN(parsed) && parsed >= 0) maxRetries = parsed;
-  }
+  const cfg = env ? loadConfig(env) : loadConfig();
+  const enabled = cfg.repairEnabled;
+  const maxRetries = cfg.repairMaxRetries;
 
   return {
     enabled,

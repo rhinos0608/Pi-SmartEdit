@@ -260,12 +260,11 @@ describe("checkEditSafety — edge cases", () => {
     assert.strictEqual(result.warnings.length, 0);
   });
 
-  it("defaults to never_prompt when no config given", async () => {
-    // Without setting SMART_EDIT_APPROVAL_LEVEL, defaults to never_prompt
+  it("defaults to prompt_on_dangerous when no config given", async () => {
+    // Without setting SMART_EDIT_APPROVAL_LEVEL, defaults to prompt_on_dangerous
     const result = await checkEditSafety("src/main.ts", [makeEdit("function main()", "function main() {}")]);
-    assert.strictEqual(result.safe, true);
-    assert.strictEqual(result.warnings.length, 0);
-    assert.strictEqual(result.level, "never_prompt");
+    assert.strictEqual(result.safe, false);
+    assert.strictEqual(result.level, "prompt_on_dangerous");
   });
 
   it("combines path warning and symbol warning", async () => {
