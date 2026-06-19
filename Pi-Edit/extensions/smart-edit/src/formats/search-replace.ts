@@ -10,6 +10,8 @@
  * >>>>>>> REPLACE
  */
 
+import { ParseError } from "../../lib/errors";
+
 export interface SearchReplaceBlock {
   /** Optional filename hint (first non-marker line of the block) */
   path?: string;
@@ -60,7 +62,8 @@ export function parseSearchReplace(input: string, knownPaths?: string[]): Search
       const afterSepIdx = candidateIdx + '\n======='.length;
       const nextChar = afterSepIdx < normalized.length ? normalized[afterSepIdx] : '';
       
-      if (nextChar === '\n' || nextChar === '\r') {
+      const trailing = normalized.slice(afterSepIdx).match(/^[^\n]*/)?.[0] ?? '';
+      if (nextChar === '\n' || nextChar === '\r' || /^[ \t\r]*$/.test(trailing)) {
         sepIdx = candidateIdx + 1; // Skip the leading newline
         break;
       }
@@ -68,16 +71,7 @@ export function parseSearchReplace(input: string, knownPaths?: string[]): Search
       // Not a proper separator — look for the next one
       candidateIdx = normalized.indexOf('\n=======', candidateIdx + 1);
       
-      // Length ratio check: if we've scanned more content than SEARCH marker length, bail
-      // This prevents matching ===== inside SEARCH content
-      if (candidateIdx !== -1) {
-        const scannedLen = candidateIdx - afterSearchStart;
-        const markerLen = candidateIdx - searchIdx;
-        if (scannedLen > markerLen * 0.5) {
-          sepIdx = candidateIdx + 1;
-          break;
-        }
-      }
+      // Keep scanning; separator must be a standalone marker line.
     }
     
     // Fallback: check if the first ======= in the block is on its own line
@@ -86,20 +80,23 @@ export function parseSearchReplace(input: string, knownPaths?: string[]): Search
       if (firstSepCandidate !== -1) {
         // Check if it's preceded by newline (start of line)
         const beforeFirst = firstSepCandidate > 0 ? normalized[firstSepCandidate - 1] : '\n';
-        if (beforeFirst === '\n' || beforeFirst === '\r') {
+        const afterFirstIdx = firstSepCandidate + '======='.length;
+        const afterFirst = afterFirstIdx < normalized.length ? normalized[afterFirstIdx] : '';
+        const trailing = normalized.slice(afterFirstIdx).match(/^[^\n]*/)?.[0] ?? '';
+        if ((beforeFirst === '\n' || beforeFirst === '\r') && (afterFirst === '\n' || afterFirst === '\r' || /^[ \t\r]*$/.test(trailing))) {
           sepIdx = firstSepCandidate;
         }
       }
     }
     
     if (sepIdx === -1) {
-      throw new Error(`Unclosed SEARCH block at position ${searchIdx}: missing ======= separator`);
+      throw new ParseError(`Unclosed SEARCH block at position ${searchIdx}: missing ======= separator`, 'SEARCH_REPLACE_PARSE', searchIdx);
     }
     
     // Find REPLACE marker
     const replaceIdx = normalized.indexOf('>>>>>>> REPLACE', sepIdx + '======='.length);
     if (replaceIdx === -1) {
-      throw new Error(`Unclosed SEARCH block at position ${searchIdx}: missing >>>>>>> REPLACE marker`);
+      throw new ParseError(`Unclosed SEARCH block at position ${searchIdx}: missing >>>>>>> REPLACE marker`, 'SEARCH_REPLACE_PARSE', searchIdx);
     }
     
     // Extract old and new text
@@ -111,7 +108,7 @@ export function parseSearchReplace(input: string, knownPaths?: string[]): Search
     
     // Check for empty oldText
     if (oldText.trim().length === 0) {
-      throw new Error(`SEARCH block at position ${searchIdx} has no oldText`);
+      throw new ParseError(`SEARCH block at position ${searchIdx} has no oldText`, 'SEARCH_REPLACE_PARSE', searchIdx);
     }
     
     // Determine path from line before SEARCH marker
@@ -199,7 +196,7 @@ function filenameSimilarity(a: string, b: string): number {
   if (la === 0 || lb === 0) return 0;
   const maxLen = Math.max(la, lb);
   const prev = Array.from({ length: lb + 1 }, (_, j) => j);
-  const curr = new Array(lb + 1);
+  const curr = new Array<number>(lb + 1);
   for (let i = 1; i <= la; i++) {
     curr[0] = i;
     for (let j = 1; j <= lb; j++) {

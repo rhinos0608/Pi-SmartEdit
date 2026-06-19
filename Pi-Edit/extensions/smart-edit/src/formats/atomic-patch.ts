@@ -22,6 +22,7 @@ import { constants } from "fs";
 
 import { saveUndoState, restoreUndoState } from "../undo/edit-history";
 import { atomicWrite } from "../undo/atomic-write";
+import { SmartEditError } from "../../lib/errors";
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -97,13 +98,13 @@ export interface AtomicPatchParseResult {
 
 // ─── Error Types ────────────────────────────────────────────────────
 
-export class AtomicPatchError extends Error {
+export class AtomicPatchError extends SmartEditError {
   constructor(
     message: string,
     public readonly operation?: AtomicPatchOp,
     public readonly operationIndex?: number,
   ) {
-    super(`❌ Atomic patch error: ${message}`);
+    super(`❌ Atomic patch error: ${message}`, 'ATOMIC_PATCH');
     this.name = 'AtomicPatchError';
   }
 }

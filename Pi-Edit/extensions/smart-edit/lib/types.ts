@@ -113,7 +113,7 @@ export enum MatchTier {
   INDENTATION = "indentation",
   UNICODE = "unicode",
   COMMENT_PREFIX = "comment_prefix",
-  SIMILARITY = "similarity",  // deferred
+  SIMILARITY = "similarity",
   DOTDOTDOTS = "dotdotdots",
   RELATIVE_INDENT = "relative_indent",
 }
@@ -297,7 +297,7 @@ import { createHash } from "crypto";
 export function fastHash(content: string): string {
   return createHash("sha256").update(content).digest("hex").slice(0, 16);
 }
-/** @deprecated Use EditTarget instead - kept for backwards compat with internal use */
+/** Backwards-compatible AST anchor shape used by hashline scoped fallback. */
 export interface EditAnchor {
   symbolName?: string;
   symbolKind?: string;

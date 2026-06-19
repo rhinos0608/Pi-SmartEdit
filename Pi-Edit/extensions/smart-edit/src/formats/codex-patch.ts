@@ -16,6 +16,8 @@
  * Inspired by: codex-rs/apply-patch/src/parser.rs
  */
 
+import { SmartEditError } from "../../lib/errors";
+
 // ─── Types ──────────────────────────────────────────────────────────
 
 /**
@@ -58,13 +60,13 @@ export type ParseMode = 'strict' | 'lenient';
 
 // ─── Error Types ────────────────────────────────────────────────────
 
-export class PatchParseError extends Error {
+export class PatchParseError extends SmartEditError {
   constructor(
     message: string,
     public readonly line: number,
     public readonly column: number,
   ) {
-    super(`❌ Codex patch parse error at line ${line}, col ${column}: ${message}`);
+    super(`❌ Codex patch parse error at line ${line}, col ${column}: ${message}`, 'CODEX_PARSE');
     this.name = 'PatchParseError';
   }
 }

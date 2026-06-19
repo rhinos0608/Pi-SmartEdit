@@ -14,7 +14,13 @@ import { Type } from "typebox";
 
 import { constants, statSync } from "fs";
 import { access as fsAccess, readFile as fsReadFile, stat as fsStat } from "fs/promises";
-import { resolve, dirname, relative } from "path";
+import { dirname, isAbsolute, relative, resolve } from "path";
+import { withFileMutationQueue } from "./src/mutation-queue.js";
+import { resolveAnchorToScope, findTextLineRange, getHashlineAnchorLine, computeEditContainingRange } from "./src/anchor-resolution.js";
+import { sortHashlineEditsForApplication, formatHashlineBatchSummary } from "./src/hashline-batching.js";
+import { reReadAfterFailure, buildMultiFileFallbackHint } from "./src/multi-file-hints.js";
+import { buildContextGuardCheck, formatContextGuardRejection } from "./src/context-guard-check.js";
+import { prepareArguments, validateInput, formatEditError } from "./src/args.js";
 
 import {
   applyEdits,
@@ -33,15 +39,11 @@ import {
 
 import { detectLanguageFromExtension } from "./src/lsp/language-id";
 import { recordRead, checkStale, recordReadWithStat, recordReadSession, getSessionReads, checkEditAllowed, checkRangeCoverage, getSnapshot, getAllSessionPaths } from "./lib/read-cache";
-import { buildHashlineAnchors, initHashline, HASHLINE_CONTENT_SEPARATOR } from "./lib/hashline";
+import { buildHashlineAnchors, initHashline } from "./lib/hashline";
 import type { HashlineEditInput } from "./lib/hashline-edit";
+import { HashlineMismatchError } from "./lib/hashline-edit";
 
 import { detectInputFormat } from "./src/formats/format-detector";
-import { parseSearchReplace } from "./src/formats/search-replace";
-import { parseUnifiedDiffToEditItems } from "./src/formats/unified-diff";
-import { parseOpenAIPatch, openAIPatchToEditItem } from "./src/formats/openai-patch";
-import { parseCodexPatch, codexHunkToEditItem } from "./src/formats/codex-patch";
-import { enqueueAtomicPatch, parseAtomicPatchEnvelope, type AtomicPatchEnvelope } from "./src/formats/atomic-patch";
 import { StreamingPatchParser } from "./src/formats/streaming-patch-parser";
 
 import { LSPManager } from "./src/lsp/lsp-manager";
@@ -51,7 +53,6 @@ import { getCompilerForLanguage } from "./src/lsp/diagnostic-dispatcher";
 import type { DiagnosticResult } from "./src/lsp/diagnostic-dispatcher";
 
 import { runPostEditEvidencePipeline } from "./src/verification/post-edit-evidence";
-import { defaultVerificationConfig } from "./src/verification/config";
 import type { PostEditEvidenceResult } from "./src/verification/types";
 import { scopeDiagnosticsToChangedTargets } from "./src/verification/scoped-diagnostics";
 import type { ScopedDiagnostic } from "./src/verification/scoped-diagnostics";
@@ -60,14 +61,14 @@ import { getSmartEditRuntimeConfig } from "./src/edit-mode";
 import { checkEditSafety } from "./src/safety/approval-gating";
 import { saveUndoState } from "./src/undo/edit-history";
 import { atomicWrite } from "./src/undo/atomic-write";
-import { repairJson } from "./src/formats/forgiving-parser";
+import { checkContextGuardSimilarity } from "./src/safety/context-guard";
+import { MatchError } from "./lib/errors";
 import { runAutoValidation, formatValidationFeedback, resetRetryCounts, checkStructural, incrementRetryCount as incRetryCount } from "./src/verification/auto-validate";
-import { applySymbolicEdits, buildSymbolicEditGuidance, isSymbolicEdit, resolveSymbolicEditLineRange } from "./src/symbolic-edits";
+import { applySymbolicEdits, buildSymbolicEditGuidance, resolveSymbolicEditLineRange } from "./src/symbolic-edits";
 import type { SymbolicEditRequest } from "./src/symbolic-edits";
 
 import type {
   EditTarget,
-  EditAnchor,
   EditItem,
   EditInput,
   EditResult,
@@ -78,31 +79,17 @@ import type {
 
 const smartEditRuntimeConfig = getSmartEditRuntimeConfig();
 
-const HASHLINE_PREFIX_RE = new RegExp(`^\\d+[a-z]{2}\\${HASHLINE_CONTENT_SEPARATOR}`);
-
-function stripHashlineDisplayPrefixes(content: string): { text: string; stripped: boolean } {
-  if (!smartEditRuntimeConfig.useHashlineEditing) return { text: content, stripped: false };
-  if (!content || !content.includes(HASHLINE_CONTENT_SEPARATOR)) return { text: content, stripped: false };
-  const lines = content.split('\n');
-  let anyStripped = false;
-  const strippedLines = lines.map((line) => {
-    if (HASHLINE_PREFIX_RE.test(line)) { anyStripped = true; return line.replace(HASHLINE_PREFIX_RE, ''); }
-    return line;
-  });
-  return { text: strippedLines.join('\n'), stripped: anyStripped };
-}
-
 function coerceText(value: unknown): string {
   if (typeof value === "string") return value;
   if (value === null || value === undefined) return "";
-  if (typeof value === "object") {
-    try {
-      return JSON.stringify(value);
-    } catch {
-      return String(value);
-    }
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value);
+  if (typeof value === "symbol") return value.description ?? value.toString();
+  if (typeof value === "function") return value.name ? `[Function: ${value.name}]` : "[Function]";
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return Object.prototype.toString.call(value);
   }
-  return String(value);
 }
 
 // ─── Schema (must match built-in edit schema exactly) ──────────────
@@ -163,665 +150,22 @@ const editSchema = Type.Object(
   },
 );
 
-// ─── Error formatting (actionable client-facing errors) ─────────────
-
-/**
- * Wrap an error with an actionable message instead of a raw data dump.
- *
- * Strips the "Received arguments:" noise that Pi's built-in validation
- * dumps and returns a concise, fix-oriented error.
- */
-function formatEditError(message: string, hint?: string): Error {
-  let text = `❌ ${message}`;
-  if (hint) {
-    text += `\n\n${hint}`;
-  }
-  return new Error(text);
-}
-
-
-// ─── JSON string repair (truncated / unescaped newlines) ────────────
-
-/**
- * Attempt to repair a malformed JSON string that may have:
- * - Literal newlines inside string values (most common — tool pipelines
- *   sometimes serialise arrays into strings without escaping newlines)
- * - Truncation (incomplete JSON array from a clipped tool-call pipeline)
- * - Improper escaping
- *
- * Returns the parsed result if any strategy succeeds, or undefined.
- */
-function tryRepairJSONString(raw: string): unknown {
-  // Delegate to the forgiving parser (SmallCode-inspired 7-strategy pipeline).
-  // The forgiving parser handles: as-is, trailing comma, wrap braces, strip
-  // markdown fences, extract {...} block, literal newline escape, and
-  // unbalanced brace fix — all with fuzzy key matching built in.
-  const forgivingResult = repairJson(raw, {
-    edit: ["path", "edits", "oldText", "newText", "replaceAll", "target"],
-  });
-  if (forgivingResult.value !== undefined) {
-    return forgivingResult.value;
-  }
-
-  // Strategy: truncated JSON array — extract complete edit objects.
-  // Only activate when the string actually contains object braces so we
-  // don't accidentally treat random non-JSON text (e.g. "[not valid")
-  // as a truncated array.
-  try {
-    if (/^\s*\[/.test(raw) && !/\]\s*$/.test(raw) && raw.includes('{') && raw.includes('}')) {
-      return tryExtractPartialEdits(raw);
-    }
-  } catch {
-    // fall through
-  }
-
-  return undefined;
-}
-
-
-/**
- * Extract complete edit objects from a truncated JSON array string.
- * Walks character-by-character tracking brace depth and string state,
- * collecting every complete top-level { … } object it can find.
- */
-function tryExtractPartialEdits(raw: string): unknown[] {
-  const results: unknown[] = [];
-  let depth = 0;
-  let start = -1;
-  let inString = false;
-  let escaped = false;
-
-  for (let i = 0; i < raw.length; i++) {
-    const ch = raw[i];
-
-    if (inString) {
-      if (escaped) {
-        escaped = false;
-        continue;
-      }
-      if (ch === '\\') {
-        escaped = true;
-        continue;
-      }
-      if (ch === '"') {
-        inString = false;
-      }
-      continue;
-    }
-
-    if (ch === '"') {
-      inString = true;
-      continue;
-    }
-
-    if (ch === '{') {
-      if (depth === 0) start = i;
-      depth++;
-    } else if (ch === '}') {
-      depth--;
-      if (depth === 0 && start >= 0) {
-        const objStr = raw.slice(start, i + 1);
-        try {
-          const parsed = JSON.parse(objStr) as Record<string, unknown>;
-          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-            results.push(parsed);
-          }
-        } catch {
-          // skip unparseable fragment
-        }
-        start = -1;
-      }
-    }
-  }
-
-  return results;
-}
-
-
-// ─── Legacy input compatibility ─────────────────────────────────────
-
-async function prepareArguments(input: Record<string, unknown>): Promise<Record<string, unknown>> {
-  if (!input || typeof input !== "object") return input;
-
-  const args = { ...input } as Record<string, unknown>;
-
-  // ── Early validation for missing required fields ────────────
-  // The built-in schema validation rejects these with a terse generic error
-  // like "must have required properties path". We catch them here with
-  // descriptive, actionable messages before schema validation runs.
-  // IMPORTANT: This must come BEFORE legacy format normalization (which
-  // converts {path, oldText, newText} to {path, edits: [...]}) but the
-  // edits-missing check must come AFTER that normalization, since legacy
-  // calls don't have an edits field.
-
-  if (!args.path && !args.edits) {
+function resolveWorkspacePath(cwd: string, targetPath: string): string {
+  const absolutePath = resolve(cwd, targetPath);
+  const rel = relative(cwd, absolutePath);
+  if (rel.startsWith("..") || isAbsolute(rel)) {
     throw formatEditError(
-      `Edit tool is missing both required fields: path and edits.`,
-      `edit must be called with two fields:
-` +
-      `  path: string   — path to the file to edit (relative or absolute)
-` +
-      `  edits: array   — one or more oldText/newText edit objects
-` +
-      `               OR edits: string — raw text in a supported format:
-` +
-      `                 • search/replace (<<<<<<< SEARCH blocks)
-` +
-      `                 • unified diff (--- a/ +++ b/ with @@ hunks)
-` +
-      `                 • OpenAI patch (*** Begin Patch)
-` +
-      `                 • Codex patch (*** Begin Patch with Add/Delete/Move)
-` +
-      `                 • Atomic Patch (*** Begin Atomic Patch, multi-file)
-
-` +
-      `Example:
-` +
-      `  edit({
-` +
-      `    path: "src/foo.ts",
-` +
-      `    edits: [{ oldText: "old line", newText: "new line" }]
-` +
-      `  })`
+      `Cannot edit "${targetPath}": path is outside the current workspace.`,
+      `Use a path inside ${cwd}.`,
     );
   }
-
-  if (!args.path) {
-    throw formatEditError(
-      `Edit tool is missing the required "path" field.`,
-      `You must specify which file to edit. Add a path string to your edit call:
-
-` +
-      `  {
-` +
-      `    path: "src/foo.ts",  // <-- add this — relative or absolute path
-` +
-      `    edits: [{ oldText: "...", newText: "..." }]
-` +
-      `  }`
-    );
-  }
-
-  // Some models send edits as a JSON string instead of an array.
-  // This happens when the model serializes the array into a string
-  // somewhere in the tool-calling pipeline.
-  if (typeof args.edits === "string") {
-    const raw = (args.edits as string).trim();
-
-    // Empty string: immediate actionable error
-    if (!raw) {
-      throw formatEditError(
-        `edits was received as an empty string.`,
-        `Send edits as an oldText/newText array:\n` +
-        `  edits: [{ oldText: "...", newText: "..." }]`
-      );
-    }
-
-    // Attempt first parse, then try recovery strategies for common
-    // edge cases (literal newlines in string values, truncation, etc.)
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      // First parse failed — try repair strategies before falling through
-      // to the non-array diagnostic below.
-      parsed = tryRepairJSONString(raw);
-    }
-
-    // Double-escaped JSON: if first parse returned a string (JSON array encoded
-    // as a string), try one more level of JSON.parse to unwrap it.
-    if (typeof parsed === "string") {
-      let secondParse: unknown;
-      try {
-        secondParse = JSON.parse(parsed);
-      } catch {
-        // Second parse also failed — handled below
-      }
-      if (secondParse !== undefined) {
-        parsed = secondParse;
-      }
-    }
-
-    // Validate parsed result is an array — clear diagnostic with snippet.
-    // If it's not a valid JSON array, try multi-format detection first since
-    // the input could be a search/replace block, unified diff, OpenAI/Codex patch, or Atomic Patch.
-    if (!Array.isArray(parsed)) {
-      const format = detectInputFormat(raw);
-
-      if (format !== 'raw_edits') {
-        try {
-          let parsedEdits: Array<{ path?: string; oldText: string; newText: string }> = [];
-
-          switch (format) {
-            case 'search_replace': {
-              const blocks = parseSearchReplace(raw);
-              parsedEdits = blocks.map(block => ({
-                path: block.path,
-                oldText: block.oldText,
-                newText: block.newText,
-              }));
-              break;
-            }
-            case 'unified_diff': {
-              parsedEdits = parseUnifiedDiffToEditItems(raw);
-              break;
-            }
-            case 'openai_patch': {
-              const patches = parseOpenAIPatch(raw);
-              parsedEdits = patches.map(patch => openAIPatchToEditItem(patch));
-              break;
-            }
-            case 'codex_patch': {
-              const codexResult = parseCodexPatch(raw, 'lenient');
-              // Convert each hunk to EditItem-compatible format
-              for (const hunk of codexResult.hunks) {
-                // Read file old contents for DeleteFile operations
-                let fileOldContents: string | undefined;
-                if (hunk.kind === 'DeleteFile' && hunk.path) {
-                  try {
-                    fileOldContents = await fsReadFile(hunk.path, 'utf-8');
-                  } catch {
-                    // File doesn't exist — nothing to delete, skip silently
-                    continue;
-                  }
-                }
-                const items = codexHunkToEditItem(hunk, fileOldContents);
-                parsedEdits.push(...items);
-              }
-              break;
-            }
-            case 'atomic_patch': {
-              // Atomic patches are handled via enqueueAtomicPatch in the edit flow
-              // For now, extract path hints from the envelope for multi-file support
-              const { envelope } = parseAtomicPatchEnvelope(raw);
-
-              // Collect unique paths from the envelope
-              const paths = new Set<string>();
-              for (const op of envelope.operations) {
-                if (op.kind === 'AddFile' || op.kind === 'DeleteFile' || op.kind === 'UpdateFile') {
-                  paths.add(op.path);
-                }
-                if (op.kind === 'UpdateFile' && op.movePath) {
-                  paths.add(op.movePath);
-                }
-                if (op.kind === 'RenameFile') {
-                  paths.add(op.oldPath);
-                  paths.add(op.newPath);
-                }
-              }
-
-              // Store parsed envelope for later processing
-              (args as Record<string, unknown>).__atomicPatchEnvelope = envelope;
-
-              // If no path hint from args, use first path from envelope
-              if (paths.size > 0 && !args.path) {
-                args.path = Array.from(paths)[0];
-              }
-
-              // Extract first UpdateFile's patches as edit items
-              for (const op of envelope.operations) {
-                if (op.kind === 'UpdateFile') {
-                  for (const patch of op.patches) {
-                    parsedEdits.push({
-                      path: op.movePath ?? op.path,
-                      oldText: patch.oldText,
-                      newText: patch.newText,
-                    });
-                  }
-                }
-              }
-              break;
-            }
-          }
-
-          if (parsedEdits.length > 0) {
-            // If a parsed format contained a path hint and none was provided, use it
-            const pathHint = parsedEdits.find(e => e.path)?.path;
-            if (pathHint && !args.path) {
-              args.path = pathHint;
-            }
-
-            parsed = parsedEdits.map(e => ({
-              oldText: e.oldText,
-              newText: e.newText,
-            })) as unknown[];
-          } else {
-            throw formatEditError(
-              `edits was received as a ${format} string but parsed into zero edits.`,
-              `Ensure the ${format} block contains at least one valid oldText/newText pair.`
-            );
-          }
-        } catch (formatError) {
-          if (formatError instanceof Error && formatError.message.startsWith('❌')) {
-            throw formatError;
-          }
-          throw formatEditError(
-            `Failed to parse ${format} format input: ${(formatError as Error).message}`,
-          );
-        }
-      } else {
-        const snippet = raw.length > 120
-          ? raw.slice(0, 80) + "..." + raw.slice(-30)
-          : raw;
-        let typeDesc: string;
-        if (parsed === undefined) {
-          typeDesc = "(unparseable — not valid JSON)";
-        } else if (typeof parsed === "string") {
-          typeDesc = `a string ("${parsed.slice(0, 60)}${parsed.length > 60 ? "..." : ""}")`;
-        } else {
-          typeDesc = typeof parsed;
-        }
-        throw formatEditError(
-          `edits was received as a JSON string but parsed into ${typeDesc}, not an array.`,
-          `edits must be an array of edit objects with oldText/newText fields.\n` +
-          `Raw value (${raw.length} chars) starts with:\n  ${snippet}\n\n` +
-          `This typically happens when the JSON is improperly escaped or truncated.\n` +
-          `Automatic repair was attempted but could not recover a valid edits array.\n` +
-          `Fix: ensure edits is sent as a proper JSON array, not a string.`
-        );
-      }
-    }
-
-    // Validate each item is an object with required fields.
-    const parsedArr = parsed as unknown[];
-    for (let i = 0; i < parsedArr.length; i++) {
-      const item = parsedArr[i] as Record<string, unknown>;
-      if (item === null || typeof item !== "object") {
-        throw formatEditError(
-          `edits[${i}] is ${item === null ? "null" : `a ${typeof item}`}, not an object.`,
-          `Each element in edits must be an object with oldText/newText fields.`
-        );
-      }
-      const isHashlineEdit = item.hashline && typeof item.hashline === "object" &&
-        (item.hashline as Record<string, unknown>).range;
-      const isSymbolEdit = isSymbolicEdit(item);
-      if (isSymbolEdit) {
-        const t = item.target as Record<string, unknown> | undefined;
-        const operationCount = [t?.replaceBody, t?.insertBefore, t?.insertAfter]
-          .filter((value) => typeof value === "string")
-          .length;
-        if (operationCount !== 1) {
-          throw formatEditError(
-            `edits[${i}] is a target edit but does not provide exactly one symbolic operation.`,
-            `Use { target: { name: "myFunction" }, replaceBody: "..." } or insertBefore/insertAfter.`
-          );
-        }
-      }
-      if (!isHashlineEdit && !isSymbolEdit) {
-        if (typeof item.oldText !== "string") {
-          throw formatEditError(
-            `edits[${i}].oldText is ${typeof item.oldText}, but must be a string.`,
-            `oldText is the exact text to find in the file for replacement. ` +
-            `Alternatively, use symbol edits.`
-          );
-        }
-        if (typeof item.newText !== "string") {
-          throw formatEditError(
-            `edits[${i}].newText is ${typeof item.newText}, but must be a string.`,
-            `newText is the replacement text to write in place of oldText. ` +
-            `Alternatively, use symbol edits.`
-          );
-        }
-      }
-    }
-
-    if (!smartEditRuntimeConfig.useHashlineEditing) {
-      const hasHashlineEdits = parsedArr.some((item) => {
-        const edit = item as Record<string, unknown>;
-        return Boolean(
-          edit?.hashline &&
-          typeof edit.hashline === "object" &&
-          (edit.hashline as Record<string, unknown>).range,
-        );
-      });
-      if (hasHashlineEdits) {
-        throw formatEditError(
-          "Hashline edits are disabled."
-        );
-      }
-    }
-
-    args.edits = parsed;
-
-
-  }
-
-  // Legacy single-edit format: { path, oldText, newText, edits?: [...] }
-  const legacy = args as Record<string, unknown>;
-  if (
-    typeof legacy.oldText === "string" &&
-    typeof legacy.newText === "string"
-  ) {
-    const { text: oldText, stripped: oldStripped } = stripHashlineDisplayPrefixes(legacy.oldText);
-    const { text: newText, stripped: newStripped } = stripHashlineDisplayPrefixes(legacy.newText);
-    const edits: EditItem[] = Array.isArray(legacy.edits)
-      ? [...(legacy.edits as EditItem[])]
-      : [];
-    edits.push({ oldText, newText });
-    const { oldText: _, newText: __, ...rest } = legacy;
-    return { ...rest, edits };
-  }
-
-  // ── Edits missing check (after legacy normalization, which returns early) ──
-  // By this point, edits is not a string (handled above) and not a legacy format
-  // (returned early). If it's still missing, provide an actionable error.
-  if (args.edits === undefined || args.edits === null) {
-    throw formatEditError(
-      `Edit tool is missing the required "edits" field.`,
-      `You must specify which replacements to make. Add an edits array:
-
-` +
-      `  {
-` +
-      `    path: "${typeof args.path === "string" ? args.path : "..."}",
-` +
-      `    edits: [{ oldText: '...', newText: '...' }]  // <-- add this
-` +
-      `  }`
-    );
-  }
-
-  // Strip replaceAll/target/lineRange from edits so built-in schema validation
-  // passes. The values are restored in execute() before calling applyEdits().
-  // For backwards compat, we convert old-style anchor/symbol to new target shape.
-  if (Array.isArray(args.edits)) {
-    const flags: boolean[] = [];
-    const targets: (Record<string, unknown> | undefined)[] = [];
-    const hashlines: (Record<string, unknown> | undefined)[] = [];
-    const editNotes: string[] = [];
-
-    for (const edit of args.edits as Array<Record<string, unknown>>) {
-      if (edit.oldText && typeof edit.oldText === "string") {
-        const { text, stripped } = stripHashlineDisplayPrefixes(edit.oldText);
-        if (stripped) { edit.oldText = text; editNotes.push("Auto-stripped hashline display prefixes from edit content."); }
-      }
-      if (edit.newText && typeof edit.newText === "string") {
-        const { text, stripped } = stripHashlineDisplayPrefixes(edit.newText);
-        if (stripped) edit.newText = text;
-      }
-      // ── Backwards compat: convert old-style anchor/symbol to target ──
-      let target: Record<string, unknown> | undefined;
-
-      // Convert old anchor { symbolName, symbolKind, symbolLine } to target
-      if (edit.anchor && typeof edit.anchor === 'object') {
-        const anchor = edit.anchor as Record<string, unknown>;
-        target = {
-          name: anchor.symbolName,
-          kind: anchor.symbolKind,
-          line: anchor.symbolLine,
-        };
-        delete edit.anchor;
-      }
-
-      // Convert old symbol + operation to target
-      if (edit.symbol && typeof edit.symbol === 'object') {
-        const symbol = edit.symbol as Record<string, unknown>;
-        if (!target) target = {};
-        target.name = symbol.name ?? target.name;
-        target.namePath = symbol.namePath ?? target.namePath;
-        target.kind = symbol.kind ?? target.kind;
-        target.line = symbol.line ?? target.line;
-        delete edit.symbol;
-      }
-
-      // Move operation fields into target if present
-      if (edit.replaceBody !== undefined) {
-        if (!target) target = {};
-        target.replaceBody = edit.replaceBody;
-        delete edit.replaceBody;
-      }
-      if (edit.insertBefore !== undefined) {
-        if (!target) target = {};
-        target.insertBefore = edit.insertBefore;
-        delete edit.insertBefore;
-      }
-      if (edit.insertAfter !== undefined) {
-        if (!target) target = {};
-        target.insertAfter = edit.insertAfter;
-        delete edit.insertAfter;
-      }
-
-      // replaceAll
-      if (typeof edit.replaceAll === 'boolean') {
-        flags.push(edit.replaceAll);
-        delete edit.replaceAll;
-      } else {
-        flags.push(false);
-      }
-
-      // target (new unified form, or converted from old-style)
-      if (target && Object.keys(target).length > 0) {
-        targets.push(target);
-      } else {
-        targets.push(undefined);
-      }
-
-      // hashline
-      if (edit.hashline && typeof edit.hashline === 'object') {
-        hashlines.push(edit.hashline as Record<string, unknown>);
-        delete edit.hashline;
-      } else {
-        hashlines.push(undefined);
-      }
-    }
-
-    const hasFlags = flags.some((f) => f);
-    const hasTargets = targets.some((t) => t);
-    const hasHashlines = hashlines.some((h) => h);
-    const hasEditNotes = editNotes.length > 0;
-    if (hasFlags || hasTargets || hasHashlines || hasEditNotes) {
-      const extraData = {
-        replaceAllFlags: hasFlags ? flags : null,
-        targetData: hasTargets ? targets : null,
-        hashlineData: hasHashlines ? hashlines : null,
-        editNotes: hasEditNotes ? [...new Set(editNotes)] : null,
-      };
-      if (typeof args.path === "string" && !args.path.includes("??smartEditExtra=")) {
-        args.path = args.path + "??smartEditExtra=" + Buffer.from(JSON.stringify(extraData)).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-      }
-    }
-  }
-
-  return args;
+  return absolutePath;
 }
 
-// ─── Validate input ─────────────────────────────────────────────────
 
-function validateInput(
-  input: Record<string, unknown>,
-  allowHashlineEdits: boolean,
-): EditInput {
-  if (
-    !Array.isArray(input.edits) ||
-    (input.edits as EditItem[]).length === 0
-  ) {
-    throw formatEditError(
-      "Edit tool input is invalid: edits must contain at least one edit.",
-      "Make sure edits is an array of edit objects with oldText/newText fields."
-    );
-  }
 
-  if (!allowHashlineEdits) {
-    const edits = input.edits as Array<Record<string, unknown>>;
-    if (edits.some((edit) => Boolean(edit?.hashline && typeof edit.hashline === "object" && (edit.hashline as Record<string, unknown>).range))) {
-      throw formatEditError(
-        "Hashline edits are disabled."
-      );
-    }
-  }
 
-  return {
-    path: input.path as string,
-    edits: input.edits as EditItem[],
-  };
-}
 
-// ─── File mutation queue (prevents concurrent edits to same file) ──
-
-/** Maximum time a single edit operation can hold the mutation queue.
- *  Prevents a hung LSP diagnostic call (e.g. unresponsive language server,
- *  orphaned document-sync in flight) from blocking all subsequent edits
- *  to the same file. The timed-out operation continues executing in the
- *  background but its result is discarded. */
-const MUTATION_QUEUE_TIMEOUT_MS = 60_000;
-
-const fileMutationQueues = new Map<string, Promise<void>>();
-
-function getMutationKey(filePath: string): string {
-  return resolve(filePath);
-}
-
-async function withFileMutationQueue<T>(
-  filePath: string,
-  fn: () => Promise<T>,
-): Promise<T> {
-  const key = getMutationKey(filePath);
-  const currentQueue = fileMutationQueues.get(key) ?? Promise.resolve();
-
-  let releaseNext!: () => void;
-  const nextQueue = new Promise<void>((resolveQueue) => {
-    releaseNext = resolveQueue;
-  });
-
-  // Chain that waits for nextQueue even if currentQueue rejected — prevents
-  // a single failed edit from deadlocking all future edits to this file.
-  const chainedQueue = currentQueue.then(
-    () => nextQueue,
-    () => nextQueue,
-  );
-  fileMutationQueues.set(key, chainedQueue);
-
-  // Wait for previous operations, but don't let their errors block us.
-  await currentQueue.catch(() => {});
-
-  try {
-    // Race the edit against a timeout so a hung LSP diagnostic call (or any
-    // other async stall) can't block the queue indefinitely. The losing
-    // promise is abandoned (fire-and-forget) — the next queued operation
-    // may edit the file concurrently, which is acceptable over a dead queue.
-    return await Promise.race([
-      fn(),
-      new Promise<T>((_, reject) => {
-        const timer = setTimeout(() => {
-          reject(
-            new Error(
-              `Mutation queue timeout after ${MUTATION_QUEUE_TIMEOUT_MS}ms for ${filePath}. ` +
-              `The edit may still be completing in the background.`,
-            ),
-          );
-        }, MUTATION_QUEUE_TIMEOUT_MS);
-        timer.unref();
-      }),
-    ]);
-  } finally {
-    releaseNext();
-    if (fileMutationQueues.get(key) === chainedQueue) {
-      fileMutationQueues.delete(key);
-    }
-  }
-}
 
 // ─── AST resolver and conflict detector instances (per-session) ────
 
@@ -834,101 +178,6 @@ let conflictDetector: ReturnType<typeof createConflictDetector> | null = null;
 /** LSP manager instance, created once per session. */
 let lspManager: LSPManager | null = null;
 
-/**
- * Resolve an edit's anchor/lineRange to a SearchScope for narrowing.
- * Called per-edit before matching.
- */
-async function resolveAnchorToScope(
-  edit: EditItem,
-  content: string,
-  filePath: string,
-): Promise<SearchScope | null> {
-  // Priority 1: AST anchor by symbol name (from target.name)
-  if (edit.target?.name && astResolver) {
-    let parseResult: Awaited<ReturnType<typeof astResolver.parseFile>> = null;
-    try {
-      parseResult = await astResolver.parseFile(content, filePath);
-      if (parseResult) {
-        const anchor = {
-          symbolName: edit.target.name,
-          symbolKind: edit.target.kind,
-          symbolLine: edit.target.line,
-        };
-        const targetNode = astResolver.findSymbolNode(
-          parseResult.tree,
-          anchor,
-        );
-        if (targetNode) {
-          const scope: SearchScope = {
-            startIndex: targetNode.startIndex,
-            endIndex: targetNode.endIndex,
-            description: `${targetNode.type} "${edit.target.name}"`,
-            source: "anchor",
-          };
-          return scope;
-        }
-      }
-    } catch {
-      // AST resolution failed
-    } finally {
-      if (parseResult) {
-        astResolver?.disposeParseResult(parseResult);
-      }
-    }
-  }
-
-  return null;
-}
-
-// ─── Re-read helpers for failed edits ──────────────────────────────
-
-/**
- * Find approximate line numbers for a text snippet in file content.
- * Returns the first line (1-based) where oldText appears, or null.
- */
-function findTextLineRange(
-  content: string,
-  oldText: string,
-): { startLine: number; endLine: number } | null {
-  if (!oldText) return null;
-  const lines = content.split('\n');
-  const searchText = oldText.split('\n')[0]; // First line of oldText
-  if (!searchText) return null;
-
-  for (let i = 0; i < lines.length; i++) {
-    if (lines[i].includes(searchText)) {
-      const startLine = i + 1; // 1-based
-      const endLine = Math.min(startLine + oldText.split('\n').length - 1, lines.length);
-      return { startLine, endLine };
-    }
-  }
-  return null;
-}
-
-/**
- * Extract the target line number from a hashline anchor string.
- * Handles special anchors, numeric anchors, and :after/:before suffixes.
- * Used by the range coverage guard to validate hashline-only edits.
- */
-function getHashlineAnchorLine(anchorStr: string, totalLines: number): number | null {
-  const trimmed = anchorStr.trim();
-
-  // Special anchors
-  if (trimmed === "EOF" || trimmed === "end") return totalLines;
-  if (trimmed === "start" || trimmed === "BOF") return 1;
-
-  // Strip :after / :before suffix
-  const base = trimmed.replace(/:after$|:before$/, "");
-
-  // Extract leading number from LINE+HASH format
-  const lineMatch = base.match(/^(\d+)/);
-  if (lineMatch) {
-    const ln = parseInt(lineMatch[1], 10);
-    return ln >= 1 && ln <= totalLines ? ln : null;
-  }
-
-  return null;
-}
 
 /**
  * Compute the containing line range for a set of edits from their oldText.
@@ -937,223 +186,17 @@ function getHashlineAnchorLine(anchorStr: string, totalLines: number): number | 
  * Used by the range coverage guard to validate that edit targets fall within
  * lines that were actually read this session.
  */
-function computeEditContainingRange(
-  content: string,
-  edits: EditItem[],
-): [number, number] | null {
-  let minStart = Infinity;
-  let maxEnd = -Infinity;
-  const contentLines = content.split("\n");
 
-  for (const edit of edits) {
-    if (!edit.oldText) continue;
-    const searchLine = edit.oldText.split("\n")[0];
-    if (!searchLine) continue;
 
-    for (let i = 0; i < contentLines.length; i++) {
-      if (contentLines[i].includes(searchLine)) {
-        const startLine = i + 1; // 1-based
-        const endLine = Math.min(
-          startLine + edit.oldText.split("\n").length - 1,
-          contentLines.length,
-        );
-        if (startLine < minStart) minStart = startLine;
-        if (endLine > maxEnd) maxEnd = endLine;
-        break; // only first match per edit
-      }
-    }
-  }
+export { sortHashlineEditsForApplication, formatHashlineBatchSummary };
 
-  if (minStart === Infinity || maxEnd === -Infinity) return null;
-  return [minStart, maxEnd];
-}
-
-/**
- * Sort hashline edits bottom-up so higher lines apply first.
- *
- * This preserves line-number stability across a batch and prevents an
- * earlier stale edit from blocking later valid edits in the same file.
- */
-export function sortHashlineEditsForApplication(
-  edits: Array<{ editIdx: number; sortLine: number; hashline?: Record<string, unknown> }>,
-): Array<{ editIdx: number; sortLine: number; hashline?: Record<string, unknown> }> {
-  return [...edits].sort((a, b) => {
-    const lineDelta = b.sortLine - a.sortLine;
-    if (lineDelta !== 0) return lineDelta;
-    return a.editIdx - b.editIdx;
-  });
-}
-
-/**
- * Format a compact batch summary for partial hashline success.
- *
- * When some hashline edits succeed and others fail stale-anchor validation,
- * a single summary keeps the agent output readable while still surfacing
- * that some edits were skipped.
- */
-export function formatHashlineBatchSummary(
-  totalEdits: number,
-  appliedEdits: number,
-  failedEdits: Array<{ editIdx: number; message: string }>,
-): string | null {
-  if (totalEdits <= 0 || failedEdits.length === 0 || failedEdits.length === totalEdits) {
-    return null;
-  }
-
-  const skipped = failedEdits
-    .map((edit) => `#${edit.editIdx + 1}`)
-    .join(", ");
-  const editWord = failedEdits.length === 1 ? "edit" : "edits";
-
-  return `Hashline batch: applied ${appliedEdits}/${totalEdits} edit(s); skipped stale ${editWord} ${skipped}.`;
-}
-
-/**
- * Read a range of lines from a file and return them as a string.
- * Returns the lines with their line numbers for context.
- */
-function readLinesWithContext(
-  lines: string[],
-  startLine: number,
-  endLine: number,
-  contextLines: number = 5,
-): string {
-  const totalLines = lines.length;
-  // Expand range to include context lines
-  const ctxStart = Math.max(1, startLine - contextLines);
-  const ctxEnd = Math.min(totalLines, endLine + contextLines);
-
-  const result: string[] = [];
-  for (let i = ctxStart - 1; i < ctxEnd; i++) {
-    const lineNum = i + 1;
-    const marker = (lineNum >= startLine && lineNum <= endLine) ? '>>>' : '   ';
-    result.push(`${marker} ${lineNum.toString().padStart(4)}: ${lines[i]}`);
-  }
-  return result.join('\n');
-}
-
-/**
- * After a failed edit, re-read the file from disk and build an enhanced
- * error message that includes the current file content around the edit
- * location. Also updates the read cache with the fresh content.
- */
-async function reReadAfterFailure(
-  absolutePath: string,
-  path: string,
-  cwd: string,
-  edits: EditItem[],
-  error: Error,
-): Promise<Error> {
-  let currentContent: string;
-  try {
-    currentContent = (await fsReadFile(absolutePath)).toString('utf-8');
-  } catch {
-    // Can't re-read — return original error
-    return error;
-  }
-
-  // Update the read cache with the fresh content so the user can retry
-  const lines = currentContent.split('\n');
-  const hashline = smartEditRuntimeConfig.useHashlineEditing
-    ? await buildHashlineAnchors(lines)
-    : undefined;
-  recordRead(path, cwd, currentContent, false, hashline);
-  // Also update session reads so range coverage doesn't reject the retry
-  recordReadSession(path, cwd, 1, -1, lines.length, "reReadAfterFailure");
-
-  // Build context snippets for each edit that failed
-  const contextParts: string[] = [];
-  for (const edit of edits) {
-    if (!edit.oldText) continue;
-
-    // Try to find where this oldText should be
-    const lineRange = findTextLineRange(currentContent, edit.oldText);
-    if (lineRange) {
-      const context = readLinesWithContext(lines, lineRange.startLine, lineRange.endLine);
-      contextParts.push(
-        `Edit target (lines ${lineRange.startLine}–${lineRange.endLine}):\n${context}`
-      );
-    }
-  }
-
-  // If no line ranges found, show the whole file (up to first 100 lines)
-  if (contextParts.length === 0) {
-    const previewLines = lines.slice(0, 100);
-    contextParts.push(
-      `File preview (first ${previewLines.length} lines):\n` +
-      previewLines.map((line, i) => `     ${(i + 1).toString().padStart(4)}: ${line}`).join('\n')
-    );
-  }
-
-  const contextStr = contextParts.join('\n\n---\n\n');
-  const enhancedMessage = `${error.message}\n\n📖 Current file content around edit location:\n\n${contextStr}`;
-
-  return new Error(enhancedMessage);
-}
-
-/**
- * Check if any recently-read files in this session contain oldText from the failing edits.
- * Returns a hint string to append to the error, or empty string if no candidates found.
- */
-async function buildMultiFileFallbackHint(
-  failingPath: string,
-  edits: EditItem[],
-  cwd: string,
-): Promise<string> {
-  const allPaths = getAllSessionPaths();
-  const candidates: string[] = [];
-  const failingResolved = resolve(failingPath);
-
-  // Limit search to first 30 session files to avoid O(n) disk reads on every failure
-  const MAX_SEARCH_FILES = 30;
-  const searchPaths = allPaths.length > MAX_SEARCH_FILES
-    ? allPaths.filter(p => p !== failingPath).slice(0, MAX_SEARCH_FILES)
-    : allPaths;
-
-  for (const filePath of searchPaths) {
-    const resolved = resolve(filePath);
-    if (resolved === failingResolved) continue;
-
-    let content: string;
-    try {
-      content = await fsReadFile(resolved, 'utf-8');
-    } catch {
-      // File not accessible — skip
-      continue;
-    }
-
-    const normalizedContent = normalizeToLF(content);
-
-    for (const edit of edits) {
-      if (!edit.oldText?.trim()) continue;
-
-      if (normalizedContent.includes(edit.oldText) ||
-          normalizedContent.includes(edit.oldText.trim())) {
-        if (!candidates.includes(resolved)) {
-          candidates.push(resolved);
-        }
-      }
-    }
-  }
-
-  if (candidates.length === 0) return '';
-
-  const relCandidates = candidates.map(c => relative(cwd, c) || c);
-
-  if (relCandidates.length === 1) {
-    return `\n\nNote: The search text was found in a different file: ${relCandidates[0]}\n` +
-           `Did you mean to edit that file instead?`;
-  }
-  return `\n\nNote: The search text was found in ${relCandidates.length} other files:` +
-         relCandidates.map(f => `\n  - ${f}`).join('') +
-         `\nDid you mean to edit one of those files instead?`;
-}
 
 // ─── Extension entry point ──────────────────────────────────────────
 
 export default function smartEdit(pi: ExtensionAPI) {
   // ── Populate read cache on every successful read ──
   pi.on("tool_result", async (event, _ctx) => {
+    const toolCwd = process.cwd();
     if (
       event.toolName === "read" &&
       !event.isError &&
@@ -1181,7 +224,7 @@ export default function smartEdit(pi: ExtensionAPI) {
             const hashline = smartEditRuntimeConfig.useHashlineEditing
               ? await buildHashlineAnchors(lines, readOffset)
               : undefined;
-            recordRead(inputPath, process.cwd(), fullText, true, hashline, readOffset);
+            recordRead(inputPath, toolCwd, fullText, true, hashline, readOffset);
 
             // Track read range for coverage validation
             const explicitLimit = (event.input as { limit?: number })?.limit;
@@ -1194,16 +237,16 @@ export default function smartEdit(pi: ExtensionAPI) {
             if (explicitLimit === undefined) {
               let totalFileLines = lines.length + readOffset - 1;
               try {
-                const snapshot = getSnapshot(inputPath, process.cwd());
+                const snapshot = getSnapshot(inputPath, toolCwd);
                 if (snapshot?.hashline?.formattedLines?.length) {
                   totalFileLines = snapshot.hashline.formattedLines.length;
                 }
               } catch {
                 // Fall back to computed value
               }
-              recordReadSession(inputPath, process.cwd(), readOffset, -1, totalFileLines, "read");
+              recordReadSession(inputPath, toolCwd, readOffset, -1, totalFileLines, "read");
             } else {
-              recordReadSession(inputPath, process.cwd(), readOffset, explicitLimit, lines.length + readOffset - 1, "read");
+              recordReadSession(inputPath, toolCwd, readOffset, explicitLimit, lines.length + readOffset - 1, "read");
             }
             return;
           }
@@ -1213,7 +256,7 @@ export default function smartEdit(pi: ExtensionAPI) {
           // We record as partial so the stale check only verifies mtime.
           let isTruncated = false;
           try {
-            const resolvedPath = resolve(process.cwd(), inputPath);
+            const resolvedPath = resolve(toolCwd, inputPath);
             const fileStat = statSync(resolvedPath);
             if (fileStat.size > fullText.length) {
               isTruncated = true;
@@ -1227,10 +270,10 @@ export default function smartEdit(pi: ExtensionAPI) {
           const hashline = smartEditRuntimeConfig.useHashlineEditing
             ? await buildHashlineAnchors(lines)
             : undefined;
-          recordRead(inputPath, process.cwd(), fullText, isTruncated, hashline);
+          recordRead(inputPath, toolCwd, fullText, isTruncated, hashline);
 
           // Track read range for coverage validation
-          recordReadSession(inputPath, process.cwd(), 1, -1, lines.length, "read");
+          recordReadSession(inputPath, toolCwd, 1, -1, lines.length, "read");
         }
       } catch {
         /* silently ignore cache population errors */
@@ -1266,7 +309,7 @@ export default function smartEdit(pi: ExtensionAPI) {
             if ('ok' in file && file.ok === false) continue;
 
             try {
-              const resolvedPath = resolve(process.cwd(), file.path);
+              const resolvedPath = resolve(toolCwd, file.path);
               const content = (await fsReadFile(resolvedPath)).toString("utf-8");
               if (content) {
                 const inputInfo = inputMap.get(file.path);
@@ -1275,12 +318,12 @@ export default function smartEdit(pi: ExtensionAPI) {
                 const hashline = smartEditRuntimeConfig.useHashlineEditing
                   ? await buildHashlineAnchors(lines)
                   : undefined;
-                recordRead(file.path, process.cwd(), content, isPartial, hashline);
+                recordRead(file.path, toolCwd, content, isPartial, hashline);
 
                 // Track read range for coverage validation
                 const readOffset = inputInfo?.offset ?? 1;
                 const readLimit = inputInfo?.limit ?? -1;
-                recordReadSession(file.path, process.cwd(), readOffset, readLimit, lines.length, "read_files");
+                recordReadSession(file.path, toolCwd, readOffset, readLimit, lines.length, "read_files");
               }
             } catch {
               // File may not exist or can't be read — skip silently
@@ -1308,7 +351,7 @@ export default function smartEdit(pi: ExtensionAPI) {
             if (!file.ok) continue;
 
             try {
-              const resolvedPath = resolve(process.cwd(), file.path);
+              const resolvedPath = resolve(toolCwd, file.path);
               const content = (await fsReadFile(resolvedPath)).toString("utf-8");
               if (content) {
                 // Mark as partial if the file wasn't fully included in output
@@ -1319,11 +362,11 @@ export default function smartEdit(pi: ExtensionAPI) {
                 const hashline = smartEditRuntimeConfig.useHashlineEditing
                   ? await buildHashlineAnchors(lines)
                   : undefined;
-                recordRead(file.path, process.cwd(), content, isPartial, hashline);
+                recordRead(file.path, toolCwd, content, isPartial, hashline);
 
                 // Track read range for coverage validation
                 // intent_read reads full files, so offset=1, limit=-1 (full file)
-                recordReadSession(file.path, process.cwd(), 1, -1, lines.length, "intent_read");
+                recordReadSession(file.path, toolCwd, 1, -1, lines.length, "intent_read");
               }
             } catch {
               // File may not exist or can't be read — skip silently
@@ -1344,14 +387,14 @@ export default function smartEdit(pi: ExtensionAPI) {
     ) {
       try {
         // Read the file from disk to get what was actually written
-        const resolvedPath = resolve(process.cwd(), writePath);
+        const resolvedPath = resolve(toolCwd, writePath);
         const content = (await fsReadFile(resolvedPath)).toString("utf-8");
         if (content) {
-          recordRead(writePath, process.cwd(), content);
+          recordRead(writePath, toolCwd, content);
 
           // Track write as a read (write-then-edit flow bypasses stale guard)
           const lines = content.split("\n");
-          recordReadSession(writePath, process.cwd(), 1, -1, lines.length, "write");
+          recordReadSession(writePath, toolCwd, 1, -1, lines.length, "write");
 
           // ── Auto-validation hook (SmallCode-inspired) ──
           // After a write, run structural + compiler/linter validation.
@@ -1365,7 +408,7 @@ export default function smartEdit(pi: ExtensionAPI) {
           // rather than a blocking response. See formatValidationFeedback for the
           // shape of validation feedback that gets attached to the event object.
           runAutoValidation(writePath, content, {
-            cwd: process.cwd(),
+            cwd: toolCwd,
             maxRetries: 3,
             enabled: true,
           }).then((validationResult) => {
@@ -1390,6 +433,7 @@ export default function smartEdit(pi: ExtensionAPI) {
 
   // ── Initialize per-session state ──
   pi.on("session_start", async (_event, _ctx) => {
+    const sessionCwd = process.cwd();
     // Create AST resolver (returns null if Tree-sitter unavailable)
     astResolver = createAstResolver();
 
@@ -1397,7 +441,7 @@ export default function smartEdit(pi: ExtensionAPI) {
     conflictDetector = createConflictDetector(defaultConflictConfig, () => astResolver);
 
     // Create LSP manager for semantic intelligence
-    lspManager = new LSPManager(process.cwd());
+    lspManager = new LSPManager(sessionCwd);
 
     // Clear conflict history and retry counts on session start
     if (conflictDetector) {
@@ -1451,7 +495,7 @@ export default function smartEdit(pi: ExtensionAPI) {
       // Save original edits string for streaming (before prepareArguments converts it)
       const rawEditsString = typeof input.edits === "string" ? input.edits : undefined;
 
-      input = await prepareArguments(input) || input;
+      input = prepareArguments(input, smartEditRuntimeConfig.useHashlineEditing) || input;
 
       // ── Streaming patch preview ───────────────────────────────
       // When onUpdate is provided and the edits were originally a codex_patch
@@ -1477,8 +521,21 @@ export default function smartEdit(pi: ExtensionAPI) {
         if (extraIdx !== -1) {
           try {
             extraData = JSON.parse(Buffer.from(input.path.slice(extraIdx + 17).replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf-8")) as Record<string, unknown> | null;
-          } catch {}
-          input.path = input.path.slice(0, extraIdx);
+          // Validate decoded extraData shape before use
+          if (extraData && typeof extraData === 'object' && !Array.isArray(extraData)) {
+            const ed = extraData as Record<string, unknown>;
+            if (ed.replaceAllFlags != null && (!Array.isArray(ed.replaceAllFlags) || !ed.replaceAllFlags.every(f => typeof f === 'boolean'))) {
+              extraData = null;
+            }
+            if (ed.targetData != null && (!Array.isArray(ed.targetData) || !ed.targetData.every(t => t == null || (typeof t === 'object' && !Array.isArray(t))))) {
+              extraData = null;
+            }
+            if (ed.hashlineData != null && (!Array.isArray(ed.hashlineData) || !ed.hashlineData.every(h => h == null || (typeof h === 'object' && !Array.isArray(h))))) {
+              extraData = null;
+            }
+          }
+        } catch {}
+        input.path = input.path.slice(0, extraIdx);
         }
       }
 
@@ -1486,7 +543,7 @@ export default function smartEdit(pi: ExtensionAPI) {
 
       // Resolve path
       const cwd = process.cwd();
-      const absolutePath = resolve(cwd, path);
+      const absolutePath = resolveWorkspacePath(cwd, path);
 
       // Check if aborted
       if (signal?.aborted) {
@@ -1517,16 +574,30 @@ export default function smartEdit(pi: ExtensionAPI) {
 
           if (aborted) throw new Error("Operation aborted");
 
-          // ── Stale file check (checkStale handles its own APFS retry + zero-read) ──
-          const staleError = await checkStale(path, cwd);
-          if (staleError) {
-            if (signal) signal.removeEventListener("abort", onAbort);
-            throw new Error(staleError);
-          }
-
           // Read the file
           const buffer = await fsReadFile(absolutePath);
           const rawContent = buffer.toString("utf-8");
+          const { bom, text: content } = stripBom(rawContent);
+          const originalEnding = detectLineEnding(content);
+          let normalizedContent = normalizeToLF(content);
+
+          const localFlags = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).replaceAllFlags as unknown[] ?? null : null;
+          const localTargets = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).targetData as unknown[] ?? null : null;
+          const localHashlines = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).hashlineData as unknown[] ?? null : null;
+          const contextGuardCheck = await buildContextGuardCheck(normalizedContent, path, edits, localTargets, astResolver);
+          const contextGuardNotes: string[] = [];
+
+          // ── Stale file check (checkStale handles its own APFS retry + zero-read) ──
+          const staleError = await checkStale(path, cwd);
+          if (staleError) {
+            if (!contextGuardCheck.allowed) {
+              if (signal) signal.removeEventListener("abort", onAbort);
+              throw new MatchError(formatContextGuardRejection(staleError, contextGuardCheck.reason), 'STALE');
+            }
+            for (const note of contextGuardCheck.notes) {
+              if (!contextGuardNotes.includes(note)) contextGuardNotes.push(note);
+            }
+          }
 
           // ── Session read fallback ──
           // Edge case: snapshot exists (file was read) but session reads weren't
@@ -1534,11 +605,10 @@ export default function smartEdit(pi: ExtensionAPI) {
           //   - The tool_result handler didn't fire for this read
           //   - A previous reReadAfterFailure populated the snapshot without session reads
           //   - The file was injected via --context or @mention
-          // If we passed checkStale (snapshot exists) but have no session reads,
+          // If checkStale passed (snapshot exists) but there are no session reads,
           // populate them from the fresh file content so range coverage can validate.
-          // This is safe because checkStale already confirmed the file was read.
           const existingSessions = getSessionReads(path, cwd);
-          if (existingSessions.length === 0 && getSnapshot(path, cwd)) {
+          if (!staleError && existingSessions.length === 0 && getSnapshot(path, cwd)) {
             const rawLines = rawContent.split('\n');
             recordReadSession(path, cwd, 1, -1, rawLines.length, "edit_fallback");
           }
@@ -1588,7 +658,7 @@ export default function smartEdit(pi: ExtensionAPI) {
                 content: normalizeToLF(stripBom(rawContent).text),
                 filePath: path,
                 astResolver,
-                edit: { target: target as import("./lib/types").EditTarget },
+                edit: { target: target as EditTarget },
               });
               if (!range) continue;
               if (range[0] < minStart) minStart = range[0];
@@ -1602,22 +672,17 @@ export default function smartEdit(pi: ExtensionAPI) {
           if (editLineRange) {
             const coverageResult = checkRangeCoverage(path, cwd, editLineRange[0], editLineRange[1]);
             if (!coverageResult.covered) {
-              if (signal) signal.removeEventListener("abort", onAbort);
-              throw new Error(coverageResult.reason);
+              if (!contextGuardCheck.allowed) {
+                if (signal) signal.removeEventListener("abort", onAbort);
+                throw new MatchError(formatContextGuardRejection(coverageResult.reason, contextGuardCheck.reason), 'COVERAGE');
+              }
+              for (const note of contextGuardCheck.notes) {
+                if (!contextGuardNotes.includes(note)) contextGuardNotes.push(note);
+              }
             }
           }
 
           if (aborted) throw new Error("Operation aborted");
-
-          // Strip BOM for matching
-          const { bom, text: content } = stripBom(rawContent);
-          const originalEnding = detectLineEnding(content);
-          let normalizedContent = normalizeToLF(content);
-
-          // ── Re-inject replaceAll/anchor/lineRange from extracted extra data ──
-          const localFlags = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).replaceAllFlags as unknown[] ?? null : null;
-          const localTargets = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).targetData as unknown[] ?? null : null;
-          const localHashlines = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).hashlineData as unknown[] ?? null : null;
 
           // Separate hashline edits from legacy edits
           const totalLines = rawContent.split("\n").length;
@@ -1640,7 +705,7 @@ export default function smartEdit(pi: ExtensionAPI) {
               // A target with an operation field is a symbolic edit
               if (targetData.replaceBody || targetData.insertBefore || targetData.insertAfter) {
                 symbolicEdits.push({
-                  target: targetData as import("./lib/types").EditTarget,
+                  target: targetData as EditTarget,
                   editIdx: i,
                 });
               } else {
@@ -1669,7 +734,7 @@ export default function smartEdit(pi: ExtensionAPI) {
           const baseContent = normalizedContent;
 
           // ── Collect match notes and conflict warnings ──
-          const matchNotes: string[] = [];
+          const matchNotes: string[] = [...contextGuardNotes];
           const conflictWarnings: string[] = [];
           const editCapabilities = new Set<EditCapability>();
           if (hashlineEdits.length > 0) editCapabilities.add("hashline");
@@ -1717,7 +782,7 @@ export default function smartEdit(pi: ExtensionAPI) {
 
             // Build adapter for AST scope resolution
             const resolveScopeFn = async (
-              anchor: EditAnchor,
+              anchor: { symbolName?: string; symbolKind?: string; symbolLine?: number },
               content: string,
               _filePath: string,
             ) => {
@@ -1725,6 +790,7 @@ export default function smartEdit(pi: ExtensionAPI) {
                 { oldText: "", newText: "", target: { name: anchor.symbolName, kind: anchor.symbolKind, line: anchor.symbolLine } } as EditItem,
                 content,
                 path,
+                astResolver,
               );
               if (!scope) return null;
               return scope;
@@ -1842,7 +908,7 @@ export default function smartEdit(pi: ExtensionAPI) {
             const resolvedScopes: (SearchScope | undefined)[] = [];
             for (const { edit } of legacyEdits) {
               if (edit.target) {
-                const scope = await resolveAnchorToScope(edit, normalizedContent, path);
+                const scope = await resolveAnchorToScope(edit, normalizedContent, path, astResolver);
                 resolvedScopes.push(scope ?? undefined);
               } else {
                 resolvedScopes.push(undefined);
@@ -1931,7 +997,9 @@ export default function smartEdit(pi: ExtensionAPI) {
           }
 
           // ── Save undo state before write (non-blocking, fire-and-forget) ──
-          saveUndoState(cwd, absolutePath, baseContent, edits.length).catch(() => {});
+          saveUndoState(cwd, absolutePath, baseContent, edits.length).catch((undoErr: unknown) => {
+            console.warn("saveUndoState failed:", undoErr instanceof Error ? undoErr.message : String(undoErr));
+          });
 
           // Atomic write
           await atomicWrite(absolutePath, finalContent);
@@ -2204,21 +1272,24 @@ export default function smartEdit(pi: ExtensionAPI) {
           // feedback so the model receives the full picture.
           if (deferralController) {
             const languageId = detectLanguageFromExtension(path) ?? "unknown";
-            const lspServer = await lspManager!.getServer(languageId);
+            const lspServer = await lspManager?.getServer(languageId);
+            const controller = deferralController;
 
             await new Promise<void>((promiseResolve) => {
               let didResolve = false;
-              let unsub: (() => void) | undefined;
+              const subscription: { unsubscribe?: () => void } = {};
 
               function done() {
                 if (didResolve) return;
                 didResolve = true;
                 clearTimeout(timer);
-                unsub?.();
+                subscription.unsubscribe?.();
                 promiseResolve();
               }
 
-              const timer = setTimeout(() => done(), 2000);
+              const timer = setTimeout(() => {
+                done();
+              }, 2000);
               timer.unref();
 
               if (!lspServer) {
@@ -2227,7 +1298,7 @@ export default function smartEdit(pi: ExtensionAPI) {
               }
 
               const uri = `file://${resolve(absolutePath)}`;
-              unsub = lspServer.onNotification?.(
+              subscription.unsubscribe = lspServer.onNotification?.(
                 "textDocument/publishDiagnostics",
                 (params: unknown) => {
                   const p = params as {
@@ -2266,7 +1337,9 @@ export default function smartEdit(pi: ExtensionAPI) {
               );
 
               // Clean up listener when controller is aborted or timer fires
-              deferralController!.signal.addEventListener("abort", () => done());
+              controller.signal.addEventListener("abort", () => {
+                done();
+              });
             });
 
             // Flush any deferred diagnostics and append to result
@@ -2363,12 +1436,8 @@ export default function smartEdit(pi: ExtensionAPI) {
             // re-read the file from disk and include current content in the error.
             // This gives the user immediate context for retrying the edit.
             const isMatchFailure =
-              err.message.includes("not found") ||
-              err.message.includes("No matches") ||
-              err.message.includes("has been modified") ||
-              err.message.includes("not been read") ||
-              err.message.includes("unique") ||
-              err.message.includes("ambiguous");
+              err instanceof MatchError ||
+              err instanceof HashlineMismatchError;
 
             if (isMatchFailure) {
               const enhancedError = await reReadAfterFailure(
@@ -2377,14 +1446,15 @@ export default function smartEdit(pi: ExtensionAPI) {
                 cwd,
                 edits,
                 err,
+                smartEditRuntimeConfig.useHashlineEditing,
               );
 
               // Multi-file fallback hint: check if oldText exists in other session-read files.
               // Only for match-not-found errors (not stale-file, range-coverage, or ambiguity).
               if (
-                err.message.includes("Could not find") ||
-                err.message.includes("No matches")
-              ) {
+              err instanceof MatchError &&
+              (err.code === "NOT_FOUND")
+            ) {
                 const multiFileHint = await buildMultiFileFallbackHint(
                   absolutePath,
                   edits,

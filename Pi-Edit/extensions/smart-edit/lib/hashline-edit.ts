@@ -15,6 +15,7 @@ import {
 } from "./hashline";
 
 import type { EditAnchor, FileSnapshot } from "./types";
+import { SmartEditError } from "./errors";
 
 /**
  * A parsed LINE+ID anchor (e.g., "42ab" → line=42, hash="ab").
@@ -801,7 +802,7 @@ function applySingleEdit(
  * Formatted error thrown when hashline anchors don't match the file content.
  * Contains both a user-facing message (for the model) and a CLI-facing message.
  */
-export class HashlineMismatchError extends Error {
+export class HashlineMismatchError extends SmartEditError {
   /** Mismatched anchor details */
   readonly mismatches: HashMismatch[];
 
@@ -819,18 +820,14 @@ export class HashlineMismatchError extends Error {
     fileLines: string[],
     ambiguous = false,
   ) {
-    super();
+    const modelMessage = buildModelMessage(mismatches, fileLines, ambiguous);
+    const cliMessage = buildCliMessage(mismatches, fileLines, ambiguous);
+    super(modelMessage, 'HASHLINE_MISMATCH');
+    this.name = "HashlineMismatchError";
     this.mismatches = mismatches;
     this.ambiguous = ambiguous;
-    this.name = "HashlineMismatchError";
-
-    // Build CLI message
-    this.cliMessage = buildCliMessage(mismatches, fileLines, ambiguous);
-
-    // Build model message (LLM-friendly)
-    this.modelMessage = buildModelMessage(mismatches, fileLines, ambiguous);
-
-    this.message = this.modelMessage; // Error.message shows the model-friendly version
+    this.modelMessage = modelMessage;
+    this.cliMessage = cliMessage;
   }
 }
 

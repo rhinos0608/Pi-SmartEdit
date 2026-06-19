@@ -23,6 +23,7 @@ import { MatchTier } from "./types";
 import { access, readFile } from "fs/promises";
 import { constants } from "fs";
 import { resolveToCwd } from "./path-utils";
+import { MatchError } from "./errors";
 
 // ─── Configuration constants ────────────────────────────────────────
 
@@ -757,11 +758,8 @@ export function findTextWithTelemetry(
   let tierStart = performance.now();
   let exactIndex = -1;
   if (searchScope) {
-    // searchScope is present: searchContent is sliced [searchStart, searchEnd).
-    // Use indexOf without explicit start offset (searches from position 0 of searchContent).
-    // The global index = searchStart + local position within searchContent.
-    const localIndex = searchContent.indexOf(oldText);
-    if (localIndex !== -1) exactIndex = searchStart + localIndex;
+    const scopedIndex = originalContent.indexOf(oldText, searchStart);
+    if (scopedIndex !== -1 && scopedIndex < searchEnd) exactIndex = scopedIndex;
   } else {
     // No searchScope: search from searchStart position in originalContent.
     exactIndex = searchContent.indexOf(oldText, searchStart);
@@ -1390,14 +1388,16 @@ function countSimilarityOccurrences(
           count++;
           if (count >= 2) return { count, bestScore, secondBestScore };
         }
-      } else {
-        // Track scores for dominant-fuzzy check
-        if (score > bestScore) {
-          secondBestScore = bestScore;
-          bestScore = score;
-        } else if (score > secondBestScore) {
-          secondBestScore = score;
-        }
+      }
+
+      // Track best/second-best scores for dominant-fuzzy auto-accept
+      // Must run for ALL scores (including ≥threshold) so early-exit returns
+      // valid bestScore/secondBestScore, not stale sub-threshold values.
+      if (score > bestScore) {
+        secondBestScore = bestScore;
+        bestScore = score;
+      } else if (score > secondBestScore) {
+        secondBestScore = score;
       }
     }
   }
@@ -1499,6 +1499,10 @@ function lineSimilarity(linesA: string[], linesB: string[]): number {
 
   // Weighted combination
   return lineRatio * 0.4 + charRatio * 0.6;
+}
+
+export function textSimilarityRatio(a: string, b: string): number {
+  return levenshteinRatio(normalizeForFuzzyMatch(a), normalizeForFuzzyMatch(b));
 }
 
 function levenshteinRatio(a: string, b: string): number {
@@ -1621,7 +1625,7 @@ function getNotFoundError(
   diagnostic?: ClosestMatchDiagnostic | null,
   description?: string,
   allowFuzzy?: boolean,
-): Error {
+): MatchError {
   let msg: string;
   const desc = description ? ` (${description})` : "";
 
@@ -1639,7 +1643,7 @@ function getNotFoundError(
     msg += fuzzyHint;
   }
 
-  return new Error(msg);
+  return new MatchError(msg, 'NOT_FOUND', editIndex);
 }
 
 function getAmbiguousError(
@@ -1649,7 +1653,7 @@ function getAmbiguousError(
   occurrences: number,
   lineIndices?: number[],
   description?: string,
-): Error {
+): MatchError {
   const desc = description ? ` (${description})` : "";
   let lineInfo = "";
   if (lineIndices && lineIndices.length > 0) {
@@ -1659,18 +1663,15 @@ function getAmbiguousError(
   } else {
     lineInfo = ` Found ${occurrences} occurrences.`;
   }
-  if (totalEdits === 1) {
-    return new Error(
-      `Could not find unique text${desc} in ${path}.${lineInfo}` +
-      ` Please provide more surrounding context to make it unique, ` +
-      `or use replaceAll: true if you intend to replace all occurrences.`,
-    );
-  }
-  return new Error(
-    `Could not find unique text for edits[${editIndex}]${desc} in ${path}.${lineInfo}` +
-    ` Each oldText must be unique. Please provide more surrounding context to make it unique, ` +
-    `or use replaceAll: true if you intend to replace all occurrences.`,
-  );
+  const msg =
+    totalEdits === 1
+      ? `Could not find unique text${desc} in ${path}.${lineInfo}` +
+        ` Please provide more surrounding context to make it unique, ` +
+        `or use replaceAll: true if you intend to replace all occurrences.`
+      : `Could not find unique text for edits[${editIndex}]${desc} in ${path}.${lineInfo}` +
+        ` Each oldText must be unique. Please provide more surrounding context to make it unique, ` +
+        `or use replaceAll: true if you intend to replace all occurrences.`;
+  return new MatchError(msg, 'AMBIGUOUS', editIndex);
 }
 
 function getEmptyOldTextError(
@@ -1728,6 +1729,7 @@ export interface ApplyEditsOptions {
     content: string,
     filePath: string,
   ) => Promise<SearchScope | null> | SearchScope | null;
+
 }
 
 // ─── Line-range helpers ─────────────────────────────────────────
@@ -1885,10 +1887,8 @@ export async function applyEdits(
   if (options?.searchScopes || options?.onResolveAnchor) {
     for (let i = 0; i < normalizedEdits.length; i++) {
       if (options?.searchScopes?.[i]) {
-        // Pre-computed scope takes priority
         searchScopes.push(options.searchScopes[i]);
       } else if (options?.onResolveAnchor) {
-        // Ask the caller to resolve anchor/lineRange to a scope
         const scope = await options.onResolveAnchor(
           normalizedEdits[i],
           normalizedContent,
@@ -1931,14 +1931,14 @@ export async function applyEdits(
     // but the file has it after oldText, include the trailing newline in the match.
     // This prevents leaving an orphan blank line.
     if (
-      edit.newText.length === 0 &&
-      edit.oldText.length > 0 &&
-      !edit.oldText.endsWith("\n")
-    ) {
-      // Check if the file has oldText followed by \n
-      const withNewline = edit.oldText + "\n";
-      if (normalizedContent.includes(withNewline)) {
-        edit.oldText = withNewline;
+        edit.newText.length === 0 &&
+        edit.oldText.length > 0 &&
+        !edit.oldText.endsWith("\n")
+      ) {
+        // Check if the file has oldText followed by \n
+        const withNewline = edit.oldText + "\n";
+        if (normalizedContent.includes(withNewline)) {
+          edit = { ...edit, oldText: withNewline };
       }
     }
 
