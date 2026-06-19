@@ -38,6 +38,10 @@ export interface RepairResult {
  */
 export type KnownSchema = Record<string, string[]>;
 
+function parseJson(input: string): unknown {
+  return JSON.parse(input) as unknown;
+}
+
 // ─── Strategy implementations ────────────────────────────────────────
 
 /**
@@ -129,22 +133,21 @@ export function repairJson(
   knownSchema?: KnownSchema,
 ): RepairResult {
   const renames: Record<string, string> = {};
-  let fuzzyApplied = false;
 
   // Strip BOM at the start
   const input = raw.replace(/^\uFEFF/, '');
 
   // Strategy 1: As-is
   try {
-    const value = JSON.parse(input);
+    const value = parseJson(input);
     return { value: applyFuzzyKeys(value, knownSchema, renames), strategy: 0, fuzzyKeysApplied: Object.keys(renames).length > 0, fuzzyRenames: renames };
   } catch { /* fall through */ }
 
   // Strategy 2: Fix trailing comma before } or ]
   try {
-    const fixed = raw.replace(/,\s*([}\]])/g, "$1");
-    if (fixed !== raw) {
-      const value = JSON.parse(fixed);
+    const fixed = input.replace(/,\s*([}\]])/g, "$1");
+    if (fixed !== input) {
+      const value = parseJson(fixed);
       return { value: applyFuzzyKeys(value, knownSchema, renames), strategy: 2, fuzzyKeysApplied: Object.keys(renames).length > 0, fuzzyRenames: renames };
     }
   } catch { /* fall through */ }
@@ -153,23 +156,23 @@ export function repairJson(
   const trimmed = raw.trim();
   if (trimmed.length > 0 && !trimmed.startsWith("{") && !trimmed.startsWith("[")) {
     try {
-      const value = JSON.parse("{" + trimmed + "}");
+      const value = parseJson("{" + trimmed + "}");
       return { value: applyFuzzyKeys(value, knownSchema, renames), strategy: 3, fuzzyKeysApplied: Object.keys(renames).length > 0, fuzzyRenames: renames };
     } catch { /* fall through */ }
     try {
-      const value = JSON.parse("[" + trimmed + "]");
+      const value = parseJson("[" + trimmed + "]");
       return { value: applyFuzzyKeys(value, knownSchema, renames), strategy: 3, fuzzyKeysApplied: Object.keys(renames).length > 0, fuzzyRenames: renames };
     } catch { /* fall through */ }
   }
 
   // Strategy 4: Strip markdown code fences
-  let cleaned = trimmed
+  const cleaned = trimmed
     .replace(/^```(?:json)?\s*\n?/i, "")
     .replace(/\n?```\s*$/, "")
     .trim();
   if (cleaned !== trimmed) {
     try {
-      const value = JSON.parse(cleaned);
+      const value = parseJson(cleaned);
       return { value: applyFuzzyKeys(value, knownSchema, renames), strategy: 4, fuzzyKeysApplied: Object.keys(renames).length > 0, fuzzyRenames: renames };
     } catch { /* fall through */ }
   }
@@ -180,14 +183,14 @@ export function repairJson(
   const arrMatch = trimmed.match(/(\[[\s\S]*\])/);
   if (arrMatch) {
     try {
-      const value = JSON.parse(arrMatch[1]);
+      const value = parseJson(arrMatch[1]);
       return { value: applyFuzzyKeys(value, knownSchema, renames), strategy: 5, fuzzyKeysApplied: Object.keys(renames).length > 0, fuzzyRenames: renames };
     } catch { /* fall through */ }
   }
   const objMatch = trimmed.match(/(\{[\s\S]*\})/);
   if (objMatch) {
     try {
-      const value = JSON.parse(objMatch[1]);
+      const value = parseJson(objMatch[1]);
       return { value: applyFuzzyKeys(value, knownSchema, renames), strategy: 5, fuzzyKeysApplied: Object.keys(renames).length > 0, fuzzyRenames: renames };
     } catch { /* fall through */ }
   }
@@ -204,7 +207,7 @@ export function repairJson(
       },
     );
     if (repaired !== trimmed) {
-      const value = JSON.parse(repaired);
+      const value = parseJson(repaired);
       return { value: applyFuzzyKeys(value, knownSchema, renames), strategy: 6, fuzzyKeysApplied: Object.keys(renames).length > 0, fuzzyRenames: renames };
     }
   } catch { /* fall through */ }
@@ -235,7 +238,7 @@ export function repairJson(
   }
   if (mustClose.length > 0) {
     try {
-      const value = JSON.parse(trimmed + mustClose.reverse().join(""));
+      const value = parseJson(trimmed + mustClose.reverse().join(""));
       return { value: applyFuzzyKeys(value, knownSchema, renames), strategy: 7, fuzzyKeysApplied: Object.keys(renames).length > 0, fuzzyRenames: renames };
     } catch { /* fall through */ }
   }

@@ -18,8 +18,9 @@ import {
   rmdir as fsRmdir,
 } from "fs/promises";
 import { resolve as pathResolve, dirname, join } from "path";
-import { createHash } from "crypto";
 import { randomBytes } from "crypto";
+
+import { fastHash } from "../../lib/types";
 
 import { atomicWrite } from "./atomic-write";
 import type { AtomicWriteOptions } from "./atomic-write";
@@ -59,10 +60,6 @@ export interface DecodedUndoEntry extends Omit<UndoEntry, "originalContent"> {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────
-
-function fastHash(content: string): string {
-  return createHash("sha256").update(content).digest("hex").slice(0, 16);
-}
 
 function getUndoDir(cwd: string): string {
   return pathResolve(cwd, UNDO_DIR);

@@ -22,7 +22,6 @@ node_modules/
 # Build outputs
 dist/
 build/
-lib/
 
 # Test coverage reports
 coverage/

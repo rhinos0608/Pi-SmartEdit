@@ -3,7 +3,9 @@ import assert from "node:assert";
 import { clearCache, checkRangeCoverage, recordReadSession } from "../lib/read-cache";
 
 describe("checkRangeCoverage read summary", () => {
-  beforeEach(() => clearCache());
+  beforeEach(() => {
+    clearCache();
+  });
 
   it("lists every recorded read span when coverage is incomplete", () => {
     const cwd = process.cwd();
