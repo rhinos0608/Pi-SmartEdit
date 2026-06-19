@@ -87,9 +87,10 @@ function safeSpawnAsync(
   args: string[],
   options: { cwd?: string; timeout?: number }
 ): Promise<{ stdout: string; stderr: string; status: number | null }> {
+  const maxOutputChars = 100_000;
   return new Promise((resolve) => {
-    const stdout: string[] = [];
-    const stderr: string[] = [];
+    let stdout = "";
+    let stderr = "";
     const child = spawn(command, args, {
       cwd: options.cwd,
       stdio: ["ignore", "pipe", "pipe"],
@@ -106,21 +107,21 @@ function safeSpawnAsync(
     }
 
     if (child.stdout) {
-      child.stdout.on("data", (data: unknown) => {
-        stdout.push(String(data));
+      child.stdout.on("data", (data: Buffer) => {
+        stdout = appendBounded(stdout, data.toString(), maxOutputChars);
       });
     }
     if (child.stderr) {
-      child.stderr.on("data", (data: unknown) => {
-        stderr.push(String(data));
+      child.stderr.on("data", (data: Buffer) => {
+        stderr = appendBounded(stderr, data.toString(), maxOutputChars);
       });
     }
 
     child.on("close", (code: number | null) => {
       if (timeoutId) clearTimeout(timeoutId);
       resolve({
-        stdout: stdout.join(""),
-        stderr: stderr.join(""),
+        stdout,
+        stderr,
         status: timedOut ? -1 : code,
       });
     });
@@ -128,12 +129,17 @@ function safeSpawnAsync(
     child.on("error", () => {
       if (timeoutId) clearTimeout(timeoutId);
       resolve({
-        stdout: stdout.join(""),
-        stderr: stderr.join(""),
+        stdout,
+        stderr,
         status: -1,
       });
     });
   });
+}
+
+function appendBounded(current: string, chunk: string, maxChars: number): string {
+  if (current.length >= maxChars) return current;
+  return (current + chunk).slice(0, maxChars);
 }
 
 async function findAncestorDirWithFile(

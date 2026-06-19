@@ -10,6 +10,10 @@ export type { LSPRequest, LSPResponse, LSPNotification } from "./lsp-connection"
 
 // LSP Manager (server lifecycle)
 export { LSPManager } from "./lsp-manager";
+export type { LSPServerHealth, LSPManagerOptions } from "./lsp-manager";
+
+// Document sync
+export { withOpenDocument } from "./document-sync";
 
 // Diagnostics (post-edit checking)
 export { checkPostEditDiagnostics } from "./diagnostics";
@@ -17,7 +21,7 @@ export type { Diagnostic, DiagnosticResult } from "./diagnostics";
 
 // Semantic navigation
 export {
-  goToDefinition,
+  goToDefinitions,
   findReferences,
   getHoverInfo,
 } from "./semantic-nav";

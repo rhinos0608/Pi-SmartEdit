@@ -46,11 +46,13 @@ export class LSPConnection {
   private messageId = 0;
   private pending = new Map<number, PendingCallback>();
   private buffer = "";
+  private bufferLimit = 50 * 1024 * 1024; // 50MB max buffer before truncation
   private notificationHandlers = new Map<string, Array<(params: unknown) => void>>();
   private closed = false;
   private exitCode: number | null = null;
   private exitSignal: NodeJS.Signals | null = null;
   public serverCapabilities: unknown;
+  private cleanupHandlers: Array<() => void> = [];
 
   /**
    * Create a new LSP connection by spawning a server process.
@@ -64,31 +66,39 @@ export class LSPConnection {
     });
 
     // Handle stdout — parse Content-Length headers and dispatch JSON messages
-    this.process.stdout?.on("data", (chunk: Buffer) => {
-      this.onData(chunk);
-    });
+    const onStdout = (chunk: Buffer) => { this.onData(chunk); };
+    this.process.stdout?.on("data", onStdout);
 
     // Handle stderr separately (log but don't process as LSP messages)
-    this.process.stderr?.on("data", (_chunk: Buffer) => {
+    const onStderr = (_chunk: Buffer) => {
       // LSP servers write diagnostics and logs to stderr
       // We only log at debug level to avoid noise
-    });
+    };
+    this.process.stderr?.on("data", onStderr);
+
+    // Suppress EPIPE errors on stdin — may fire if server closes stdin
+    // before we finish writing. EPIPE after shutdown is handled separately.
+    this.process.stdin?.on("error", () => {});
 
     // Handle process exit
-    this.process.on("exit", (code, signal) => {
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
       this.closed = true;
       this.exitCode = code;
       this.exitSignal = signal;
-      const err = new Error(`LSP server exited: code=${code} signal=${signal}`);
+      const reason = signal
+        ? `LSP server killed by ${signal}`
+        : `LSP server exited unexpectedly (code=${code})`;
+      const err = new Error(reason);
       for (const [, cb] of this.pending) {
-        if (code === 0) cb.resolve(null);
-        else cb.reject(err);
+        if (cb.timer) clearTimeout(cb.timer);
+        cb.reject(err);
       }
       this.pending.clear();
       this.notificationHandlers.clear();
-    });
+    };
+    this.process.on("exit", onExit);
 
-    this.process.on("error", (err) => {
+    const onError = (err: Error) => {
       this.closed = true;
       // Process spawn failed — reject all pending requests
       for (const [, cb] of this.pending) {
@@ -96,6 +106,14 @@ export class LSPConnection {
       }
       this.pending.clear();
       this.notificationHandlers.clear();
+    };
+    this.process.on("error", onError);
+
+    this.cleanupHandlers.push(() => {
+      this.process.stdout?.removeListener("data", onStdout);
+      this.process.stderr?.removeListener("data", onStderr);
+      this.process.removeListener("exit", onExit);
+      this.process.removeListener("error", onError);
     });
 
     // Allow Node event loop to exit even if this child is still running
@@ -104,6 +122,10 @@ export class LSPConnection {
 
   isRunning(): boolean {
     return !this.closed;
+  }
+
+  getBufferSize(): number {
+    return this.buffer.length;
   }
 
   getExitState(): { code: number | null; signal: NodeJS.Signals | null } | null {
@@ -270,6 +292,9 @@ export class LSPConnection {
     this.closed = true;
     this.pending.clear();
     this.notificationHandlers.clear();
+    for (const cleanup of this.cleanupHandlers) { cleanup(); }
+    this.cleanupHandlers = [];
+    this.buffer = "";
   }
 
   private write(msg: object): void {
@@ -284,7 +309,29 @@ export class LSPConnection {
    * Handles concatenated messages in a single chunk.
    */
   private onData(chunk: Buffer): void {
-    this.buffer += chunk.toString();
+    const appended = this.buffer + chunk.toString();
+    if (appended.length > this.bufferLimit) {
+      // Overflow: reject any in-flight requests with a clear cause so callers
+      // don't just hit a 5s timeout. Malformed/oversized message framing can
+      // cause this — closing the connection is the only safe recovery.
+      const err = new Error(
+        `LSP receive buffer exceeded ${this.bufferLimit} bytes; aborting connection`
+      );
+      for (const [id, cb] of this.pending) {
+        if (cb.timer) clearTimeout(cb.timer);
+        cb.reject(err);
+      }
+      this.pending.clear();
+      this.notificationHandlers.clear();
+      this.buffer = "";
+      this.closed = true; // Mark closed BEFORE kill so request()/notify() reject immediately
+      for (const cleanup of this.cleanupHandlers) { cleanup(); }
+      this.cleanupHandlers = [];
+      // Force-close so we don't keep accumulating on a broken stream.
+      try { this.process.kill(); } catch { /* already dead */ }
+      return;
+    }
+    this.buffer = appended;
 
     while (this.buffer.length > 0) {
       // Check for Content-Length header
@@ -299,17 +346,19 @@ export class LSPConnection {
       }
 
       const contentLength = parseInt(headerMatch[1], 10);
-      const headerEnd =
-        (headerMatch.index ?? 0) + headerMatch[0].length + "\r\n".length;
+      const headerStart = headerMatch.index ?? 0;
+      const headerEnd = this.buffer.indexOf("\r\n\r\n", headerStart);
+      if (headerEnd === -1) break;
+      const bodyStart = headerEnd + "\r\n\r\n".length;
 
-      if (this.buffer.length < headerEnd + contentLength) {
+      if (this.buffer.length < bodyStart + contentLength) {
         // Don't have the full body yet — wait for more data
         break;
       }
 
       // Extract the JSON body
-      const body = this.buffer.slice(headerEnd, headerEnd + contentLength);
-      this.buffer = this.buffer.slice(headerEnd + contentLength);
+      const body = this.buffer.slice(bodyStart, bodyStart + contentLength);
+      this.buffer = this.buffer.slice(bodyStart + contentLength);
 
       try {
         const message = JSON.parse(body) as { id?: number; error?: unknown; result?: unknown; method?: string; params?: unknown };
@@ -341,7 +390,11 @@ export class LSPConnection {
           const handlers = this.notificationHandlers.get(message.method);
           if (handlers) {
             for (const handler of handlers) {
-              handler(message.params);
+              try {
+                handler(message.params);
+              } catch (err) {
+                console.warn(`[LSP] notification handler for "${message.method}" threw:`, err);
+              }
             }
           }
         }

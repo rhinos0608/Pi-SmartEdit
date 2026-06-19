@@ -100,10 +100,10 @@ export class DeferredDiagnosticCollector {
    * @returns List of collected diagnostics, oldest first
    */
   flush(path: string): DeferredDiagnostic[] {
-    const pending = this.pending.get(path) ?? [];
+    const result = [...(this.pending.get(path) ?? [])];
     this.pending.delete(path);
     this.sentinels.delete(path);
-    return pending;
+    return result;
   }
 
   /**

@@ -335,7 +335,7 @@ export async function findReferences(
     });
 
     if (!response) return [];
-    return response as Location[];
+    return normalizeLocations(response).map(r => r.location);
   } catch {
     return [];
   }

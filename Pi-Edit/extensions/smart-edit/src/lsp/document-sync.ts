@@ -10,16 +10,27 @@
 
 interface OpenDocumentConnection {
   notify(method: string, params?: unknown): Promise<void>;
+  request?(method: string, params?: unknown): Promise<unknown>;
 }
 
-// In-memory locks per document URI to serialize operations
-const locks = new Map<string, Promise<void>>();
+interface ConnectionState {
+  locks: Map<string, Promise<void>>;
+  versions: Map<string, number>;
+  openDocuments: Set<string>;
+}
 
-// Monotonic versioning per URI as required by LSP didOpen/didChange
-const versions = new Map<string, number>();
+// Per-server state to prevent cross-connection leaks (e.g. tsserver vs pyright).
+// WeakMap so connections can be GC'd; .delete(server) is also safe.
+const states = new WeakMap<OpenDocumentConnection, ConnectionState>();
 
-// Track which documents this helper has currently opened
-const openDocuments = new Set<string>();
+function stateFor(server: OpenDocumentConnection): ConnectionState {
+  let s = states.get(server);
+  if (!s) {
+    s = { locks: new Map(), versions: new Map(), openDocuments: new Set() };
+    states.set(server, s);
+  }
+  return s;
+}
 
 /**
  * Execute a function within the context of an open LSP document.
@@ -42,24 +53,25 @@ export async function withOpenDocument<T>(
   fn: () => Promise<T>,
 ): Promise<T> {
   const { uri, languageId, content } = input;
+  const state = stateFor(server);
 
   // 1. Serialization per URI
-  const prevLock = locks.get(uri) || Promise.resolve();
+  const prevLock = state.locks.get(uri) || Promise.resolve();
   let resolveLock: () => void = () => {};
   const nextLock = new Promise<void>((resolve) => {
     resolveLock = resolve;
   });
-  locks.set(uri, nextLock);
+  state.locks.set(uri, nextLock);
 
   try {
     await prevLock;
 
     // 2. Incremental versioning
-    const version = (versions.get(uri) || 0) + 1;
-    versions.set(uri, version);
+    const version = (state.versions.get(uri) || 0) + 1;
+    state.versions.set(uri, version);
 
     // 3. Open if needed
-    const needsOpen = !openDocuments.has(uri);
+    const needsOpen = !state.openDocuments.has(uri);
     if (needsOpen) {
       await server.notify("textDocument/didOpen", {
         textDocument: {
@@ -69,7 +81,8 @@ export async function withOpenDocument<T>(
           text: content,
         },
       });
-      openDocuments.add(uri);
+      state.openDocuments.add(uri);
+      await server.request?.("workspace/symbol", { query: "__smart_edit_sync_after_didopen__" }).catch(() => undefined);
     }
 
     // 4. Execute operation
@@ -85,14 +98,14 @@ export async function withOpenDocument<T>(
         } catch (err) {
           console.warn(`[smart-edit] Failed to close document "${uri}":`, err);
         }
-        openDocuments.delete(uri);
+        state.openDocuments.delete(uri);
       }
     }
   } finally {
     // Release lock
     resolveLock();
-    if (locks.get(uri) === nextLock) {
-      locks.delete(uri);
+    if (state.locks.get(uri) === nextLock) {
+      state.locks.delete(uri);
     }
   }
 }
