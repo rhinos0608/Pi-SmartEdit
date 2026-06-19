@@ -21,6 +21,7 @@ import {
   autoRepair,
   suggestDecompositionFromRepair,
 } from "../../src/verification/repair-loop";
+import type { RepairAttempt } from "../../src/verification/repair-loop";
 
 const testDir = join(tmpdir(), "repair-loop-tests");
 
@@ -244,11 +245,11 @@ describe("registerRepairHook", () => {
     );
 
     let hookCalled = false;
-    let hookAttempt: unknown = null;
+    const hookAttempts: RepairAttempt[] = [];
 
     const unregister = registerRepairHook((attempt) => {
       hookCalled = true;
-      hookAttempt = attempt;
+      hookAttempts.push(attempt);
     });
 
     await runRepairLoop(
@@ -259,9 +260,7 @@ describe("registerRepairHook", () => {
     );
 
     assert.strictEqual(hookCalled, true);
-    assert.ok(hookAttempt !== null);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    assert.strictEqual((hookAttempt as any).attempt, 1);
+    assert.strictEqual(hookAttempts[0]?.attempt, 1);
 
     unregister();
   });

@@ -10,6 +10,8 @@
  * importable by test utilities and config without side effects.
  */
 
+import type { RepairLoopResult } from "./repair-loop";
+
 /**
  * A semantic target that was changed by an edit.
  * Built from edit match spans + AST resolution.
@@ -225,6 +227,6 @@ export interface PostEditEvidenceResult {
     /** Historical context per target */
     history: HistoryEvidence[];
     /** Repair loop results (null if repair is disabled or not triggered) */
-    repair: import("./repair-loop").RepairLoopResult | null;
+    repair: RepairLoopResult | null;
   };
 }

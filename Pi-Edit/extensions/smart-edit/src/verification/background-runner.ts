@@ -91,8 +91,9 @@ export class BackgroundRunRegistry {
     const actualTimeout = timeoutMs ?? this.defaultTimeoutMs;
 
     const promise = new Promise<VerificationRunStatus>((resolve, reject) => {
-      let child: ChildProcess | undefined;
-      const run: ManagedRun = { runId, startedAt, command, resolve, reject };
+      const [cmd, ...args] = command;
+      const child = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"] });
+      const run: ManagedRun = { runId, startedAt, command, resolve, reject, child };
 
       // Timeout guard
       run.timer = setTimeout(() => {
@@ -118,10 +119,6 @@ export class BackgroundRunRegistry {
       this.runs.set(runId, run);
       this.activeCount++;
 
-      // Spawn the child process
-      const [cmd, ...args] = command;
-      child = spawn(cmd, args, { stdio: ["pipe", "pipe", "pipe"] });
-      run.child = child;
       let stdout = "";
       let stderr = "";
       const MAX_OUTPUT_CHARS = 10000;

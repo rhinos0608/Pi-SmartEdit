@@ -17,7 +17,7 @@ import {
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
-const tmpDir = resolve(tmpdir(), "smart-edit-auto-validate-test-" + Date.now());
+const tmpDir = resolve(tmpdir(), `smart-edit-auto-validate-test-${Date.now()}`);
 
 function cleanup() {
   try {

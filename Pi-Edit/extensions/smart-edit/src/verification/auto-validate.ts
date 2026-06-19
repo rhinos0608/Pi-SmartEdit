@@ -16,6 +16,8 @@
 import { resolve, dirname } from "path";
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { spawn } from "child_process";
+import { randomUUID } from "crypto";
+import { tmpdir } from "os";
 import { diffLines } from "diff";
 import { detectLanguageFromExtension } from "../lsp/language-id";
 import { getCompilerForLanguage } from "../lsp/diagnostic-dispatcher";
@@ -294,7 +296,7 @@ export async function runFormatEquivalenceCheck(
 
   // Create a temporary file for formatting (preserve extension for formatter detection)
   const ext = filePath.slice(filePath.lastIndexOf('.')) || '.ts';
-  const tmpPath = resolve(cwd, `.smart-edit-tmp-${Date.now()}${ext}`);
+  const tmpPath = resolve(tmpdir(), `.smart-edit-tmp-${randomUUID()}${ext}`);
 
   try {
     // Write content to temp file
@@ -384,11 +386,12 @@ async function runFormatterCommand(
       resolve({ success: false, error: err.message });
     });
 
-    // Timeout after 30 seconds
-    setTimeout(() => {
+    // Timeout after 30 seconds, unref'd so it doesn't keep process alive
+    const timer = setTimeout(() => {
       child.kill('SIGKILL');
       resolve({ success: false, error: 'Formatter timed out' });
     }, 30_000);
+    timer.unref();
   });
 }
 

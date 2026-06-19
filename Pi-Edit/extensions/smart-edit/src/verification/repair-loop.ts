@@ -42,18 +42,6 @@ export interface RepairLoopOptions {
   maxRetries?: number;
   /** Delay between retries in milliseconds (default: 0) */
   retryDelayMs?: number;
-  /** External lint commands to run as part of validation */
-  lintCommands?: Array<{
-    command: string;
-    args: string[];
-    fileGlobs?: string[];
-  }>;
-  /** External test commands to run as part of validation */
-  testCommands?: Array<{
-    command: string;
-    args: string[];
-    fileGlobs?: string[];
-  }>;
 }
 
 export interface RepairLoopResult {
@@ -245,18 +233,21 @@ export async function autoRepair(
   let repairedContent = newContent;
   const appliedStrategies: string[] = [];
 
-  // Strategy 1: Fix unbalanced braces
-  const bracesFixed = fixUnbalancedBraces(repairedContent);
-  if (bracesFixed !== repairedContent) {
-    repairedContent = bracesFixed;
-    appliedStrategies.push("fix-unbalanced-braces");
-  }
+  // Strategy 1: Fix unbalanced braces (skip if file has template literals — backticks in strings cause false counts)
+  const hasTemplateLiterals = repairedContent.includes("`");
+  if (!hasTemplateLiterals) {
+    const bracesFixed = fixUnbalancedBraces(repairedContent);
+    if (bracesFixed !== repairedContent) {
+      repairedContent = bracesFixed;
+      appliedStrategies.push("fix-unbalanced-braces");
+    }
 
-  // Strategy 2: Fix unbalanced brackets
-  const bracketsFixed = fixUnbalancedBrackets(repairedContent);
-  if (bracketsFixed !== repairedContent) {
-    repairedContent = bracketsFixed;
-    appliedStrategies.push("fix-unbalanced-brackets");
+    // Strategy 2: Fix unbalanced brackets (same template-literal guard)
+    const bracketsFixed = fixUnbalancedBrackets(repairedContent);
+    if (bracketsFixed !== repairedContent) {
+      repairedContent = bracketsFixed;
+      appliedStrategies.push("fix-unbalanced-brackets");
+    }
   }
 
   // Strategy 3: Normalize indentation to match file style
