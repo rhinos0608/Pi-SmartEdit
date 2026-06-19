@@ -5,7 +5,9 @@
  * using Language Server Protocol (LSP) or Tree-sitter AST fallbacks.
  */
 
-import { resolve } from "path";
+import { realpath } from "fs/promises";
+import { fileURLToPath } from "url";
+import { isAbsolute, relative, resolve } from "path";
 import type {
   DocumentSymbol,
   ResolvedLocation,
@@ -82,25 +84,36 @@ export async function buildSemanticContext(
   // 1. Determine Language ID
   const languageId = detectLanguageFromExtension(input.path) || "typescript";
 
-  // 2. Read File Content
+  // 2. Read File Content + per-build caches
+  const inputAbsPath = resolve(input.path);
   const content = await deps.readFile(input.path);
+  const contentLines = content.split("\n");
+  const fileContentCache = new Map<string, string>([[inputAbsPath, content]]);
+  const symbolCache = new Map<string, DocumentSymbol[]>();
+  let preExtractedTokens: { name: string; line: number; character: number; score: number }[] = [];
 
   // 3. Resolve Target and Fetch Symbols
   let documentSymbols: DocumentSymbol[] = [];
-  let target: ResolvedTarget;
+  let target!: ResolvedTarget;
 
   const server = deps.lspManager ? await deps.lspManager.getServer(languageId) : null;
 
+  // Consolidate all LSP work (symbols, target, tokens, expansion) into a single
+  // withOpenDocument call to avoid double-open/double-close for the same content.
+  const items: ContextItem[] = [];
+  const processedLocations = new Set<string>();
+  let source: "lsp" | "ast" | "none" = "none";
+
   if (server) {
     const uri = `file://${resolve(input.path)}`;
-    target = await withOpenDocument(server, {
+    await withOpenDocument(server, {
       uri,
       languageId,
       content,
     }, async () => {
       documentSymbols = await getDocumentSymbols(input.path, languageId, deps.lspManager);
-      
-      return await resolveTargetRange({
+
+      const resolved = await resolveTargetRange({
         path: input.path,
         content,
         lineRange: input.lineRange,
@@ -110,6 +123,105 @@ export async function buildSemanticContext(
         astResolver: deps.astResolver,
         documentSymbols,
       });
+
+      // Fetch semantic tokens while the document is still open in the server
+      // (some servers only return accurate tokens for currently-open docs).
+      const serverCaps = server.serverCapabilities as {
+        capabilities?: { semanticTokensProvider?: unknown };
+        semanticTokensProvider?: unknown;
+      } | undefined;
+      const provider = serverCaps?.capabilities?.semanticTokensProvider ?? serverCaps?.semanticTokensProvider;
+      if (provider) {
+        const lspRange = {
+          start: { line: resolved.lineRange.startLine - 1, character: 0 },
+          end: { line: resolved.lineRange.endLine - 1, character: 9999 }
+        };
+        const tokens = await getSemanticTokensForRange(input.path, lspRange, languageId, deps.lspManager);
+        preExtractedTokens = tokens
+          .map(t => {
+            const line = contentLines[t.line];
+            const text = line?.slice(t.character, t.character + t.length) || "";
+            return { ...t, text };
+          })
+          .map(t => ({
+            name: t.text,
+            line: t.line,
+            character: t.character,
+            score: scoreToken(t)
+          }))
+          .filter(t => t.score > 0);
+      }
+
+      // 4. Extract Key Tokens (inside same open-document context)
+      let keyTokens: { name: string; line: number; character: number; score: number }[] = [];
+
+      if (preExtractedTokens.length > 0) {
+        source = "lsp";
+        keyTokens = preExtractedTokens;
+      } else if (deps.astResolver) {
+        source = "ast";
+        keyTokens = extractTokensViaAst(content, resolved.byteRange);
+      }
+
+      // Dedupe and sort key tokens
+      keyTokens = Array.from(new Map(keyTokens.map(t => [`${t.name}:${t.line}:${t.character}`, t])).values())
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 20);
+
+      // 5. Expand Semantic Graph (inside same withOpenDocument)
+      // Compute realCwd once for all getWorkspacePath calls in processLocation
+      const realCwd = await realpath(deps.cwd);
+
+      const SEMAPHORE_LIMIT = 5;
+      for (let i = 0; i < keyTokens.length; i += SEMAPHORE_LIMIT) {
+        const batch = keyTokens.slice(i, i + SEMAPHORE_LIMIT);
+        await Promise.all(batch.map(async (token) => {
+          const defs = await goToDefinitions(input.path, token.line, token.character, languageId, deps.lspManager);
+          for (const def of defs.slice(0, 3)) {
+            await processLocation(def, "definition", token.name, token.score, realCwd);
+          }
+
+          if (input.includeTypeDefinitions !== false) {
+            const typeDefs = await goToTypeDefinition(input.path, token.line, token.character, languageId, deps.lspManager);
+            for (const tdef of typeDefs.slice(0, 2)) {
+              await processLocation(tdef, "typeDefinition", token.name, token.score - 5, realCwd);
+            }
+          }
+
+          if (input.includeImplementations) {
+            const impls = await goToImplementation(input.path, token.line, token.character, languageId, deps.lspManager);
+            for (const impl of impls.slice(0, 2)) {
+              await processLocation(impl, "implementation", token.name, token.score - 10, realCwd);
+            }
+          }
+
+          if (input.includeHover) {
+            const hover = await getHoverInfo(input.path, token.line, token.character, languageId, deps.lspManager);
+            if (hover) {
+              items.push({
+                symbolName: token.name,
+                relationship: "hover",
+                uri: input.path,
+                range: { start: { line: token.line, character: token.character }, end: { line: token.line, character: token.character + token.name.length } },
+                score: token.score,
+                excerptKind: "hover",
+                text: hover,
+                truncated: false,
+              });
+            }
+          }
+
+          if (input.includeReferences) {
+            const refs = await findReferences(input.path, token.line, token.character, languageId, deps.lspManager);
+            const limit = input.includeReferences === "all" ? 50 : 2;
+            for (const ref of refs.slice(0, limit)) {
+              await processLocation({ location: ref }, "reference", token.name, token.score - 20, realCwd);
+            }
+          }
+        }));
+      }
+
+      target = resolved;
     });
   } else {
     target = await resolveTargetRange({
@@ -124,119 +236,13 @@ export async function buildSemanticContext(
     });
   }
 
-  // 4. Extract Key Tokens
-  let keyTokens: { name: string; line: number; character: number; score: number }[] = [];
-  let source: "lsp" | "ast" | "none" = "none";
-
-  const serverCaps = server?.serverCapabilities as {
-    capabilities?: { semanticTokensProvider?: unknown };
-    semanticTokensProvider?: unknown;
-  } | undefined;
-  const semanticTokensProvider = serverCaps?.capabilities?.semanticTokensProvider ?? serverCaps?.semanticTokensProvider;
-
-  if (server && semanticTokensProvider) {
-    source = "lsp";
-    const lspRange = {
-      start: { line: target.lineRange.startLine - 1, character: 0 },
-      end: { line: target.lineRange.endLine - 1, character: 9999 }
-    };
-    // Semantic tokens are already fetched inside the withOpenDocument block above.
-    // We just need to get them here using the same server connection.
-    const tokens = await getSemanticTokensForRange(input.path, lspRange, languageId, deps.lspManager);
-    
-    keyTokens = tokens
-      .map(t => {
-        // Populate text from content
-        const line = content.split("\n")[t.line];
-        const text = line?.slice(t.character, t.character + t.length) || "";
-        return { ...t, text };
-      })
-      .map(t => ({
-        name: t.text,
-        line: t.line,
-        character: t.character,
-        score: scoreToken(t)
-      }))
-      .filter(t => t.score > 0);
-  } else if (deps.astResolver) {
-    source = "ast";
-    // AST Fallback
-    keyTokens = await extractTokensViaAst(content, target.byteRange, deps.astResolver);
-  }
-
-  // Dedupe and sort key tokens
-  keyTokens = Array.from(new Map(keyTokens.map(t => [`${t.name}:${t.line}:${t.character}`, t])).values())
-    .sort((a, b) => b.score - a.score)
-    .slice(0, 20);
-
-  // 6. Expand Semantic Graph
-  const items: ContextItem[] = [];
-  const processedLocations = new Set<string>();
-
-  const definitionTasks = keyTokens.map(async (token) => {
-    // Standard Definition
-    const defs = await goToDefinitions(input.path, token.line, token.character, languageId, deps.lspManager);
-    for (const def of defs.slice(0, 3)) {
-      await processLocation(def, "definition", token.name, token.score);
-    }
-
-    // Type Definition
-    if (input.includeTypeDefinitions !== false) {
-      const typeDefs = await goToTypeDefinition(input.path, token.line, token.character, languageId, deps.lspManager);
-      for (const tdef of typeDefs.slice(0, 2)) {
-        await processLocation(tdef, "typeDefinition", token.name, token.score - 5);
-      }
-    }
-
-    // Implementation
-    if (input.includeImplementations) {
-      const impls = await goToImplementation(input.path, token.line, token.character, languageId, deps.lspManager);
-      for (const impl of impls.slice(0, 2)) {
-        await processLocation(impl, "implementation", token.name, token.score - 10);
-      }
-    }
-
-    // Hover
-    if (input.includeHover) {
-      const hover = await getHoverInfo(input.path, token.line, token.character, languageId, deps.lspManager);
-      if (hover) {
-        items.push({
-          symbolName: token.name,
-          relationship: "hover",
-          uri: input.path,
-          range: { start: { line: token.line, character: token.character }, end: { line: token.line, character: token.character + token.name.length } },
-          score: token.score,
-          excerptKind: "hover",
-          text: hover,
-          truncated: false,
-        });
-      }
-    }
-
-    // References
-    if (input.includeReferences) {
-      const refs = await findReferences(input.path, token.line, token.character, languageId, deps.lspManager);
-      const limit = input.includeReferences === "all" ? Infinity : 2;
-      for (const ref of refs.slice(0, limit)) {
-        await processLocation({ location: ref }, "reference", token.name, token.score - 20);
-      }
-    }
-  });
-
-  // Concurrency limit: process tokens in batches of 5 to avoid overwhelming the LSP server
-  const SEMAPHORE_LIMIT = 5;
-  for (let i = 0; i < definitionTasks.length; i += SEMAPHORE_LIMIT) {
-    const batch = definitionTasks.slice(i, i + SEMAPHORE_LIMIT);
-    await Promise.all(batch);
-  }
-
-  async function processLocation(resolved: ResolvedLocation, relationship: ContextItem["relationship"], symbolName: string, score: number) {
+  async function processLocation(resolved: ResolvedLocation, relationship: ContextItem["relationship"], symbolName: string, score: number, realCwdFromCaller?: string) {
     const loc = resolved.location;
     const locKey = `${loc.uri}:${loc.range.start.line}:${loc.range.start.character}`;
     if (processedLocations.has(locKey)) return;
-    
-    // Ignore definitions inside the target range (unless it's a reference)
-    if (relationship !== "reference" && loc.uri.endsWith(input.path)) {
+
+    const locFilePath = filePathFromUri(loc.uri);
+    if (relationship !== "reference" && locFilePath && resolve(locFilePath) === inputAbsPath) {
       if (loc.range.start.line + 1 >= target.lineRange.startLine && loc.range.end.line + 1 <= target.lineRange.endLine) {
         return;
       }
@@ -245,7 +251,8 @@ export async function buildSemanticContext(
     processedLocations.add(locKey);
 
     try {
-      const isExternal = !loc.uri.startsWith("file://") || !loc.uri.includes(deps.cwd);
+      const workspacePath = locFilePath ? await getWorkspacePath(locFilePath, deps.cwd, realCwdFromCaller) : null;
+      const isExternal = !workspacePath;
       let itemText = "";
       let itemTruncated = false;
       let excerptKind: ContextItem["excerptKind"] = "signature";
@@ -255,25 +262,32 @@ export async function buildSemanticContext(
         itemText = hover || "(external definition)";
         excerptKind = "hover";
       } else {
-        const filePath = loc.uri.replace("file://", "");
-        const fileContent = await deps.readFile(filePath);
-        
-        // Fetch symbols for dependency file to provide better context
-        const depSymbols = await getDocumentSymbols(filePath, languageId, deps.lspManager);
+        const filePath = workspacePath;
+        const cacheKey = resolve(filePath);
+        let fileContent = fileContentCache.get(cacheKey);
+        if (fileContent === undefined) {
+          fileContent = await deps.readFile(filePath);
+          fileContentCache.set(cacheKey, fileContent);
+        }
+
+        let depSymbols = symbolCache.get(cacheKey);
+        if (!depSymbols) {
+          depSymbols = await getDocumentSymbols(filePath, languageId, deps.lspManager);
+          symbolCache.set(cacheKey, depSymbols);
+        }
         const enclosingSymbol = findEnclosingDocumentSymbol(depSymbols, loc);
-        
+
         const excerpt = extractSymbolExcerpt(fileContent, enclosingSymbol, loc, {
           maxLines: 20,
           preferSkeleton: relationship === "reference" ? false : true
         });
-        
+
         itemText = excerpt.text;
         itemTruncated = excerpt.truncated;
         excerptKind = excerpt.excerptKind;
-        
-        // Record read for dependency
+
         if (deps.recordReadSession) {
-          deps.recordReadSession(filePath, deps.cwd, [{ 
+          deps.recordReadSession(filePath, deps.cwd, [{
             startLine: enclosingSymbol?.range.start.line ? enclosingSymbol.range.start.line + 1 : loc.range.start.line + 1,
             endLine: enclosingSymbol?.range.end.line ? enclosingSymbol.range.end.line + 1 : loc.range.end.line + 1
           }]);
@@ -344,33 +358,68 @@ function scoreToken(t: SemanticToken): number {
   return 10;
 }
 
-async function extractTokensViaAst(content: string, byteRange: { startIndex: number; endIndex: number }, _astResolver: AstResolverLike | null): Promise<{ name: string; line: number; character: number; score: number }[]> {
+function extractTokensViaAst(content: string, byteRange: { startIndex: number; endIndex: number }): { name: string; line: number; character: number; score: number }[] {
   const result: { name: string; line: number; character: number; score: number }[] = [];
-  
-  // Regex fallback: find whole-word identifiers
+
+  // Regex fallback: find whole-word identifiers in the byte range.
+  // (Full AST extraction deferred — see AstResolverLike comment in semantic-nav.)
   const text = content.slice(byteRange.startIndex, byteRange.endIndex);
   const regex = /\b[a-zA-Z_][a-zA-Z0-9_]*\b/g;
   let match;
-  
+
   const keywords = new Set(["async", "await", "function", "const", "let", "var", "return", "class", "interface", "export", "import", "from", "extends", "implements", "public", "private", "protected", "static", "readonly", "type", "of", "in", "as"]);
+
+  // Precompute absolute line-start offsets for the entire content once.
+  // Then for each match we do a single O(log n) binary search to map
+  // offset -> (line, column). Total work: O(n + k log n) instead of O(n*k).
+  const lineStarts: number[] = [0];
+  for (let i = 0; i < content.length; i++) {
+    if (content.charCodeAt(i) === 10) lineStarts.push(i + 1);
+  }
 
   while ((match = regex.exec(text)) !== null) {
     const name = match[0];
     if (name.length < 3) continue;
     if (keywords.has(name)) continue;
-    
-    // Estimate line/char
+
     const offset = byteRange.startIndex + match.index;
-    const prefix = content.slice(0, offset);
-    const lines = prefix.split("\n");
-    
+    // Binary search: find greatest lineStart <= offset.
+    let lo = 0, hi = lineStarts.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >>> 1;
+      if (lineStarts[mid] <= offset) lo = mid;
+      else hi = mid - 1;
+    }
     result.push({
       name,
-      line: lines.length - 1,
-      character: lines[lines.length - 1].length,
+      line: lo,
+      character: offset - lineStarts[lo],
       score: 30
     });
   }
 
   return result;
+}
+
+function filePathFromUri(uri: string): string | null {
+  if (!uri.startsWith("file://")) return null;
+  try {
+    return fileURLToPath(uri);
+  } catch {
+    return null;
+  }
+}
+
+async function getWorkspacePath(filePath: string, cwd: string, preComputedRealCwd?: string): Promise<string | null> {
+  try {
+    const [realCwd, realFile] = await Promise.all([
+      preComputedRealCwd ? Promise.resolve(preComputedRealCwd) : realpath(cwd),
+      realpath(filePath)
+    ]);
+    const rel = relative(realCwd, realFile);
+    if (rel.startsWith("..") || isAbsolute(rel)) return null;
+    return realFile;
+  } catch {
+    return null;
+  }
 }
