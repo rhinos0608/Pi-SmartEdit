@@ -21,6 +21,7 @@
 
 import { loadGrammar } from "../../lib/grammar-loader";
 import type { ChangedTarget, ConcurrencySignal } from "./types";
+import { byteOffsetToLine } from "./byte-offset";
 
 // --- Per-language token signal tables ---
 
@@ -329,15 +330,6 @@ function byteOffsetToCharIndex(content: string, byteOffset: number): number {
   return charIndex;
 }
 
-function byteOffsetToLine(content: string, offset: number): number {
-  if (offset <= 0) return 1;
-  if (offset >= content.length) offset = content.length - 1;
-  let line = 1;
-  for (let i = 0; i < offset; i++) {
-    if (content[i] === "\n") line++;
-  }
-  return line;
-}
 
 // --- AST-based concurrency detection (optional layer) ---
 

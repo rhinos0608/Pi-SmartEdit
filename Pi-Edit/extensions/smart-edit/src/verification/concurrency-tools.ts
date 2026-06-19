@@ -147,7 +147,7 @@ export class ConfiguredCommandTool implements VerificationTool {
         // File glob filter
         if (cmd.fileGlobs && cmd.fileGlobs.length > 0) {
           const matched = cmd.fileGlobs.some((glob) =>
-            simpleGlobMatch(glob, input.filePath),
+            simpleGlobMatchLoose(glob, input.filePath),
           );
           if (!matched) return false;
         }
@@ -478,7 +478,12 @@ async function findNearestFile(
   }
 }
 
-function simpleGlobMatch(glob: string, path: string): boolean {
+// Simplified glob matcher using substring/prefix/suffix checks.
+// DIFFERENT from the canonical simpleGlobMatch in glob-match.ts (which uses full regex).
+// This version only supports **\/ prefix, *. suffix, and **\/ suffix patterns.
+// Kept local because the simplified semantics are sufficient for file-glob
+// matching in ConfiguredCommandTool and a full regex is unnecessary overhead.
+function simpleGlobMatchLoose(glob: string, path: string): boolean {
   const normalised = path.replace(/\\/g, "/");
   if (glob.startsWith("**/")) {
     const suffix = glob.slice(3);

@@ -18,6 +18,7 @@ import { readdir, readFile, stat } from "fs/promises";
 import { join, relative, resolve } from "path";
 import type { ChangedTarget, TraceabilityConfig } from "./types";
 import type { TraceabilityEvidence, TraceabilityTargetEvidence } from "./types";
+import { simpleGlobMatch } from "./glob-match";
 
 // ─── Defaults ───────────────────────────────────────────────────────
 
@@ -279,54 +280,3 @@ function matchesAnyGlob(filePath: string, globs: string[]): boolean {
   return false;
 }
 
-const REGEX_SPECIAL = new Set([".", "+", "?", "^", "$", "{", "}", "(", ")", "|", "[", "]", "\\"]);
-
-function simpleGlobMatch(glob: string, path: string): boolean {
-  const normalised = path.split("\\").join("/");
-
-  // Handle /** at the end (matches directory and all subfiles)
-  let globBody = glob;
-  let endsWithStarSlashStar = false;
-  if (glob.endsWith("/**")) {
-    endsWithStarSlashStar = true;
-    globBody = glob.slice(0, -3);
-  }
-
-  let regexStr = "^";
-  let i = 0;
-  while (i < globBody.length) {
-    if (globBody.startsWith("**/", i)) {
-      regexStr += "(?:.*\\/)?";
-      i += 3;
-    } else if (globBody.startsWith("**", i)) {
-      regexStr += ".*";
-      i += 2;
-    } else if (globBody[i] === "*") {
-      regexStr += "[^/]*";
-      i++;
-    } else if (globBody[i] === "?") {
-      regexStr += "[^/]";
-      i++;
-    } else {
-      const ch = globBody[i];
-      if (REGEX_SPECIAL.has(ch)) {
-        regexStr += "\\" + ch;
-      } else {
-        regexStr += ch;
-      }
-      i++;
-    }
-  }
-
-  if (endsWithStarSlashStar) {
-    regexStr += "(?:\\/.*)?";
-  }
-
-  regexStr += "$";
-
-  try {
-    return new RegExp(regexStr).test(normalised);
-  } catch {
-    return false;
-  }
-}

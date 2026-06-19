@@ -19,6 +19,7 @@ import { spawn } from "child_process";
 import { join } from "path";
 import type { ChangedTarget, HistoryConfig } from "./types";
 import type { HistoryEvidence } from "./types";
+import { byteOffsetToLine } from "./byte-offset";
 
 // ─── Risky keywords for commit ranking ──────────────────────────────
 
@@ -111,6 +112,12 @@ async function retrieveHistoryForTarget(
 ): Promise<HistoryEvidence | null> {
   const maxCommits = config.maxCommits;
   const maxChars = config.maxChars;
+
+  // Security: validate path before passing to git log -L / git log --
+  // Reject paths that look like flags, contain injection markers, or traverse up
+  if (!target.path || target.path.startsWith("-") || target.path.includes("--") || target.path.includes("..")) {
+    return null;
+  }
 
   // Try three strategies in order:
   // 1. git log -L :<symbol>:<path> — best if the symbol name is meaningful
@@ -435,24 +442,6 @@ function extractNearbyComments(
   return comments;
 }
 
-/**
- * Compute 1-based line number for a byte offset.
- * Operates on actual UTF-8 bytes.
- */
-function byteOffsetToLine(content: string, offset: number): number {
-  if (offset <= 0) return 1;
-
-  const buffer = Buffer.from(content, "utf8");
-  const maxOffset = Math.min(offset, buffer.length);
-
-  let line = 1;
-  for (let i = 0; i < maxOffset; i++) {
-    if (buffer[i] === 0x0A) { // '\n' in UTF-8
-      line++;
-    }
-  }
-  return line;
-}
 
 /**
  * Escape a symbol name for use in `git log -L :<funcname>:<file>`.

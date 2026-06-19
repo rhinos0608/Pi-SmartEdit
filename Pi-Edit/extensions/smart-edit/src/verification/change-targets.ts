@@ -14,6 +14,11 @@
 import type { ParseResult } from "../../lib/ast-resolver";
 import { createAstResolver, disposeParseResult } from "../../lib/ast-resolver";
 import type { ChangedTarget } from "./types";
+import { byteOffsetToLine } from "./byte-offset";
+import { simpleGlobMatch } from "./glob-match";
+
+// Re-export for backward compatibility (used by tests)
+export { byteOffsetToLine, simpleGlobMatch };
 
 // ─── Symbol kind mapping ────────────────────────────────────────────
 
@@ -83,64 +88,6 @@ function classifyEditKind(
   return "logic";
 }
 
-/**
- * Simple glob matcher supporting * (non-slash wildcard), ? (single-character non-slash), and double-star directory prefixes.
- * Does NOT support brace expansion or character classes.
- * Uses a Set of special-regex characters to avoid inline regex issues with esbuild.
- */
-const REGEX_SPECIAL = new Set([".", "+", "?", "^", "$", "{", "}", "(", ")", "|", "[", "]", "\\"]);
-
-function simpleGlobMatch(glob: string, path: string): boolean {
-  const normalised = path.split("\\").join("/");
-
-  // Handle /** at the end (matches directory and all subfiles)
-  let globBody = glob;
-  let endsWithStarSlashStar = false;
-  if (glob.endsWith("/**")) {
-    endsWithStarSlashStar = true;
-    globBody = glob.slice(0, -3);
-  }
-
-  // Build regex from simple glob pattern
-  let regexStr = "^";
-  let i = 0;
-  while (i < globBody.length) {
-    if (globBody.startsWith("**/", i)) {
-      regexStr += "(?:.*\\/)?";
-      i += 3;
-    } else if (globBody.startsWith("**", i)) {
-      // ** not followed by /
-      regexStr += ".*";
-      i += 2;
-    } else if (globBody[i] === "*") {
-      regexStr += "[^/]*";
-      i++;
-    } else if (globBody[i] === "?") {
-      regexStr += "[^/]";
-      i++;
-    } else {
-      const ch = globBody[i];
-      if (REGEX_SPECIAL.has(ch)) {
-        regexStr += "\\" + ch;
-      } else {
-        regexStr += ch;
-      }
-      i++;
-    }
-  }
-
-  if (endsWithStarSlashStar) {
-    regexStr += "(?:\\/.*)?";
-  }
-
-  regexStr += "$";
-
-  try {
-    return new RegExp(regexStr).test(normalised);
-  } catch {
-    return false;
-  }
-}
 
 // ─── Default test globs (same as TraceabilityConfig defaults) ───────
 
@@ -282,24 +229,3 @@ export async function buildChangedTargets(
   return targets;
 }
 
-// ─── Utility ────────────────────────────────────────────────────────
-
-/**
- * Find the 1-based line number for a byte offset in the content.
- * Line 1 is the first line.
- */
-export function byteOffsetToLine(content: string, byteOffset: number): number {
-  if (byteOffset <= 0) return 1;
-  
-  // Create UTF-8 byte buffer from content
-  const buffer = Buffer.from(content, "utf8");
-  const maxOffset = Math.min(byteOffset, buffer.length);
-  
-  let line = 1;
-  for (let i = 0; i < maxOffset; i++) {
-    if (buffer[i] === 0x0A) { // '\n' in UTF-8
-      line++;
-    }
-  }
-  return line;
-}
