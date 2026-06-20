@@ -387,6 +387,25 @@ export function prepareArguments(input: Record<string, unknown>, useHashlineEdit
             `Use { target: { name: "myFunction" }, replaceBody: "..." } or insertBefore/insertAfter.`
           );
         }
+        // Early check: symbol edits need at least one identifier (name, namePath, or line)
+        const hasName = typeof t?.name === "string" && t.name.length > 0;
+        const hasNamePath = typeof t?.namePath === "string" && t.namePath.length > 0;
+        const hasLine = typeof t?.line === "number" && Number.isInteger(t.line) && t.line >= 1;
+        if (!hasName && !hasNamePath && !hasLine) {
+          const gotLine = t?.line != null;
+          const hint = gotLine
+            ? `target.line must be a positive integer (1-based). Got: ${JSON.stringify(t?.line)}`
+            : `Provide at least one identifier in target:\n` +
+              `  target.name     — symbol name (e.g. "handleRequest")\n` +
+              `  target.namePath — qualified path (e.g. "MyClass.handleRequest")\n` +
+              `  target.line     — 1-based line number containing the symbol\n\n` +
+              `Example:\n` +
+              `  { target: { name: "handleRequest", kind: "method_definition" }, replaceBody: "..." }`;
+          throw formatEditError(
+            `edits[${i}] is a symbol edit but has no valid identifier.`,
+            hint
+          );
+        }
       }
       if (!isHashlineEdit && !isSymbolEdit) {
         if (typeof item.oldText !== "string") {

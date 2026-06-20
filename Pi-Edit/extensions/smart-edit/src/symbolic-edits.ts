@@ -130,10 +130,14 @@ export async function applySymbolicEdits(
   let newContent = input.content;
   const resolved: ResolvedSymbolicEdit[] = [];
 
-  // Validate all targets have name or namePath before attempting resolution
+  // Validate all targets have enough identifying info before attempting resolution
   for (const edit of input.edits) {
-    if (!edit.target.name && !edit.target.namePath) {
-      throw new Error("Symbol edit requires target.name or target.namePath.");
+    const hasName = edit.target.name || edit.target.namePath;
+    const hasLine = edit.target.line != null;
+    if (!hasName && !hasLine) {
+      throw new Error(
+        `Symbol edit #${edit.editIdx + 1} needs an identifier: provide target.name, target.namePath, or target.line (1-based line number).`
+      );
     }
   }
 
@@ -290,11 +294,18 @@ function targetNameFromEditTarget(target: EditTarget): string {
     const last = parts[parts.length - 1];
     if (last) return last;
   }
-  throw new Error("Symbol edit requires target.name or target.namePath.");
+  // Line-only target: generate descriptive label
+  if (target.line != null) {
+    return `<symbol at line ${target.line}${target.kind ? ` (${target.kind})` : ""}>`;
+  }
+  return "<unnamed>";
 }
 
 function formatTarget(target: EditTarget): string {
-  return target.namePath ?? target.name ?? "<unnamed>";
+  if (target.namePath) return target.namePath;
+  if (target.name) return target.name;
+  if (target.line != null) return `<symbol at line ${target.line}${target.kind ? ` (${target.kind})` : ""}>`;
+  return "<unnamed>";
 }
 
 function operationIndex(edit: ResolvedSymbolicEdit): number {

@@ -87,7 +87,7 @@ describe("symbolic edits", () => {
     assert.strictEqual(isSymbolicEdit({ target: { namePath: "a.b", replaceBody: "..." } as any }), true);
   });
 
-  it("applySymbolicEdits throws when both name and namePath are absent", async () => {
+  it("applySymbolicEdits throws when no identifier (name, namePath, or line)", async () => {
     await assert.rejects(
       applySymbolicEdits({
         content: "function target() { return 1; }\n",
@@ -95,8 +95,19 @@ describe("symbolic edits", () => {
         astResolver: createAstResolver(),
         edits: [{ editIdx: 0, target: { replaceBody: "function target() { return 2; }" } as any }],
       }),
-      /target\.name or target\.namePath/,
+      /needs an identifier/,
     );
+  });
+
+  it("applySymbolicEdits resolves symbol by line-only (no name)", async () => {
+    const result = await applySymbolicEdits({
+      content: "function target() { return 1; }\nfunction other() { return 2; }\n",
+      filePath: "example.ts",
+      astResolver: createAstResolver(),
+      edits: [{ editIdx: 0, target: { line: 1, replaceBody: "function target() { return 99; }" } as any }],
+    });
+    assert.ok(result.newContent.includes("return 99"));
+    assert.strictEqual(result.applied.length, 1);
   });
 
   it("applySymbolicEdits throws when multiple operations are provided", async () => {

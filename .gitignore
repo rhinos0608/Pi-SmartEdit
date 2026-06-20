@@ -22,3 +22,5 @@ progress.md
 **/.pi/
 .pi-smartread/
 .pi-smartread.embeddings.cache/
+Pi-Edit/.graphify_uncached.txt
+Pi-Edit/extensions/smart-edit/index.ts.bak

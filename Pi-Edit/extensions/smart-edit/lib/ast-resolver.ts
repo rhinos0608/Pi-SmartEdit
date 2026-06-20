@@ -453,55 +453,83 @@ export async function parseFile(
  * Walks the entire syntax tree looking for named symbols that match
  * the anchor's name, kind, and line hint constraints.
  *
+ * Supports two resolution modes:
+ * - Name-based: finds symbols matching `symbolName` (with optional kind/line disambiguation)
+ * - Line-only: when `symbolName` is absent but `symbolLine` is set, finds the
+ *   innermost symbol whose range contains that line (filtered by `symbolKind` if set)
+ *
  * @param tree - The parsed syntax tree
  * @param anchor - The edit anchor specifying which symbol to find
- * @returns The matching node, or null if no match or anchor has no symbolName
+ * @returns The matching node, or null if no match or anchor has no identifiers
  */
 export function findSymbolNode(
   tree: Parser.Tree,
   anchor: EditAnchor,
 ): Parser.SyntaxNode | null {
-  if (!anchor.symbolName) return null;
   if (!tree) return null;
   if (!tree.rootNode) return null;
+
+  // Must have at least one identifier: name or line
+  if (!anchor.symbolName && anchor.symbolLine == null) return null;
 
   const root = tree.rootNode;
 
   // Skip if tree has errors — anchor resolution is unreliable
   if (root.hasError) return null;
 
-  const candidates: Array<{ node: Parser.SyntaxNode; nameLine: number }> = [];
+  const candidates: Array<{ node: Parser.SyntaxNode; nameLine: number; containmentScore: number }> = [];
 
-  // Walk all nodes looking for symbol containers with matching names
+  // Walk all nodes looking for symbol containers
   walkTree(root, (node) => {
     if (!isSymbolNode(node)) return;
-
-    // Get the name of this node
-    const nameNode = findNameChild(node);
-    if (!nameNode) return;
-
-    const name = nameNode.text;
-    if (name !== anchor.symbolName) return;
 
     // Kind filter
     if (anchor.symbolKind && node.type !== anchor.symbolKind) return;
 
-    candidates.push({
-      node,
-      nameLine: nameNode.startPosition.row + 1, // 1-based
-    });
+    if (anchor.symbolName) {
+      // Name-based resolution: match by name
+      const nameNode = findNameChild(node);
+      if (!nameNode) return;
+
+      const name = nameNode.text;
+      if (name !== anchor.symbolName) return;
+
+      candidates.push({
+        node,
+        nameLine: nameNode.startPosition.row + 1,
+        containmentScore: 0,
+      });
+    } else if (anchor.symbolLine != null) {
+      // Line-only resolution: find symbols whose range contains the target line
+      const startLine = node.startPosition.row + 1; // 1-based
+      const endLine = node.endPosition.row + 1;
+      if (anchor.symbolLine >= startLine && anchor.symbolLine <= endLine) {
+        // Score by containment tightness — smaller range = more specific match
+        const span = endLine - startLine;
+        candidates.push({
+          node,
+          nameLine: startLine,
+          containmentScore: span,
+        });
+      }
+    }
   });
 
   if (candidates.length === 0) return null;
 
-  // If symbolLine provided, prefer the node whose name is closest to that line
-  if (anchor.symbolLine != null && candidates.length > 1) {
-    const targetLine = anchor.symbolLine;
-    candidates.sort(
-      (a, b) =>
-        Math.abs(a.nameLine - targetLine) -
-        Math.abs(b.nameLine - targetLine),
-    );
+  if (anchor.symbolName) {
+    // Name-based: prefer closest to symbolLine hint when disambiguating
+    if (anchor.symbolLine != null && candidates.length > 1) {
+      const targetLine = anchor.symbolLine;
+      candidates.sort(
+        (a, b) =>
+          Math.abs(a.nameLine - targetLine) -
+          Math.abs(b.nameLine - targetLine),
+      );
+    }
+  } else {
+    // Line-only: prefer the tightest containment (innermost symbol)
+    candidates.sort((a, b) => a.containmentScore - b.containmentScore);
   }
 
   return candidates[0].node;
