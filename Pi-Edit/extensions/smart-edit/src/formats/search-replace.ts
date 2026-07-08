@@ -10,7 +10,7 @@
  * >>>>>>> REPLACE
  */
 
-import { ParseError } from "../../lib/errors";
+import { ParseError } from "../core/errors";
 
 export interface SearchReplaceBlock {
   /** Optional filename hint (first non-marker line of the block) */

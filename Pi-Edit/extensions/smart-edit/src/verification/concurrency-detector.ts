@@ -19,7 +19,7 @@
  * Falls back to regex-only mode if tree-sitter isn't available.
  */
 
-import { loadGrammar } from "../../lib/grammar-loader";
+import { loadGrammar } from "../core/grammar-loader";
 import type { ChangedTarget, ConcurrencySignal } from "./types";
 import { byteOffsetToLine } from "./byte-offset";
 

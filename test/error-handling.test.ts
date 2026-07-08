@@ -10,7 +10,7 @@ import {
   prepareArguments,
   formatEditError,
   validateInput,
-} from "../.pi/extensions/smart-edit/index.ts";
+} from "../.pi/extensions/smart-edit/src/index.ts";
 
 // ─── formatEditError ─────────────────────────────────────────────────
 

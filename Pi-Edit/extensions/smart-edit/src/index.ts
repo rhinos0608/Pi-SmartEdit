@@ -6,7 +6,7 @@
  * richer diagnostics.
  *
  * Installation: copy to ~/.pi/agent/extensions/smart-edit.ts
- *   or place in .pi/extensions/smart-edit/index.ts for project-local use.
+ *   or place in .pi/extensions/smart-edit/src/index.ts for project-local use.
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -14,13 +14,13 @@ import { Type } from "typebox";
 
 import { constants, statSync } from "fs";
 import { access as fsAccess, readFile as fsReadFile, stat as fsStat } from "fs/promises";
-import { dirname, isAbsolute, relative, resolve } from "path";
-import { withFileMutationQueue } from "./src/mutation-queue.js";
-import { resolveAnchorToScope, findTextLineRange, getHashlineAnchorLine, computeEditContainingRange } from "./src/anchor-resolution.js";
-import { sortHashlineEditsForApplication, formatHashlineBatchSummary } from "./src/hashline-batching.js";
-import { reReadAfterFailure, buildMultiFileFallbackHint } from "./src/multi-file-hints.js";
-import { buildContextGuardCheck, formatContextGuardRejection } from "./src/context-guard-check.js";
-import { prepareArguments, validateInput, formatEditError } from "./src/args.js";
+import { dirname, resolve } from "path";
+import { withFileMutationQueue } from "./mutation-queue.js";
+import { resolveAnchorToScope, findTextLineRange, getHashlineAnchorLine, computeEditContainingRange } from "./anchor-resolution.js";
+import { sortHashlineEditsForApplication, formatHashlineBatchSummary } from "./hashline-batching.js";
+import { reReadAfterFailure, buildMultiFileFallbackHint } from "./multi-file-hints.js";
+import { buildContextGuardCheck, formatContextGuardRejection } from "./context-guard-check.js";
+import { prepareArguments, validateInput, formatEditError } from "./args.js";
 
 import {
   applyEdits,
@@ -29,43 +29,45 @@ import {
   normalizeToLF,
   restoreLineEndings,
   stripBom,
-} from "./lib/edit-diff";
+} from "./core/edit-diff";
 
-import { createAstResolver, validateSyntax } from "./lib/ast-resolver";
+import { createAstResolver, validateSyntax } from "./core/ast-resolver";
 import {
   createConflictDetector,
   defaultConflictConfig,
-} from "./lib/conflict-detector";
+} from "./core/conflict-detector";
 
-import { detectLanguageFromExtension } from "./src/lsp/language-id";
-import { recordRead, checkStale, recordReadWithStat, recordReadSession, getSessionReads, checkEditAllowed, checkRangeCoverage, getSnapshot, getAllSessionPaths } from "./lib/read-cache";
-import { buildHashlineAnchors, initHashline } from "./lib/hashline";
-import type { HashlineEditInput } from "./lib/hashline-edit";
-import { HashlineMismatchError } from "./lib/hashline-edit";
+import { detectLanguageFromExtension } from "./lsp/language-id";
+import { recordRead, checkStale, recordReadWithStat, recordReadSession, getSessionReads, checkEditAllowed, checkRangeCoverage, getSnapshot, getAllSessionPaths } from "./core/read-cache";
+import { buildHashlineAnchors, initHashline } from "./core/hashline";
+import type { HashlineEditInput } from "./core/hashline-edit";
+import { HashlineMismatchError } from "./core/hashline-edit";
 
-import { detectInputFormat } from "./src/formats/format-detector";
-import { StreamingPatchParser } from "./src/formats/streaming-patch-parser";
+import { detectInputFormat } from "./formats/format-detector";
+import { StreamingPatchParser } from "./formats/streaming-patch-parser";
 
-import { LSPManager } from "./src/lsp/lsp-manager";
-import { checkPostEditDiagnostics } from "./src/lsp/diagnostics";
-import { deferredDiagnostics } from "./src/lsp/deferred-diagnostics";
-import { getCompilerForLanguage } from "./src/lsp/diagnostic-dispatcher";
-import type { DiagnosticResult } from "./src/lsp/diagnostic-dispatcher";
+import { LSPManager } from "./lsp/lsp-manager";
+import { checkPostEditDiagnostics } from "./lsp/diagnostics";
+import { deferredDiagnostics } from "./lsp/deferred-diagnostics";
+import { getCompilerForLanguage } from "./lsp/diagnostic-dispatcher";
+import type { DiagnosticResult } from "./lsp/diagnostic-dispatcher";
 
-import { runPostEditEvidencePipeline } from "./src/verification/post-edit-evidence";
-import type { PostEditEvidenceResult } from "./src/verification/types";
-import { scopeDiagnosticsToChangedTargets } from "./src/verification/scoped-diagnostics";
-import type { ScopedDiagnostic } from "./src/verification/scoped-diagnostics";
-import { recordBreakage, recordCoChange } from "./src/smartread-bridge";
-import { getSmartEditRuntimeConfig } from "./src/edit-mode";
-import { checkEditSafety } from "./src/safety/approval-gating";
-import { saveUndoState } from "./src/undo/edit-history";
-import { atomicWrite } from "./src/undo/atomic-write";
-import { checkContextGuardSimilarity } from "./src/safety/context-guard";
-import { MatchError } from "./lib/errors";
-import { runAutoValidation, formatValidationFeedback, resetRetryCounts, checkStructural, incrementRetryCount as incRetryCount } from "./src/verification/auto-validate";
-import { applySymbolicEdits, buildSymbolicEditGuidance, resolveSymbolicEditLineRange } from "./src/symbolic-edits";
-import type { SymbolicEditRequest } from "./src/symbolic-edits";
+import { runPostEditEvidencePipeline } from "./verification/post-edit-evidence";
+import type { PostEditEvidenceResult } from "./verification/types";
+import { scopeDiagnosticsToChangedTargets } from "./verification/scoped-diagnostics";
+import type { ScopedDiagnostic } from "./verification/scoped-diagnostics";
+import { recordBreakage, recordCoChange } from "./smartread-bridge";
+import { getSmartEditRuntimeConfig } from "./edit-mode";
+import { checkEditSafety } from "./safety/approval-gating";
+import { saveUndoState } from "./undo/edit-history";
+import { atomicWrite } from "./undo/atomic-write";
+import { checkContextGuardSimilarity } from "./safety/context-guard";
+import { MatchError } from "./core/errors";
+import { runAutoValidation, formatValidationFeedback, resetRetryCounts, checkStructural, incrementRetryCount as incRetryCount } from "./verification/auto-validate";
+import { applySymbolicEdits, buildSymbolicEditGuidance, resolveSymbolicEditLineRange } from "./symbolic-edits";
+import type { SymbolicEditRequest } from "./symbolic-edits";
+import { computeAnchorDelta, formatAnchorDeltaForModel, ANCHOR_CHURN_THRESHOLD, type AnchorDelta } from "./anchor-registry";
+import { isAstGrepAvailable, findWithPattern, replaceWithPattern } from "./astgrep-anchor";
 
 import type {
   EditTarget,
@@ -75,7 +77,8 @@ import type {
   EditCapability,
   MatchSpan,
   SearchScope,
-} from "./lib/types";
+} from "./core/types";
+import { MatchTier } from "./core/types";
 
 const smartEditRuntimeConfig = getSmartEditRuntimeConfig();
 
@@ -99,6 +102,7 @@ function coerceText(value: unknown): string {
 
 const editItemSchema = Type.Object(
   {
+    path: Type.Optional(Type.String({ description: "File path for this edit. If top-level path is omitted, all edits must use the same path." })),
     oldText: Type.Optional(Type.String()),
     newText: Type.Optional(Type.String()),
     description: Type.Optional(Type.String({ description: "Optional label echoed in diagnostics for self-reference." })),
@@ -124,9 +128,9 @@ const editItemSchema = Type.Object(
 
 const editSchema = Type.Object(
   {
-    path: Type.String({
-      description: "Path to the file to edit (relative or absolute)",
-    }),
+    path: Type.Optional(Type.String({
+      description: "Path to the file to edit (relative or absolute). May be omitted when every edit includes the same path.",
+    })),
     replaceAll: Type.Optional(
       Type.Boolean({
         description:
@@ -150,16 +154,8 @@ const editSchema = Type.Object(
   },
 );
 
-function resolveWorkspacePath(cwd: string, targetPath: string): string {
-  const absolutePath = resolve(cwd, targetPath);
-  const rel = relative(cwd, absolutePath);
-  if (rel.startsWith("..") || isAbsolute(rel)) {
-    throw formatEditError(
-      `Cannot edit "${targetPath}": path is outside the current workspace.`,
-      `Use a path inside ${cwd}.`,
-    );
-  }
-  return absolutePath;
+export function resolveEditPath(cwd: string, targetPath: string): string {
+  return resolve(cwd, targetPath);
 }
 
 
@@ -476,7 +472,6 @@ export default function smartEdit(pi: ExtensionAPI) {
       "Use oldText/newText for small, exact local changes inside a symbol, import tweaks, config values, or other non-symbol edits.",
       "Use multiple edits in one call for independent changes to the same file. All edits are matched against the original file content, not incrementally.",
       "Do not emit overlapping edits — merge nearby changes into one edit. Keep content arrays concise — only include lines that change.",
-      "Before editing code that depends on custom types, imported factories, interfaces, or unfamiliar symbols, call semantic_context for the target range instead of reading whole dependency files.",
     ],
 
     parameters: editSchema as unknown as Record<string, unknown>,
@@ -543,7 +538,7 @@ export default function smartEdit(pi: ExtensionAPI) {
 
       // Resolve path
       const cwd = process.cwd();
-      const absolutePath = resolveWorkspacePath(cwd, path);
+      const absolutePath = resolveEditPath(cwd, path);
 
       // Check if aborted
       if (signal?.aborted) {
@@ -703,7 +698,7 @@ export default function smartEdit(pi: ExtensionAPI) {
             } else if (localTargets?.[i]) {
               const targetData = localTargets[i] as Record<string, unknown>;
               // A target with an operation field is a symbolic edit
-              if (targetData.replaceBody || targetData.insertBefore || targetData.insertAfter) {
+              if (targetData.replaceBody || targetData.insertBefore || targetData.insertAfter || targetData.pattern) {
                 symbolicEdits.push({
                   target: targetData as EditTarget,
                   editIdx: i,
@@ -742,6 +737,11 @@ export default function smartEdit(pi: ExtensionAPI) {
           if (legacyEdits.length > 0) editCapabilities.add("oldText");
           if (legacyEdits.some(({ edit }) => edit.replaceAll)) editCapabilities.add("replaceAll");
           if (legacyEdits.some(({ edit }) => edit.target)) editCapabilities.add("astAnchor");
+          // Check ast-grep availability (non-blocking, cached after first call)
+          const astGrepAvailable = await isAstGrepAvailable();
+          if (astGrepAvailable) {
+            editCapabilities.add("astGrepAnchor");
+          }
           const resultMatchSpans: MatchSpan[] = [];
           let replacementCount = 0;
 
@@ -773,9 +773,9 @@ export default function smartEdit(pi: ExtensionAPI) {
             // Import hashline-edit functions at runtime to avoid circular deps
             const {
               applyHashlinePath,
-            } = await import("./lib/hashline-edit.js");
-            const { getSnapshot } = await import("./lib/read-cache.js");
-            const { findText, findTextWithTelemetry, detectIndentation } = await import("./lib/edit-diff.js");
+            } = await import("./core/hashline-edit.js");
+            const { getSnapshot } = await import("./core/read-cache.js");
+            const { findText, findTextWithTelemetry, detectIndentation } = await import("./core/edit-diff.js");
 
             // Get file snapshot from cache for oldText reconstruction
             const snapshot = getSnapshot(path, cwd);
@@ -863,7 +863,59 @@ export default function smartEdit(pi: ExtensionAPI) {
             }
           }
 
-          // ── Phase B: Apply symbolic AST edits (if any) ──
+          // ── Phase B (ast-grep pattern edits first) ──
+          // Separate pattern-based symbolic edits for ast-grep processing.
+          // Pattern edits use ast-grep's structural find+replace instead of tree-sitter queries.
+          const patternSymbolicEdits = symbolicEdits.filter((se) => se.target?.pattern);
+
+          if (patternSymbolicEdits.length > 0) {
+            const languageId = detectLanguageFromExtension(path);
+            if (!languageId) {
+              // ast-grep requires a valid language; skip pattern edits
+              matchNotes.push("astGrep skipped: unknown language for " + path);
+            } else {
+              for (const ps of patternSymbolicEdits) {
+                if (!ps.target?.pattern || !ps.target?.replacement) continue;
+                // Find matches first to get accurate spans
+                const matches = await findWithPattern(
+                  normalizedContent,
+                  languageId,
+                  ps.target.pattern,
+                );
+                if (matches.length === 0) continue;
+                const result = await replaceWithPattern(
+                  normalizedContent,
+                  languageId,
+                  ps.target.pattern,
+                  ps.target.replacement,
+                );
+                if (result && result.matchCount > 0) {
+                  normalizedContent = result.newContent;
+                  replacementCount += result.matchCount;
+                  // Use actual match positions for spans
+                  for (const m of matches) {
+                    resultMatchSpans.push({
+                      editIndex: ps.editIdx ?? 0,
+                      matchIndex: m.startByte,
+                      matchLength: m.endByte - m.startByte,
+                      newText: ps.target.replacement,
+                      tier: MatchTier.EXACT,
+                      replaceAll: true,
+                    });
+                  }
+                  matchNotes.push(`astGrep pattern: ${ps.target.pattern} (${result.matchCount} matches)`);
+                }
+              }
+            }
+            // Remove processed pattern edits so Phase B doesn't process them again
+            for (let i = symbolicEdits.length - 1; i >= 0; i--) {
+              if (symbolicEdits[i].target?.pattern) {
+                symbolicEdits.splice(i, 1);
+              }
+            }
+          }
+
+          // ── Phase B (continued): Apply symbolic AST edits (if any) ──
           if (symbolicEdits.length > 0) {
             const symbolicPreview = await applySymbolicEdits({
               content: normalizedContent,
@@ -985,6 +1037,19 @@ export default function smartEdit(pi: ExtensionAPI) {
           }
 
           if (aborted) throw new Error("Operation aborted");
+
+          // ── Anchor hygiene: compute delta for model-visible drift notification ──
+          let anchorDeltaSummary: string | null = null;
+          let anchorDelta: AnchorDelta | null = null;
+          const snapshot = getSnapshot(path, cwd);
+          if (snapshot?.hashline?.anchors && snapshot.hashline.anchors.size > 0) {
+            try {
+              anchorDelta = await computeAnchorDelta(snapshot, normalizedContent);
+              anchorDeltaSummary = formatAnchorDeltaForModel(anchorDelta, ANCHOR_CHURN_THRESHOLD);
+            } catch {
+              // Anchor delta computation is advisory — never block the edit result
+            }
+          }
 
           // Reconstruct with BOM and line endings
           const finalContent =
@@ -1202,6 +1267,7 @@ export default function smartEdit(pi: ExtensionAPI) {
                 cwd,
                 path: absolutePath,
                 content: normalizedContent,
+                oldContent: baseContent,
                 languageId: detectLanguageFromExtension(path) ?? "unknown",
                 matchSpans: resultMatchSpans.map((s) => ({
                   startIndex: s.matchIndex,
@@ -1364,6 +1430,11 @@ export default function smartEdit(pi: ExtensionAPI) {
             text += "\n\n" + conflictWarnings.join("\n\n");
           }
 
+          // Append anchor drift notification
+          if (anchorDeltaSummary) {
+            text += "\n[anchor updates: " + anchorDeltaSummary + "]";
+          }
+
           // Add conflict details to details output
           const details: {
             diff?: string;
@@ -1380,6 +1451,7 @@ export default function smartEdit(pi: ExtensionAPI) {
             }>;
             editCapabilities?: EditCapability[];
             scopedDiagnostics?: ScopedDiagnostic[];
+            anchorDelta?: { summary: string; shifted: number; deleted: number; changed: number };
           } = {
             diff: diffResult.diff,
             firstChangedLine: diffResult.firstChangedLine,
@@ -1413,6 +1485,14 @@ export default function smartEdit(pi: ExtensionAPI) {
           }
           if (editCapabilities.size > 0) {
             details.editCapabilities = [...editCapabilities].sort();
+          }
+          if (anchorDeltaSummary && anchorDelta) {
+            details.anchorDelta = {
+              summary: anchorDeltaSummary,
+              shifted: anchorDelta.shifted.length,
+              deleted: anchorDelta.deleted.length,
+              changed: anchorDelta.changed.length,
+            };
           }
           if (scopedDiagnostics.length > 0) {
             details.scopedDiagnostics = scopedDiagnostics;
@@ -1479,6 +1559,7 @@ export default function smartEdit(pi: ExtensionAPI) {
     // renderCall and renderResult are optional; Pi's built-in rendering
     // provides sensible defaults for tools with text results.
   } as unknown));
+
 }
 
 // ── Exports for testing ─────────────────────────────────────────────

@@ -21,10 +21,10 @@ import {
   parseFile,
   disposeParseResult,
   type EditDelta,
-} from "../lib/ast-resolver.js";
+} from "../src/core/ast-resolver.js";
 
 // Import grammar loader for setup/teardown
-import { clearGrammarCache, resetParser } from "../lib/grammar-loader.js";
+import { clearGrammarCache, resetParser } from "../src/core/grammar-loader.js";
 
 // ─── Test Suite ─────────────────────────────────────────────────────────────
 

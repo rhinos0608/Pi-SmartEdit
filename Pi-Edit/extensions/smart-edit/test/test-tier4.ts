@@ -7,8 +7,8 @@
 
 import { describe, test } from "node:test";
 import { strict as assert } from "node:assert";
-import { findText, detectIndentation } from "../lib/edit-diff";
-import { MatchTier } from "../lib/types";
+import { findText, detectIndentation } from "../src/core/edit-diff";
+import { MatchTier } from "../src/core/types";
 
 describe("Tier 4 similarity matching", () => {
   test("findText falls back to similarity tier when exact/indent/unicode all fail", () => {

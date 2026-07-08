@@ -16,11 +16,11 @@
 import {
   applyEdits,
   lineRangeToByteRange,
-} from "../.pi/extensions/smart-edit/lib/edit-diff";
-import { validateSyntax } from "../.pi/extensions/smart-edit/lib/ast-resolver";
+} from "../.pi/extensions/smart-edit/src/core/edit-diff";
+import { validateSyntax } from "../.pi/extensions/smart-edit/src/core/ast-resolver";
 
-import type { SearchScope } from "../.pi/extensions/smart-edit/lib/types";
-import type { EditItem } from "../.pi/extensions/smart-edit/lib/types";
+import type { SearchScope } from "../.pi/extensions/smart-edit/src/core/types";
+import type { EditItem } from "../.pi/extensions/smart-edit/src/core/types";
 
 // ─── Helpers ──────────────────────────────────────────────────────
 

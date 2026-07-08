@@ -16,7 +16,7 @@
  * Inspired by: codex-rs/apply-patch/src/parser.rs
  */
 
-import { SmartEditError } from "../../lib/errors";
+import { SmartEditError } from "../core/errors";
 
 // ─── Types ──────────────────────────────────────────────────────────
 

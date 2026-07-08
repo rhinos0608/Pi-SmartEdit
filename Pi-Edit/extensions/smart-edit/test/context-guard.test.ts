@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
 import { checkContextGuardSimilarity, CONTEXT_GUARD_SIMILARITY_THRESHOLD } from "../src/safety/context-guard";
-import { textSimilarityRatio } from "../lib/edit-diff";
+import { textSimilarityRatio } from "../src/core/edit-diff";
 
 const block = [
   "function buildConfig() {",

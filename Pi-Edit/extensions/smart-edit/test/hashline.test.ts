@@ -1,5 +1,5 @@
 /**
- * Unit tests for hashline anchoring (lib/hashline.ts).
+ * Unit tests for hashline anchoring (src/core/hashline.ts).
  *
  * Covers: bigram table, computeLineHash, structural bigrams,
  * formatLineHash, formatHashLine, buildHashlineAnchors, collision rate.
@@ -18,7 +18,7 @@ import {
   formatHashLine,
   initHashline,
   buildHashlineAnchors,
-} from "../lib/hashline.js";
+} from "../src/core/hashline.js";
 
 // Initialize hashline before running tests
 let initialized = false;

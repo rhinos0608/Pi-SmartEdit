@@ -1,5 +1,5 @@
-import type { EditItem, SearchScope } from "../lib/types";
-import type { ParseResult } from "../lib/ast-resolver";
+import type { EditItem, SearchScope } from "./core/types";
+import type { ParseResult } from "./core/ast-resolver";
 
 /**
  * The shape of the AST resolver object used by anchor resolution.

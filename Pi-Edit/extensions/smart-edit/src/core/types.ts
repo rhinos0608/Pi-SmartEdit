@@ -51,6 +51,12 @@ export interface EditTarget {
 
   /** Optional label echoed in diagnostics for model self-reference. */
   description?: string;
+
+  /** ast-grep pattern for structural search (e.g., "console.log($$$ARGS)") */
+  pattern?: string;
+
+  /** Replacement for ast-grep pattern (e.g., "logger.info($$$ARGS)") */
+  replacement?: string;
 }
 
 /**
@@ -69,9 +75,11 @@ export type EditCapability =
   | "symbolicEdit"
   | "lspDiagnostics"
   | "compilerDiagnostics"
-  | "scopedDiagnostics";
+  | "scopedDiagnostics"
+  | "astGrepAnchor";
 
 export interface EditItem {
+  path?: string;
   oldText: string;
   newText: string;
   replaceAll?: boolean;

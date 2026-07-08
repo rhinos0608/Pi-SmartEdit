@@ -6,7 +6,7 @@
  * from edit-diff.ts rather than reimplementing similarity inline.
  */
 
-import { findText, detectIndentation } from './.pi/extensions/smart-edit/lib/edit-diff';
+import { findText, detectIndentation } from './.pi/extensions/smart-edit/src/core/edit-diff';
 
 // Simple test harness
 function assert(condition: boolean, message: string): void {

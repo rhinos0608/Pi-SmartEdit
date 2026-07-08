@@ -20,7 +20,7 @@ import {
 import { resolve as pathResolve, dirname, join } from "path";
 import { randomBytes } from "crypto";
 
-import { fastHash } from "../../lib/types";
+import { fastHash } from "../core/types";
 
 import { atomicWrite } from "./atomic-write";
 import type { AtomicWriteOptions } from "./atomic-write";

@@ -23,6 +23,7 @@ import { detectLanguageFromExtension } from "../lsp/language-id";
 import { getCompilerForLanguage } from "../lsp/diagnostic-dispatcher";
 import type { Diagnostic, DiagnosticResult } from "../lsp/diagnostic-dispatcher";
 import type Parser from "web-tree-sitter";
+import { computeStructuralDiff, hasStructuralAnomalies, type StructuralDiffResult } from "./structural-diff.js";
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -56,6 +57,8 @@ export interface ValidationResult {
   summary: string;
   /** Format equivalence check result */
   formatEquivalence?: FormatEquivalenceResult;
+  /** Structural diff verification (GumTree-Simplified on tree-sitter CSTs) */
+  structuralDiff?: StructuralDiffResult;
 }
 
 export interface AutoValidateOptions {
@@ -447,6 +450,7 @@ export async function runAutoValidation(
       retryCount: 0,
       shouldDecompose: false,
       summary: "",
+      structuralDiff: undefined,
       formatEquivalence: { equivalent: true, indentScore: 0 },
     };
   }
@@ -463,7 +467,7 @@ export async function runAutoValidation(
   if (oldTree && oldContent) {
     try {
       // Dynamic import to avoid circular dependency
-      const { validateSyntax } = await import("../../lib/ast-resolver.js");
+      const { validateSyntax } = await import("../core/ast-resolver.js");
       const syntaxResult = await validateSyntax(content, filePath, oldTree, oldContent);
       if (!syntaxResult.valid) {
         syntaxError = syntaxResult.error;
@@ -502,12 +506,37 @@ export async function runAutoValidation(
     }
   }
 
+  // Run structural diff verification if old tree is available
+  let structuralDiff: StructuralDiffResult | undefined;
+  if (oldTree && oldContent) {
+    try {
+      const { parseFile } = await import("../core/ast-resolver.js");
+      const parseResult = await parseFile(content, filePath);
+      if (parseResult) {
+        try {
+          structuralDiff = computeStructuralDiff(oldTree, parseResult.tree, "unknown", languageId ?? undefined);
+          if (hasStructuralAnomalies(structuralDiff)) {
+            structuralDiff = { ...structuralDiff, passed: false };
+            structural.errors.push(...structuralDiff.errors);
+          }
+        } finally {
+          // Clean up the new tree to avoid memory leaks
+          parseResult.tree.delete();
+          parseResult.parser.delete();
+        }
+      }
+    } catch {
+      // Structural diff is advisory — continue with other checks
+    }
+  }
+
   // Determine if validation passed
   const hasStructuralErrors = !structural.passed;
   const hasSyntaxErrors = syntaxError !== null;
   const hasFormatErrors = !formatEquivalence.equivalent;
   const hasCompilerErrors = diagnostics.filter((d) => d.severity === 1).length > 0;
-  const passed = !hasStructuralErrors && !hasSyntaxErrors && !hasCompilerErrors;
+  const hasStructuralDiffErrors = structuralDiff ? !structuralDiff.passed : false;
+  const passed = !hasStructuralErrors && !hasSyntaxErrors && !hasCompilerErrors && !hasStructuralDiffErrors;
 
   // Only increment retry count on actual failure (matches index.ts pattern)
   const retryCount = passed
@@ -523,6 +552,9 @@ export async function runAutoValidation(
   }
   if (hasSyntaxErrors && syntaxError) {
     parts.push(`Syntax: ${syntaxError}`);
+  }
+  if (structuralDiff && !structuralDiff.passed) {
+    parts.push(`Structural diff: ${structuralDiff.errors.join("; ")}`);
   }
   if (hasFormatErrors) {
     parts.push(
@@ -555,6 +587,7 @@ export async function runAutoValidation(
     retryCount,
     shouldDecompose,
     summary,
+    structuralDiff,
     formatEquivalence,
   };
 }

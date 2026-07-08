@@ -11,8 +11,8 @@
  * has something to work with (e.g., traceability by filename).
  */
 
-import type { ParseResult } from "../../lib/ast-resolver";
-import { createAstResolver, disposeParseResult } from "../../lib/ast-resolver";
+import type { ParseResult } from "../core/ast-resolver";
+import { createAstResolver, disposeParseResult } from "../core/ast-resolver";
 import type { ChangedTarget } from "./types";
 import { byteOffsetToLine } from "./byte-offset";
 import { simpleGlobMatch } from "./glob-match";

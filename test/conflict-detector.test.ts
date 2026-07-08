@@ -10,8 +10,8 @@
  * Run: npx tsx test/conflict-detector.test.ts
  */
 
-import { createConflictDetector } from "../.pi/extensions/smart-edit/lib/conflict-detector";
-import type { ConflictDetectionConfig } from "../.pi/extensions/smart-edit/lib/types";
+import { createConflictDetector } from "../.pi/extensions/smart-edit/src/core/conflict-detector";
+import type { ConflictDetectionConfig } from "../.pi/extensions/smart-edit/src/core/types";
 
 // ─── Helpers ────────────────────────────────────────────────────────
 

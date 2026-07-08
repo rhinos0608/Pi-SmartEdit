@@ -21,6 +21,7 @@ import { retrieveHistory } from "./history-context";
 import { analyzeTraceability } from "./traceability";
 import { defaultVerificationConfig } from "./config";
 import { isVerificationActive } from "./config";
+import { checkPatchCorrectness, type PatchCorrectnessResult } from "./patch-correctness";
 import type { VerificationConfig } from "./types";
 import type { PostEditEvidenceResult, ConcurrencyEvidence } from "./types";
 import type { ChangedTarget } from "./types";
@@ -35,6 +36,8 @@ export interface PostEditEvidenceInput {
   path: string;
   /** Post-edit file content (LF-normalized, BOM-stripped) */
   content: string;
+  /** Pre-edit file content (for patch correctness diffing) */
+  oldContent?: string;
   /** Language ID from the edit pipeline */
   languageId: string;
   /** Byte ranges of actual changes from edit match spans */
@@ -68,6 +71,25 @@ export async function runPostEditEvidencePipeline(
 
   if (!isVerificationActive(config)) {
     return { notes, details: { changes, concurrency, traceability, history, repair: null } };
+  }
+
+  // ── Step 0: Patch correctness pre-verification (static, fast) ──
+  let patchCorrectness: PatchCorrectnessResult | undefined;
+  try {
+    patchCorrectness = checkPatchCorrectness(
+      input.oldContent ?? "",
+      input.content,
+      input.languageId,
+      undefined,
+    );
+  } catch {
+    // Patch correctness is advisory — never block
+  }
+
+  if (patchCorrectness && !patchCorrectness.passed) {
+    for (const warning of patchCorrectness.warnings) {
+      notes.push(`[patch-correctness] ${warning}`);
+    }
   }
 
   // ── Phase A: Build changed targets ──
@@ -257,6 +279,7 @@ export async function runPostEditEvidencePipeline(
       history,
       repair: repairResult,
     },
+    patchCorrectness,
   };
 }
 

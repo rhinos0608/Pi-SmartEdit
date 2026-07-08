@@ -1,5 +1,5 @@
 /**
- * Unit tests for hashline edit application (lib/hashline-edit.ts).
+ * Unit tests for hashline edit application (src/core/hashline-edit.ts).
  *
  * Covers: parseTag, tryRebaseAnchor, resolveHashlineEdits, applyHashlineEdits,
  * HashlineMismatchError, detectEditFormat.
@@ -37,14 +37,14 @@ import {
   // Types for test data
   type Anchor,
   type HashlineEditOp,
-} from "../lib/hashline-edit.js";
+} from "../src/core/hashline-edit.js";
 
 import {
   computeLineHashSync,
   initHashline,
-} from "../lib/hashline.js";
+} from "../src/core/hashline.js";
 
-import type { ApplyResult } from "../lib/hashline-edit.js";
+import type { ApplyResult } from "../src/core/hashline-edit.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 

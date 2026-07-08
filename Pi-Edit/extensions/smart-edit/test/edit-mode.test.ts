@@ -5,6 +5,16 @@ import {
   getSmartEditRuntimeConfig,
   parseBooleanEnv,
 } from "../src/edit-mode.js";
+import { resolveEditPath } from "../src/index.js";
+
+describe("edit path resolution", () => {
+  it("resolves parent-directory paths instead of rejecting them", () => {
+    assert.strictEqual(
+      resolveEditPath("/repo/workspace", "../outside.txt"),
+      "/repo/outside.txt",
+    );
+  });
+});
 
 describe("edit mode config", () => {
   it("defaults to the oldText/newText path", () => {

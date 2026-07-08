@@ -3,8 +3,8 @@ import {
   findText,
   normalizeIndentation,
   textSimilarityRatio,
-} from "../../lib/edit-diff";
-import type { EditItem, SearchScope } from "../../lib/types";
+} from "../core/edit-diff";
+import type { EditItem, SearchScope } from "../core/types";
 
 export const CONTEXT_GUARD_SIMILARITY_THRESHOLD = 0.95;
 

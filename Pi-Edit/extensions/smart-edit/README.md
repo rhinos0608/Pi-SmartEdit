@@ -197,67 +197,20 @@ Only use this after enabling `SMART_EDIT_USE_HASHLINE_EDITING=1`.
 
 ```text
 .pi/extensions/smart-edit/
-├── index.ts                   # Tool registration, stale guard, atomic writes, mutation queue,
-│                              #   atomic patch envelope integration
-├── lib/
-│   ├── types.ts               # Shared types, FileSnapshot, fastHash, MatchTier
-│   ├── edit-diff.ts           # 6-tier matching pipeline and diff generation
-│   ├── hashline.ts            # Line hashing for hashline anchors (xxhash-wasm)
-│   ├── hashline-edit.ts       # Hashline edit application and validation
-│   ├── read-cache.ts          # Snapshot cache and read-range coverage guard
-│   ├── ast-resolver.ts        # Tree-sitter parsing, symbol resolution, incremental re-parse
-│   │                          #   with LRU parse cache (10 entries)
-│   ├── conflict-detector.ts   # AST-level conflict detection between edit calls
-│   ├── grammar-loader.ts      # Lazy-loads tree-sitter WASM grammars
-│   └── path-utils.ts          # Path resolution (resolveToCwd)
 ├── src/
+│   ├── index.ts               # Tool registration, stale guard, atomic writes, mutation queue
+│   ├── core/                  # Matching, AST, hashline, read cache, and shared types
+│   ├── formats/               # JSON/search-replace/diff/OpenAI/Codex patch parsers
+│   ├── lsp/                   # LSP lifecycle, diagnostics, semantic context, symbol navigation
+│   ├── safety/                # Approval gating and context-guard checks
+│   ├── undo/                  # Atomic writes and per-edit undo capture
+│   ├── verification/          # Validation, evidence, diagnostics, repair loop
 │   ├── edit-mode.ts           # Runtime config (hashline toggle, env vars)
 │   ├── symbolic-edits.ts      # Symbolic edit engine (replaceBody, insertBefore, insertAfter)
-│   ├── smartread-bridge.ts    # Breakage/co-change recording to Pi-SmartRead
-│   ├── safety/
-│   │   └── approval-gating.ts # Path/symbol/line-range safety checks
-│   ├── undo/
-│   │   ├── atomic-write.ts    # Temp-file write + rename with mode preservation
-│   │   └── edit-history.ts    # Per-edit undo capture (base64 JSON in .smart-edit-undo/)
-│   ├── formats/
-│   │   ├── index.ts           # Format detection and dispatch
-│   │   ├── format-detector.ts # Auto-detect input format from raw text
-│   │   ├── search-replace.ts  # Search/replace block parser
-│   │   ├── unified-diff.ts    # Unified diff parser
-│   │   ├── openai-patch.ts    # OpenAI patch format parser
-│   │   ├── codex-patch.ts     # Codex apply_patch grammar parser
-│   │   ├── atomic-patch.ts    # Multi-file atomic patch envelope parser
-│   │   ├── streaming-patch-parser.ts # Progressive parse with progress callbacks
-│   │   ├── forgiving-parser.ts # JSON repair for malformed LLM output
-│   │   └── context-markers.ts # XML-style markers for injected semantic context
-│   ├── lsp/
-│   │   ├── index.ts           # LSP module public API
-│   │   ├── lsp-connection.ts  # JSON-RPC over stdio
-│   │   ├── lsp-manager.ts     # Lazy server startup and runtime config
-│   │   ├── diagnostics.ts     # Post-edit LSP diagnostic checks
-│   │   ├── diagnostic-dispatcher.ts # Compiler fallback + output parsing
-│   │   ├── semantic-context.ts # Semantic context resolution (definitions, refs)
-│   │   ├── semantic-nav.ts    # LSP-based semantic navigation
-│   │   ├── context-renderer.ts # Render semantic context as markdown
-│   │   ├── symbol-skeleton.ts # Extract symbol outlines from AST
-│   │   ├── target-range.ts    # Resolve symbol targets to byte ranges
-│   │   ├── document-sync.ts   # DidOpen/DidChange/DidClose synchronization
-│   │   └── language-id.ts     # Extension → LSP language ID mapping
-│   ├── verification/
-│   │   ├── types.ts           # Shared verification types (config, evidence, repair)
-│   │   ├── config.ts          # Default verification configuration + deep merge
-│   │   ├── auto-validate.ts   # Retry-aware structural + incremental syntax validation
-│   │   ├── post-edit-evidence.ts # Orchestrates full evidence pipeline (including Phase E repair)
-│   │   ├── change-targets.ts  # Identify what symbols were changed
-│   │   ├── concurrency-detector.ts # Detect async/thread/lock patterns
-│   │   ├── concurrency-tools.ts    # Run ecosystem verification tools
-│   │   ├── traceability.ts    # Test coverage linkage analysis
-│   │   ├── history-context.ts # Git blame + commit history context
-│   │   ├── scoped-diagnostics.ts   # Filter diagnostics to changed targets only
-│   │   ├── command-runner.ts  # Subprocess execution with timeout
-│   │   ├── background-runner.ts    # Background task scheduling
-│   │   └── repair-loop.ts     # Aider-style lint-fix retry system
-└── test/                      # 30+ test suites (25 test files)
+│   └── smartread-bridge.ts    # Breakage/co-change recording to Pi-SmartRead
+├── test/                      # 30+ test suites (25 test files)
+├── benchmark/                 # Hashline and matching benchmarks
+└── docs/                      # Feature specs and design notes
 ```
 
 ### Flow

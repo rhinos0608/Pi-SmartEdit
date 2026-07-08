@@ -24,7 +24,7 @@ import {
   checkStructural,
   type ValidationResult,
 } from "./auto-validate";
-import { detectIndentation, normalizeIndentation } from "../../lib/edit-diff";
+import { detectIndentation, normalizeIndentation } from "../core/edit-diff";
 
 // ─── Public Types ───────────────────────────────────────────────────
 

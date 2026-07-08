@@ -11,6 +11,7 @@
  */
 
 import type { RepairLoopResult } from "./repair-loop";
+import type { PatchCorrectnessResult } from "./patch-correctness";
 
 /**
  * A semantic target that was changed by an edit.
@@ -229,4 +230,6 @@ export interface PostEditEvidenceResult {
     /** Repair loop results (null if repair is disabled or not triggered) */
     repair: RepairLoopResult | null;
   };
+  /** Pre-verification: static patch correctness checks (runs before LSP) */
+  patchCorrectness?: PatchCorrectnessResult;
 }

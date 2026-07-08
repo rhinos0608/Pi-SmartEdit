@@ -8,7 +8,7 @@ import {
   DANGEROUS_SYMBOL_PATTERNS,
 } from "../src/safety/approval-gating.js";
 import type { ApprovalLevel, SafetyCheckResult } from "../src/safety/approval-gating.js";
-import type { EditItem } from "../lib/types.js";
+import type { EditItem } from "../src/core/types.js";
 
 // ─── Helpers ───────────────────────────────────────────────────────────
 

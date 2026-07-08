@@ -12,8 +12,8 @@
 
 import { parsePatch } from 'diff';
 
-import { lineRangeToByteRange } from '../../lib/edit-diff';
-import type { SearchScope } from '../../lib/types';
+import { lineRangeToByteRange } from '../core/edit-diff';
+import type { SearchScope } from '../core/types';
 
 export interface UnifiedDiffHunk {
   oldStart: number;

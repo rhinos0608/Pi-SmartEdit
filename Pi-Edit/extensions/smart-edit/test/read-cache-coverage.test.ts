@@ -1,6 +1,6 @@
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert";
-import { clearCache, checkRangeCoverage, recordReadSession } from "../lib/read-cache";
+import { clearCache, checkRangeCoverage, recordReadSession } from "../src/core/read-cache";
 
 describe("checkRangeCoverage read summary", () => {
   beforeEach(() => {

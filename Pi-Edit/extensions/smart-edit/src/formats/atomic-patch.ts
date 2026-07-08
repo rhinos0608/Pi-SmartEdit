@@ -22,7 +22,7 @@ import { constants } from "fs";
 
 import { saveUndoState, restoreUndoState } from "../undo/edit-history";
 import { atomicWrite } from "../undo/atomic-write";
-import { SmartEditError } from "../../lib/errors";
+import { SmartEditError } from "../core/errors";
 
 // ─── Types ──────────────────────────────────────────────────────────
 

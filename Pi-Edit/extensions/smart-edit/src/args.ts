@@ -1,9 +1,9 @@
 import { readFileSync } from "fs";
 import { relative, isAbsolute, resolve } from "path";
 import { Buffer } from "buffer";
-import type { EditItem, EditInput } from "../lib/types";
+import type { EditItem, EditInput } from "./core/types";
 import { isSymbolicEdit } from "./symbolic-edits.js";
-import { HASHLINE_CONTENT_SEPARATOR } from "../lib/hashline";
+import { HASHLINE_CONTENT_SEPARATOR } from "./core/hashline";
 import { detectInputFormat } from "./formats/format-detector.js";
 import { parseSearchReplace } from "./formats/search-replace.js";
 import { parseUnifiedDiffToEditItems } from "./formats/unified-diff.js";
@@ -139,6 +139,41 @@ function tryExtractPartialEdits(raw: string): unknown[] {
   return results;
 }
 
+function inferPathFromEditItems(args: Record<string, unknown>): void {
+  if (!Array.isArray(args.edits)) return;
+
+  const editPaths = args.edits
+    .map((edit) => edit && typeof edit === "object" && !Array.isArray(edit) ? (edit as Record<string, unknown>).path : undefined)
+    .filter((path): path is string => typeof path === "string" && path.length > 0);
+
+  if (editPaths.length === 0) return;
+
+  const uniqueByResolvedPath = new Map<string, string>();
+  for (const path of editPaths) {
+    uniqueByResolvedPath.set(resolve(path), path);
+  }
+
+  if (uniqueByResolvedPath.size > 1) {
+    throw formatEditError(
+      "Nested edit paths are ambiguous: edits must target one file.",
+      `Received paths: ${[...uniqueByResolvedPath.values()].join(", ")}\n` +
+        "Use one edit call per file, or use Atomic Patch for multi-file edits.",
+    );
+  }
+
+  const inferredPath = uniqueByResolvedPath.values().next().value as string;
+  if (typeof args.path === "string" && resolve(args.path) !== resolve(inferredPath)) {
+    throw formatEditError(
+      "Top-level path conflicts with edits[].path.",
+      `path is ${JSON.stringify(args.path)}, but edits[].path is ${JSON.stringify(inferredPath)}.`,
+    );
+  }
+
+  if (typeof args.path !== "string" || args.path.length === 0) {
+    args.path = inferredPath;
+  }
+}
+
 // ─── Legacy input compatibility ─────────────────────────────────────
 
 export function prepareArguments(input: Record<string, unknown>, useHashlineEditing: boolean): Record<string, unknown> {
@@ -172,17 +207,6 @@ export function prepareArguments(input: Record<string, unknown>, useHashlineEdit
       `    path: "src/foo.ts",\n` +
       `    edits: [{ oldText: "old line", newText: "new line" }]\n` +
       `  })`
-    );
-  }
-
-  if (!args.path) {
-    throw formatEditError(
-      `Edit tool is missing the required "path" field.`,
-      `You must specify which file to edit. Add a path string to your edit call:\n\n` +
-      `  {\n` +
-      `    path: "src/foo.ts",  // <-- add this — relative or absolute path\n` +
-      `    edits: [{ oldText: "...", newText: "..." }]\n` +
-      `  }`
     );
   }
 
@@ -444,6 +468,23 @@ export function prepareArguments(input: Record<string, unknown>, useHashlineEdit
     args.edits = parsed;
   }
 
+  inferPathFromEditItems(args);
+
+  if (!args.path) {
+    throw formatEditError(
+      `Edit tool is missing the required "path" field.`,
+      `You must specify which file to edit. Add a path string to your edit call:\n\n` +
+      `  {\n` +
+      `    path: "src/foo.ts",  // <-- add this — relative or absolute path\n` +
+      `    edits: [{ oldText: "...", newText: "..." }]\n` +
+      `  }\n\n` +
+      `Or put path on each edit when all edits target the same file:\n` +
+      `  {\n` +
+      `    edits: [{ path: "src/foo.ts", oldText: "...", newText: "..." }]\n` +
+      `  }`
+    );
+  }
+
   // Legacy single-edit format: { path, oldText, newText, edits?: [...] }
   const legacy = args as Record<string, unknown>;
   if (
@@ -478,6 +519,7 @@ export function prepareArguments(input: Record<string, unknown>, useHashlineEdit
   // passes. The values are restored in execute() before calling applyEdits().
   // For backwards compat, we convert old-style anchor/symbol to new target shape.
   if (Array.isArray(args.edits)) {
+    const topLevelReplaceAll = args.replaceAll === true;
     const flags: boolean[] = [];
     const targets: (Record<string, unknown> | undefined)[] = [];
     const hashlines: (Record<string, unknown> | undefined)[] = [];
@@ -543,7 +585,7 @@ export function prepareArguments(input: Record<string, unknown>, useHashlineEdit
         flags.push(edit.replaceAll);
         delete edit.replaceAll;
       } else {
-        flags.push(false);
+        flags.push(topLevelReplaceAll);
       }
 
       // target (new unified form, or converted from old-style)

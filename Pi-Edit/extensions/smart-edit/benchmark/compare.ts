@@ -13,15 +13,15 @@ import {
   computeLineHash,
   initHashline,
   computeLineHashSync,
-} from "../lib/hashline";
+} from "../src/core/hashline";
 import {
   resolveHashlineEdits,
   validateHashlineEdits,
   applyHashlineEdits,
   detectEditFormat,
   type HashlineEditInput,
-} from "../lib/hashline-edit";
-import { findText, detectIndentation } from "../lib/edit-diff";
+} from "../src/core/hashline-edit";
+import { findText, detectIndentation } from "../src/core/edit-diff";
 import { mkdirSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";

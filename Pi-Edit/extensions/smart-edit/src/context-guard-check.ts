@@ -1,7 +1,7 @@
-import type { EditItem, EditTarget, SearchScope } from "../lib/types";
+import type { EditItem, EditTarget, SearchScope } from "./core/types";
 import { checkContextGuardSimilarity } from "./safety/context-guard.js";
 import { resolveAnchorToScope } from "./anchor-resolution.js";
-import type { ParseResult } from "../lib/ast-resolver";
+import type { ParseResult } from "./core/ast-resolver";
 
 interface AstResolverLike {
   parseFile(content: string, filePath: string): Promise<ParseResult | null>;

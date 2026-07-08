@@ -9,7 +9,7 @@
  * environment variable (never_prompt | prompt_on_dangerous | prompt_always).
  */
 
-import type { EditItem } from "../../lib/types";
+import type { EditItem } from "../core/types";
 import { resolve } from "path";
 import { realpath, stat, open } from "fs/promises";
 import { loadConfig } from "../config/schema.js";

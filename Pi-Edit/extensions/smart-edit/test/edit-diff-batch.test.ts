@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { applyEdits } from "../lib/edit-diff.js";
+import { applyEdits } from "../src/core/edit-diff.js";
 
 describe("applyEdits batch validation", () => {
   it("does not run pre-apply hooks for overlapping edits", async () => {

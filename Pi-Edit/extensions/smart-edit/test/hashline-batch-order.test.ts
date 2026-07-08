@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import { formatHashlineBatchSummary, sortHashlineEditsForApplication } from "../index.js";
+import { formatHashlineBatchSummary, sortHashlineEditsForApplication } from "../src/index.js";
 
 describe("sortHashlineEditsForApplication", () => {
   it("sorts higher lines before lower lines and preserves original order on ties", () => {
