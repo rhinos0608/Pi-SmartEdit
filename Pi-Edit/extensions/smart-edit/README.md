@@ -130,7 +130,31 @@ The format is auto-detected; pass the text as the `raw` parameter.
 }
 ```
 
-This is the default path.
+This is the default path. Edit metadata such as `replaceAll`, `target`, and `hashline` stays on each edit object and is validated directly; paths remain plain filesystem paths.
+
+Legacy callers that append `??smartEditExtra=` metadata to `path` remain accepted during migration, but Smart Edit no longer produces encoded paths.
+
+### Multi-file edit
+
+Omit top-level `path` and provide `path` on every edit. Files execute sequentially; use Atomic Patch when all-or-nothing behavior is required.
+
+```json
+{
+  "edits": [
+    {
+      "path": "src/foo.ts",
+      "oldText": "const oldName = 1;",
+      "newText": "const newName = 1;"
+    },
+    {
+      "path": "src/bar.ts",
+      "oldText": "oldName",
+      "newText": "newName",
+      "replaceAll": true
+    }
+  ]
+}
+```
 
 ### Scoped edit
 

@@ -20,7 +20,10 @@ progress.md
 .DS_Store
 **/.DS_Store
 **/.pi/
+**/.pi-subagents/
 .pi-smartread/
 .pi-smartread.embeddings.cache/
+research.md
+research/
 Pi-Edit/.graphify_uncached.txt
 Pi-Edit/extensions/smart-edit/index.ts.bak

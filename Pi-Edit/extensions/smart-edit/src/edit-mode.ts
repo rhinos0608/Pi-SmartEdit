@@ -9,13 +9,16 @@ import { loadConfig } from "./config/schema.js";
 
 export interface SmartEditRuntimeConfig {
   useHashlineEditing: boolean;
+  allowFuzzyMatching: boolean;
 }
 
 export function getSmartEditRuntimeConfig(
   env: Record<string, string | undefined> = process.env,
 ): SmartEditRuntimeConfig {
+  const config = loadConfig(env);
   return {
-    useHashlineEditing: loadConfig(env).useHashlineEditing,
+    useHashlineEditing: config.useHashlineEditing,
+    allowFuzzyMatching: config.allowFuzzyMatching,
   };
 }
 

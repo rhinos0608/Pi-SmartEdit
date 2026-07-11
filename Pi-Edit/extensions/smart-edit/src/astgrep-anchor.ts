@@ -155,6 +155,7 @@ function escapeRegex(str: string): string {
  * Never throws.
  */
 export async function isAstGrepAvailable(): Promise<boolean> {
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
   const mod = await ensureAstGrep();
   return mod !== null;
 }
@@ -168,7 +169,7 @@ export async function isAstGrepAvailable(): Promise<boolean> {
  * Returns an empty array on any error or if ast-grep is unavailable.
  * Never throws.
  */
-/* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/restrict-plus-operands */
+/* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/restrict-plus-operands, @typescript-eslint/no-unsafe-assignment */
 export async function findWithPattern(
   content: string,
   languageId: string,
@@ -221,7 +222,7 @@ export async function findWithPattern(
  * When no matches are found, returns `{ newContent: content, matchCount: 0 }`.
  * Never throws.
  */
-/* eslint-disable @typescript-eslint/no-unsafe-call */
+/* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-assignment */
 export async function replaceWithPattern(
   content: string,
   languageId: string,

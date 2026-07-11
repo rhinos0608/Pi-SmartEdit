@@ -78,12 +78,19 @@ export type EditCapability =
   | "scopedDiagnostics"
   | "astGrepAnchor";
 
+export interface HashlineEditMetadata {
+  range: { pos: string; end: string };
+  content?: string[] | string | null;
+  symbol?: { name: string; kind?: string; line?: number };
+}
+
 export interface EditItem {
   path?: string;
   oldText: string;
   newText: string;
   replaceAll?: boolean;
   description?: string;
+  hashline?: HashlineEditMetadata;
 
   /** Unified target: anchor scoping (name/kind/line) + optional symbolic operation.
    *  Anchor: oldText/newText matched within the symbol's byte range.

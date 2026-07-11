@@ -1,6 +1,11 @@
 import { describe, test } from "node:test";
 import assert from "node:assert";
-import { prepareArguments } from "../src/args";
+import {
+  decodeLegacyPathMetadata,
+  prepareArguments,
+  resolveEditMetadata,
+  splitMultiFileEditInput,
+} from "../src/args";
 
 describe("prepareArguments", () => {
   test("infers top-level path from a single edit path", () => {
@@ -49,7 +54,7 @@ describe("prepareArguments", () => {
     ]);
   });
 
-  test("preserves top-level replaceAll for execute via side-channel", () => {
+  test("preserves top-level replaceAll as first-class per-edit metadata", () => {
     const result = prepareArguments(
       {
         path: "src/foo.ts",
@@ -62,10 +67,11 @@ describe("prepareArguments", () => {
       false,
     );
 
-    assert.match(String(result.path), /^src\/foo\.ts\?\?smartEditExtra=/);
-    const encoded = String(result.path).split("??smartEditExtra=")[1];
-    const extraData = JSON.parse(Buffer.from(encoded, "base64url").toString("utf-8"));
-    assert.deepStrictEqual(extraData.replaceAllFlags, [true, true]);
+    assert.strictEqual(result.path, "src/foo.ts");
+    assert.deepStrictEqual(result.edits, [
+      { oldText: "old", newText: "new", replaceAll: true },
+      { oldText: "x", newText: "y", replaceAll: true },
+    ]);
   });
 
   test("lets per-edit replaceAll override top-level replaceAll", () => {
@@ -81,23 +87,150 @@ describe("prepareArguments", () => {
       false,
     );
 
-    const encoded = String(result.path).split("??smartEditExtra=")[1];
-    const extraData = JSON.parse(Buffer.from(encoded, "base64url").toString("utf-8"));
-    assert.deepStrictEqual(extraData.replaceAllFlags, [false, true]);
+    assert.strictEqual(result.path, "src/foo.ts");
+    assert.deepStrictEqual(result.edits, [
+      { oldText: "old", newText: "new", replaceAll: false },
+      { oldText: "x", newText: "y", replaceAll: true },
+    ]);
   });
 
-  test("rejects conflicting edit paths", () => {
-    assert.throws(
-      () => prepareArguments(
-        {
-          edits: [
-            { path: "src/foo.ts", oldText: "old", newText: "new" },
-            { path: "src/bar.ts", oldText: "old", newText: "new" },
-          ],
+  test("keeps target and hashline metadata on edit objects", () => {
+    const target = { name: "run", replaceBody: "function run() {}" };
+    const hashline = {
+      range: { pos: "1ab", end: "1ab" },
+      content: ["updated"],
+    };
+    const result = prepareArguments({
+      path: "src/foo.ts",
+      edits: [
+        { target },
+        { hashline },
+      ],
+    }, true);
+
+    assert.strictEqual(result.path, "src/foo.ts");
+    assert.deepStrictEqual(result.edits, [{ target }, { hashline }]);
+  });
+
+  test("resolves direct metadata before legacy side-channel metadata", () => {
+    const edits = [
+      {
+        oldText: "old",
+        newText: "new",
+        replaceAll: false,
+        target: { name: "direct" },
+        hashline: { range: { pos: "1ab", end: "1ab" } },
+      },
+    ];
+    const metadata = resolveEditMetadata(edits, {
+      replaceAllFlags: [true],
+      targetData: [{ name: "legacy" }],
+      hashlineData: [{ range: { pos: "2cd", end: "2cd" } }],
+    });
+
+    assert.deepStrictEqual(metadata.replaceAllFlags, [false]);
+    assert.deepStrictEqual(metadata.targetData, [{ name: "direct" }]);
+    assert.deepStrictEqual(metadata.hashlineData, [{ range: { pos: "1ab", end: "1ab" } }]);
+  });
+
+  test("decodes legacy path metadata without producing new encoded paths", () => {
+    const encoded = Buffer.from(JSON.stringify({
+      replaceAllFlags: [true],
+      targetData: [null],
+      hashlineData: [null],
+    })).toString("base64url");
+
+    assert.deepStrictEqual(
+      decodeLegacyPathMetadata(`src/foo.ts??smartEditExtra=${encoded}`),
+      {
+        path: "src/foo.ts",
+        metadata: {
+          replaceAllFlags: [true],
+          targetData: [null],
+          hashlineData: [null],
         },
-        false,
-      ),
-      /edits must target one file/,
+      },
+    );
+    assert.deepStrictEqual(decodeLegacyPathMetadata("src/foo.ts"), {
+      path: "src/foo.ts",
+      metadata: null,
+    });
+    assert.deepStrictEqual(decodeLegacyPathMetadata("src/file??smartEditExtra=not-json.ts"), {
+      path: "src/file??smartEditExtra=not-json.ts",
+      metadata: null,
+    });
+  });
+
+  test("allows distinct edit paths for multi-file execution", () => {
+    const input = {
+      edits: [
+        { path: "src/foo.ts", oldText: "old", newText: "new" },
+        { path: "src/bar.ts", oldText: "before", newText: "after" },
+        { path: "src/foo.ts", oldText: "x", newText: "y" },
+      ],
+    };
+
+    const prepared = prepareArguments(input, false);
+    const batches = splitMultiFileEditInput(prepared);
+
+    assert.deepStrictEqual(batches, [
+      {
+        path: "src/foo.ts",
+        edits: [
+          { oldText: "old", newText: "new" },
+          { oldText: "x", newText: "y" },
+        ],
+      },
+      {
+        path: "src/bar.ts",
+        edits: [{ oldText: "before", newText: "after" }],
+      },
+    ]);
+  });
+
+  test("allows distinct paths from a JSON-string edits array", () => {
+    const prepared = prepareArguments({
+      edits: JSON.stringify([
+        { path: "src/foo.ts", oldText: "old", newText: "new" },
+        { path: "src/bar.ts", oldText: "before", newText: "after" },
+      ]),
+    }, false);
+
+    assert.deepStrictEqual(splitMultiFileEditInput(prepared), [
+      {
+        path: "src/foo.ts",
+        edits: [{ oldText: "old", newText: "new" }],
+      },
+      {
+        path: "src/bar.ts",
+        edits: [{ oldText: "before", newText: "after" }],
+      },
+    ]);
+  });
+
+  test("does not split single-file edit paths", () => {
+    assert.strictEqual(splitMultiFileEditInput({
+      edits: [
+        { path: "src/foo.ts", oldText: "old", newText: "new" },
+        { path: "src/foo.ts", oldText: "x", newText: "y" },
+      ],
+    }), null);
+  });
+
+  test("defers incomplete multi-file path validation to execution splitting", () => {
+    const input = {
+      edits: [
+        { path: "src/foo.ts", oldText: "old", newText: "new" },
+        { path: "src/bar.ts", oldText: "before", newText: "after" },
+        { oldText: "x", newText: "y" },
+      ],
+    };
+
+    const prepared = prepareArguments(input, false);
+    assert.deepStrictEqual(prepared, input);
+    assert.throws(
+      () => splitMultiFileEditInput(prepared),
+      /every edit must include path/,
     );
   });
 

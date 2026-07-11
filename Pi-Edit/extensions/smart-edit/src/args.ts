@@ -139,27 +139,152 @@ function tryExtractPartialEdits(raw: string): unknown[] {
   return results;
 }
 
-function inferPathFromEditItems(args: Record<string, unknown>): void {
-  if (!Array.isArray(args.edits)) return;
+const LEGACY_EXTRA_MARKER = "??smartEditExtra=";
+
+export interface LegacyEditMetadata {
+  replaceAllFlags?: boolean[] | null;
+  targetData?: Array<Record<string, unknown> | null> | null;
+  hashlineData?: Array<Record<string, unknown> | null> | null;
+}
+
+export interface ResolvedEditMetadata {
+  replaceAllFlags: boolean[];
+  targetData: Array<Record<string, unknown> | undefined>;
+  hashlineData: Array<Record<string, unknown> | undefined>;
+}
+
+export function decodeLegacyPathMetadata(path: string): {
+  path: string;
+  metadata: LegacyEditMetadata | null;
+} {
+  const markerIndex = path.indexOf(LEGACY_EXTRA_MARKER);
+  if (markerIndex === -1) return { path, metadata: null };
+
+  const cleanPath = path.slice(0, markerIndex);
+  try {
+    const decoded = JSON.parse(
+      Buffer.from(path.slice(markerIndex + LEGACY_EXTRA_MARKER.length), "base64url").toString("utf8"),
+    ) as Record<string, unknown>;
+    if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
+      return { path, metadata: null };
+    }
+
+    const replaceAllFlags = decoded.replaceAllFlags;
+    const targetData = decoded.targetData;
+    const hashlineData = decoded.hashlineData;
+    const validFlags = replaceAllFlags == null ||
+      (Array.isArray(replaceAllFlags) && replaceAllFlags.every((flag) => typeof flag === "boolean"));
+    const validObjects = (value: unknown) => value == null ||
+      (Array.isArray(value) && value.every((item) => item == null ||
+        (typeof item === "object" && !Array.isArray(item))));
+    if (!validFlags || !validObjects(targetData) || !validObjects(hashlineData)) {
+      return { path, metadata: null };
+    }
+
+    return {
+      path: cleanPath,
+      metadata: {
+        replaceAllFlags: replaceAllFlags as boolean[] | null | undefined,
+        targetData: targetData as Array<Record<string, unknown> | null> | null | undefined,
+        hashlineData: hashlineData as Array<Record<string, unknown> | null> | null | undefined,
+      },
+    };
+  } catch {
+    return { path, metadata: null };
+  }
+}
+
+export function resolveEditMetadata(
+  edits: Array<Record<string, unknown>>,
+  legacy: LegacyEditMetadata | null = null,
+): ResolvedEditMetadata {
+  return {
+    replaceAllFlags: edits.map((edit, index) =>
+      typeof edit.replaceAll === "boolean"
+        ? edit.replaceAll
+        : legacy?.replaceAllFlags?.[index] === true,
+    ),
+    targetData: edits.map((edit, index) =>
+      edit.target && typeof edit.target === "object" && !Array.isArray(edit.target)
+        ? edit.target as Record<string, unknown>
+        : legacy?.targetData?.[index] ?? undefined,
+    ),
+    hashlineData: edits.map((edit, index) =>
+      edit.hashline && typeof edit.hashline === "object" && !Array.isArray(edit.hashline)
+        ? edit.hashline as Record<string, unknown>
+        : legacy?.hashlineData?.[index] ?? undefined,
+    ),
+  };
+}
+
+export function splitMultiFileEditInput(
+  input: Record<string, unknown>,
+): Record<string, unknown>[] | null {
+  if (!Array.isArray(input.edits)) return null;
+
+  const edits = input.edits as Array<Record<string, unknown>>;
+  const distinctPaths = new Map<string, string>();
+  for (const edit of edits) {
+    if (!edit || typeof edit !== "object" || Array.isArray(edit)) continue;
+    if (typeof edit.path === "string" && edit.path.length > 0) {
+      distinctPaths.set(resolve(edit.path), edit.path);
+    }
+  }
+
+  if (distinctPaths.size <= 1) return null;
+
+  const missingPathIndex = edits.findIndex(
+    (edit) => !edit || typeof edit !== "object" || Array.isArray(edit) ||
+      typeof edit.path !== "string" || edit.path.length === 0,
+  );
+  if (missingPathIndex !== -1) {
+    throw formatEditError(
+      "Multi-file edit input is invalid: every edit must include path.",
+      `edits[${missingPathIndex}] has no path. Add path to each edit in a multi-file call.`,
+    );
+  }
+
+  const batches = new Map<string, { path: string; edits: Record<string, unknown>[] }>();
+  for (const edit of edits) {
+    const path = edit.path as string;
+    const resolvedPath = resolve(path);
+    let batch = batches.get(resolvedPath);
+    if (!batch) {
+      batch = { path, edits: [] };
+      batches.set(resolvedPath, batch);
+    }
+    const { path: _path, ...fileEdit } = edit;
+    batch.edits.push(fileEdit);
+  }
+
+  const sharedInput = { ...input };
+  delete sharedInput.path;
+  delete sharedInput.edits;
+
+  return [...batches.values()].map((batch) => ({
+    ...sharedInput,
+    path: batch.path,
+    edits: batch.edits,
+  }));
+}
+
+type EditPathMode = "none" | "single" | "multiple";
+
+function inferPathFromEditItems(args: Record<string, unknown>): EditPathMode {
+  if (!Array.isArray(args.edits)) return "none";
 
   const editPaths = args.edits
     .map((edit) => edit && typeof edit === "object" && !Array.isArray(edit) ? (edit as Record<string, unknown>).path : undefined)
     .filter((path): path is string => typeof path === "string" && path.length > 0);
 
-  if (editPaths.length === 0) return;
+  if (editPaths.length === 0) return "none";
 
   const uniqueByResolvedPath = new Map<string, string>();
   for (const path of editPaths) {
     uniqueByResolvedPath.set(resolve(path), path);
   }
 
-  if (uniqueByResolvedPath.size > 1) {
-    throw formatEditError(
-      "Nested edit paths are ambiguous: edits must target one file.",
-      `Received paths: ${[...uniqueByResolvedPath.values()].join(", ")}\n` +
-        "Use one edit call per file, or use Atomic Patch for multi-file edits.",
-    );
-  }
+  if (uniqueByResolvedPath.size > 1) return "multiple";
 
   const inferredPath = uniqueByResolvedPath.values().next().value as string;
   if (typeof args.path === "string" && resolve(args.path) !== resolve(inferredPath)) {
@@ -172,6 +297,7 @@ function inferPathFromEditItems(args: Record<string, unknown>): void {
   if (typeof args.path !== "string" || args.path.length === 0) {
     args.path = inferredPath;
   }
+  return "single";
 }
 
 // ─── Legacy input compatibility ─────────────────────────────────────
@@ -468,7 +594,11 @@ export function prepareArguments(input: Record<string, unknown>, useHashlineEdit
     args.edits = parsed;
   }
 
-  inferPathFromEditItems(args);
+  const editPathMode = inferPathFromEditItems(args);
+
+  if (editPathMode === "multiple") {
+    return args;
+  }
 
   if (!args.path) {
     throw formatEditError(
@@ -478,7 +608,7 @@ export function prepareArguments(input: Record<string, unknown>, useHashlineEdit
       `    path: "src/foo.ts",  // <-- add this — relative or absolute path\n` +
       `    edits: [{ oldText: "...", newText: "..." }]\n` +
       `  }\n\n` +
-      `Or put path on each edit when all edits target the same file:\n` +
+      `Or put path on every edit (required when edits target multiple files):\n` +
       `  {\n` +
       `    edits: [{ path: "src/foo.ts", oldText: "...", newText: "..." }]\n` +
       `  }`
@@ -515,108 +645,60 @@ export function prepareArguments(input: Record<string, unknown>, useHashlineEdit
     );
   }
 
-  // Strip replaceAll/target/lineRange from edits so built-in schema validation
-  // passes. The values are restored in execute() before calling applyEdits().
-  // For backwards compat, we convert old-style anchor/symbol to new target shape.
+  // Normalize edit metadata without moving it out of the validated edit object.
+  // Legacy anchor/symbol shapes remain accepted and are converted to target.
   if (Array.isArray(args.edits)) {
     const topLevelReplaceAll = args.replaceAll === true;
-    const flags: boolean[] = [];
-    const targets: (Record<string, unknown> | undefined)[] = [];
-    const hashlines: (Record<string, unknown> | undefined)[] = [];
-    const editNotes: string[] = [];
-
-    // Deep-clone edits before mutation to avoid mutating caller's input
-    const clonedEdits = (args.edits as Array<Record<string, unknown>>).map(e => ({ ...e }));
+    const clonedEdits = (args.edits as Array<Record<string, unknown>>).map((edit) => ({ ...edit }));
     args.edits = clonedEdits;
 
     for (const edit of clonedEdits) {
-      if (edit.oldText && typeof edit.oldText === "string") {
-        const { text, stripped } = stripHashlineDisplayPrefixes(edit.oldText, useHashlineEditing);
-        if (stripped) { edit.oldText = text; editNotes.push("Auto-stripped hashline display prefixes from edit content."); }
+      if (typeof edit.oldText === "string") {
+        edit.oldText = stripHashlineDisplayPrefixes(edit.oldText, useHashlineEditing).text;
       }
-      if (edit.newText && typeof edit.newText === "string") {
-        const { text, stripped } = stripHashlineDisplayPrefixes(edit.newText, useHashlineEditing);
-        if (stripped) edit.newText = text;
+      if (typeof edit.newText === "string") {
+        edit.newText = stripHashlineDisplayPrefixes(edit.newText, useHashlineEditing).text;
       }
-      // ── Backwards compat: convert old-style anchor/symbol to target ──
-      let target: Record<string, unknown> | undefined;
 
-      // Convert old anchor { symbolName, symbolKind, symbolLine } to target
-      if (edit.anchor && typeof edit.anchor === 'object') {
+      let target = edit.target && typeof edit.target === "object" && !Array.isArray(edit.target)
+        ? { ...(edit.target as Record<string, unknown>) }
+        : undefined;
+
+      if (edit.anchor && typeof edit.anchor === "object" && !Array.isArray(edit.anchor)) {
         const anchor = edit.anchor as Record<string, unknown>;
         target = {
-          name: anchor.symbolName,
-          kind: anchor.symbolKind,
-          line: anchor.symbolLine,
+          ...target,
+          name: anchor.symbolName ?? target?.name,
+          kind: anchor.symbolKind ?? target?.kind,
+          line: anchor.symbolLine ?? target?.line,
         };
         delete edit.anchor;
       }
 
-      // Convert old symbol + operation to target
-      if (edit.symbol && typeof edit.symbol === 'object') {
+      if (edit.symbol && typeof edit.symbol === "object" && !Array.isArray(edit.symbol)) {
         const symbol = edit.symbol as Record<string, unknown>;
-        if (!target) target = {};
-        target.name = symbol.name ?? target.name;
-        target.namePath = symbol.namePath ?? target.namePath;
-        target.kind = symbol.kind ?? target.kind;
-        target.line = symbol.line ?? target.line;
+        target = {
+          ...target,
+          name: symbol.name ?? target?.name,
+          namePath: symbol.namePath ?? target?.namePath,
+          kind: symbol.kind ?? target?.kind,
+          line: symbol.line ?? target?.line,
+        };
         delete edit.symbol;
       }
 
-      // Move operation fields into target if present
-      if (edit.replaceBody !== undefined) {
-        if (!target) target = {};
-        target.replaceBody = edit.replaceBody;
-        delete edit.replaceBody;
-      }
-      if (edit.insertBefore !== undefined) {
-        if (!target) target = {};
-        target.insertBefore = edit.insertBefore;
-        delete edit.insertBefore;
-      }
-      if (edit.insertAfter !== undefined) {
-        if (!target) target = {};
-        target.insertAfter = edit.insertAfter;
-        delete edit.insertAfter;
+      for (const operation of ["replaceBody", "insertBefore", "insertAfter"] as const) {
+        if (edit[operation] !== undefined) {
+          target = { ...target, [operation]: edit[operation] };
+          delete edit[operation];
+        }
       }
 
-      // replaceAll
-      if (typeof edit.replaceAll === 'boolean') {
-        flags.push(edit.replaceAll);
-        delete edit.replaceAll;
-      } else {
-        flags.push(topLevelReplaceAll);
+      if (target && Object.values(target).some((value) => value !== undefined)) {
+        edit.target = target;
       }
-
-      // target (new unified form, or converted from old-style)
-      if (target && Object.keys(target).length > 0) {
-        targets.push(target);
-      } else {
-        targets.push(undefined);
-      }
-
-      // hashline
-      if (edit.hashline && typeof edit.hashline === 'object') {
-        hashlines.push(edit.hashline as Record<string, unknown>);
-        delete edit.hashline;
-      } else {
-        hashlines.push(undefined);
-      }
-    }
-
-    const hasFlags = flags.some((f) => f);
-    const hasTargets = targets.some((t) => t);
-    const hasHashlines = hashlines.some((h) => h);
-    const hasEditNotes = editNotes.length > 0;
-    if (hasFlags || hasTargets || hasHashlines || hasEditNotes) {
-      const extraData = {
-        replaceAllFlags: hasFlags ? flags : null,
-        targetData: hasTargets ? targets : null,
-        hashlineData: hasHashlines ? hashlines : null,
-        editNotes: hasEditNotes ? [...new Set(editNotes)] : null,
-      };
-      if (typeof args.path === "string" && !args.path.includes("??smartEditExtra=")) {
-        args.path = args.path + "??smartEditExtra=" + Buffer.from(JSON.stringify(extraData)).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+      if (typeof edit.replaceAll !== "boolean" && topLevelReplaceAll) {
+        edit.replaceAll = true;
       }
     }
   }

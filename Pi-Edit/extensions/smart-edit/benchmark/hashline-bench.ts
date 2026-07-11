@@ -932,17 +932,13 @@ function bool(v: boolean): string {
 function printDistribution(sorted: number[]): void {
   const pcts = computePercentiles(sorted);
 
-  // Find recommendation
-  let recommended = ANCHOR_CHURN_THRESHOLD;
-  let capturedPct = 0;
-
   // Try thresholds from 5 to 50, pick the one at p90
   // P90 means 90% of edits have churn ≤ that value
   // If current threshold < p90, recommend p90
   // If current threshold >= p90, keep current threshold but flag if too high
 
-  const churnAtP90 = pcts.get("p90")!;
-  const churnAtP95 = pcts.get("p95")!;
+  const churnAtP90 = pcts.get("p90") ?? 0;
+  const churnAtP95 = pcts.get("p95") ?? 0;
 
   // What percentage of edits fall under current threshold?
   const underCurrent = sorted.filter(c => c <= ANCHOR_CHURN_THRESHOLD).length / sorted.length;

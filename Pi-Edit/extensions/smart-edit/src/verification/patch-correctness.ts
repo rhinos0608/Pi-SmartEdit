@@ -344,7 +344,7 @@ function checkDuplicateDeclarations(
 
   // Constrain to changedSymbols when available
   const candidates = changedSymbols && changedSymbols.length > 0
-    ? [...addedDecls].filter((s) => changedSymbols!.includes(s))
+    ? [...addedDecls].filter((s) => changedSymbols.includes(s))
     : [...addedDecls];
 
   // For each name whose declaration count increased, check if it
@@ -402,7 +402,7 @@ function checkOrphanedReferences(
 
   // Constrain to changedSymbols when available
   const filteredOrphans = changedSymbols && changedSymbols.length > 0
-    ? orphans.filter((s) => changedSymbols!.includes(s))
+    ? orphans.filter((s) => changedSymbols.includes(s))
     : orphans;
 
   if (filteredOrphans.length > 0) {
@@ -764,7 +764,7 @@ function extractImports(content: string, languageId: string): Set<string> {
     case "rust": {
       // use foo::bar::baz → baz
       // use foo::bar as baz → baz
-      let re = /\buse\s+(?:\S+::)*(\w+)\s*(?:as\s+(\w+))?/g;
+      const re = /\buse\s+(?:\S+::)*(\w+)\s*(?:as\s+(\w+))?/g;
       let match: RegExpExecArray | null;
       while ((match = re.exec(content)) !== null) {
         imports.add(match[2] || match[1]);

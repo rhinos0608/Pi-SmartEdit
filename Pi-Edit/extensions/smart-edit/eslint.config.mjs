@@ -15,6 +15,7 @@ export default tseslint.config(
       "**/.pi-smartread.embeddings.cache/**",
       "**/.pi-smartread.tags.cache/**",
       "**/test/fixtures/**",
+      "**/*.mjs",
     ],
   },
   ...tseslint.configs.strictTypeChecked,

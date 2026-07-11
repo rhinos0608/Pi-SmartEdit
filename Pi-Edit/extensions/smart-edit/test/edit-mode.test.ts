@@ -17,20 +17,32 @@ describe("edit path resolution", () => {
 });
 
 describe("edit mode config", () => {
-  it("defaults to the oldText/newText path", () => {
+  it("defaults to oldText/newText matching with fuzzy rescue enabled", () => {
     assert.deepStrictEqual(getSmartEditRuntimeConfig({}), {
       useHashlineEditing: false,
+      allowFuzzyMatching: true,
     });
+  });
+
+  it("allows fuzzy matching to be explicitly disabled", () => {
+    assert.strictEqual(
+      getSmartEditRuntimeConfig({ SMART_EDIT_FUZZY_MATCHING: "false" }).allowFuzzyMatching,
+      false,
+    );
+    assert.strictEqual(
+      getSmartEditRuntimeConfig({ SMART_EDIT_FUZZY_MATCHING: "0" }).allowFuzzyMatching,
+      false,
+    );
   });
 
   it("enables hashline editing when the env flag is truthy", () => {
     assert.deepStrictEqual(
       getSmartEditRuntimeConfig({ SMART_EDIT_USE_HASHLINE_EDITING: "true" }),
-      { useHashlineEditing: true },
+      { useHashlineEditing: true, allowFuzzyMatching: true },
     );
     assert.deepStrictEqual(
       getSmartEditRuntimeConfig({ SMART_EDIT_HASHLINE_EXPERIMENTAL: "1" }),
-      { useHashlineEditing: true },
+      { useHashlineEditing: true, allowFuzzyMatching: true },
     );
   });
 

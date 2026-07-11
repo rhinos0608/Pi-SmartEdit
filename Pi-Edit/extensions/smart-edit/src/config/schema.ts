@@ -10,6 +10,7 @@
  *   SMART_EDIT_EDIT_AUTOGEN          — allow editing auto-generated files (1|true|yes|on)
  *   SMART_EDIT_USE_HASHLINE_EDITING  — opt-in to hashline-based editing (1|true|yes|on)
  *   SMART_EDIT_HASHLINE_EXPERIMENTAL — alias for USE_HASHLINE_EDITING
+ *   SMART_EDIT_FUZZY_MATCHING        — enable similarity rescue (default: true)
  *   SMART_EDIT_VERIFICATION_COMMANDS — JSON array of verification commands
  *   SMART_EDIT_REPAIR_ENABLED        — enable repair loop (default: true)
  *   SMART_EDIT_REPAIR_MAX_RETRIES    — max retry attempts (default: 3, capped: 50)
@@ -31,6 +32,9 @@ export interface SmartEditConfig {
 
   /** Opt-in to hashline-based editing (experimental). */
   useHashlineEditing: boolean;
+
+  /** Enable similarity-based fuzzy matching. */
+  allowFuzzyMatching: boolean;
 
   /** JSON string of external verification commands. */
   verificationCommands: string;
@@ -95,6 +99,10 @@ export function loadConfig(
     useHashlineEditing = parseBooleanEnv(hashlineAlias);
   }
 
+  // ── allowFuzzyMatching ──────────────────────────────────
+  const fuzzyRaw = env["SMART_EDIT_FUZZY_MATCHING"];
+  const allowFuzzyMatching = fuzzyRaw != null ? parseBooleanEnv(fuzzyRaw) : true;
+
   // ── verificationCommands ────────────────────────────────
   const verificationCommands = env["SMART_EDIT_VERIFICATION_COMMANDS"] ?? "";
 
@@ -119,6 +127,7 @@ export function loadConfig(
     approvalLevel,
     editAutogen,
     useHashlineEditing,
+    allowFuzzyMatching,
     verificationCommands,
     repairEnabled,
     repairMaxRetries,

@@ -744,6 +744,7 @@ export function findTextWithTelemetry(
   indentationStyle: IndentationStyle,
   startOffset: number = 0,
   searchScope?: SearchScope,
+  allowFuzzy: boolean = true,
 ): { result: MatchResult; telemetry: TierTelemetry[] } {
   const telemetry: TierTelemetry[] = [];
 
@@ -820,13 +821,21 @@ export function findTextWithTelemetry(
 
   // Tier 5: Similarity-scored match (safety net for near-matches)
   tierStart = performance.now();
-  const similarityResult = trySimilarityMatch(originalContent, oldText, searchStart, searchEnd);
+  const similarityResult = allowFuzzy
+    ? trySimilarityMatch(originalContent, oldText, searchStart, searchEnd)
+    : null;
   const similarityDuration = performance.now() - tierStart;
   if (similarityResult && (!searchScope || (similarityResult.index >= searchStart && similarityResult.index < searchEnd))) {
     telemetry.push({ tier: MatchTier.SIMILARITY, durationMs: similarityDuration, success: true, matchCount: 1 });
     return { result: similarityResult, telemetry };
   }
-  telemetry.push({ tier: MatchTier.SIMILARITY, durationMs: similarityDuration, success: false, matchCount: 0 });
+  telemetry.push({
+    tier: MatchTier.SIMILARITY,
+    durationMs: similarityDuration,
+    success: false,
+    matchCount: 0,
+    note: allowFuzzy ? undefined : "Disabled by configuration",
+  });
 
   // Tier 5: Stripped-indent match (handles indent-level shifts)
   tierStart = performance.now();
@@ -863,6 +872,7 @@ export function findText(
   indentationStyle: IndentationStyle,
   startOffset: number = 0,
   searchScope?: SearchScope,
+  allowFuzzy: boolean = true,
 ): MatchResult {
   return findTextWithTelemetry(
     originalContent,
@@ -870,6 +880,7 @@ export function findText(
     indentationStyle,
     startOffset,
     searchScope,
+    allowFuzzy,
   ).result;
 }
 
@@ -1280,6 +1291,7 @@ export function findAllMatches(
   indentationStyle: IndentationStyle,
   minTier: MatchTier,
   searchScope?: SearchScope,
+  allowFuzzy: boolean = true,
 ): MatchResult[] {
   const results: MatchResult[] = [];
   const rangeStart = searchScope?.startIndex ?? 0;
@@ -1289,7 +1301,14 @@ export function findAllMatches(
   while (searchStart < rangeEnd) {
     // Don't pass searchScope to findText here — we iterate manually via searchStart.
     // Passing searchScope would hardcode startIndex, preventing iteration past the first match.
-    const match = findText(originalContent, oldText, indentationStyle, searchStart);
+    const match = findText(
+      originalContent,
+      oldText,
+      indentationStyle,
+      searchStart,
+      undefined,
+      allowFuzzy,
+    );
 
     if (!match.found) break;
 
@@ -1708,6 +1727,9 @@ export interface ApplyEditsOptions {
    */
   searchScopes?: (SearchScope | undefined)[];
 
+  /** Enable similarity-based fuzzy matching. Defaults to true. */
+  allowFuzzy?: boolean;
+
   /** Called with resolved match spans before applying, e.g., for conflict detection */
   onBeforeApply?: (spans: MatchSpan[], content: string) => void | Promise<void>;
 
@@ -1853,8 +1875,7 @@ export async function applyEdits(
   replacementCount: number;
   matchSpans: MatchSpan[];
 }> {
-  // Normalize edit texts to LF — guard against undefined oldText/newText
-  // (hashline-only edits can reach here if the hashline side-channel fails to decode)
+  // Normalize edit texts to LF. Metadata-only edits are routed before this pipeline.
   const normalizedEdits: EditItem[] = [];
   for (let i = 0; i < edits.length; i++) {
     const edit = edits[i];
@@ -1881,6 +1902,7 @@ export async function applyEdits(
 
   // Detect file indentation style once
   const indentationStyle = detectIndentation(normalizedContent);
+  const allowFuzzy = options?.allowFuzzy ?? true;
 
   // Resolve search scopes for edits with anchors or lineRanges
   const searchScopes: (SearchScope | undefined)[] = [];
@@ -1963,7 +1985,14 @@ export async function applyEdits(
 
     if (edit.replaceAll) {
       // Find all occurrences
-      const match = findText(normalizedContent, edit.oldText, indentationStyle, 0, searchScopes[i]);
+      const match = findText(
+        normalizedContent,
+        edit.oldText,
+        indentationStyle,
+        0,
+        searchScopes[i],
+        allowFuzzy,
+      );
       if (!match.found) {
         // Idempotency: if the replacement is already in place, treat as no-op
         if (checkIdempotency(normalizedContent, edit.oldText, edit.newText, path, i, edit.description)) {
@@ -1975,7 +2004,7 @@ export async function applyEdits(
         }
         const diagnostic = findClosestMatch(normalizedContent, edit.oldText);
         throw getNotFoundError(
-          path, i, normalizedEdits.length, diagnostic, edit.description,
+          path, i, normalizedEdits.length, diagnostic, edit.description, allowFuzzy,
         );
       }
 
@@ -1986,12 +2015,13 @@ export async function applyEdits(
         indentationStyle,
         match.tier,
         searchScopes[i],
+        allowFuzzy,
       );
 
       if (allMatches.length === 0) {
         const diagnostic = findClosestMatch(normalizedContent, edit.oldText);
         throw getNotFoundError(
-          path, i, normalizedEdits.length, diagnostic, edit.description,
+          path, i, normalizedEdits.length, diagnostic, edit.description, allowFuzzy,
         );
       }
 
@@ -2035,7 +2065,14 @@ export async function applyEdits(
       }
     } else {
       // Single match required
-      const match = findText(normalizedContent, edit.oldText, indentationStyle, 0, searchScopes[i]);
+      const match = findText(
+        normalizedContent,
+        edit.oldText,
+        indentationStyle,
+        0,
+        searchScopes[i],
+        allowFuzzy,
+      );
 
       if (!match.found) {
         // Idempotency: if the replacement is already in place, treat as no-op
@@ -2048,7 +2085,7 @@ export async function applyEdits(
         }
         const diagnostic = findClosestMatch(normalizedContent, edit.oldText);
         throw getNotFoundError(
-          path, i, normalizedEdits.length, diagnostic, edit.description,
+          path, i, normalizedEdits.length, diagnostic, edit.description, allowFuzzy,
         );
       }
 
