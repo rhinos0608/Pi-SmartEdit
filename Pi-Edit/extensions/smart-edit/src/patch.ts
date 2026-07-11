@@ -1,7 +1,21 @@
 /**
- * Patch tool — additive single-file patch with workspace-evidence authorization.
+ * Patch tool — v3 multi-file patch with workspace-evidence authorization.
  *
- * - Accepts a single EvidenceRef (`{inspectionId, resourceIds}`).
+ * v1 was single-file, evidence-bound, with a hard multi-file prohibition.
+ * v3 adds:
+ *   - Multi-file support: each edit may carry its own `path` (PatchEditItemV3)
+ *     which overrides the top-level `path` default.
+ *   - Grouped atomic application: edits are grouped by file path, each group
+ *     is applied atomically to its own file.
+ *   - Per-file evidence coverage: every file targeted by an edit must have at
+ *     least one resource in the envelope covering it.
+ *   - Auto-inspect fallback: if no `evidenceRef` is provided, the patch tool
+ *     reads each target file, computes SHA-256, and constructs a synthetic
+ *     full-file evidence envelope so the patch is self-contained for simple
+ *     cases. SHA-256 freshness is computed against the on-disk content.
+ *
+ * - Accepts a single EvidenceRef (`{inspectionId, resourceIds}`) or no
+ *   evidenceRef at all (auto-inspect).
  * - Resolves evidence through event-RPC against the SmartRead resolver.
  * - Validates that the current on-disk full content SHA-256 matches the
  *   resource's attested `fullFileSha256` (stale-file guard).
@@ -19,11 +33,12 @@ import { readFile as fsReadFile, writeFile as fsWriteFile, stat as fsStat, renam
 import { resolve as pathResolve } from "node:path";
 import { realpathSync } from "node:fs";
 
-import type {
-    PROTOCOL_SCHEMA_VERSION,
-} from "@rhinos0608/pi-workspace-protocol";
 import {
+    PROTOCOL_SCHEMA_VERSION,
     hashSessionFilePath,
+    inspectionIdFor,
+    resourceIdFor,
+    sha256OfString,
     validatePatchRequest as validatePatchRequestProto,
     type WorkspaceEvidenceEnvelope,
     type InspectedResource,
@@ -137,10 +152,6 @@ export function resolvePatchAuthorization(args: {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-function sha256OfString(s: string): string {
-    return createHash("sha256").update(s, "utf8").digest("hex");
-}
-
 function safeReadUtf8(path: string): Promise<string> {
     return fsReadFile(path).then((b) => b.toString("utf8"));
 }
@@ -171,25 +182,157 @@ function findTargetLineRangeForEdits(
     return { startLine: min, endLine: max };
 }
 
+function findResourceForCanonicalPath(
+    envelope: WorkspaceEvidenceEnvelope,
+    canonicalPath: string,
+    requestedIds: ReadonlyArray<string>,
+): InspectedResource | null {
+    // First, restrict to requested resources. Then look for a canonical path
+    // match (case-sensitive equality — canonical paths are realpath-resolved).
+    for (const rid of requestedIds) {
+        const r = envelope.resources.find((x) => x.resourceId === rid);
+        if (!r) continue;
+        if (r.canonicalPath === canonicalPath) return r;
+    }
+    // Fall back: any resource in the envelope with this canonical path,
+    // even if not explicitly requested. This makes the contract friendlier
+    // for multi-file patch where resourceIds may list subset.
+    return envelope.resources.find((r) => r.canonicalPath === canonicalPath) ?? null;
+}
+
 async function atomicWrite(path: string, content: string): Promise<void> {
     const tmp = `${path}.${randomUUID()}.tmp`;
     await fsWriteFile(tmp, content, "utf8");
     await fsRename(tmp, path);
 }
 
+// ── Per-edit grouping ───────────────────────────────────────────────
+
+interface GroupedEdit {
+    readonly oldText?: string;
+    readonly newText?: string;
+    readonly description?: string;
+    readonly replaceAll?: boolean;
+}
+
+interface EditGroup {
+    /** Resolved absolute path (cwd-relative input has been resolved). */
+    readonly absolutePath: string;
+    /** Original input path string (used for diagnostics). */
+    readonly rawPath: string;
+    readonly edits: ReadonlyArray<GroupedEdit>;
+}
+
+function groupEditsByPath(
+    cwd: string,
+    topLevelPath: string,
+    edits: ReadonlyArray<GroupedEdit & { path?: string }>,
+): { ok: true; groups: EditGroup[] } | { ok: false; error: string } {
+    const buckets = new Map<string, EditGroup>();
+    for (let i = 0; i < edits.length; i++) {
+        const e = edits[i];
+        const rawPath = typeof e.path === "string" && e.path.length > 0 ? e.path : topLevelPath;
+        if (typeof rawPath !== "string" || rawPath.length === 0) {
+            return { ok: false, error: `edits[${i}]: no path (top-level path missing and per-edit path missing)` };
+        }
+        const absolutePath = pathResolve(cwd, rawPath);
+        const existing = buckets.get(absolutePath);
+        const groupEdit: GroupedEdit = {
+            oldText: e.oldText,
+            newText: e.newText,
+            description: e.description,
+            replaceAll: e.replaceAll,
+        };
+        if (existing) {
+            // Replace the entry in the map with an extended group.
+            buckets.set(absolutePath, {
+                absolutePath: existing.absolutePath,
+                rawPath: existing.rawPath,
+                edits: [...existing.edits, groupEdit],
+            });
+        } else {
+            buckets.set(absolutePath, { absolutePath, rawPath, edits: [groupEdit] });
+        }
+    }
+    return { ok: true, groups: [...buckets.values()] };
+}
+
+// ── Auto-inspect envelope construction ──────────────────────────────
+
+async function buildAutoInspectEnvelope(args: {
+    sessionFilePath: string;
+    canonicalRoot: string;
+    groups: ReadonlyArray<EditGroup>;
+}): Promise<{ ok: true; envelope: WorkspaceEvidenceEnvelope; canonicalByGroup: string[] } | { ok: false; error: string }> {
+    const sessionId = hashSessionFilePath(args.sessionFilePath);
+    const resources: InspectedResource[] = [];
+    const canonicalByGroup: string[] = [];
+    const resourceKeyItems: Array<{ canonicalPath: string; range?: { startLine: number; endLine: number } }> = [];
+
+    for (const g of args.groups) {
+        let canonical: string;
+        try {
+            canonical = realpathSync(g.absolutePath);
+        } catch (err) {
+            return { ok: false, error: `auto-inspect: file not found: ${g.absolutePath} (${err instanceof Error ? err.message : String(err)})` };
+        }
+        let content: string;
+        try {
+            content = await safeReadUtf8(canonical);
+        } catch (err) {
+            return { ok: false, error: `auto-inspect: read failed for ${canonical} (${err instanceof Error ? err.message : String(err)})` };
+        }
+        const sha = sha256OfString(content);
+        const lineCount = content.split("\n").length;
+        const resource: InspectedResource = {
+            resourceId: resourceIdFor({ canonicalPath: canonical, kind: "full" }),
+            canonicalPath: canonical,
+            kind: "full",
+            coverage: "full-file",
+            allowedRanges: [{ startLine: 1, endLine: lineCount }],
+            fullFileSha256: sha,
+            fresh: true,
+            byteLength: Buffer.byteLength(content, "utf8"),
+            lineCount,
+        };
+        resources.push(resource);
+        resourceKeyItems.push({ canonicalPath: canonical });
+        canonicalByGroup.push(canonical);
+    }
+
+    const inspectionId = inspectionIdFor({
+        sessionId,
+        workspaceRoot: args.canonicalRoot,
+        resources: resourceKeyItems,
+    });
+    const envelope: WorkspaceEvidenceEnvelope = {
+        schemaVersion: 2 as typeof PROTOCOL_SCHEMA_VERSION,
+        inspectionId,
+        sessionId,
+        workspaceRoot: args.canonicalRoot,
+        canonicalWorkspaceRoot: args.canonicalRoot,
+        createdAt: new Date().toISOString(),
+        resources,
+        mode: "path",
+    };
+    return { ok: true, envelope, canonicalByGroup };
+}
+
 // ── Patch tool factory ──────────────────────────────────────────────
 
 const PATCH_PARAMS_DOC = {
-    description: "Apply a single-file edit gated by a workspace-evidence inspection. Provide a `path`, a list of `edits` matching the existing single-file edit shape, and an `evidenceRef` from a prior `inspect` call. No multi-file atomic claim.",
+    description:
+        "Apply edits gated by a workspace-evidence inspection. Provide a `path`, a list of `edits`, and (optionally) an `evidenceRef` from a prior `inspect` call. If `evidenceRef` is omitted, patch auto-inspects each target file (full-file). v3 supports multi-file: each edit may carry its own `path` to override the top-level default.",
     type: "object",
     properties: {
-        path: { type: "string", description: "Target file path (single file only)." },
+        path: { type: "string", description: "Default target file path. May be omitted when every edit provides its own path." },
         edits: {
             type: "array",
             description: "One or more targeted edits.",
             items: {
                 type: "object",
                 properties: {
+                    path: { type: "string", description: "Per-edit target file path. Overrides the top-level path." },
                     oldText: { type: "string" },
                     newText: { type: "string" },
                     description: { type: "string" },
@@ -199,7 +342,7 @@ const PATCH_PARAMS_DOC = {
         },
         evidenceRef: {
             type: "object",
-            description: "Reference to a prior `inspect` tool result.",
+            description: "Optional reference to a prior `inspect` tool result. If omitted, patch auto-inspects each target file.",
             properties: {
                 inspectionId: { type: "string" },
                 resourceIds: { type: "array", items: { type: "string" } },
@@ -207,7 +350,6 @@ const PATCH_PARAMS_DOC = {
             required: ["inspectionId", "resourceIds"],
         },
     },
-    required: ["path", "edits", "evidenceRef"],
 } as const;
 
 export interface PatchTool {
@@ -229,7 +371,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
         name: "patch",
         label: "patch",
         description:
-            "Apply a single-file edit gated by a workspace-evidence inspection. Returns a discriminated lifecycle result (applied | rejected | failed) and never authorizes edits outside the inspected resource's coverage.",
+            "Apply edits gated by a workspace-evidence inspection. v3 supports multi-file: each edit may carry its own `path`. If no `evidenceRef` is provided, patch auto-inspects each target file (full-file, SHA-256 freshness). Returns a discriminated lifecycle result (applied | rejected | failed).",
         parameters: PATCH_PARAMS_DOC as unknown as Record<string, unknown>,
 
         async execute(toolCallId, params, signal, _onUpdate, ctx) {
@@ -246,281 +388,368 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 return {
                     content: [{ type: "text" as const, text: "rejected: ephemeral session identity" }],
                     details: makeRejected(toolCallId, "session", ["no real session file path"], {
-                        inspectionId: v.value.evidenceRef.inspectionId,
-                        resourceIds: v.value.evidenceRef.resourceIds,
+                        inspectionId: typeof v.value.evidenceRef?.inspectionId === "string" ? v.value.evidenceRef.inspectionId : "",
+                        resourceIds: Array.isArray(v.value.evidenceRef?.resourceIds) ? [...v.value.evidenceRef.resourceIds] : [],
                     }, freshChecks()),
                 };
             }
 
             const canonicalRoot = deps.getCanonicalWorkspaceRoot();
-            const absolutePath = pathResolve(ctx.cwd, v.value.path);
+            if (typeof canonicalRoot !== "string" || canonicalRoot.length === 0) {
+                return {
+                    content: [{ type: "text" as const, text: "rejected: missing canonical workspace root" }],
+                    details: makeRejected(toolCallId, "session", ["no canonical workspace root"], {
+                        inspectionId: v.value.evidenceRef.inspectionId,
+                        resourceIds: [...v.value.evidenceRef.resourceIds],
+                    }, freshChecks()),
+                };
+            }
 
-            // 1. Resolve evidence via RPC
-            const rpc = deps.getRpcClient();
+            // Group edits by file path (per-edit path overrides top-level).
+            const grouping = groupEditsByPath(ctx.cwd, v.value.path, v.value.edits);
+            if (!grouping.ok) {
+                return {
+                    content: [{ type: "text" as const, text: `rejected: ${grouping.error}` }],
+                    details: makeRejected(toolCallId, "session", [grouping.error], {
+                        inspectionId: v.value.evidenceRef.inspectionId,
+                        resourceIds: [...v.value.evidenceRef.resourceIds],
+                    }, freshChecks()),
+                };
+            }
+            const groups = grouping.groups;
             const checks: MutableChecks = freshChecks();
             const diagnostics: string[] = [];
             const usedEvidence: string[] = [];
 
+            // ── Acquire envelope ──────────────────────────────────────
+            // v3: if no evidenceRef is provided, auto-inspect each target file
+            // (read content, compute SHA-256, build synthetic full-file
+            // envelope). Otherwise resolve via RPC.
+
             let envelope: WorkspaceEvidenceEnvelope;
-            try {
-                const reply = await rpc.request(
-                    "resolve_evidence" as RpcMethod,
-                    {
-                        inspectionId: v.value.evidenceRef.inspectionId,
-                        sessionFilePath,
-                        workspaceRoot: canonicalRoot,
-                    },
-                    { signal },
-                );
-                if (!reply.ok || !reply.payload) {
-                    checks.completed.push(makeCheck("evidence-pipeline", "fail", reply.error ?? "rpc returned no payload"));
+            let autoInspected = false;
+            let evidenceRefForDetails: EvidenceRef;
+
+            if (v.value.evidenceRef.resourceIds.length === 0) {
+                // No evidenceRef — auto-inspect.
+                const built = await buildAutoInspectEnvelope({
+                    sessionFilePath,
+                    canonicalRoot,
+                    groups,
+                });
+                if (!built.ok) {
+                    diagnostics.push(built.error);
+                    checks.completed.push(makeCheck("auto-inspect", "fail", built.error));
                     return {
-                        content: [{ type: "text" as const, text: `rejected: ${reply.error ?? "unknown rpc error"}` }],
-                        details: makeRejected(toolCallId, classifyRpcError(reply.error), [reply.error ?? "rpc failure"], {
-                            inspectionId: v.value.evidenceRef.inspectionId,
-                            resourceIds: v.value.evidenceRef.resourceIds,
-                        }, checks),
+                        content: [{ type: "text" as const, text: `failed: ${built.error}` }],
+                        details: makeFailed(toolCallId, "stage", built.error, {
+                            inspectionId: "",
+                            resourceIds: [],
+                        }, checks, diagnostics),
                     };
                 }
-                envelope = reply.payload as WorkspaceEvidenceEnvelope;
-                checks.completed.push(makeCheck("evidence-pipeline", "pass", "rpc resolve_evidence succeeded"));
-            } catch (err) {
-                const msg = err instanceof Error ? err.message : String(err);
-                diagnostics.push(msg);
-                checks.completed.push(makeCheck("evidence-pipeline", "timeout", msg));
-                return {
-                    content: [{ type: "text" as const, text: `failed: ${msg}` }],
-                    details: makeFailed(toolCallId, "stage", msg, {
-                        inspectionId: v.value.evidenceRef.inspectionId,
-                        resourceIds: v.value.evidenceRef.resourceIds,
-                    }, checks, diagnostics),
+                envelope = built.envelope;
+                autoInspected = true;
+                evidenceRefForDetails = {
+                    inspectionId: envelope.inspectionId,
+                    resourceIds: envelope.resources.map((r) => r.resourceId),
                 };
-            } finally {
-                rpc.dispose();
-            }
-
-            // 2. Find the requested resource in the envelope
-            const resource = envelope.resources.find((r) => v.value.evidenceRef.resourceIds.includes(r.resourceId));
-            if (!resource) {
-                diagnostics.push("requested resource not found in envelope");
-                return {
-                    content: [{ type: "text" as const, text: "rejected: missing resource" }],
-                    details: finalize(makeRejected(toolCallId, "coverage", diagnostics, {
-                        inspectionId: envelope.inspectionId,
-                        resourceIds: v.value.evidenceRef.resourceIds,
-                    }, checks)),
+                checks.completed.push(makeCheck("auto-inspect", "pass", `synthesized envelope for ${envelope.resources.length} file(s)`));
+            } else {
+                evidenceRefForDetails = {
+                    inspectionId: v.value.evidenceRef.inspectionId,
+                    resourceIds: [...v.value.evidenceRef.resourceIds],
                 };
-            }
-            usedEvidence.push(resource.resourceId);
-
-            // 3. Path must match resource.canonicalPath
-            let canonicalTarget: string;
-            try {
-                canonicalTarget = realpathSync(absolutePath);
-            } catch {
-                diagnostics.push(`file not found: ${absolutePath}`);
-                return {
-                    content: [{ type: "text" as const, text: "failed: file not found" }],
-                    details: finalize(makeFailed(toolCallId, "stage", "file not found", {
-                        inspectionId: envelope.inspectionId,
-                        resourceIds: [resource.resourceId],
-                    }, checks, diagnostics, usedEvidence)),
-                };
-            }
-            if (canonicalTarget !== resource.canonicalPath) {
-                diagnostics.push(`target path ${canonicalTarget} != resource.canonicalPath ${resource.canonicalPath}`);
-                return {
-                    content: [{ type: "text" as const, text: "rejected: path/canonical mismatch" }],
-                    details: finalize(makeRejected(toolCallId, "coverage", diagnostics, {
-                        inspectionId: envelope.inspectionId,
-                        resourceIds: [resource.resourceId],
-                    }, checks, usedEvidence)),
-                };
-            }
-
-            // 4. Read current content + compute sha
-            let currentContent: string;
-            let currentSha: string;
-            try {
-                currentContent = await safeReadUtf8(canonicalTarget);
-                currentSha = sha256OfString(currentContent);
-            } catch (err) {
-                diagnostics.push(`read failed: ${err instanceof Error ? err.message : String(err)}`);
-                return {
-                    content: [{ type: "text" as const, text: "failed: read" }],
-                    details: finalize(makeFailed(toolCallId, "stage", "read failed", {
-                        inspectionId: envelope.inspectionId,
-                        resourceIds: [resource.resourceId],
-                    }, checks, diagnostics, usedEvidence)),
-                };
-            }
-
-            // 5. Freshness check
-            if (typeof resource.fullFileSha256 === "string" && resource.fullFileSha256 !== currentSha) {
-                diagnostics.push(`stale: current sha ${currentSha} != attested ${resource.fullFileSha256}`);
-                return {
-                    content: [{ type: "text" as const, text: "rejected: stale" }],
-                    details: finalize(makeRejected(toolCallId, "stale", diagnostics, {
-                        inspectionId: envelope.inspectionId,
-                        resourceIds: [resource.resourceId],
-                    }, checks, usedEvidence)),
-                };
-            }
-
-            // 6. Compute actual target line range and validate coverage
-            const targetRange = findTargetLineRangeForEdits(currentContent, v.value.edits);
-            if (!targetRange) {
-                diagnostics.push("target line range could not be derived from edits (oldText not found)");
-                return {
-                    content: [{ type: "text" as const, text: "failed: target not found" }],
-                    details: finalize(makeFailed(toolCallId, "stage", "target not found", {
-                        inspectionId: envelope.inspectionId,
-                        resourceIds: [resource.resourceId],
-                    }, checks, diagnostics, usedEvidence)),
-                };
-            }
-            if (resource.coverage === "line-range") {
-                const covered = resource.allowedRanges.some((a) => withinRange(targetRange, a));
-                if (!covered) {
-                    diagnostics.push(`coverage: target [${targetRange.startLine},${targetRange.endLine}] not within any allowedRange`);
+                const rpc = deps.getRpcClient();
+                try {
+                    const reply = await rpc.request(
+                        "resolve_evidence" as RpcMethod,
+                        {
+                            inspectionId: v.value.evidenceRef.inspectionId,
+                            sessionFilePath,
+                            workspaceRoot: canonicalRoot,
+                        },
+                        { signal },
+                    );
+                    if (!reply.ok || !reply.payload) {
+                        checks.completed.push(makeCheck("evidence-pipeline", "fail", reply.error ?? "rpc returned no payload"));
+                        return {
+                            content: [{ type: "text" as const, text: `rejected: ${reply.error ?? "unknown rpc error"}` }],
+                            details: makeRejected(toolCallId, classifyRpcError(reply.error), [reply.error ?? "rpc failure"], evidenceRefForDetails, checks),
+                        };
+                    }
+                    envelope = reply.payload as WorkspaceEvidenceEnvelope;
+                    checks.completed.push(makeCheck("evidence-pipeline", "pass", "rpc resolve_evidence succeeded"));
+                } catch (err) {
+                    const msg = err instanceof Error ? err.message : String(err);
+                    diagnostics.push(msg);
+                    checks.completed.push(makeCheck("evidence-pipeline", "timeout", msg));
                     return {
-                        content: [{ type: "text" as const, text: "rejected: coverage" }],
-                        details: finalize(makeRejected(toolCallId, "coverage", diagnostics, {
-                            inspectionId: envelope.inspectionId,
+                        content: [{ type: "text" as const, text: `failed: ${msg}` }],
+                        details: makeFailed(toolCallId, "stage", msg, evidenceRefForDetails, checks, diagnostics),
+                    };
+                } finally {
+                    rpc.dispose();
+                }
+            }
+
+            // Verify session/workspace binding on the envelope.
+            const expectedSessionId = hashSessionFilePath(sessionFilePath);
+            if (envelope.sessionId !== expectedSessionId) {
+                diagnostics.push("envelope session identity mismatch");
+                return {
+                    content: [{ type: "text" as const, text: "rejected: session identity mismatch" }],
+                    details: finalize(makeRejected(toolCallId, "session", diagnostics, evidenceRefForDetails, checks, usedEvidence)),
+                };
+            }
+            if (envelope.canonicalWorkspaceRoot !== canonicalRoot) {
+                diagnostics.push("envelope workspace root mismatch");
+                return {
+                    content: [{ type: "text" as const, text: "rejected: workspace mismatch" }],
+                    details: finalize(makeRejected(toolCallId, "session", diagnostics, evidenceRefForDetails, checks, usedEvidence)),
+                };
+            }
+
+            // ── Per-group application ────────────────────────────────
+            // We validate and apply each file's edits in order. On the
+            // first failure, abort the whole batch and report.
+
+            const invalidations: ResourceInvalidation[] = [];
+            const postEditEvidenceByPath = new Map<string, PostEditEvidence>();
+            const appliedFiles: string[] = [];
+
+            for (const group of groups) {
+                // Resolve canonical path for this group.
+                let canonicalTarget: string;
+                try {
+                    canonicalTarget = realpathSync(group.absolutePath);
+                } catch (err) {
+                    diagnostics.push(`file not found: ${group.absolutePath}`);
+                    return {
+                        content: [{ type: "text" as const, text: `failed: file not found: ${group.rawPath}` }],
+                        details: finalize(makeFailed(toolCallId, "stage", `file not found: ${group.rawPath}`, {
+                            ...evidenceRefForDetails,
+                            resourceIds: [""],
+                        }, checks, diagnostics, usedEvidence)),
+                    };
+                }
+
+                // Find a resource that authorizes this path.
+                const resource = findResourceForCanonicalPath(
+                    envelope,
+                    canonicalTarget,
+                    evidenceRefForDetails.resourceIds,
+                );
+                if (!resource) {
+                    diagnostics.push(`coverage: no resource in envelope for ${canonicalTarget}`);
+                    return {
+                        content: [{ type: "text" as const, text: `rejected: coverage (no resource for ${group.rawPath})` }],
+                        details: finalize(makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence)),
+                    };
+                }
+                usedEvidence.push(resource.resourceId);
+
+                // Read current content + compute sha.
+                let currentContent: string;
+                let currentSha: string;
+                try {
+                    currentContent = await safeReadUtf8(canonicalTarget);
+                    currentSha = sha256OfString(currentContent);
+                } catch (err) {
+                    diagnostics.push(`read failed: ${err instanceof Error ? err.message : String(err)}`);
+                    return {
+                        content: [{ type: "text" as const, text: `failed: read ${group.rawPath}` }],
+                        details: finalize(makeFailed(toolCallId, "stage", `read failed: ${group.rawPath}`, {
+                            inspectionId: evidenceRefForDetails.inspectionId,
+                            resourceIds: [resource.resourceId],
+                        }, checks, diagnostics, usedEvidence)),
+                    };
+                }
+
+                // Freshness check.
+                if (typeof resource.fullFileSha256 === "string" && resource.fullFileSha256 !== currentSha) {
+                    diagnostics.push(`stale: current sha ${currentSha} != attested ${resource.fullFileSha256} for ${canonicalTarget}`);
+                    return {
+                        content: [{ type: "text" as const, text: `rejected: stale (${group.rawPath})` }],
+                        details: finalize(makeRejected(toolCallId, "stale", diagnostics, {
+                            inspectionId: evidenceRefForDetails.inspectionId,
                             resourceIds: [resource.resourceId],
                         }, checks, usedEvidence)),
                     };
                 }
-            }
 
-            // 7. Apply the edits in-memory
-            const appliedEdits: Array<{ ok: boolean; message?: string }> = [];
-            let newContent = currentContent;
-            for (const edit of v.value.edits) {
-                if (typeof edit.oldText !== "string" || typeof edit.newText !== "string") {
-                    appliedEdits.push({ ok: false, message: "edit missing oldText/newText" });
-                    continue;
+                // Compute target line range from edits, then validate coverage.
+                const targetRange = findTargetLineRangeForEdits(currentContent, group.edits);
+                if (!targetRange) {
+                    diagnostics.push(`target line range could not be derived from edits (oldText not found) for ${canonicalTarget}`);
+                    return {
+                        content: [{ type: "text" as const, text: `failed: target not found in ${group.rawPath}` }],
+                        details: finalize(makeFailed(toolCallId, "stage", `target not found: ${group.rawPath}`, {
+                            inspectionId: evidenceRefForDetails.inspectionId,
+                            resourceIds: [resource.resourceId],
+                        }, checks, diagnostics, usedEvidence)),
+                    };
                 }
-                if (edit.replaceAll) {
-                    if (!newContent.includes(edit.oldText)) {
-                        appliedEdits.push({ ok: false, message: "oldText not found" });
-                        continue;
+                if (resource.coverage === "line-range") {
+                    const covered = resource.allowedRanges.some((a) => withinRange(targetRange, a));
+                    if (!covered) {
+                        diagnostics.push(`coverage: target [${targetRange.startLine},${targetRange.endLine}] not within any allowedRange for ${canonicalTarget}`);
+                        return {
+                            content: [{ type: "text" as const, text: `rejected: coverage (${group.rawPath})` }],
+                            details: finalize(makeRejected(toolCallId, "coverage", diagnostics, {
+                                inspectionId: evidenceRefForDetails.inspectionId,
+                                resourceIds: [resource.resourceId],
+                            }, checks, usedEvidence)),
+                        };
                     }
-                    newContent = newContent.split(edit.oldText).join(edit.newText);
-                } else {
-                    if (!newContent.includes(edit.oldText)) {
-                        appliedEdits.push({ ok: false, message: "oldText not found" });
-                        continue;
-                    }
-                    newContent = newContent.replace(edit.oldText, edit.newText);
                 }
-                appliedEdits.push({ ok: true });
-            }
-            if (appliedEdits.some((e) => !e.ok)) {
-                diagnostics.push(appliedEdits.find((e) => !e.ok)?.message ?? "edit failed");
-                return {
-                    content: [{ type: "text" as const, text: "failed: edit" }],
-                    details: finalize(makeFailed(toolCallId, "write", "edit application failed", {
-                        inspectionId: envelope.inspectionId,
-                        resourceIds: [resource.resourceId],
-                    }, checks, diagnostics, usedEvidence)),
-                };
-            }
 
-            // 8. Run allowlisted checks
-            const verifiers = deps.getVerificationChecks?.() ?? [];
-            for (const v of verifiers) {
-                let outcome: "pass" | "fail" | "skipped" | "timeout" = "pass";
-                let detail: string | undefined;
+                // Apply the edits in-memory.
+                let newContent = currentContent;
+                for (const edit of group.edits) {
+                    if (typeof edit.oldText !== "string" || typeof edit.newText !== "string") {
+                        diagnostics.push(`edit missing oldText/newText in ${group.rawPath}`);
+                        return {
+                            content: [{ type: "text" as const, text: `failed: edit (missing fields) in ${group.rawPath}` }],
+                            details: finalize(makeFailed(toolCallId, "write", `edit missing oldText/newText: ${group.rawPath}`, {
+                                inspectionId: evidenceRefForDetails.inspectionId,
+                                resourceIds: [resource.resourceId],
+                            }, checks, diagnostics, usedEvidence)),
+                        };
+                    }
+                    if (!newContent.includes(edit.oldText)) {
+                        diagnostics.push(`oldText not found in ${group.rawPath}`);
+                        return {
+                            content: [{ type: "text" as const, text: `failed: edit (oldText not found) in ${group.rawPath}` }],
+                            details: finalize(makeFailed(toolCallId, "write", `oldText not found: ${group.rawPath}`, {
+                                inspectionId: evidenceRefForDetails.inspectionId,
+                                resourceIds: [resource.resourceId],
+                            }, checks, diagnostics, usedEvidence)),
+                        };
+                    }
+                    if (edit.replaceAll) {
+                        newContent = newContent.split(edit.oldText).join(edit.newText);
+                    } else {
+                        newContent = newContent.replace(edit.oldText, edit.newText);
+                    }
+                }
+
+                // Run allowlisted checks (per file).
+                const verifiers = deps.getVerificationChecks?.() ?? [];
+                for (const v of verifiers) {
+                    let outcome: "pass" | "fail" | "skipped" | "timeout" = "pass";
+                    let detail: string | undefined;
+                    try {
+                        const result = await Promise.race([
+                            v.run({ path: canonicalTarget, content: newContent, toolCallId }),
+                            new Promise<never>((_r, rej) => {
+                                setTimeout(() => { rej(new Error("timeout")); }, 5000);
+                            }),
+                        ]);
+                        outcome = result.outcome;
+                        if (result.detail) detail = result.detail;
+                    } catch (err) {
+                        outcome = "timeout";
+                        detail = err instanceof Error ? err.message : String(err);
+                    }
+                    const check = makeCheck(`${v.id}:${group.rawPath}`, outcome, detail);
+                    if (outcome === "timeout") checks.timedOut.push(check);
+                    else if (v.kind === "blocking") checks.blocking.push(check);
+                    else checks.advisory.push(check);
+                    checks.completed.push(check);
+                }
+
+                // Atomic write.
                 try {
-                    const result = await Promise.race([
-                        v.run({ path: canonicalTarget, content: newContent, toolCallId }),
-                        new Promise<never>((_r, rej) => {
-                            setTimeout(() => { rej(new Error("timeout")); }, 5000);
-                        }),
-                    ]);
-                    outcome = result.outcome;
-                    if (result.detail) detail = result.detail;
+                    await atomicWrite(canonicalTarget, newContent);
                 } catch (err) {
-                    outcome = "timeout";
-                    detail = err instanceof Error ? err.message : String(err);
+                    diagnostics.push(`write failed: ${err instanceof Error ? err.message : String(err)}`);
+                    return {
+                        content: [{ type: "text" as const, text: `failed: write ${group.rawPath}` }],
+                        details: finalize(makeFailed(toolCallId, "write", `write failed: ${group.rawPath}`, {
+                            inspectionId: evidenceRefForDetails.inspectionId,
+                            resourceIds: [resource.resourceId],
+                        }, checks, diagnostics, usedEvidence)),
+                    };
                 }
-                const check = makeCheck(v.id, outcome, detail);
-                if (outcome === "timeout") checks.timedOut.push(check);
-                else if (v.kind === "blocking") checks.blocking.push(check);
-                else checks.advisory.push(check);
-                checks.completed.push(check);
-            }
-            // Surface evidence-pipeline uncertainty in skipped bucket
-            checks.skipped.push(makeCheck("evidence-pipeline", "skipped", "evidence-pipeline check ran above; this row records pipeline uncertainty for the consumer"));
 
-            // 9. Write atomically, then verify post sha
-            try {
-                await atomicWrite(canonicalTarget, newContent);
-            } catch (err) {
-                diagnostics.push(`write failed: ${err instanceof Error ? err.message : String(err)}`);
-                return {
-                    content: [{ type: "text" as const, text: "failed: write" }],
-                    details: finalize(makeFailed(toolCallId, "write", "write failed", {
-                        inspectionId: envelope.inspectionId,
-                        resourceIds: [resource.resourceId],
-                    }, checks, diagnostics, usedEvidence)),
+                // Post-write verify.
+                let postContent: string;
+                try {
+                    const statRes = await fsStat(canonicalTarget);
+                    void statRes;
+                    postContent = await safeReadUtf8(canonicalTarget);
+                } catch (err) {
+                    diagnostics.push(`verify read failed: ${err instanceof Error ? err.message : String(err)}`);
+                    return {
+                        content: [{ type: "text" as const, text: `failed: verify ${group.rawPath}` }],
+                        details: finalize(makeFailed(toolCallId, "verify", `post-write read failed: ${group.rawPath}`, {
+                            inspectionId: evidenceRefForDetails.inspectionId,
+                            resourceIds: [resource.resourceId],
+                        }, checks, diagnostics, usedEvidence)),
+                    };
+                }
+                const postSha = sha256OfString(postContent);
+                const postVerifySha = sha256OfString(newContent);
+                if (postSha !== postVerifySha) {
+                    diagnostics.push(`verify mismatch: in-memory ${postVerifySha} != on-disk ${postSha} for ${canonicalTarget}`);
+                    return {
+                        content: [{ type: "text" as const, text: `failed: verify ${group.rawPath}` }],
+                        details: finalize(makeFailed(toolCallId, "verify", `post-write hash mismatch: ${group.rawPath}`, {
+                            inspectionId: evidenceRefForDetails.inspectionId,
+                            resourceIds: [resource.resourceId],
+                        }, checks, diagnostics, usedEvidence)),
+                    };
+                }
+
+                const invalidation: ResourceInvalidation = {
+                    resourceId: resource.resourceId,
+                    canonicalPath: resource.canonicalPath,
+                    fullFileSha256: currentSha,
+                    newFullFileSha256: postSha,
+                    coverage: resource.coverage,
                 };
-            }
-            const postSha = sha256OfString(newContent);
-            let postContent: string;
-            try {
-                const statRes = await fsStat(canonicalTarget);
-                void statRes;
-                postContent = await safeReadUtf8(canonicalTarget);
-            } catch (err) {
-                diagnostics.push(`verify read failed: ${err instanceof Error ? err.message : String(err)}`);
-                return {
-                    content: [{ type: "text" as const, text: "failed: verify" }],
-                    details: finalize(makeFailed(toolCallId, "verify", "post-write read failed", {
-                        inspectionId: envelope.inspectionId,
-                        resourceIds: [resource.resourceId],
-                    }, checks, diagnostics, usedEvidence)),
+                invalidations.push(invalidation);
+                const newLines = postContent.split("\n");
+                const postEditEvidence: PostEditEvidence = {
+                    fullFileSha256: postSha,
+                    lineCount: newLines.length,
+                    byteLength: Buffer.byteLength(postContent, "utf8"),
                 };
-            }
-            const postVerifySha = sha256OfString(postContent);
-            if (postVerifySha !== postSha) {
-                diagnostics.push(`verify mismatch: in-memory ${postSha} != on-disk ${postVerifySha}`);
-                return {
-                    content: [{ type: "text" as const, text: "failed: verify" }],
-                    details: finalize(makeFailed(toolCallId, "verify", "post-write hash mismatch", {
-                        inspectionId: envelope.inspectionId,
-                        resourceIds: [resource.resourceId],
-                    }, checks, diagnostics, usedEvidence)),
-                };
+                postEditEvidenceByPath.set(canonicalTarget, postEditEvidence);
+                appliedFiles.push(group.rawPath);
             }
 
-            const newLines = postContent.split("\n");
-            const invalidation: ResourceInvalidation = {
-                resourceId: resource.resourceId,
-                canonicalPath: resource.canonicalPath,
-                fullFileSha256: currentSha,
-                newFullFileSha256: postVerifySha,
-                coverage: resource.coverage,
-            };
-            const postEditEvidence: PostEditEvidence = {
-                fullFileSha256: postVerifySha,
-                lineCount: newLines.length,
-                byteLength: Buffer.byteLength(postContent, "utf8"),
-            };
+            // Surface evidence-pipeline uncertainty in skipped bucket.
+            if (autoInspected) {
+                checks.skipped.push(makeCheck("evidence-pipeline", "skipped", "auto-inspected (no prior inspect call); pipeline check was replaced by in-tool read+sha"));
+            } else {
+                checks.skipped.push(makeCheck("evidence-pipeline", "skipped", "evidence-pipeline check ran above; this row records pipeline uncertainty for the consumer"));
+            }
+
+            // Build the final details. For v3 multi-file, postEditEvidence is
+            // emitted per file via the postEditEvidenceByPath map, and the
+            // top-level postEditEvidence is the last (or only) file's value
+            // for backward compatibility with v1 single-file consumers.
+            const lastCanonical = appliedFiles.length > 0 ? realpathSync(pathResolve(ctx.cwd, appliedFiles[appliedFiles.length - 1]!)) : "";
+            const lastPost = lastCanonical ? postEditEvidenceByPath.get(lastCanonical) : undefined;
+
             const details: PatchDetails = {
                 tool: "patch",
                 status: { kind: "applied" },
                 toolCallId,
-                evidenceRef: { inspectionId: envelope.inspectionId, resourceIds: [resource.resourceId] },
-                usedEvidence,
-                changedResources: [invalidation],
-                postEditEvidence,
+                evidenceRef: evidenceRefForDetails,
+                usedEvidence: [...new Set(usedEvidence)],
+                changedResources: invalidations,
+                postEditEvidence: lastPost,
                 checks: freezeChecks(checks),
                 diagnostics,
             };
+            const summary = appliedFiles.length === 1
+                ? `applied ${groups[0]?.edits.length ?? 0} edit(s) to ${appliedFiles[0]}`
+                : `applied edits to ${appliedFiles.length} file(s): ${appliedFiles.join(", ")}`;
             return {
-                content: [{ type: "text" as const, text: `applied ${v.value.edits.length} edit(s) to ${canonicalTarget}` }],
+                content: [{ type: "text" as const, text: summary }],
                 details,
             };
         },

@@ -425,7 +425,7 @@ test("end-to-end: replaces via resolvePatchAuthorization, no parsing of rendered
     assert.equal(d.status.kind, "applied");
 });
 
-test("end-to-end: multi-file patch is rejected at validation (no multi-file atomic claim)", async () => {
+test("end-to-end: multi-file patch with per-edit paths (v3)", async () => {
     const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-")));
     mkdirSync(workdir, { recursive: true });
     const file = join(workdir, "a.ts");
@@ -469,5 +469,6 @@ test("end-to-end: multi-file patch is rejected at validation (no multi-file atom
         makeCtx(workdir),
     );
     const d = res.details as any;
-    assert.equal(d.status.kind, "rejected");
+    // v3: multi-file is allowed. Second edit targets non-existent file with no evidence → fails.
+    assert.equal(d.status.kind, "failed");
 });
