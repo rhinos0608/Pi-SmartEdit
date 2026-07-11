@@ -20,7 +20,14 @@ import { resolveAnchorToScope, findTextLineRange, getHashlineAnchorLine, compute
 import { sortHashlineEditsForApplication, formatHashlineBatchSummary } from "./hashline-batching.js";
 import { reReadAfterFailure, buildMultiFileFallbackHint } from "./multi-file-hints.js";
 import { buildContextGuardCheck, formatContextGuardRejection } from "./context-guard-check.js";
-import { prepareArguments, validateInput, formatEditError } from "./args.js";
+import {
+  decodeLegacyPathMetadata,
+  prepareArguments,
+  resolveEditMetadata,
+  splitMultiFileEditInput,
+  validateInput,
+  formatEditError,
+} from "./args.js";
 
 import {
   applyEdits,
@@ -68,6 +75,8 @@ import { applySymbolicEdits, buildSymbolicEditGuidance, resolveSymbolicEditLineR
 import type { SymbolicEditRequest } from "./symbolic-edits";
 import { computeAnchorDelta, formatAnchorDeltaForModel, ANCHOR_CHURN_THRESHOLD, type AnchorDelta } from "./anchor-registry";
 import { isAstGrepAvailable, findWithPattern, replaceWithPattern } from "./astgrep-anchor";
+import { createPatchTool, type PatchToolDeps } from "./patch.js";
+import { createRpcClient, RPC_CHANNELS } from "@rhinos0608/pi-workspace-protocol";
 
 import type {
   EditTarget,
@@ -95,17 +104,39 @@ function coerceText(value: unknown): string {
   }
 }
 
-// ─── Schema (must match built-in edit schema exactly) ──────────────
-// Extra properties like `replaceAll`, `target` are stripped
-// by prepareArguments before validation, then restored in execute().
+// ─── Schema ───────────────────────────────────────────────────────
+// Rich edit metadata is validated directly. Legacy path-encoded metadata
+// remains decode-only compatibility input during migration.
 
 
 const editItemSchema = Type.Object(
   {
-    path: Type.Optional(Type.String({ description: "File path for this edit. If top-level path is omitted, all edits must use the same path." })),
+    path: Type.Optional(Type.String({ description: "File path for this edit. Required on every item in a multi-file call." })),
     oldText: Type.Optional(Type.String()),
     newText: Type.Optional(Type.String()),
     description: Type.Optional(Type.String({ description: "Optional label echoed in diagnostics for self-reference." })),
+    replaceAll: Type.Optional(Type.Boolean({
+      description: "Replace every non-overlapping occurrence for this edit. Overrides top-level replaceAll.",
+    })),
+    hashline: Type.Optional(Type.Object(
+      {
+        range: Type.Object({
+          pos: Type.String({ description: "Start hashline anchor, optionally with :before or :after." }),
+          end: Type.String({ description: "End hashline anchor." }),
+        }),
+        content: Type.Optional(Type.Union([
+          Type.Array(Type.String()),
+          Type.String(),
+          Type.Null(),
+        ])),
+        symbol: Type.Optional(Type.Object({
+          name: Type.String(),
+          kind: Type.Optional(Type.String()),
+          line: Type.Optional(Type.Number()),
+        })),
+      },
+      { description: "Freshness-checked hashline edit metadata." },
+    )),
     target: Type.Optional(Type.Object(
       {
         name: Type.Optional(Type.String({ description: "Symbol name to target (e.g., function name, class name)." })),
@@ -115,6 +146,9 @@ const editItemSchema = Type.Object(
         replaceBody: Type.Optional(Type.String({ description: "Replace the entire AST symbol definition with this text." })),
         insertBefore: Type.Optional(Type.String({ description: "Insert this text immediately before the AST symbol definition." })),
         insertAfter: Type.Optional(Type.String({ description: "Insert this text immediately after the AST symbol definition." })),
+        description: Type.Optional(Type.String({ description: "Optional target label for diagnostics." })),
+        pattern: Type.Optional(Type.String({ description: "ast-grep structural pattern." })),
+        replacement: Type.Optional(Type.String({ description: "Replacement for ast-grep pattern matches." })),
       },
       {
         description:
@@ -129,7 +163,7 @@ const editItemSchema = Type.Object(
 const editSchema = Type.Object(
   {
     path: Type.Optional(Type.String({
-      description: "Path to the file to edit (relative or absolute). May be omitted when every edit includes the same path.",
+      description: "Default file path for single-file edits. May be omitted when each edit includes its own path.",
     })),
     replaceAll: Type.Optional(
       Type.Boolean({
@@ -156,6 +190,47 @@ const editSchema = Type.Object(
 
 export function resolveEditPath(cwd: string, targetPath: string): string {
   return resolve(cwd, targetPath);
+}
+
+type ToolEditResult = {
+  content: Array<{ type: "text"; text: string }>;
+  details?: EditResult["details"];
+};
+
+export function combineMultiFileEditResults(results: ToolEditResult[]): ToolEditResult {
+  const details: EditResult["details"] = {};
+  const diffs: string[] = [];
+  const matchNotes: string[] = [];
+  const conflictWarnings: string[] = [];
+  const mutatedPaths = new Set<string>();
+  const diagnostics: NonNullable<EditResult["details"]["diagnostics"]> = [];
+  const editCapabilities = new Set<EditCapability>();
+  const scopedDiagnostics: NonNullable<EditResult["details"]["scopedDiagnostics"]> = [];
+
+  for (const result of results) {
+    const childDetails = result.details;
+    if (!childDetails) continue;
+    if (childDetails.diff) diffs.push(childDetails.diff);
+    matchNotes.push(...(childDetails.matchNotes ?? []));
+    conflictWarnings.push(...(childDetails.conflictWarnings ?? []));
+    for (const path of childDetails.mutatedPaths ?? []) mutatedPaths.add(path);
+    diagnostics.push(...(childDetails.diagnostics ?? []));
+    for (const capability of childDetails.editCapabilities ?? []) editCapabilities.add(capability);
+    scopedDiagnostics.push(...(childDetails.scopedDiagnostics ?? []));
+  }
+
+  if (diffs.length > 0) details.diff = diffs.join("\n");
+  if (matchNotes.length > 0) details.matchNotes = matchNotes;
+  if (conflictWarnings.length > 0) details.conflictWarnings = conflictWarnings;
+  if (mutatedPaths.size > 0) details.mutatedPaths = [...mutatedPaths];
+  if (diagnostics.length > 0) details.diagnostics = diagnostics;
+  if (editCapabilities.size > 0) details.editCapabilities = [...editCapabilities].sort();
+  if (scopedDiagnostics.length > 0) details.scopedDiagnostics = scopedDiagnostics;
+
+  return {
+    content: results.flatMap((result) => result.content),
+    details,
+  };
 }
 
 
@@ -428,7 +503,10 @@ export default function smartEdit(pi: ExtensionAPI) {
   });
 
   // ── Initialize per-session state ──
-  pi.on("session_start", async (_event, _ctx) => {
+  let currentSessionFilePath: string | null = null;
+  let currentCanonicalWorkspaceRoot: string | null = null;
+
+  pi.on("session_start", async (_event, ctx) => {
     const sessionCwd = process.cwd();
     // Create AST resolver (returns null if Tree-sitter unavailable)
     astResolver = createAstResolver();
@@ -444,6 +522,26 @@ export default function smartEdit(pi: ExtensionAPI) {
       conflictDetector.clearAll();
     }
     resetRetryCounts();
+
+    // Capture the real session file path and canonical workspace root.
+    // We require a REAL (non-ephemeral) session file for `patch` authorization.
+    try {
+      const sm = (ctx as { sessionManager?: { getSessionFile?: () => string | undefined } } | undefined)
+        ?.sessionManager;
+      const p = typeof sm?.getSessionFile === "function" ? sm.getSessionFile() : undefined;
+      currentSessionFilePath = typeof p === "string" && p.length > 0 ? p : null;
+    } catch {
+      currentSessionFilePath = null;
+    }
+    try {
+      // canonical workspace root = realpath of cwd, no trailing slash
+      const { realpathSync } = await import("node:fs");
+      let r = realpathSync(sessionCwd);
+      if (r.length > 1 && r.endsWith("/")) r = r.slice(0, -1);
+      currentCanonicalWorkspaceRoot = r;
+    } catch {
+      currentCanonicalWorkspaceRoot = null;
+    }
   });
 
   // ── Shutdown on session end ──
@@ -456,11 +554,11 @@ export default function smartEdit(pi: ExtensionAPI) {
   // TypeScript cannot express the full structural variance of Pi's ExtensionAPI.
   // The cast to `unknown` + `as any` bypasses the inferred generic constraints
   // that are stricter than what Pi actually enforces at runtime.
-  (pi.registerTool as (t: unknown) => void)(({
+  (pi.registerTool as (t: unknown) => void)({
     name: "edit",
     label: "edit",
     description:
-      "Edit a single file. Proactively use symbol edits for whole function/class/method replacements or insertions; use oldText/newText for small local changes. " +
+      "Edit one or more files. For multi-file calls, omit top-level path and provide path on every edit. Proactively use symbol edits for whole function/class/method replacements or insertions; use oldText/newText for small local changes. " +
       "If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. " +
       "Do not include large unchanged regions just to connect distant changes.",
 
@@ -468,22 +566,22 @@ export default function smartEdit(pi: ExtensionAPI) {
       "Make precise file edits. Prefer symbol edits for whole-symbol changes, oldText/newText for narrow local edits.",
 
     promptGuidelines: [
-      "Proactively use symbol edits for whole function/class/method replacements or insertions: { symbol: { name: 'handleRequest' }, replaceBody: 'function handleRequest(...) { ... }' }. This avoids reproducing oldText for large semantic units.",
+      "Proactively use symbol edits for whole function/class/method replacements or insertions: { target: { name: 'handleRequest', replaceBody: 'function handleRequest(...) { ... }' } }. This avoids reproducing oldText for large semantic units.",
       "Use oldText/newText for small, exact local changes inside a symbol, import tweaks, config values, or other non-symbol edits.",
-      "Use multiple edits in one call for independent changes to the same file. All edits are matched against the original file content, not incrementally.",
+      "Use multiple edits in one call for independent changes. For multiple files, put path on every edit. Edits within each file are matched against that file's original content, not incrementally.",
       "Do not emit overlapping edits — merge nearby changes into one edit. Keep content arrays concise — only include lines that change.",
     ],
 
     parameters: editSchema as unknown as Record<string, unknown>,
     renderShell: "self" as const,
 
-    async execute(
+    execute: async function execute(
       _toolCallId: string,
       input: Record<string, unknown>,
       signal: AbortSignal | undefined,
       onUpdate: ((update: { content: Array<{ type: "text"; text: string }> }) => void) | undefined,
       _ctx: unknown,
-    ): Promise<{ content: Array<{ type: "text"; text: string }>; details?: EditResult["details"] }> {
+    ): Promise<ToolEditResult> {
       if (smartEditRuntimeConfig.useHashlineEditing) {
         await initHashline();
       }
@@ -493,10 +591,7 @@ export default function smartEdit(pi: ExtensionAPI) {
       input = prepareArguments(input, smartEditRuntimeConfig.useHashlineEditing) || input;
 
       // ── Streaming patch preview ───────────────────────────────
-      // When onUpdate is provided and the edits were originally a codex_patch
-      // string, feed the raw patch text through StreamingPatchParser before
-      // processing. This gives the caller real-time progress on how many hunks
-      // are being processed.
+      // Preview raw patch input once, before multi-file inputs split into batches.
       if (onUpdate && rawEditsString) {
         try {
           const format = detectInputFormat(rawEditsString);
@@ -510,28 +605,21 @@ export default function smartEdit(pi: ExtensionAPI) {
         }
       }
 
-      let extraData: Record<string, unknown> | null = null;
-      if (typeof input.path === "string") {
-        const extraIdx = input.path.indexOf("??smartEditExtra=");
-        if (extraIdx !== -1) {
-          try {
-            extraData = JSON.parse(Buffer.from(input.path.slice(extraIdx + 17).replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf-8")) as Record<string, unknown> | null;
-          // Validate decoded extraData shape before use
-          if (extraData && typeof extraData === 'object' && !Array.isArray(extraData)) {
-            const ed = extraData as Record<string, unknown>;
-            if (ed.replaceAllFlags != null && (!Array.isArray(ed.replaceAllFlags) || !ed.replaceAllFlags.every(f => typeof f === 'boolean'))) {
-              extraData = null;
-            }
-            if (ed.targetData != null && (!Array.isArray(ed.targetData) || !ed.targetData.every(t => t == null || (typeof t === 'object' && !Array.isArray(t))))) {
-              extraData = null;
-            }
-            if (ed.hashlineData != null && (!Array.isArray(ed.hashlineData) || !ed.hashlineData.every(h => h == null || (typeof h === 'object' && !Array.isArray(h))))) {
-              extraData = null;
-            }
-          }
-        } catch {}
-        input.path = input.path.slice(0, extraIdx);
+      const fileInputs = splitMultiFileEditInput(input);
+      if (fileInputs) {
+        const results: ToolEditResult[] = [];
+        for (const fileInput of fileInputs) {
+          if (signal?.aborted) throw new Error("Operation aborted");
+          results.push(await execute(_toolCallId, fileInput, signal, onUpdate, _ctx));
         }
+        return combineMultiFileEditResults(results);
+      }
+
+      let legacyMetadata = null;
+      if (typeof input.path === "string") {
+        const decodedPath = decodeLegacyPathMetadata(input.path);
+        input.path = decodedPath.path;
+        legacyMetadata = decodedPath.metadata;
       }
 
       const { path, edits } = validateInput(input, smartEditRuntimeConfig.useHashlineEditing);
@@ -576,9 +664,14 @@ export default function smartEdit(pi: ExtensionAPI) {
           const originalEnding = detectLineEnding(content);
           let normalizedContent = normalizeToLF(content);
 
-          const localFlags = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).replaceAllFlags as unknown[] ?? null : null;
-          const localTargets = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).targetData as unknown[] ?? null : null;
-          const localHashlines = extraData != null && !Array.isArray(extraData) ? (extraData as Record<string, unknown>).hashlineData as unknown[] ?? null : null;
+          const {
+            replaceAllFlags: localFlags,
+            targetData: localTargets,
+            hashlineData: localHashlines,
+          } = resolveEditMetadata(
+            edits as unknown as Array<Record<string, unknown>>,
+            legacyMetadata,
+          );
           const contextGuardCheck = await buildContextGuardCheck(normalizedContent, path, edits, localTargets, astResolver);
           const contextGuardNotes: string[] = [];
 
@@ -617,12 +710,12 @@ export default function smartEdit(pi: ExtensionAPI) {
           // Priority 2: Derive range from hashline anchors (works for hashline-only edits)
           let editLineRange = computeEditContainingRange(rawContent, edits);
 
-          if (!editLineRange && extraData?.hashlineData) {
+          if (!editLineRange && localHashlines.some(Boolean)) {
             const totalLines = rawContent.split('\n').length;
             let minStart = Infinity;
             let maxEnd = -Infinity;
 
-            for (const h of (extraData.hashlineData as unknown[])) {
+            for (const h of localHashlines) {
               if (!h) continue;
               const he = h as Record<string, unknown>;
               const range = he.range as { pos?: string; end?: string } | undefined;
@@ -641,10 +734,10 @@ export default function smartEdit(pi: ExtensionAPI) {
             }
           }
 
-          if (!editLineRange && extraData?.targetData) {
+          if (!editLineRange && localTargets.some(Boolean)) {
             let minStart = Infinity;
             let maxEnd = -Infinity;
-            for (const target of extraData.targetData as unknown[]) {
+            for (const target of localTargets) {
               if (!target) continue;
               // Only check targets with operation fields (symbolic edits)
               const t = target as Record<string, unknown>;
@@ -710,13 +803,11 @@ export default function smartEdit(pi: ExtensionAPI) {
                 legacyEdits.push({ editIdx: i, edit: edits[i] });
               }
             } else {
-              // Guard: hashline-only edit with no oldText can't go through legacy pipeline
-              // This happens when the hashline side-channel (path-encoded extraData) fails to decode.
+              // Guard: metadata-only edits cannot go through the text pipeline.
               if (typeof rawEdit.oldText !== "string") {
                 throw new Error(
                   `edits[${i}] has no oldText and no recoverable hashline or target data. ` +
-                  `This edit was sent as hashline or symbol format but the side-channel data was lost during tool parameter processing. ` +
-                  `Re-read the file and retry the edit.`
+                  `Provide hashline or target metadata directly on the edit object, then retry.`
                 );
               }
               // Restore replaceAll/anchor/lineRange
@@ -798,7 +889,14 @@ export default function smartEdit(pi: ExtensionAPI) {
 
             // Wrap findText with telemetry for matching instrumentation
             const findTextWithT: typeof findText = (content, search, style, offset, scope) => {
-              const { result, telemetry } = findTextWithTelemetry(content, search, style, offset, scope);
+              const { result, telemetry } = findTextWithTelemetry(
+                content,
+                search,
+                style,
+                offset,
+                scope,
+                smartEditRuntimeConfig.allowFuzzyMatching,
+              );
               // Only report telemetry when a fuzzy tier was used
               if (telemetry && telemetry.length > 0) {
                 const successTiers = telemetry.filter((t: { success: boolean }) => t.success);
@@ -974,6 +1072,7 @@ export default function smartEdit(pi: ExtensionAPI) {
               path,
               {
                 searchScopes: resolvedScopes,
+                allowFuzzy: smartEditRuntimeConfig.allowFuzzyMatching,
                 onBeforeApply: conflictDetector
                   ? async (spans) => {
                       const realSpans = spans.map((s) => ({
@@ -1558,8 +1657,25 @@ export default function smartEdit(pi: ExtensionAPI) {
     // ── TUI rendering (delegates to same diff rendering as built-in) ──
     // renderCall and renderResult are optional; Pi's built-in rendering
     // provides sensible defaults for tools with text results.
-  } as unknown));
+  } as unknown);
 
+  // ── Register the additive `patch` tool (workspace-evidence gated) ──
+  // Resolves evidence through event-RPC against the SmartRead resolver.
+  // Carries the real session file path and canonical workspace root captured
+  // at session_start. Rejects ephemeral session identity.
+  if (pi.events && typeof pi.events.on === "function") {
+    const bus = pi.events as {
+      emit: (c: string, d: unknown) => void;
+      on: (c: string, h: (d: unknown) => void) => () => void;
+    };
+    const patchDeps: PatchToolDeps = {
+      getRpcClient: () => createRpcClient({ bus, channel: RPC_CHANNELS.inspectPatch, timeoutMs: 2000 }),
+      getSessionFilePath: () => currentSessionFilePath,
+      getCanonicalWorkspaceRoot: () => currentCanonicalWorkspaceRoot ?? "",
+    };
+    const patchTool = createPatchTool(patchDeps);
+    (pi.registerTool as (t: unknown) => void)(patchTool as unknown);
+  }
 }
 
 // ── Exports for testing ─────────────────────────────────────────────
