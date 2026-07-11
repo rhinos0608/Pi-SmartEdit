@@ -123,6 +123,25 @@ export type AuthorizationResult =
     | { ok: true; resource: InspectedResource }
     | { ok: false; reason: string };
 
+/**
+ * NOTE: not on execute()'s runtime hot path.
+ *
+ * `execute()` below does its own per-group authorization inline, using
+ * `findResourceForCanonicalPath` plus per-group weak-coverage/line-range
+ * checks — it does not call this function. That inline path is
+ * canonical-path-aware (required for v3 multi-file batches, where each
+ * edit group targets a different file), whereas this function checks a
+ * single `targetLineRange` against all `requestedResourceIds` without any
+ * path matching. The two are semantically equivalent today, but that is
+ * not structurally enforced.
+ *
+ * This function is retained because its behavior is directly unit-tested
+ * (see test/patch.test.ts) and expresses the authorization policy (reject
+ * missing resources, reject weak coverage, require line-range coverage) in
+ * one place for that purpose. Until the two are unified, any change to
+ * authorization policy here MUST be mirrored in `execute()`'s inline
+ * checks, and vice versa.
+ */
 export function resolvePatchAuthorization(args: {
     envelope: WorkspaceEvidenceEnvelope;
     sessionFilePath: string;
