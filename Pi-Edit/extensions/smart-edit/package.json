@@ -11,7 +11,7 @@
     "url": ""
   },
   "dependencies": {
-    "@rhinos0608/pi-workspace-protocol": "github:rhinos0608/Pi-Workspace-Protocol#v0.2.0",
+    "@rhinos0608/pi-workspace-protocol": "github:rhinos0608/Pi-Workspace-Protocol#v0.3.0",
     "@vscode/tree-sitter-wasm": "^0.3.1",
     "diff": "^7.0.0",
     "web-tree-sitter": "^0.22.6",

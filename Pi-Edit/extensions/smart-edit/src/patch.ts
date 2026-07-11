@@ -5,10 +5,17 @@
  * v3 adds:
  *   - Multi-file support: each edit may carry its own `path` (PatchEditItemV3)
  *     which overrides the top-level `path` default.
- *   - Grouped atomic application: edits are grouped by file path, each group
- *     is applied atomically to its own file.
- *   - Per-file evidence coverage: every file targeted by an edit must have at
- *     least one resource in the envelope covering it.
+ *   - Validated batch mutation (NOT atomic across files): edits are grouped
+ *     by file path and applied in order, one file at a time. Each single
+ *     file's write is atomic (tmp + rename). If a later file in the batch
+ *     fails, files already written earlier in the batch remain on disk as
+ *     written — the caller must inspect `changedResources` in the failure
+ *     result to see exactly which files were mutated before the failure.
+ *   - Per-file evidence coverage: every file targeted by an edit must have a
+ *     strong-coverage resource (full-file or line-range) in the envelope
+ *     covering it. Weak-coverage resources (search-match, metadata-only —
+ *     produced by inspect's query/symbol modes) are explicitly rejected;
+ *     the model must path-mode inspect a file before patching it.
  *   - Auto-inspect fallback: if no `evidenceRef` is provided, the patch tool
  *     reads each target file, computes SHA-256, and constructs a synthetic
  *     full-file evidence envelope so the patch is self-contained for simple
@@ -25,7 +32,8 @@
  *   whole file.
  * - For line-range resources: only the attested lines may be edited.
  * - Only structural/LSP/configured allowlisted checks run. No arbitrary
- *   shell or verification commands.
+ *   shell or verification commands. A failing blocking check rejects the
+ *   patch before the write — it is not merely advisory.
  * - Returns a discriminated `details` with the full lifecycle.
  */
 import { createHash, randomUUID } from "node:crypto";
@@ -132,22 +140,28 @@ export function resolvePatchAuthorization(args: {
     }
     if (args.requestedResourceIds.length === 0) return { ok: false, reason: "missing resourceIds" };
 
+    const resources: InspectedResource[] = [];
     for (const rid of args.requestedResourceIds) {
         const r = args.envelope.resources.find((x) => x.resourceId === rid);
         if (!r) return { ok: false, reason: `missing resource: ${rid}` };
+        if (r.coverage === "search-match" || r.coverage === "metadata-only") {
+            return { ok: false, reason: `coverage: ${r.coverage} is weak evidence and cannot authorize a patch (path-mode inspect this file first)` };
+        }
+        resources.push(r);
+    }
+
+    for (const r of resources) {
         if (r.coverage === "line-range") {
             const tr = args.targetLineRange;
-            if (!tr) {
-                return { ok: false, reason: "coverage: line-range resource requires an explicit target line range" };
-            }
-            const ok = r.allowedRanges.some(
+            if (!tr) continue;
+            const covered = r.allowedRanges.some(
                 (a) => tr.startLine >= a.startLine && tr.endLine <= a.endLine,
             );
-            if (!ok) return { ok: false, reason: "coverage: target line range not within allowedRanges" };
+            if (!covered) continue;
         }
         return { ok: true, resource: r };
     }
-    return { ok: false, reason: "no matching resource" };
+    return { ok: false, reason: "coverage: no requested resource covers the target line range" };
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -187,17 +201,16 @@ function findResourceForCanonicalPath(
     canonicalPath: string,
     requestedIds: ReadonlyArray<string>,
 ): InspectedResource | null {
-    // First, restrict to requested resources. Then look for a canonical path
-    // match (case-sensitive equality — canonical paths are realpath-resolved).
+    // Restrict strictly to requested resources — evidenceRef.resourceIds is
+    // the explicit authorization list. A resource not listed there must
+    // never authorize a patch, even if it happens to share a canonical path
+    // with a listed resource.
     for (const rid of requestedIds) {
         const r = envelope.resources.find((x) => x.resourceId === rid);
         if (!r) continue;
         if (r.canonicalPath === canonicalPath) return r;
     }
-    // Fall back: any resource in the envelope with this canonical path,
-    // even if not explicitly requested. This makes the contract friendlier
-    // for multi-file patch where resourceIds may list subset.
-    return envelope.resources.find((r) => r.canonicalPath === canonicalPath) ?? null;
+    return null;
 }
 
 async function atomicWrite(path: string, content: string): Promise<void> {
@@ -375,21 +388,26 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
         parameters: PATCH_PARAMS_DOC as unknown as Record<string, unknown>,
 
         async execute(toolCallId, params, signal, _onUpdate, ctx) {
-            const v = validatePatchRequestProto(params);
+            // The wire payload from the model never includes toolCallId (Pi
+            // supplies it out-of-band as this function's first argument).
+            // Inject it before validating so the schema-conforming request
+            // the model actually sends can pass validation.
+            const v = validatePatchRequestProto({ ...params, toolCallId });
             if (!v.ok) {
                 return {
                     content: [{ type: "text" as const, text: `invalid patch request: ${v.error}` }],
                     details: makeRejected(toolCallId, "session", ["invalid patch request shape"], { inspectionId: "", resourceIds: [] }, freshChecks()),
                 };
             }
+            const requestEvidenceRef = v.value.evidenceRef;
 
             const sessionFilePath = deps.getSessionFilePath();
             if (typeof sessionFilePath !== "string" || sessionFilePath.length === 0) {
                 return {
                     content: [{ type: "text" as const, text: "rejected: ephemeral session identity" }],
                     details: makeRejected(toolCallId, "session", ["no real session file path"], {
-                        inspectionId: typeof v.value.evidenceRef?.inspectionId === "string" ? v.value.evidenceRef.inspectionId : "",
-                        resourceIds: Array.isArray(v.value.evidenceRef?.resourceIds) ? [...v.value.evidenceRef.resourceIds] : [],
+                        inspectionId: requestEvidenceRef?.inspectionId ?? "",
+                        resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [],
                     }, freshChecks()),
                 };
             }
@@ -399,20 +417,22 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 return {
                     content: [{ type: "text" as const, text: "rejected: missing canonical workspace root" }],
                     details: makeRejected(toolCallId, "session", ["no canonical workspace root"], {
-                        inspectionId: v.value.evidenceRef.inspectionId,
-                        resourceIds: [...v.value.evidenceRef.resourceIds],
+                        inspectionId: requestEvidenceRef?.inspectionId ?? "",
+                        resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [],
                     }, freshChecks()),
                 };
             }
 
             // Group edits by file path (per-edit path overrides top-level).
-            const grouping = groupEditsByPath(ctx.cwd, v.value.path, v.value.edits);
+            // v.value.path may be undefined when every edit supplies its own
+            // path (validator enforces this invariant).
+            const grouping = groupEditsByPath(ctx.cwd, v.value.path ?? "", v.value.edits);
             if (!grouping.ok) {
                 return {
                     content: [{ type: "text" as const, text: `rejected: ${grouping.error}` }],
                     details: makeRejected(toolCallId, "session", [grouping.error], {
-                        inspectionId: v.value.evidenceRef.inspectionId,
-                        resourceIds: [...v.value.evidenceRef.resourceIds],
+                        inspectionId: requestEvidenceRef?.inspectionId ?? "",
+                        resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [],
                     }, freshChecks()),
                 };
             }
@@ -430,7 +450,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             let autoInspected = false;
             let evidenceRefForDetails: EvidenceRef;
 
-            if (v.value.evidenceRef.resourceIds.length === 0) {
+            if (!requestEvidenceRef) {
                 // No evidenceRef — auto-inspect.
                 const built = await buildAutoInspectEnvelope({
                     sessionFilePath,
@@ -457,15 +477,15 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 checks.completed.push(makeCheck("auto-inspect", "pass", `synthesized envelope for ${envelope.resources.length} file(s)`));
             } else {
                 evidenceRefForDetails = {
-                    inspectionId: v.value.evidenceRef.inspectionId,
-                    resourceIds: [...v.value.evidenceRef.resourceIds],
+                    inspectionId: requestEvidenceRef.inspectionId,
+                    resourceIds: [...requestEvidenceRef.resourceIds],
                 };
                 const rpc = deps.getRpcClient();
                 try {
                     const reply = await rpc.request(
                         "resolve_evidence" as RpcMethod,
                         {
-                            inspectionId: v.value.evidenceRef.inspectionId,
+                            inspectionId: requestEvidenceRef.inspectionId,
                             sessionFilePath,
                             workspaceRoot: canonicalRoot,
                         },
@@ -530,7 +550,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         details: finalize(makeFailed(toolCallId, "stage", `file not found: ${group.rawPath}`, {
                             ...evidenceRefForDetails,
                             resourceIds: [""],
-                        }, checks, diagnostics, usedEvidence)),
+                        }, checks, diagnostics, usedEvidence, invalidations)),
                     };
                 }
 
@@ -544,7 +564,17 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     diagnostics.push(`coverage: no resource in envelope for ${canonicalTarget}`);
                     return {
                         content: [{ type: "text" as const, text: `rejected: coverage (no resource for ${group.rawPath})` }],
-                        details: finalize(makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence)),
+                        details: finalize(makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations)),
+                    };
+                }
+                if (resource.coverage === "search-match" || resource.coverage === "metadata-only") {
+                    diagnostics.push(`coverage: ${resource.coverage} is weak evidence and cannot authorize a patch for ${canonicalTarget} (path-mode inspect this file first)`);
+                    return {
+                        content: [{ type: "text" as const, text: `rejected: coverage (weak evidence for ${group.rawPath})` }],
+                        details: finalize(makeRejected(toolCallId, "coverage", diagnostics, {
+                            inspectionId: evidenceRefForDetails.inspectionId,
+                            resourceIds: [resource.resourceId],
+                        }, checks, usedEvidence, invalidations)),
                     };
                 }
                 usedEvidence.push(resource.resourceId);
@@ -562,7 +592,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         details: finalize(makeFailed(toolCallId, "stage", `read failed: ${group.rawPath}`, {
                             inspectionId: evidenceRefForDetails.inspectionId,
                             resourceIds: [resource.resourceId],
-                        }, checks, diagnostics, usedEvidence)),
+                        }, checks, diagnostics, usedEvidence, invalidations)),
                     };
                 }
 
@@ -574,7 +604,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         details: finalize(makeRejected(toolCallId, "stale", diagnostics, {
                             inspectionId: evidenceRefForDetails.inspectionId,
                             resourceIds: [resource.resourceId],
-                        }, checks, usedEvidence)),
+                        }, checks, usedEvidence, invalidations)),
                     };
                 }
 
@@ -587,7 +617,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         details: finalize(makeFailed(toolCallId, "stage", `target not found: ${group.rawPath}`, {
                             inspectionId: evidenceRefForDetails.inspectionId,
                             resourceIds: [resource.resourceId],
-                        }, checks, diagnostics, usedEvidence)),
+                        }, checks, diagnostics, usedEvidence, invalidations)),
                     };
                 }
                 if (resource.coverage === "line-range") {
@@ -599,7 +629,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                             details: finalize(makeRejected(toolCallId, "coverage", diagnostics, {
                                 inspectionId: evidenceRefForDetails.inspectionId,
                                 resourceIds: [resource.resourceId],
-                            }, checks, usedEvidence)),
+                            }, checks, usedEvidence, invalidations)),
                         };
                     }
                 }
@@ -614,7 +644,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                             details: finalize(makeFailed(toolCallId, "write", `edit missing oldText/newText: ${group.rawPath}`, {
                                 inspectionId: evidenceRefForDetails.inspectionId,
                                 resourceIds: [resource.resourceId],
-                            }, checks, diagnostics, usedEvidence)),
+                            }, checks, diagnostics, usedEvidence, invalidations)),
                         };
                     }
                     if (!newContent.includes(edit.oldText)) {
@@ -624,7 +654,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                             details: finalize(makeFailed(toolCallId, "write", `oldText not found: ${group.rawPath}`, {
                                 inspectionId: evidenceRefForDetails.inspectionId,
                                 resourceIds: [resource.resourceId],
-                            }, checks, diagnostics, usedEvidence)),
+                            }, checks, diagnostics, usedEvidence, invalidations)),
                         };
                     }
                     if (edit.replaceAll) {
@@ -639,11 +669,12 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 for (const v of verifiers) {
                     let outcome: "pass" | "fail" | "skipped" | "timeout" = "pass";
                     let detail: string | undefined;
+                    let timer: ReturnType<typeof setTimeout> | undefined;
                     try {
                         const result = await Promise.race([
                             v.run({ path: canonicalTarget, content: newContent, toolCallId }),
                             new Promise<never>((_r, rej) => {
-                                setTimeout(() => { rej(new Error("timeout")); }, 5000);
+                                timer = setTimeout(() => { rej(new Error("timeout")); }, 5000);
                             }),
                         ]);
                         outcome = result.outcome;
@@ -651,12 +682,28 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     } catch (err) {
                         outcome = "timeout";
                         detail = err instanceof Error ? err.message : String(err);
+                    } finally {
+                        if (timer) clearTimeout(timer);
                     }
                     const check = makeCheck(`${v.id}:${group.rawPath}`, outcome, detail);
                     if (outcome === "timeout") checks.timedOut.push(check);
                     else if (v.kind === "blocking") checks.blocking.push(check);
                     else checks.advisory.push(check);
                     checks.completed.push(check);
+                }
+
+                // A failing blocking check must prevent the write — recording
+                // it in checks.blocking is not itself a gate.
+                const failedBlocking = checks.blocking.find((c) => c.outcome === "fail");
+                if (failedBlocking) {
+                    diagnostics.push(`blocking check failed: ${failedBlocking.id}${failedBlocking.detail ? ` (${failedBlocking.detail})` : ""}`);
+                    return {
+                        content: [{ type: "text" as const, text: `rejected: blocking check failed (${group.rawPath})` }],
+                        details: finalize(makeRejected(toolCallId, "approval", diagnostics, {
+                            inspectionId: evidenceRefForDetails.inspectionId,
+                            resourceIds: [resource.resourceId],
+                        }, checks, usedEvidence, invalidations)),
+                    };
                 }
 
                 // Atomic write.
@@ -669,7 +716,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         details: finalize(makeFailed(toolCallId, "write", `write failed: ${group.rawPath}`, {
                             inspectionId: evidenceRefForDetails.inspectionId,
                             resourceIds: [resource.resourceId],
-                        }, checks, diagnostics, usedEvidence)),
+                        }, checks, diagnostics, usedEvidence, invalidations)),
                     };
                 }
 
@@ -686,7 +733,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         details: finalize(makeFailed(toolCallId, "verify", `post-write read failed: ${group.rawPath}`, {
                             inspectionId: evidenceRefForDetails.inspectionId,
                             resourceIds: [resource.resourceId],
-                        }, checks, diagnostics, usedEvidence)),
+                        }, checks, diagnostics, usedEvidence, invalidations)),
                     };
                 }
                 const postSha = sha256OfString(postContent);
@@ -698,7 +745,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         details: finalize(makeFailed(toolCallId, "verify", `post-write hash mismatch: ${group.rawPath}`, {
                             inspectionId: evidenceRefForDetails.inspectionId,
                             resourceIds: [resource.resourceId],
-                        }, checks, diagnostics, usedEvidence)),
+                        }, checks, diagnostics, usedEvidence, invalidations)),
                     };
                 }
 
@@ -765,6 +812,7 @@ function makeRejected(
     evidenceRef: EvidenceRef,
     checks: MutableChecks,
     usedEvidence: ReadonlyArray<string> = [],
+    changedResources: ReadonlyArray<ResourceInvalidation> = [],
 ): PatchDetails {
     return {
         tool: "patch",
@@ -772,7 +820,7 @@ function makeRejected(
         toolCallId,
         evidenceRef,
         usedEvidence: [...usedEvidence],
-        changedResources: [],
+        changedResources: [...changedResources],
         checks: freezeChecks(checks),
         diagnostics,
     };
@@ -786,6 +834,7 @@ function makeFailed(
     checks: MutableChecks,
     diagnostics: string[],
     usedEvidence: ReadonlyArray<string> = [],
+    changedResources: ReadonlyArray<ResourceInvalidation> = [],
 ): PatchDetails {
     return {
         tool: "patch",
@@ -793,7 +842,7 @@ function makeFailed(
         toolCallId,
         evidenceRef,
         usedEvidence: [...usedEvidence],
-        changedResources: [],
+        changedResources: [...changedResources],
         checks: freezeChecks(checks),
         diagnostics: [...diagnostics, message],
         error: message,

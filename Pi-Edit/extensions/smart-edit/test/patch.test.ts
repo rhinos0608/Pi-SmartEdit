@@ -21,6 +21,7 @@ import {
     resolvePatchAuthorization,
     createPatchTool,
     type PatchToolDeps,
+    type VerificationCheck,
 } from "../src/patch.js";
 
 function sha256(s: string): string {
@@ -206,6 +207,7 @@ async function runApply(opts: {
     range?: { startLine: number; endLine: number };
     edits: Array<{ oldText: string; newText: string; replaceAll?: boolean }>;
     rpc: (envelope: WorkspaceEvidenceEnvelope | null) => { ok: boolean; payload?: unknown; error?: string };
+    checks?: VerificationCheck[];
 }) {
     const file = join(opts.workdir, "a.ts");
     writeFileSync(file, opts.fileContent, "utf8");
@@ -241,6 +243,7 @@ async function runApply(opts: {
         }),
         getSessionFilePath: () => sessionFilePath,
         getCanonicalWorkspaceRoot: () => opts.workdir,
+        ...(opts.checks ? { getVerificationChecks: () => opts.checks! } : {}),
     };
     const tool = createPatchTool(deps);
     const res = await tool.execute(
@@ -471,4 +474,266 @@ test("end-to-end: multi-file patch with per-edit paths (v3)", async () => {
     const d = res.details as any;
     // v3: multi-file is allowed. Second edit targets non-existent file with no evidence → fails.
     assert.equal(d.status.kind, "failed");
+});
+
+// ── Review-fix regression tests (B1-B4) ──────────────────────────────
+
+test("end-to-end: auto-inspect fallback is reachable when evidenceRef is omitted entirely (not just empty)", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-")));
+    mkdirSync(workdir, { recursive: true });
+    const file = join(workdir, "a.ts");
+    writeFileSync(file, "alpha\nbeta\n", "utf8");
+    const sessionFilePath = "/sessions/a.jsonl";
+    const deps: PatchToolDeps = {
+        getRpcClient: () => ({
+            request: async () => {
+                throw new Error("rpc must not be called when evidenceRef is omitted");
+            },
+            dispose: () => {},
+        }),
+        getSessionFilePath: () => sessionFilePath,
+        getCanonicalWorkspaceRoot: () => workdir,
+    };
+    const tool = createPatchTool(deps);
+    // No evidenceRef field at all in params — schema-conforming auto-inspect call.
+    const res = await tool.execute(
+        "tc1",
+        {
+            path: "a.ts",
+            edits: [{ oldText: "beta", newText: "BETA" }],
+        },
+        undefined,
+        undefined,
+        makeCtx(workdir),
+    );
+    const d = res.details as any;
+    assert.equal(d.status.kind, "applied");
+    const final = readFileSync(realpathSync(file), "utf8");
+    assert.equal(final, "alpha\nBETA\n");
+});
+
+test("end-to-end: toolCallId is not required in the wire payload (Pi supplies it as the execute() argument)", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-")));
+    mkdirSync(workdir, { recursive: true });
+    const file = join(workdir, "a.ts");
+    writeFileSync(file, "alpha\nbeta\n", "utf8");
+    const sessionFilePath = "/sessions/a.jsonl";
+    const deps: PatchToolDeps = {
+        getRpcClient: () => ({ request: async () => { throw new Error("unused"); }, dispose: () => {} }),
+        getSessionFilePath: () => sessionFilePath,
+        getCanonicalWorkspaceRoot: () => workdir,
+    };
+    const tool = createPatchTool(deps);
+    // Schema-conforming params per PATCH_PARAMS_DOC: no toolCallId field.
+    const res = await tool.execute(
+        "tc-from-harness",
+        { path: "a.ts", edits: [{ oldText: "beta", newText: "BETA" }] },
+        undefined,
+        undefined,
+        makeCtx(workdir),
+    );
+    const d = res.details as any;
+    assert.equal(d.status.kind, "applied");
+    assert.equal(d.toolCallId, "tc-from-harness");
+});
+
+test("end-to-end: multi-file mid-batch failure reports files already applied in changedResources (not empty), and earlier writes are not silently hidden", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-")));
+    mkdirSync(workdir, { recursive: true });
+    const file1 = join(workdir, "a.ts");
+    const file2 = join(workdir, "b.ts");
+    writeFileSync(file1, "alpha\nbeta\n", "utf8");
+    writeFileSync(file2, "gamma\ndelta\n", "utf8");
+    const canonical1 = realpathSync(file1);
+    const canonical2 = realpathSync(file2);
+    const sessionFilePath = "/sessions/a.jsonl";
+    const envelope = makeEnvelope({
+        sessionFilePath,
+        canonicalRoot: workdir,
+        resources: [
+            makeResource({ canonicalPath: canonical1, full: true, content: "alpha\nbeta\n" }),
+            makeResource({ canonicalPath: canonical2, full: true, content: "gamma\ndelta\n" }),
+        ],
+    });
+    const [r1, r2] = envelope.resources;
+    const deps: PatchToolDeps = {
+        getRpcClient: () => ({
+            request: async () => ({
+                kind: "reply" as const,
+                schemaVersion: PROTOCOL_SCHEMA_VERSION,
+                requestId: "r1",
+                ok: true,
+                payload: envelope,
+            }),
+            dispose: () => {},
+        }),
+        getSessionFilePath: () => sessionFilePath,
+        getCanonicalWorkspaceRoot: () => workdir,
+    };
+    const tool = createPatchTool(deps);
+    const res = await tool.execute(
+        "tc1",
+        {
+            edits: [
+                { oldText: "alpha", newText: "ALPHA", path: "a.ts" },
+                // b.ts oldText doesn't exist -> group 2 fails at write-target-derivation
+                { oldText: "NOPE-NOT-PRESENT", newText: "x", path: "b.ts" },
+            ],
+            evidenceRef: { inspectionId: envelope.inspectionId, resourceIds: [r1!.resourceId, r2!.resourceId] },
+            toolCallId: "tc1",
+        },
+        undefined,
+        undefined,
+        makeCtx(workdir),
+    );
+    const d = res.details as any;
+    assert.equal(d.status.kind, "failed");
+    // file1 was actually written to disk before file2 failed.
+    assert.equal(readFileSync(canonical1, "utf8"), "ALPHA\nbeta\n");
+    // The failure report must reflect that file1 was changed, not report an empty array.
+    assert.equal(d.changedResources.length, 1);
+    assert.equal(d.changedResources[0].canonicalPath, canonical1);
+});
+
+test("end-to-end: query-mode-style evidence (search-match coverage, no sha) is rejected by patch even with a matching path", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-")));
+    mkdirSync(workdir, { recursive: true });
+    const file = join(workdir, "a.ts");
+    writeFileSync(file, "alpha\nbeta\n", "utf8");
+    const canonicalFile = realpathSync(file);
+    const sessionFilePath = "/sessions/a.jsonl";
+    const weakResource: InspectedResource = {
+        resourceId: resourceIdFor({ canonicalPath: canonicalFile, kind: "range", range: { startLine: 1, endLine: 1 } }),
+        canonicalPath: canonicalFile,
+        kind: "range",
+        coverage: "search-match",
+        allowedRanges: [{ startLine: 1, endLine: 1 }],
+        fresh: false,
+    };
+    const envelope = makeEnvelope({ sessionFilePath, canonicalRoot: workdir, resources: [weakResource] });
+    const deps: PatchToolDeps = {
+        getRpcClient: () => ({
+            request: async () => ({
+                kind: "reply" as const,
+                schemaVersion: PROTOCOL_SCHEMA_VERSION,
+                requestId: "r1",
+                ok: true,
+                payload: envelope,
+            }),
+            dispose: () => {},
+        }),
+        getSessionFilePath: () => sessionFilePath,
+        getCanonicalWorkspaceRoot: () => workdir,
+    };
+    const tool = createPatchTool(deps);
+    // Rewrite the file after "inspection" — if freshness were the only gate,
+    // this whole-file rewrite would be undetectable since there is no sha.
+    writeFileSync(file, "totally\nREWRITTEN\ncontent\nnow\n", "utf8");
+    const res = await tool.execute(
+        "tc1",
+        {
+            path: "a.ts",
+            edits: [{ oldText: "totally", newText: "changed" }],
+            evidenceRef: { inspectionId: envelope.inspectionId, resourceIds: [weakResource.resourceId] },
+            toolCallId: "tc1",
+        },
+        undefined,
+        undefined,
+        makeCtx(workdir),
+    );
+    const d = res.details as any;
+    assert.equal(d.status.kind, "rejected");
+    assert.equal(d.status.reason, "coverage");
+    // File must be unmodified — patch must not have applied.
+    assert.equal(readFileSync(canonicalFile, "utf8"), "totally\nREWRITTEN\ncontent\nnow\n");
+});
+
+test("end-to-end: metadata-only coverage is also rejected", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-")));
+    mkdirSync(workdir, { recursive: true });
+    const file = join(workdir, "a.ts");
+    writeFileSync(file, "alpha\nbeta\n", "utf8");
+    const canonicalFile = realpathSync(file);
+    const sessionFilePath = "/sessions/a.jsonl";
+    const weakResource: InspectedResource = {
+        resourceId: resourceIdFor({ canonicalPath: canonicalFile, kind: "range", range: { startLine: 1, endLine: 1 } }),
+        canonicalPath: canonicalFile,
+        kind: "range",
+        coverage: "metadata-only",
+        allowedRanges: [{ startLine: 1, endLine: 1 }],
+        fresh: false,
+    };
+    const envelope = makeEnvelope({ sessionFilePath, canonicalRoot: workdir, resources: [weakResource] });
+    const deps: PatchToolDeps = {
+        getRpcClient: () => ({
+            request: async () => ({
+                kind: "reply" as const,
+                schemaVersion: PROTOCOL_SCHEMA_VERSION,
+                requestId: "r1",
+                ok: true,
+                payload: envelope,
+            }),
+            dispose: () => {},
+        }),
+        getSessionFilePath: () => sessionFilePath,
+        getCanonicalWorkspaceRoot: () => workdir,
+    };
+    const tool = createPatchTool(deps);
+    const res = await tool.execute(
+        "tc1",
+        {
+            path: "a.ts",
+            edits: [{ oldText: "alpha", newText: "changed" }],
+            evidenceRef: { inspectionId: envelope.inspectionId, resourceIds: [weakResource.resourceId] },
+            toolCallId: "tc1",
+        },
+        undefined,
+        undefined,
+        makeCtx(workdir),
+    );
+    const d = res.details as any;
+    assert.equal(d.status.kind, "rejected");
+    assert.equal(d.status.reason, "coverage");
+});
+
+test("end-to-end: a failing blocking verification check prevents the write", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-")));
+    mkdirSync(workdir, { recursive: true });
+    const before = "alpha\nbeta\n";
+    const { res, canonicalFile } = await runApply({
+        workdir,
+        fileContent: before,
+        envelopeContent: before,
+        fullFile: true,
+        edits: [{ oldText: "beta", newText: "BETA" }],
+        rpc: (env) => ({ ok: true, payload: env }),
+        checks: [{ id: "typecheck", kind: "blocking", run: async () => ({ outcome: "fail", detail: "type error" }) }],
+    });
+    const d = res.details as any;
+    assert.equal(d.status.kind, "rejected");
+    assert.equal(d.status.reason, "approval");
+    // File must be unmodified.
+    assert.equal(readFileSync(canonicalFile, "utf8"), before);
+});
+
+test("resolvePatchAuthorization: rejects weak coverage even when a resourceId matches", () => {
+    const sessionFilePath = "/sessions/a.jsonl";
+    const canonicalPath = "/ws/a.ts";
+    const weakResource: InspectedResource = {
+        resourceId: resourceIdFor({ canonicalPath, kind: "range", range: { startLine: 1, endLine: 1 } }),
+        canonicalPath,
+        kind: "range",
+        coverage: "search-match",
+        allowedRanges: [{ startLine: 1, endLine: 1 }],
+        fresh: false,
+    };
+    const envelope = makeEnvelope({ sessionFilePath, canonicalRoot: "/ws", resources: [weakResource] });
+    const auth = resolvePatchAuthorization({
+        envelope,
+        sessionFilePath,
+        canonicalWorkspaceRoot: "/ws",
+        requestedResourceIds: [weakResource.resourceId],
+        targetLineRange: { startLine: 1, endLine: 1 },
+    });
+    assert.equal(auth.ok, false);
 });
