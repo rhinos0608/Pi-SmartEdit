@@ -527,11 +527,9 @@ export default function smartEdit(pi: ExtensionAPI) {
   });
 
 
-  // ── Register the `patch` tool (workspace-evidence gated) ──
-  // v3: patch is the sole mutation tool; legacy `edit` was removed.
-  // Resolves evidence through event-RPC against the SmartRead resolver.
-  // Carries the real session file path and canonical workspace root captured
-  // at session_start. Rejects ephemeral session identity.
+  // ── Register `edit` tool (overrides native built-in edit) ──
+  // v3: workspace-evidence gated. Uses patch implementation under the hood.
+  // Rejects ephemeral session identity.
   if (pi.events && typeof pi.events.on === "function") {
     const bus = pi.events as {
       emit: (c: string, d: unknown) => void;
@@ -543,7 +541,22 @@ export default function smartEdit(pi: ExtensionAPI) {
       getCanonicalWorkspaceRoot: () => currentCanonicalWorkspaceRoot ?? "",
     };
     const patchTool = createPatchTool(patchDeps);
-    (pi.registerTool as (t: unknown) => void)(patchTool as unknown);
+    (pi.registerTool as (t: unknown) => void)({
+      ...patchTool,
+      name: "edit",
+
+      // Compatibility shim for resumed sessions with stored `edit` calls
+      // using flat oldText/newText instead of edits array.
+      prepareArguments(args: Record<string, unknown> | undefined): Record<string, unknown> {
+        if (!args || typeof args !== "object") return args ?? {};
+        const input = args as { oldText?: unknown; newText?: unknown };
+        if (typeof input.oldText !== "string" || typeof input.newText !== "string") {
+          return args;
+        }
+        // Migrate flat single oldText/newText to edits array.
+        return { ...args, edits: [{ oldText: input.oldText, newText: input.newText }] };
+      },
+    } as unknown);
   }
 }
 

@@ -354,7 +354,7 @@ async function buildAutoInspectEnvelope(args: {
 
 const PATCH_PARAMS_DOC = {
     description:
-        "Apply edits gated by a workspace-evidence inspection. Provide a `path`, a list of `edits`, and (optionally) an `evidenceRef` from a prior `inspect` call. If `evidenceRef` is omitted, patch auto-inspects each target file (full-file). v3 supports multi-file: each edit may carry its own `path` to override the top-level default.",
+        "Apply edits gated by a workspace-evidence inspection. Provide a `path`, a list of `edits`, and (optionally) an `evidenceRef` from a prior `inspect` or `read` call. If `evidenceRef` is omitted, patch auto-inspects each target file (full-file). v3 supports multi-file: each edit may carry its own `path` to override the top-level default.",
     type: "object",
     properties: {
         path: { type: "string", description: "Default target file path. May be omitted when every edit provides its own path." },
@@ -374,7 +374,7 @@ const PATCH_PARAMS_DOC = {
         },
         evidenceRef: {
             type: "object",
-            description: "Optional reference to a prior `inspect` tool result. If omitted, patch auto-inspects each target file.",
+            description: "Optional reference to a prior `inspect` or `read` tool result. If omitted, patch auto-inspects each target file.",
             properties: {
                 inspectionId: { type: "string" },
                 resourceIds: { type: "array", items: { type: "string" } },
@@ -406,7 +406,9 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             "Apply edits gated by a workspace-evidence inspection. v3 supports multi-file: each edit may carry its own `path`. If no `evidenceRef` is provided, patch auto-inspects each target file (full-file, SHA-256 freshness). Returns a discriminated lifecycle result (applied | rejected | failed).",
         parameters: PATCH_PARAMS_DOC as unknown as Record<string, unknown>,
 
-        async execute(toolCallId, params, signal, _onUpdate, ctx) {
+        async execute(toolCallId, params, signal, onUpdate, ctx) {
+            const stream = (text: string) => { onUpdate?.({ content: [{ type: "text", text }] }); };
+
             // The wire payload from the model never includes toolCallId (Pi
             // supplies it out-of-band as this function's first argument).
             // Inject it before validating so the schema-conforming request
@@ -459,6 +461,11 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             const checks: MutableChecks = freshChecks();
             const diagnostics: string[] = [];
             const usedEvidence: string[] = [];
+
+            const totalEdits = groups.reduce((sum, g) => sum + g.edits.length, 0);
+            const fileWord = groups.length === 1 ? "file" : "files";
+            const editWord = totalEdits === 1 ? "edit" : "edits";
+            stream(`patch — ${totalEdits} ${editWord} across ${groups.length} ${fileWord}`);
 
             // ── Acquire envelope ──────────────────────────────────────
             // v3: if no evidenceRef is provided, auto-inspect each target file
@@ -558,6 +565,8 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             const appliedFiles: string[] = [];
 
             for (const group of groups) {
+                stream(`  ${group.rawPath} — ${group.edits.length} edit(s)`);
+
                 // Resolve canonical path for this group.
                 let canonicalTarget: string;
                 try {
@@ -784,6 +793,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 };
                 postEditEvidenceByPath.set(canonicalTarget, postEditEvidence);
                 appliedFiles.push(group.rawPath);
+                stream(`  ✓ wrote ${group.rawPath}`);
             }
 
             // Surface evidence-pipeline uncertainty in skipped bucket.
