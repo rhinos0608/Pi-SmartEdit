@@ -20,6 +20,8 @@ Smart Edit replaces Pi's built-in `edit` tool with safer matching, richer diagno
 - **Edit history / undo**: captures pre-edit state to `.smart-edit-undo/` for rollback
 - **Context markers**: XML-style tags around injected semantic context for attribution/filtering
 - **Auto-validation**: retry-aware structural check + validation feedback on failed edits
+- **Fake-logic detection**: AST-based detection of stub bodies, constant conditions, and empty catch blocks (configurable via `SMART_EDIT_FAKE_LOGIC_ENABLED`)
+- **ESLint advisory diagnostics**: post-edit linting for TypeScript/JavaScript, never blocks the edit (configurable via `SMART_EDIT_LINT_ENABLED`)
 - **Incremental syntax validation**: tree-sitter incremental re-parse with LRU parse cache for fast post-edit checks
 - **Edit repair loop**: auto-retries failed edits with validation feedback (Aider-style, opt-in via config)
 - **Closest-match diagnostics**: shows the best near-match when an edit fails
@@ -224,14 +226,14 @@ Only use this after enabling `SMART_EDIT_USE_HASHLINE_EDITING=1`.
 │   ├── index.ts               # Tool registration, stale guard, atomic writes, mutation queue
 │   ├── core/                  # Matching, AST, hashline, read cache, and shared types
 │   ├── formats/               # JSON/search-replace/diff/OpenAI/Codex patch parsers
-│   ├── lsp/                   # LSP lifecycle, diagnostics, semantic context, symbol navigation
+│   ├── lsp/                   # LSP lifecycle, diagnostics, ESLint runner, semantic context, symbol navigation
 │   ├── safety/                # Approval gating and context-guard checks
 │   ├── undo/                  # Atomic writes and per-edit undo capture
-│   ├── verification/          # Validation, evidence, diagnostics, repair loop
+│   ├── verification/          # Validation, evidence, fake-logic detection, diagnostics, repair loop
 │   ├── edit-mode.ts           # Runtime config (hashline toggle, env vars)
 │   ├── symbolic-edits.ts      # Symbolic edit engine (replaceBody, insertBefore, insertAfter)
 │   └── smartread-bridge.ts    # Breakage/co-change recording to Pi-SmartRead
-├── test/                      # 40+ automated test suites plus manual scripts
+├── test/                      # 45+ automated test suites plus manual scripts
 ├── benchmark/                 # Hashline and matching benchmarks
 └── docs/                      # Feature specs and design notes
 ```
@@ -277,6 +279,8 @@ npx tsx --test test/<file>  # e.g., test/symbolic-edits.test.ts
 | `SMART_EDIT_REPAIR_ENABLED` | `1`/`true`/`yes`/`on` | **on** | Enable edit repair loop (Aider-style retry) |
 | `SMART_EDIT_REPAIR_ENABLED=0`/`false` | disable | — | Disable the repair loop (defaults to on) |
 | `SMART_EDIT_REPAIR_MAX_RETRIES` | integer | `3` | Max retry attempts in the repair loop |
+| `SMART_EDIT_FAKE_LOGIC_ENABLED` | `1`/`true`/`yes`/`on` | **on** | Detect stub bodies, constant conditions, empty catches |
+| `SMART_EDIT_LINT_ENABLED` | `1`/`true`/`yes`/`on` | **on** | Run ESLint as advisory post-edit diagnostics |
 | `SMART_EDIT_VERIFICATION_COMMANDS` | JSON array | `[]` | Concurrency/verification commands as `[{"name":"...","command":"...","args":["..."]}]` |
 
 ## Notes
@@ -287,4 +291,6 @@ npx tsx --test test/<file>  # e.g., test/symbolic-edits.test.ts
 - Undo data is stored in `.smart-edit-undo/` per project (fire-and-forget, never blocks).
 - Verification pipeline is advisory: warnings are matchNotes, never hard errors by default.
 - Repair loop is on by default (opt out with `SMART_EDIT_REPAIR_ENABLED=0` or `false`): repair failures produce notes but never block the pipeline.
+- Fake-logic detection uses tree-sitter AST analysis with regex fallback; never blocks the edit pipeline on error.
+- ESLint advisory diagnostics run via `npx eslint` only when an ESLint config is found in the file's ancestor tree; lint findings never affect pass/fail.
 - Incremental syntax validation uses tree-sitter computeEdit + re-parse; falls back to full parse when the edit delta is too large.
