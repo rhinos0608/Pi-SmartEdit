@@ -20,10 +20,12 @@ import { randomUUID } from "crypto";
 import { tmpdir } from "os";
 import { diffLines } from "diff";
 import { detectLanguageFromExtension } from "../lsp/language-id";
-import { getCompilerForLanguage } from "../lsp/diagnostic-dispatcher";
+import { getCompilerForLanguage, getLinterForLanguage } from "../lsp/diagnostic-dispatcher";
 import type { Diagnostic, DiagnosticResult } from "../lsp/diagnostic-dispatcher";
 import type Parser from "web-tree-sitter";
 import { computeStructuralDiff, hasStructuralAnomalies, type StructuralDiffResult } from "./structural-diff.js";
+import { checkFakeLogic, type FakeLogicResult } from "./fake-logic.js";
+import { defaultStaticCheckConfig } from "./config.js";
 
 // ─── Types ───────────────────────────────────────────────────────────
 
@@ -59,6 +61,12 @@ export interface ValidationResult {
   formatEquivalence?: FormatEquivalenceResult;
   /** Structural diff verification (GumTree-Simplified on tree-sitter CSTs) */
   structuralDiff?: StructuralDiffResult;
+  /** Fake-logic findings (stub bodies, tautological conditions, empty catches) */
+  fakeLogic?: FakeLogicResult;
+  /** Linter (eslint) diagnostics — always advisory, never affects `passed` */
+  lintDiagnostics?: Diagnostic[];
+  /** Source of lint diagnostics (e.g., "eslint", "none") */
+  lintSource?: string;
 }
 
 export interface AutoValidateOptions {
@@ -72,6 +80,10 @@ export interface AutoValidateOptions {
   oldTree?: Parser.Tree | null;
   /** Optional previous content matching the oldTree */
   oldContent?: string;
+  /** Whether to run fake-logic detection (default: read from SMART_EDIT_FAKE_LOGIC_ENABLED) */
+  fakeLogicEnabled?: boolean;
+  /** Whether to run lint (eslint) diagnostics (default: read from SMART_EDIT_LINT_ENABLED) */
+  lintEnabled?: boolean;
 }
 
 // ─── Per-session retry tracking ──────────────────────────────────────
@@ -133,6 +145,15 @@ const PLACEHOLDERS = [
   "# ...",
   "// stub",
   "/* stub */",
+  "... existing code ...",
+  "// rest of the",
+  "# rest of the",
+  "/* rest of the",
+  "remains the same",
+  "implementation goes here",
+  "your code here",
+  "<placeholder>",
+  "lorem ipsum",
 ];
 
 const TRUNCATION_MARKERS = [
@@ -150,9 +171,11 @@ const TRUNCATION_MARKERS = [
 export function checkStructural(content: string, _filePath: string): StructuralCheckResult {
   const errors: string[] = [];
 
-  // Check for placeholders
+  // Check for placeholders (case-insensitive — phrases like "Your Code Here"
+  // are commonly emitted by LLMs in mixed case)
+  const lowerContent = content.toLowerCase();
   for (const p of PLACEHOLDERS) {
-    if (content.includes(p)) {
+    if (lowerContent.includes(p.toLowerCase())) {
       errors.push(`Contains placeholder: "${p}"`);
     }
   }
@@ -439,6 +462,8 @@ export async function runAutoValidation(
     enabled = true,
     oldTree,
     oldContent,
+    fakeLogicEnabled,
+    lintEnabled,
   } = options;
 
   if (!enabled) {
@@ -452,6 +477,9 @@ export async function runAutoValidation(
       summary: "",
       structuralDiff: undefined,
       formatEquivalence: { equivalent: true, indentScore: 0 },
+      fakeLogic: undefined,
+      lintDiagnostics: [],
+      lintSource: "disabled",
     };
   }
 
@@ -530,13 +558,50 @@ export async function runAutoValidation(
     }
   }
 
+  // Static-check configuration is the single source of truth for fake-logic
+  // and lint enablement, and carries the per-check max-findings limit.
+  const staticConfig = defaultStaticCheckConfig();
+
+  // Run fake-logic detection (stub bodies, tautological conditions, empty catches)
+  const runFakeLogic = fakeLogicEnabled ?? (staticConfig.enabled && staticConfig.fakeLogic);
+  let fakeLogic: FakeLogicResult | undefined;
+  if (runFakeLogic) {
+    try {
+      fakeLogic = await checkFakeLogic(content, filePath, languageId, {
+        oldContent,
+        maxFindings: staticConfig.maxFindingsPerCheck,
+      });
+    } catch {
+      // Fake-logic detection is advisory — continue with other checks
+    }
+  }
+
+  // Run linter (eslint) diagnostics — always advisory, kept separate from
+  // compiler diagnostics so lint findings never affect `passed`.
+  const runLint = lintEnabled ?? (staticConfig.enabled && staticConfig.lint);
+  let lintDiagnostics: Diagnostic[] = [];
+  let lintSource = "none";
+  if (runLint && languageId) {
+    const linterRunner = getLinterForLanguage(languageId);
+    if (linterRunner) {
+      try {
+        const result: DiagnosticResult = await linterRunner(absolutePath, cwd);
+        lintDiagnostics = result.diagnostics;
+        lintSource = result.source;
+      } catch {
+        // Linter not available or failed — skip silently
+      }
+    }
+  }
+
   // Determine if validation passed
   const hasStructuralErrors = !structural.passed;
   const hasSyntaxErrors = syntaxError !== null;
   const hasFormatErrors = !formatEquivalence.equivalent;
   const hasCompilerErrors = diagnostics.filter((d) => d.severity === 1).length > 0;
   const hasStructuralDiffErrors = structuralDiff ? !structuralDiff.passed : false;
-  const passed = !hasStructuralErrors && !hasSyntaxErrors && !hasCompilerErrors && !hasStructuralDiffErrors;
+  const hasFakeLogicFindings = fakeLogic ? fakeLogic.findings.length > 0 : false;
+  const passed = !hasStructuralErrors && !hasSyntaxErrors && !hasCompilerErrors && !hasStructuralDiffErrors && !hasFakeLogicFindings;
 
   // Only increment retry count on actual failure (matches index.ts pattern)
   const retryCount = passed
@@ -571,6 +636,12 @@ export async function runAutoValidation(
       parts.push(`${diagnosticSource}: ${warnings.length} warning(s)`);
     }
   }
+  if (hasFakeLogicFindings && fakeLogic) {
+    parts.push(`Fake logic: ${fakeLogic.findings.length} finding(s)`);
+  }
+  if (lintDiagnostics.length > 0 && lintSource !== "none") {
+    parts.push(`${lintSource} (advisory): ${lintDiagnostics.length} finding(s)`);
+  }
   if (shouldDecompose) {
     parts.push(`Max retries (${maxRetries}) reached — consider decomposing the task`);
   }
@@ -589,6 +660,9 @@ export async function runAutoValidation(
     summary,
     structuralDiff,
     formatEquivalence,
+    fakeLogic,
+    lintDiagnostics,
+    lintSource,
   };
 }
 
@@ -624,6 +698,38 @@ export function formatValidationFeedback(result: ValidationResult): string | nul
     parts.push(`\n${result.diagnosticSource} warnings (${warnings.length}):`);
     for (const diag of warnings.slice(0, 5)) {
       parts.push(`  • ${diag.message}`);
+    }
+  }
+
+  if (result.fakeLogic && result.fakeLogic.findings.length > 0) {
+    const findings = result.fakeLogic.findings;
+    parts.push(`\nFake logic detected (${findings.length}):`);
+    for (const finding of findings.slice(0, 10)) {
+      parts.push(`  • line ${finding.line}: [${finding.rule}] ${finding.message}`);
+    }
+    if (findings.length > 10) {
+      parts.push(`  ... and ${findings.length - 10} more`);
+    }
+  }
+
+  if (result.lintDiagnostics && result.lintDiagnostics.length > 0) {
+    const lintSource = result.lintSource ?? "Lint";
+    const lintErrors = result.lintDiagnostics.filter((d) => d.severity === 1);
+    const lintWarnings = result.lintDiagnostics.filter((d) => d.severity === 2);
+    if (lintErrors.length > 0 || lintWarnings.length > 0) {
+      parts.push(`\n${lintSource} (advisory, does not block):`);
+      for (const diag of lintErrors.slice(0, 10)) {
+        parts.push(`  • line ${diag.range.start.line + 1}: ${diag.message}`);
+      }
+      if (lintErrors.length > 10) {
+        parts.push(`  ... and ${lintErrors.length - 10} more errors`);
+      }
+      for (const diag of lintWarnings.slice(0, 5)) {
+        parts.push(`  • line ${diag.range.start.line + 1}: ${diag.message}`);
+      }
+      if (lintWarnings.length > 5) {
+        parts.push(`  ... and ${lintWarnings.length - 5} more warnings`);
+      }
     }
   }
 

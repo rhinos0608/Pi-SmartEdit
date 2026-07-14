@@ -14,6 +14,8 @@ import {
   resetRetryCounts,
   incrementRetryCount,
 } from "../src/verification/auto-validate";
+import type { FakeLogicResult } from "../src/verification/fake-logic";
+import type { Diagnostic } from "../src/lsp/diagnostic-dispatcher";
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -106,6 +108,88 @@ describe("checkStructural", () => {
     );
     assert.strictEqual(result.passed, false);
     assert.ok(result.errors.some((e) => e.includes("placeholder")));
+  });
+
+  test("detects ... existing code ... placeholder", () => {
+    const result = checkStructural(
+      "function old() {\n  ... existing code ...\n}\n",
+      "/test/file.ts",
+    );
+    assert.strictEqual(result.passed, false);
+    assert.ok(result.errors.some((e) => e.includes("placeholder")));
+  });
+
+  test("detects rest of the placeholder", () => {
+    const result = checkStructural(
+      "// rest of the implementation stays unchanged\n",
+      "/test/file.ts",
+    );
+    assert.strictEqual(result.passed, false);
+    assert.ok(result.errors.some((e) => e.includes("placeholder")));
+  });
+
+  test("does not flag prose rest of the without preceding comment marker", () => {
+    const result = checkStructural(
+      "// We treat current content as empty so the rest of the pipeline works\n",
+      "/test/file.ts",
+    );
+    assert.strictEqual(result.passed, true);
+    assert.deepStrictEqual(result.errors, []);
+  });
+
+  test("detects remains the same placeholder", () => {
+    const result = checkStructural(
+      "// other methods remains the same\n",
+      "/test/file.ts",
+    );
+    assert.strictEqual(result.passed, false);
+    assert.ok(result.errors.some((e) => e.includes("placeholder")));
+  });
+
+  test("detects implementation goes here placeholder", () => {
+    const result = checkStructural(
+      "function compute() {\n  // implementation goes here\n}\n",
+      "/test/file.ts",
+    );
+    assert.strictEqual(result.passed, false);
+    assert.ok(result.errors.some((e) => e.includes("placeholder")));
+  });
+
+  test("detects your code here placeholder", () => {
+    const result = checkStructural(
+      "function compute() {\n  // your code here\n}\n",
+      "/test/file.ts",
+    );
+    assert.strictEqual(result.passed, false);
+    assert.ok(result.errors.some((e) => e.includes("placeholder")));
+  });
+
+  test("detects <placeholder> tag", () => {
+    const result = checkStructural(
+      "const value = <placeholder>;\n",
+      "/test/file.ts",
+    );
+    assert.strictEqual(result.passed, false);
+    assert.ok(result.errors.some((e) => e.includes("placeholder")));
+  });
+
+  test("detects lorem ipsum placeholder", () => {
+    const result = checkStructural(
+      "// lorem ipsum dolor sit amet\n",
+      "/test/file.ts",
+    );
+    assert.strictEqual(result.passed, false);
+    assert.ok(result.errors.some((e) => e.includes("placeholder")));
+  });
+
+  test("placeholder matching is case-insensitive", () => {
+    const result = checkStructural(
+      "function hello() {\n  // ToDo: implement\n}\n",
+      "/test/file.ts",
+    );
+    assert.strictEqual(result.passed, false);
+    assert.ok(result.errors.some((e) => e.includes("placeholder")));
+    assert.ok(result.errors.some((e) => e.includes("TODO")));
   });
 });
 
@@ -252,6 +336,152 @@ describe("formatValidationFeedback", () => {
     assert.ok(feedback !== null);
     assert.ok(feedback!.includes("Max retries"));
     assert.ok(feedback!.includes("smaller steps"));
+  });
+
+  test("shows fake logic findings", () => {
+    const fakeLogic: FakeLogicResult = {
+      passed: false,
+      findings: [
+        { rule: "empty-catch", line: 10, message: "Empty catch block" },
+        { rule: "constant-condition", line: 22, message: "Condition is always true" },
+      ],
+    };
+    const feedback = formatValidationFeedback({
+      passed: false,
+      structural: { passed: true, errors: [] },
+      diagnostics: [],
+      diagnosticSource: "none",
+      retryCount: 1,
+      shouldDecompose: false,
+      summary: "fail",
+      fakeLogic,
+    });
+    assert.ok(feedback !== null);
+    assert.ok(feedback!.includes("Fake logic detected (2):"));
+    assert.ok(feedback!.includes("line 10: [empty-catch] Empty catch block"));
+    assert.ok(feedback!.includes("line 22: [constant-condition] Condition is always true"));
+  });
+
+  test("caps fake logic findings at 10", () => {
+    const fakeLogic: FakeLogicResult = {
+      passed: false,
+      findings: Array.from({ length: 13 }, (_, i) => ({
+        rule: "stub-body",
+        line: i + 1,
+        message: `Finding ${i + 1}`,
+      })),
+    };
+    const feedback = formatValidationFeedback({
+      passed: false,
+      structural: { passed: true, errors: [] },
+      diagnostics: [],
+      diagnosticSource: "none",
+      retryCount: 1,
+      shouldDecompose: false,
+      summary: "fail",
+      fakeLogic,
+    });
+    assert.ok(feedback !== null);
+    assert.ok(feedback!.includes("Fake logic detected (13):"));
+    const bulletCount = (feedback!.match(/line \d+: \[stub-body\] Finding \d+/g) ?? []).length;
+    assert.strictEqual(bulletCount, 10);
+    assert.ok(feedback!.includes("... and 3 more"));
+  });
+
+  test("shows lint diagnostics as advisory", () => {
+    const lintDiagnostics: Diagnostic[] = [
+      {
+        message: "Unexpected any",
+        severity: 1,
+        range: { start: { line: 4, character: 0 }, end: { line: 4, character: 5 } },
+        source: "eslint",
+      },
+      {
+        message: "Missing semicolon",
+        severity: 2,
+        range: { start: { line: 7, character: 10 }, end: { line: 7, character: 11 } },
+        source: "eslint",
+      },
+    ];
+    const feedback = formatValidationFeedback({
+      passed: true,
+      structural: { passed: true, errors: [] },
+      diagnostics: [],
+      diagnosticSource: "none",
+      retryCount: 0,
+      shouldDecompose: false,
+      summary: "pass",
+      lintDiagnostics,
+      lintSource: "eslint",
+    });
+    assert.ok(feedback !== null);
+    assert.ok(feedback!.includes("eslint (advisory, does not block):"));
+    assert.ok(feedback!.includes("line 5: Unexpected any"));
+    assert.ok(feedback!.includes("line 8: Missing semicolon"));
+  });
+
+  test("caps lint diagnostics at 10 errors and 5 warnings", () => {
+    const lintDiagnostics: Diagnostic[] = [
+      ...Array.from({ length: 12 }, (_, i) => ({
+        message: `Error ${i + 1}`,
+        severity: 1 as const,
+        range: { start: { line: i, character: 0 }, end: { line: i, character: 1 } },
+        source: "eslint",
+      })),
+      ...Array.from({ length: 8 }, (_, i) => ({
+        message: `Warning ${i + 1}`,
+        severity: 2 as const,
+        range: { start: { line: i + 20, character: 0 }, end: { line: i + 20, character: 1 } },
+        source: "eslint",
+      })),
+    ];
+    const feedback = formatValidationFeedback({
+      passed: true,
+      structural: { passed: true, errors: [] },
+      diagnostics: [],
+      diagnosticSource: "none",
+      retryCount: 0,
+      shouldDecompose: false,
+      summary: "pass",
+      lintDiagnostics,
+      lintSource: "eslint",
+    });
+    assert.ok(feedback !== null);
+    const errorBullets = (feedback!.match(/Error \d+/g) ?? []).length;
+    const warningBullets = (feedback!.match(/Warning \d+/g) ?? []).length;
+    assert.strictEqual(errorBullets, 10);
+    assert.strictEqual(warningBullets, 5);
+    assert.ok(feedback!.includes("... and 2 more errors"));
+    assert.ok(feedback!.includes("... and 3 more warnings"));
+  });
+
+  test("omits fake logic section when findings are empty", () => {
+    const feedback = formatValidationFeedback({
+      passed: true,
+      structural: { passed: true, errors: [] },
+      diagnostics: [],
+      diagnosticSource: "none",
+      retryCount: 0,
+      shouldDecompose: false,
+      summary: "pass",
+      fakeLogic: { passed: true, findings: [] },
+    });
+    assert.strictEqual(feedback, null);
+  });
+
+  test("omits lint section when diagnostics are empty", () => {
+    const feedback = formatValidationFeedback({
+      passed: true,
+      structural: { passed: true, errors: [] },
+      diagnostics: [],
+      diagnosticSource: "none",
+      retryCount: 0,
+      shouldDecompose: false,
+      summary: "pass",
+      lintDiagnostics: [],
+      lintSource: "eslint",
+    });
+    assert.strictEqual(feedback, null);
   });
 });
 
