@@ -14,6 +14,7 @@ import type {
   TraceabilityConfig,
   HistoryConfig,
   RepairConfig,
+  StaticCheckConfig,
   VerificationCommand,
 } from "./types";
 import { loadConfig } from "../config/schema.js";
@@ -35,6 +36,7 @@ export function defaultVerificationConfig(
     traceability: defaultTraceabilityConfig(),
     history: defaultHistoryConfig(),
     repair: defaultRepairConfig(env),
+    staticChecks: defaultStaticCheckConfig(env),
   };
 }
 
@@ -98,6 +100,21 @@ export function defaultRepairConfig(
   };
 }
 
+export function defaultStaticCheckConfig(
+  env?: Record<string, string | undefined>,
+): StaticCheckConfig {
+  const cfg = env ? loadConfig(env) : loadConfig();
+  const fakeLogic = cfg.fakeLogicEnabled;
+  const lint = cfg.lintEnabled;
+
+  return {
+    enabled: true,
+    fakeLogic,
+    lint,
+    maxFindingsPerCheck: 10,
+  };
+}
+
 /**
  * Deep-merge a partial config over the defaults.
  * Only defined fields from `partial` override the corresponding defaults.
@@ -125,6 +142,9 @@ export function mergeVerificationConfig(
     repair: partial.repair
       ? mergeRepairConfig(base.repair, partial.repair)
       : base.repair,
+    staticChecks: partial.staticChecks
+      ? mergeStaticCheckConfig(base.staticChecks, partial.staticChecks)
+      : base.staticChecks,
   };
 }
 
@@ -165,6 +185,14 @@ export function mergeRepairConfig(
   base: RepairConfig,
   partial?: Partial<RepairConfig>,
 ): RepairConfig {
+  if (!partial) return base;
+  return { ...base, ...partial };
+}
+
+export function mergeStaticCheckConfig(
+  base: StaticCheckConfig,
+  partial?: Partial<StaticCheckConfig>,
+): StaticCheckConfig {
   if (!partial) return base;
   return { ...base, ...partial };
 }

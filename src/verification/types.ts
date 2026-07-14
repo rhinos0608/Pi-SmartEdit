@@ -74,6 +74,19 @@ export interface VerificationConfig {
   history: HistoryConfig;
   /** Edit repair loop config (Aider-style lint-fix pattern) */
   repair: RepairConfig;
+  /** Static fake-logic / lint artifact checks */
+  staticChecks: StaticCheckConfig;
+}
+
+export interface StaticCheckConfig {
+  /** Enable static fake-logic / lint artifact checks */
+  enabled: boolean;
+  /** Detect fake-logic placeholders (e.g. lorem ipsum, "rest of the") */
+  fakeLogic: boolean;
+  /** Detect lint / eslint artifact placeholders */
+  lint: boolean;
+  /** Maximum findings reported per static check */
+  maxFindingsPerCheck: number;
 }
 
 export interface ConcurrencyConfig {

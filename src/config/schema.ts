@@ -14,6 +14,8 @@
  *   SMART_EDIT_VERIFICATION_COMMANDS — JSON array of verification commands
  *   SMART_EDIT_REPAIR_ENABLED        — enable repair loop (default: true)
  *   SMART_EDIT_REPAIR_MAX_RETRIES    — max retry attempts (default: 3, capped: 50)
+ *   SMART_EDIT_FAKE_LOGIC_ENABLED    — detect fake-logic placeholders (default: true)
+ *   SMART_EDIT_LINT_ENABLED          — detect lint artifact placeholders (default: true)
  *   JDT_LS_JAR                       — path to JDT-LS jar for Java LSP
  */
 
@@ -44,6 +46,12 @@ export interface SmartEditConfig {
 
   /** Maximum retry attempts for the repair loop (0-50). */
   repairMaxRetries: number;
+
+  /** Detect fake-logic placeholders in generated code. */
+  fakeLogicEnabled: boolean;
+
+  /** Detect lint / eslint artifact placeholders in generated code. */
+  lintEnabled: boolean;
 
   /** Path to JDT-LS jar for Java language support. */
   jdtLsJar: string;
@@ -120,6 +128,14 @@ export function loadConfig(
     }
   }
 
+  // ── fakeLogicEnabled ────────────────────────────────────
+  const fakeLogicRaw = env["SMART_EDIT_FAKE_LOGIC_ENABLED"];
+  const fakeLogicEnabled = fakeLogicRaw != null ? parseBooleanEnv(fakeLogicRaw) : true;
+
+  // ── lintEnabled ─────────────────────────────────────────
+  const lintRaw = env["SMART_EDIT_LINT_ENABLED"];
+  const lintEnabled = lintRaw != null ? parseBooleanEnv(lintRaw) : true;
+
   // ── jdtLsJar ────────────────────────────────────────────
   const jdtLsJar = env["JDT_LS_JAR"] ?? "";
 
@@ -131,6 +147,8 @@ export function loadConfig(
     verificationCommands,
     repairEnabled,
     repairMaxRetries,
+    fakeLogicEnabled,
+    lintEnabled,
     jdtLsJar,
   };
 }
