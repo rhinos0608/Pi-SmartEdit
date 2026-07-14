@@ -3,9 +3,13 @@
  * Runs LSP, then compiler, then linter in order of priority.
  */
 
-import { spawn } from "child_process";
-import { access } from "fs/promises";
 import { dirname, resolve } from "path";
+import { checkEslintDiagnostics } from "./eslint-runner.js";
+import {
+  appendBounded,
+  findAncestorDirWithFile,
+  safeSpawnAsync,
+} from "./spawn-utils.js";
 
 export interface Diagnostic {
   message: string;
@@ -82,86 +86,6 @@ export function parsePyrightOutput(output: string): Diagnostic[] {
 /**
  * Spawn a command asynchronously with timeout support.
  */
-function safeSpawnAsync(
-  command: string,
-  args: string[],
-  options: { cwd?: string; timeout?: number }
-): Promise<{ stdout: string; stderr: string; status: number | null }> {
-  const maxOutputChars = 100_000;
-  return new Promise((resolve) => {
-    let stdout = "";
-    let stderr = "";
-    const child = spawn(command, args, {
-      cwd: options.cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
-    let timedOut = false;
-    let timeoutId: ReturnType<typeof setTimeout> | undefined;
-
-    if (options.timeout) {
-      timeoutId = setTimeout(() => {
-        timedOut = true;
-        child.kill("SIGKILL");
-      }, options.timeout);
-    }
-
-    if (child.stdout) {
-      child.stdout.on("data", (data: Buffer) => {
-        stdout = appendBounded(stdout, data.toString(), maxOutputChars);
-      });
-    }
-    if (child.stderr) {
-      child.stderr.on("data", (data: Buffer) => {
-        stderr = appendBounded(stderr, data.toString(), maxOutputChars);
-      });
-    }
-
-    child.on("close", (code: number | null) => {
-      if (timeoutId) clearTimeout(timeoutId);
-      resolve({
-        stdout,
-        stderr,
-        status: timedOut ? -1 : code,
-      });
-    });
-
-    child.on("error", () => {
-      if (timeoutId) clearTimeout(timeoutId);
-      resolve({
-        stdout,
-        stderr,
-        status: -1,
-      });
-    });
-  });
-}
-
-function appendBounded(current: string, chunk: string, maxChars: number): string {
-  if (current.length >= maxChars) return current;
-  return (current + chunk).slice(0, maxChars);
-}
-
-async function findAncestorDirWithFile(
-  startDir: string,
-  fileName: string,
-): Promise<string | null> {
-  let current = resolve(startDir);
-
-  while (true) {
-    try {
-      await access(resolve(current, fileName));
-      return current;
-    } catch {
-      const parent = dirname(current);
-      if (parent === current) {
-        return null;
-      }
-      current = parent;
-    }
-  }
-}
-
 async function findNearestTsconfig(filePath: string, cwd: string): Promise<string | null> {
   const fromFile = await findAncestorDirWithFile(dirname(filePath), "tsconfig.json");
   if (fromFile) {
@@ -369,6 +293,23 @@ export function getCompilerForLanguage(languageId: string) {
       return checkGoVetDiagnostics;
     case "ruby":
       return checkRubocopDiagnostics;
+    default:
+      return null;
+  }
+}
+
+/**
+ * Get linter runner for a language. Separate tier from the compiler —
+ * a linter runner is advisory-only and never gates pass/fail (unlike
+ * compiler diagnostics), so callers should keep its output segregated.
+ */
+export function getLinterForLanguage(languageId: string) {
+  switch (languageId) {
+    case "typescript":
+    case "javascript":
+    case "tsx":
+    case "jsx":
+      return checkEslintDiagnostics;
     default:
       return null;
   }
