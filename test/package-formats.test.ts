@@ -536,73 +536,43 @@ describe("openai-patch", () => {
 
 describe("format fixtures", () => {
     test("loads search-replace-simple.txt fixture", () => {
-        const fixturePath = resolve(__dirname, "fixtures/formats/search-replace-simple.txt");
-        let content: string;
-        try {
-            content = readFileSync(fixturePath, "utf-8");
-        } catch {
-            return; // Fixture not created yet
-        }
+        const fixturePath = resolve(__dirname, "./package-fixtures/formats/search-replace-simple.txt");
+        const content = readFileSync(fixturePath, "utf-8");
         const result = parseSearchReplace(content);
         assert.ok(result.length > 0);
     });
 
     test("loads unified-diff-simple.diff fixture", () => {
-        const fixturePath = resolve(__dirname, "fixtures/formats/unified-diff-simple.diff");
-        let content: string;
-        try {
-            content = readFileSync(fixturePath, "utf-8");
-        } catch {
-            return; // Fixture not created yet
-        }
+        const fixturePath = resolve(__dirname, "./package-fixtures/formats/unified-diff-simple.diff");
+        const content = readFileSync(fixturePath, "utf-8");
         const result = parseUnifiedDiffToEditItems(content);
         assert.ok(result.length > 0);
     });
 
     test("loads openai-patch-simple.txt fixture", () => {
-        const fixturePath = resolve(__dirname, "fixtures/formats/openai-patch-simple.txt");
-        let content: string;
-        try {
-            content = readFileSync(fixturePath, "utf-8");
-        } catch {
-            return; // Fixture not created yet
-        }
+        const fixturePath = resolve(__dirname, "./package-fixtures/formats/openai-patch-simple.txt");
+        const content = readFileSync(fixturePath, "utf-8");
         const result = parseOpenAIPatch(content);
         assert.ok(result.length > 0);
     });
 
     test("loads codex-patch-update.txt fixture", () => {
-        const fixturePath = resolve(__dirname, "fixtures/formats/codex-patch-update.txt");
-        let content: string;
-        try {
-            content = readFileSync(fixturePath, "utf-8");
-        } catch {
-            return; // Fixture not created yet
-        }
+        const fixturePath = resolve(__dirname, "./package-fixtures/formats/codex-patch-update.txt");
+        const content = readFileSync(fixturePath, "utf-8");
         const result = parseCodexPatch(content);
         assert.ok(result.hunks.length > 0);
     });
 
     test("loads codex-patch-all-ops.txt fixture", () => {
-        const fixturePath = resolve(__dirname, "fixtures/formats/codex-patch-all-ops.txt");
-        let content: string;
-        try {
-            content = readFileSync(fixturePath, "utf-8");
-        } catch {
-            return; // Fixture not created yet
-        }
+        const fixturePath = resolve(__dirname, "./package-fixtures/formats/codex-patch-all-ops.txt");
+        const content = readFileSync(fixturePath, "utf-8");
         const result = parseCodexPatch(content);
         assert.strictEqual(result.hunks.length, 3); // add + update + delete
     });
 
     test("loads codex-patch-move.txt fixture", () => {
-        const fixturePath = resolve(__dirname, "fixtures/formats/codex-patch-move.txt");
-        let content: string;
-        try {
-            content = readFileSync(fixturePath, "utf-8");
-        } catch {
-            return; // Fixture not created yet
-        }
+        const fixturePath = resolve(__dirname, "./package-fixtures/formats/codex-patch-move.txt");
+        const content = readFileSync(fixturePath, "utf-8");
         const result = parseCodexPatch(content);
         assert.ok(result.hunks.length > 0);
         if (result.hunks[0].kind === "UpdateFile") {
@@ -611,38 +581,23 @@ describe("format fixtures", () => {
     });
 
     test("loads codex-patch-multi-level.txt fixture", () => {
-        const fixturePath = resolve(__dirname, "fixtures/formats/codex-patch-multi-level.txt");
-        let content: string;
-        try {
-            content = readFileSync(fixturePath, "utf-8");
-        } catch {
-            return; // Fixture not created yet
-        }
+        const fixturePath = resolve(__dirname, "./package-fixtures/formats/codex-patch-multi-level.txt");
+        const content = readFileSync(fixturePath, "utf-8");
         const result = parseCodexPatch(content);
         assert.ok(result.hunks.length > 0);
     });
 
     test("loads codex-patch-lenient.txt fixture", () => {
-        const fixturePath = resolve(__dirname, "fixtures/formats/codex-patch-lenient.txt");
-        let content: string;
-        try {
-            content = readFileSync(fixturePath, "utf-8");
-        } catch {
-            return; // Fixture not created yet
-        }
+        const fixturePath = resolve(__dirname, "./package-fixtures/formats/codex-patch-lenient.txt");
+        const content = readFileSync(fixturePath, "utf-8");
         const result = parseCodexPatch(content);
         assert.ok(result.hunks.length > 0);
         assert.ok(result.warnings.length > 0);
     });
 
     test("loads codex-patch-no-end.txt fixture", () => {
-        const fixturePath = resolve(__dirname, "fixtures/formats/codex-patch-no-end.txt");
-        let content: string;
-        try {
-            content = readFileSync(fixturePath, "utf-8");
-        } catch {
-            return; // Fixture not created yet
-        }
+        const fixturePath = resolve(__dirname, "./package-fixtures/formats/codex-patch-no-end.txt");
+        const content = readFileSync(fixturePath, "utf-8");
         const result = parseCodexPatch(content);
         assert.ok(result.hunks.length > 0);
         assert.ok(result.warnings.some(w => w.kind === "missing_end_patch"));

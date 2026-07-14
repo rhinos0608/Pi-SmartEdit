@@ -11,14 +11,14 @@
  * Run: npx tsx test/integration.test.ts
  */
 
-import { applyEdits, lineRangeToByteRange } from "../.pi/extensions/smart-edit/src/core/edit-diff";
-import { parseSearchReplace } from "../.pi/extensions/smart-edit/src/formats/search-replace";
-import { parseUnifiedDiffToEditItems } from "../.pi/extensions/smart-edit/src/formats/unified-diff";
-import { parseOpenAIPatch, openAIPatchToEditItem } from "../.pi/extensions/smart-edit/src/formats/openai-patch";
-import { detectInputFormat } from "../.pi/extensions/smart-edit/src/formats/format-detector";
-import { validateSyntax } from "../.pi/extensions/smart-edit/src/core/ast-resolver";
+import { applyEdits, lineRangeToByteRange } from "../../src/core/edit-diff";
+import { parseSearchReplace } from "../../src/formats/search-replace";
+import { parseUnifiedDiffToEditItems } from "../../src/formats/unified-diff";
+import { parseOpenAIPatch, openAIPatchToEditItem } from "../../src/formats/openai-patch";
+import { detectInputFormat } from "../../src/formats/format-detector";
+import { validateSyntax } from "../../src/core/ast-resolver";
 
-import type { EditItem, SearchScope } from "../.pi/extensions/smart-edit/src/core/types";
+import type { EditItem, SearchScope } from "../../src/core/types";
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
@@ -211,7 +211,7 @@ async function testReplaceAll() {
 console.log('\n=== Integration: Conflict detection ===\n');
 
 async function testConflictDetectorFlow() {
-  const { createConflictDetector, defaultConflictConfig } = await import('../.pi/extensions/smart-edit/src/core/conflict-detector');
+  const { createConflictDetector, defaultConflictConfig } = await import('../../src/core/conflict-detector');
 
   const detector = createConflictDetector(defaultConflictConfig, () => null);
   const content = 'function updateUser() {\n  const name = "foo";\n  const age = 30;\n}\n\nfunction updatePost() {\n  const title = "bar";\n}';

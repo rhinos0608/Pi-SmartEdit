@@ -10,7 +10,7 @@ import {
   prepareArguments,
   formatEditError,
   validateInput,
-} from "../.pi/extensions/smart-edit/src/index.ts";
+} from "../../src/index.ts";
 
 // ─── formatEditError ─────────────────────────────────────────────────
 
@@ -332,7 +332,7 @@ describe("prepareArguments — schema-level string acceptance", () => {
     assert.strictEqual(result.edits[1].newText, edits[1].newText);
   });
 
-  it("handles JSON string with replaceAll mixed in (stripped by prepareArguments)", () => {
+  it("preserves per-edit replaceAll from JSON string edits", () => {
     const jsonString = JSON.stringify([
       { oldText: "var x", newText: "let x", replaceAll: true },
       { oldText: "var y", newText: "let y", replaceAll: true },
@@ -343,9 +343,8 @@ describe("prepareArguments — schema-level string acceptance", () => {
     });
     assert(Array.isArray(result.edits));
     assert.strictEqual(result.edits.length, 2);
-    // replaceAll should be stripped from the returned edits (side-channel)
-    assert.strictEqual((result.edits[0] as Record<string, unknown>).replaceAll, undefined);
-    assert.strictEqual((result.edits[1] as Record<string, unknown>).replaceAll, undefined);
+    assert.strictEqual((result.edits[0] as Record<string, unknown>).replaceAll, true);
+    assert.strictEqual((result.edits[1] as Record<string, unknown>).replaceAll, true);
   });
 });
 

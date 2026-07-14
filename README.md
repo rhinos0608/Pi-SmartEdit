@@ -74,10 +74,9 @@ Other formats like JSON, YAML, and HTML still work with text matching, but AST f
 
 ## Installation
 
-The extension lives in `.pi/extensions/smart-edit/`.
+Install dependencies from repository root:
 
 ```bash
-cd .pi/extensions/smart-edit
 npm install
 ```
 
@@ -220,7 +219,7 @@ Only use this after enabling `SMART_EDIT_USE_HASHLINE_EDITING=1`.
 ## Architecture
 
 ```text
-.pi/extensions/smart-edit/
+./
 ├── src/
 │   ├── index.ts               # Tool registration, stale guard, atomic writes, mutation queue
 │   ├── core/                  # Matching, AST, hashline, read cache, and shared types
@@ -232,7 +231,7 @@ Only use this after enabling `SMART_EDIT_USE_HASHLINE_EDITING=1`.
 │   ├── edit-mode.ts           # Runtime config (hashline toggle, env vars)
 │   ├── symbolic-edits.ts      # Symbolic edit engine (replaceBody, insertBefore, insertAfter)
 │   └── smartread-bridge.ts    # Breakage/co-change recording to Pi-SmartRead
-├── test/                      # 30+ test suites (25 test files)
+├── test/                      # 40+ automated test suites plus manual scripts
 ├── benchmark/                 # Hashline and matching benchmarks
 └── docs/                      # Feature specs and design notes
 ```
@@ -257,7 +256,6 @@ Only use this after enabling `SMART_EDIT_USE_HASHLINE_EDITING=1`.
 ## Testing
 
 ```bash
-cd .pi/extensions/smart-edit
 npm run lint                # ESLint strict mode, zero warnings
 npm test                    # Run all test suites (30+)
 npm run test:v              # Run verification-specific tests only

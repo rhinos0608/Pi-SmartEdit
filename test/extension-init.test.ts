@@ -16,8 +16,9 @@ import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { visibleWidth } from "@mariozechner/pi-tui";
 import smartEdit from "../src/index.js";
-import { createPatchTool, type PatchToolDeps } from "../src/patch.js";
+import { createPatchTool, type PatchToolDeps, type PatchTool } from "../src/patch.js";
 import { PROTOCOL_SCHEMA_VERSION } from "@rhinos0608/pi-workspace-protocol";
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -26,15 +27,23 @@ function sha256(s: string): string {
   return createHash("sha256").update(s, "utf8").digest("hex");
 }
 
+type PreparedArguments = Record<string, unknown> & {
+  edits: Array<{ oldText: unknown; newText: unknown }>;
+};
+
+type EventHandler = (...args: unknown[]) => unknown;
+
 type ToolRegistration = {
   name: string;
-  execute: Function;
-  prepareArguments?: Function;
+  execute: PatchTool["execute"];
+  prepareArguments?: (args: unknown) => PreparedArguments;
+  renderCall?: (...args: never[]) => unknown;
+  renderResult?: (...args: never[]) => unknown;
   [key: string]: unknown;
 };
 
 interface MockExtensionAPI {
-  on: (event: string, handler: Function) => void;
+  on: (event: string, handler: EventHandler) => void;
   registerTool: (tool: ToolRegistration) => void;
   getActiveTools: () => string[];
   setActiveTools: (names: string[]) => void;
@@ -44,14 +53,14 @@ interface MockExtensionAPI {
   };
   // Captured state
   _tools: Map<string, ToolRegistration>;
-  _events: Map<string, Set<Function>>;
+  _events: Map<string, Set<EventHandler>>;
   _activeTools: string[];
   _setActiveToolsCalls: string[][];
 }
 
 function createMockPI(): MockExtensionAPI {
   const _tools = new Map<string, ToolRegistration>();
-  const _events = new Map<string, Set<Function>>();
+  const _events = new Map<string, Set<EventHandler>>();
   let _activeTools: string[] = [
     "read", "bash", "edit", "write", "grep", "find", "ls",
     "inspect",
@@ -83,7 +92,7 @@ function createMockPI(): MockExtensionAPI {
       on: bus.on.bind(bus),
     },
 
-    on(event: string, handler: Function) {
+    on(event: string, handler: EventHandler) {
       if (!_events.has(event)) _events.set(event, new Set());
       _events.get(event)!.add(handler);
     },
@@ -135,6 +144,97 @@ test("edit tool has prepareArguments compatibility shim", () => {
   const editTool = pi._tools.get("edit")!;
   assert.equal(typeof editTool.prepareArguments, "function",
     "edit tool must have prepareArguments for session resume compat");
+});
+
+test("edit renderer names paths supplied only on multi-file edit items", () => {
+  const pi = createMockPI();
+  init(pi);
+
+  const editTool = pi._tools.get("edit")!;
+  assert.equal(typeof editTool.renderCall, "function");
+  assert.equal(typeof editTool.renderResult, "function");
+
+  const theme = {
+    bold: (text: string) => text,
+    fg: (_color: string, text: string) => text,
+  };
+  const renderCall = editTool.renderCall as unknown as (
+    args: unknown,
+    rendererTheme: typeof theme,
+  ) => { render(width: number): string[] };
+  const component = renderCall(
+    { edits: [
+      { path: "src/a.ts", oldText: "a", newText: "A" },
+      { path: "src/b.ts", oldText: "b", newText: "B" },
+    ] },
+    theme,
+  );
+
+  assert.deepEqual(component.render(120).map((line: string) => line.trimEnd()), ["edit src/a.ts, src/b.ts"]);
+
+  const renderResult = editTool.renderResult as unknown as (
+    result: unknown,
+    options: { isPartial: boolean },
+    rendererTheme: typeof theme,
+  ) => { render(width: number): string[] };
+  const resultComponent = renderResult(
+    {
+      content: [{ type: "text", text: "applied edits to 2 files" }],
+      details: {
+        status: { kind: "applied" },
+        diffs: [
+          { path: "src/a.ts", diff: "-1 a\n+1 A" },
+          { path: "src/b.ts", diff: "-1 b\n+1 B" },
+        ],
+      },
+    },
+    { isPartial: false },
+    theme,
+  );
+  assert.deepEqual(resultComponent.render(120), [
+    " src/a.ts",
+    " -1 a",
+    " +1 A",
+    " ",
+    " src/b.ts",
+    " -1 b",
+    " +1 B",
+  ]);
+});
+
+test("edit renderer truncates ANSI-styled diff lines to terminal width", () => {
+  const pi = createMockPI();
+  init(pi);
+
+  const editTool = pi._tools.get("edit")!;
+  const theme = {
+    bold: (text: string) => `\u001b[1m${text}\u001b[22m`,
+    fg: (_color: string, text: string) => `\u001b[32m${text}\u001b[39m`,
+  };
+  const renderResult = editTool.renderResult as unknown as (
+    result: unknown,
+    options: { isPartial: boolean },
+    rendererTheme: typeof theme,
+  ) => { render(width: number): string[] };
+  const component = renderResult(
+    {
+      content: [{ type: "text", text: "applied" }],
+      details: {
+        status: { kind: "applied" },
+        diff: `+${"long diff content ".repeat(30)}`,
+      },
+    },
+    { isPartial: false },
+    theme,
+  );
+
+  const width = 80;
+  const lines = component.render(width);
+  assert.ok(lines.length > 0);
+  assert.ok(
+    lines.every((line) => visibleWidth(line) <= width),
+    `rendered widths must not exceed ${width}: ${lines.map(visibleWidth).join(", ")}`,
+  );
 });
 
 test("prepareArguments converts old flat schema to edits array", () => {
@@ -229,7 +329,6 @@ test("old-format edit call converts through prepareArguments and survives valida
   // the converted shape without immediately rejecting on schema.
   //
   // We build minimal deps (session will be rejected but for the right reason).
-  let resolveCalled = false;
   const deps: PatchToolDeps = {
     getRpcClient: () => ({
       request: async () => ({ kind: "reply", schemaVersion: PROTOCOL_SCHEMA_VERSION, requestId: "x", ok: false, error: "no session" }),

@@ -21,7 +21,7 @@ function assert(condition, message) {
 
 async function runTests() {
   const { findText, detectIndentation } = await import(
-    './.pi/extensions/smart-edit/src/core/edit-diff.ts'
+    '../../src/core/edit-diff.ts'
   );
 
   // Test 1: Tier 4 should rescue near-matches with minor differences

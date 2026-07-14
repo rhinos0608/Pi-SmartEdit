@@ -37,9 +37,9 @@
  * - Returns a discriminated `details` with the full lifecycle.
  */
 import { createHash, randomUUID } from "node:crypto";
-import { readFile as fsReadFile, writeFile as fsWriteFile, stat as fsStat, rename as fsRename } from "node:fs/promises";
-import { resolve as pathResolve } from "node:path";
-import { realpathSync } from "node:fs";
+import { readFile as fsReadFile, writeFile as fsWriteFile, stat as fsStat, rename as fsRename, mkdir as fsMkdir } from "node:fs/promises";
+import { resolve as pathResolve, dirname as pathDirname } from "node:path";
+import { realpathSync, existsSync } from "node:fs";
 
 import {
     PROTOCOL_SCHEMA_VERSION,
@@ -58,13 +58,14 @@ import {
     type PostEditEvidence,
     type RpcMethod,
 } from "@rhinos0608/pi-workspace-protocol";
+import { generateDiffString } from "./core/edit-diff.js";
 
 // ── Public surface ──────────────────────────────────────────────────
 
 export interface RpcClientLike {
     request(rpc: RpcMethod, payload: unknown, options?: { signal?: AbortSignal }): Promise<{
         kind: "reply";
-        schemaVersion: typeof PROTOCOL_SCHEMA_VERSION;
+        schemaVersion: number;
         requestId: string;
         ok: boolean;
         payload?: unknown;
@@ -195,24 +196,41 @@ function withinRange(target: LineRange, range: LineRange): boolean {
 
 function findTargetLineRangeForEdits(
     content: string,
-    edits: ReadonlyArray<{ oldText?: string }>,
-): LineRange | null {
+    edits: ReadonlyArray<{ oldText?: string; replaceAll?: boolean }>,
+): { minMax: LineRange | null; occurrences: ReadonlyArray<LineRange> } {
+    const occurrences: LineRange[] = [];
     let min = Infinity;
     let max = -Infinity;
-    let any = false;
     for (const e of edits) {
         if (typeof e.oldText !== "string" || e.oldText.length === 0) continue;
-        const idx = content.indexOf(e.oldText);
-        if (idx < 0) return null;
-        const startLine = content.slice(0, idx).split("\n").length;
         const matchedLines = e.oldText.split("\n").length;
-        const endLine = startLine + matchedLines - 1;
-        if (startLine < min) min = startLine;
-        if (endLine > max) max = endLine;
-        any = true;
+        if (e.replaceAll) {
+            let searchFrom = 0;
+            let anyFound = false;
+            while (true) {
+                const idx = content.indexOf(e.oldText, searchFrom);
+                if (idx < 0) break;
+                anyFound = true;
+                const startLine = content.slice(0, idx).split("\n").length;
+                const endLine = startLine + matchedLines - 1;
+                occurrences.push({ startLine, endLine });
+                if (startLine < min) min = startLine;
+                if (endLine > max) max = endLine;
+                searchFrom = idx + e.oldText.length;
+            }
+            if (!anyFound) return { minMax: null, occurrences: [] };
+        } else {
+            const idx = content.indexOf(e.oldText);
+            if (idx < 0) return { minMax: null, occurrences: [] };
+            const startLine = content.slice(0, idx).split("\n").length;
+            const endLine = startLine + matchedLines - 1;
+            occurrences.push({ startLine, endLine });
+            if (startLine < min) min = startLine;
+            if (endLine > max) max = endLine;
+        }
     }
-    if (!any) return null;
-    return { startLine: min, endLine: max };
+    if (occurrences.length === 0) return { minMax: null, occurrences: [] };
+    return { minMax: { startLine: min, endLine: max }, occurrences };
 }
 
 function findResourceForCanonicalPath(
@@ -233,6 +251,8 @@ function findResourceForCanonicalPath(
 }
 
 async function atomicWrite(path: string, content: string): Promise<void> {
+    const parent = pathDirname(path);
+    await fsMkdir(parent, { recursive: true });
     const tmp = `${path}.${randomUUID()}.tmp`;
     await fsWriteFile(tmp, content, "utf8");
     await fsRename(tmp, path);
@@ -295,13 +315,57 @@ async function buildAutoInspectEnvelope(args: {
     sessionFilePath: string;
     canonicalRoot: string;
     groups: ReadonlyArray<EditGroup>;
-}): Promise<{ ok: true; envelope: WorkspaceEvidenceEnvelope; canonicalByGroup: string[] } | { ok: false; error: string }> {
+}): Promise<{
+    ok: true;
+    envelope: WorkspaceEvidenceEnvelope;
+    canonicalByGroup: string[];
+    newFileCanonicals: ReadonlySet<string>;
+} | { ok: false; error: string }> {
     const sessionId = hashSessionFilePath(args.sessionFilePath);
     const resources: InspectedResource[] = [];
     const canonicalByGroup: string[] = [];
+    const newFileCanonicals = new Set<string>();
     const resourceKeyItems: Array<{ canonicalPath: string; range?: { startLine: number; endLine: number } }> = [];
 
     for (const g of args.groups) {
+        const fileExists = existsSync(g.absolutePath);
+        if (!fileExists) {
+            // New-file creation is only valid when every edit has empty oldText.
+            const allEmpty = g.edits.every(
+                (e) => typeof e.oldText === "string" && e.oldText.length === 0,
+            );
+            if (!allEmpty) {
+                return {
+                    ok: false,
+                    error:
+                        `auto-inspect: file not found: ${g.absolutePath}. ` +
+                        `Patch can only create new files when every edit has empty oldText ` +
+                        `(use oldText: "" with newText containing the new file contents). ` +
+                        `For arbitrary new files, use the write tool instead.`,
+                };
+            }
+            // Synthesize an empty-file full-file resource so the rest of the
+            // pipeline can run unchanged. Mark this path as a synthesized new
+            // file so the per-group executor skips the realpath / SHA / range
+            // checks that only make sense for existing content.
+            const emptySha = sha256OfString("");
+            const resource: InspectedResource = {
+                resourceId: resourceIdFor({ canonicalPath: g.absolutePath, kind: "full" }),
+                canonicalPath: g.absolutePath,
+                kind: "full",
+                coverage: "full-file",
+                allowedRanges: [{ startLine: 1, endLine: 1 }],
+                fullFileSha256: emptySha,
+                fresh: true,
+                byteLength: 0,
+                lineCount: 0,
+            };
+            resources.push(resource);
+            resourceKeyItems.push({ canonicalPath: g.absolutePath });
+            canonicalByGroup.push(g.absolutePath);
+            newFileCanonicals.add(g.absolutePath);
+            continue;
+        }
         let canonical: string;
         try {
             canonical = realpathSync(g.absolutePath);
@@ -338,7 +402,7 @@ async function buildAutoInspectEnvelope(args: {
         resources: resourceKeyItems,
     });
     const envelope: WorkspaceEvidenceEnvelope = {
-        schemaVersion: 2 as typeof PROTOCOL_SCHEMA_VERSION,
+        schemaVersion: PROTOCOL_SCHEMA_VERSION,
         inspectionId,
         sessionId,
         workspaceRoot: args.canonicalRoot,
@@ -347,7 +411,7 @@ async function buildAutoInspectEnvelope(args: {
         resources,
         mode: "path",
     };
-    return { ok: true, envelope, canonicalByGroup };
+    return { ok: true, envelope, canonicalByGroup, newFileCanonicals };
 }
 
 // ── Patch tool factory ──────────────────────────────────────────────
@@ -384,6 +448,16 @@ const PATCH_PARAMS_DOC = {
     },
 } as const;
 
+export interface PatchDisplayDiff {
+    readonly path: string;
+    readonly diff: string;
+}
+
+export type PatchToolDetails = PatchDetails & {
+    readonly diff?: string;
+    readonly diffs?: ReadonlyArray<PatchDisplayDiff>;
+};
+
 export interface PatchTool {
     readonly name: "patch";
     readonly label: "patch";
@@ -395,7 +469,7 @@ export interface PatchTool {
         signal: AbortSignal | undefined,
         onUpdate: ((u: { content: Array<{ type: "text"; text: string }> }) => void) | undefined,
         ctx: { cwd: string; hasUI?: boolean; ui?: unknown; [k: string]: unknown },
-    ): Promise<{ content: Array<{ type: "text"; text: string }>; details: PatchDetails }>;
+    ): Promise<{ content: Array<{ type: "text"; text: string }>; details: PatchToolDetails }>;
 }
 
 export function createPatchTool(deps: PatchToolDeps): PatchTool {
@@ -475,6 +549,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             let envelope: WorkspaceEvidenceEnvelope;
             let autoInspected = false;
             let evidenceRefForDetails: EvidenceRef;
+            let newFileCanonicals: ReadonlySet<string> = new Set();
 
             if (!requestEvidenceRef) {
                 // No evidenceRef — auto-inspect.
@@ -496,6 +571,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 }
                 envelope = built.envelope;
                 autoInspected = true;
+                newFileCanonicals = built.newFileCanonicals;
                 evidenceRefForDetails = {
                     inspectionId: envelope.inspectionId,
                     resourceIds: envelope.resources.map((r) => r.resourceId),
@@ -563,23 +639,32 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             const invalidations: ResourceInvalidation[] = [];
             const postEditEvidenceByPath = new Map<string, PostEditEvidence>();
             const appliedFiles: string[] = [];
+            const displayDiffs: PatchDisplayDiff[] = [];
 
             for (const group of groups) {
                 stream(`  ${group.rawPath} — ${group.edits.length} edit(s)`);
 
                 // Resolve canonical path for this group.
                 let canonicalTarget: string;
-                try {
-                    canonicalTarget = realpathSync(group.absolutePath);
-                } catch (err) {
-                    diagnostics.push(`file not found: ${group.absolutePath}`);
-                    return {
-                        content: [{ type: "text" as const, text: `failed: file not found: ${group.rawPath}` }],
-                        details: finalize(makeFailed(toolCallId, "stage", `file not found: ${group.rawPath}`, {
-                            ...evidenceRefForDetails,
-                            resourceIds: [""],
-                        }, checks, diagnostics, usedEvidence, invalidations)),
-                    };
+                let isNewFileGroup = false;
+                if (newFileCanonicals.has(group.absolutePath)) {
+                    // Synthesized new-file: there's no on-disk file to resolve, so
+                    // skip realpath and remember this fact for the rest of the loop.
+                    canonicalTarget = group.absolutePath;
+                    isNewFileGroup = true;
+                } else {
+                    try {
+                        canonicalTarget = realpathSync(group.absolutePath);
+                    } catch (err) {
+                        diagnostics.push(`file not found: ${group.absolutePath}`);
+                        return {
+                            content: [{ type: "text" as const, text: `failed: file not found: ${group.rawPath}` }],
+                            details: finalize(makeFailed(toolCallId, "stage", `file not found: ${group.rawPath}`, {
+                                ...evidenceRefForDetails,
+                                resourceIds: [""],
+                            }, checks, diagnostics, usedEvidence, invalidations)),
+                        };
+                    }
                 }
 
                 // Find a resource that authorizes this path.
@@ -610,18 +695,28 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 // Read current content + compute sha.
                 let currentContent: string;
                 let currentSha: string;
-                try {
-                    currentContent = await safeReadUtf8(canonicalTarget);
-                    currentSha = sha256OfString(currentContent);
-                } catch (err) {
-                    diagnostics.push(`read failed: ${err instanceof Error ? err.message : String(err)}`);
-                    return {
-                        content: [{ type: "text" as const, text: `failed: read ${group.rawPath}` }],
-                        details: finalize(makeFailed(toolCallId, "stage", `read failed: ${group.rawPath}`, {
-                            inspectionId: evidenceRefForDetails.inspectionId,
-                            resourceIds: [resource.resourceId],
-                        }, checks, diagnostics, usedEvidence, invalidations)),
-                    };
+                if (isNewFileGroup) {
+                    // Synthesized new-file: the file does not exist on disk yet.
+                    // We treat current content as empty so the rest of the pipeline
+                    // (in-memory apply + verifiers + atomicWrite) operates as if the
+                    // file currently contains the empty string. Empty oldText is
+                    // expected to find its match at the start of the empty content.
+                    currentContent = "";
+                    currentSha = sha256OfString("");
+                } else {
+                    try {
+                        currentContent = await safeReadUtf8(canonicalTarget);
+                        currentSha = sha256OfString(currentContent);
+                    } catch (err) {
+                        diagnostics.push(`read failed: ${err instanceof Error ? err.message : String(err)}`);
+                        return {
+                            content: [{ type: "text" as const, text: `failed: read ${group.rawPath}` }],
+                            details: finalize(makeFailed(toolCallId, "stage", `read failed: ${group.rawPath}`, {
+                                inspectionId: evidenceRefForDetails.inspectionId,
+                                resourceIds: [resource.resourceId],
+                            }, checks, diagnostics, usedEvidence, invalidations)),
+                        };
+                    }
                 }
 
                 // Freshness check.
@@ -637,11 +732,26 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 }
 
                 // Compute target line range from edits, then validate coverage.
-                const targetRange = findTargetLineRangeForEdits(currentContent, group.edits);
+                let targetRange: LineRange | null;
+                let editOccurrences: ReadonlyArray<LineRange> = [];
+                if (isNewFileGroup) {
+                    // New-file creation: the empty oldText is implicit at offset 0
+                    // of the (empty) current content. There's no pre-existing
+                    // target range to validate against line-range coverage.
+                    targetRange = { startLine: 1, endLine: 1 };
+                    editOccurrences = [targetRange];
+                } else {
+                    const found = findTargetLineRangeForEdits(currentContent, group.edits);
+                    targetRange = found.minMax;
+                    editOccurrences = found.occurrences;
+                }
                 if (!targetRange) {
                     diagnostics.push(`target line range could not be derived from edits (oldText not found) for ${canonicalTarget}`);
                     return {
-                        content: [{ type: "text" as const, text: `failed: target not found in ${group.rawPath}` }],
+                        content: [{
+                            type: "text" as const,
+                            text: `failed: target not found in ${group.rawPath}; re-inspect the file and retry with current exact text`,
+                        }],
                         details: finalize(makeFailed(toolCallId, "stage", `target not found: ${group.rawPath}`, {
                             inspectionId: evidenceRefForDetails.inspectionId,
                             resourceIds: [resource.resourceId],
@@ -649,9 +759,18 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     };
                 }
                 if (resource.coverage === "line-range") {
-                    const covered = resource.allowedRanges.some((a) => withinRange(targetRange, a));
-                    if (!covered) {
-                        diagnostics.push(`coverage: target [${targetRange.startLine},${targetRange.endLine}] not within any allowedRange for ${canonicalTarget}`);
+                    // For replaceAll edits we must verify EVERY occurrence falls within an allowed range;
+                    // a non-replaceAll edit only needs the (single) occurrence to fall in range.
+                    const uncovered = editOccurrences.filter(
+                        (occ) => !resource.allowedRanges.some((a) => withinRange(occ, a)),
+                    );
+                    if (uncovered.length > 0) {
+                        const first = uncovered[0];
+                        if (first) {
+                            diagnostics.push(`coverage: ${uncovered.length} occurrence(s) outside allowedRanges for ${canonicalTarget} (e.g. [${first.startLine},${first.endLine}])`);
+                        } else {
+                            diagnostics.push(`coverage: ${uncovered.length} occurrence(s) outside allowedRanges for ${canonicalTarget}`);
+                        }
                         return {
                             content: [{ type: "text" as const, text: `rejected: coverage (${group.rawPath})` }],
                             details: finalize(makeRejected(toolCallId, "coverage", diagnostics, {
@@ -666,20 +785,28 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 let newContent = currentContent;
                 for (const edit of group.edits) {
                     if (typeof edit.oldText !== "string" || typeof edit.newText !== "string") {
+                        // Pre-write: input shape problem. No file write happened.
                         diagnostics.push(`edit missing oldText/newText in ${group.rawPath}`);
                         return {
                             content: [{ type: "text" as const, text: `failed: edit (missing fields) in ${group.rawPath}` }],
-                            details: finalize(makeFailed(toolCallId, "write", `edit missing oldText/newText: ${group.rawPath}`, {
+                            details: finalize(makeFailed(toolCallId, "stage", `edit missing oldText/newText: ${group.rawPath}`, {
                                 inspectionId: evidenceRefForDetails.inspectionId,
                                 resourceIds: [resource.resourceId],
                             }, checks, diagnostics, usedEvidence, invalidations)),
                         };
                     }
+                    // The target range check above already verified oldText is
+                    // present in currentContent, so we can rely on the include
+                    // here. (We still defensively re-check for newContent
+                    // because successive edits compose the buffer.)
                     if (!newContent.includes(edit.oldText)) {
-                        diagnostics.push(`oldText not found in ${group.rawPath}`);
+                        // Pre-write: content mismatch on a composed buffer. No
+                        // file write happened. This is a stage error, not a
+                        // write error.
+                        diagnostics.push(`oldText not found in composed buffer for ${group.rawPath}`);
                         return {
                             content: [{ type: "text" as const, text: `failed: edit (oldText not found) in ${group.rawPath}` }],
-                            details: finalize(makeFailed(toolCallId, "write", `oldText not found: ${group.rawPath}`, {
+                            details: finalize(makeFailed(toolCallId, "stage", `oldText not found: ${group.rawPath}`, {
                                 inspectionId: evidenceRefForDetails.inspectionId,
                                 resourceIds: [resource.resourceId],
                             }, checks, diagnostics, usedEvidence, invalidations)),
@@ -708,7 +835,15 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         outcome = result.outcome;
                         if (result.detail) detail = result.detail;
                     } catch (err) {
-                        outcome = "timeout";
+                        // Only the racing timer maps to "timeout". A blocking
+                        // verifier that throws for any other reason is treated
+                        // as a hard fail so the gate below actually blocks the
+                        // write.
+                        if (err instanceof Error && err.message === "timeout") {
+                            outcome = "timeout";
+                        } else {
+                            outcome = "fail";
+                        }
                         detail = err instanceof Error ? err.message : String(err);
                     } finally {
                         if (timer) clearTimeout(timer);
@@ -734,6 +869,37 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     };
                 }
 
+                // Fix #6: re-read and re-hash immediately before writing so a
+                // concurrent writer between the initial SHA check and the actual
+                // atomicWrite cannot slip a stale write in. For new files
+                // there's nothing on disk to race against, so the check is a
+                // no-op.
+                if (!isNewFileGroup) {
+                    let preWriteContent: string;
+                    try {
+                        preWriteContent = await safeReadUtf8(canonicalTarget);
+                    } catch (err) {
+                        diagnostics.push(`re-read failed: ${err instanceof Error ? err.message : String(err)}`);
+                        return {
+                            content: [{ type: "text" as const, text: `rejected: stale (${group.rawPath})` }],
+                            details: finalize(makeRejected(toolCallId, "stale", diagnostics, {
+                                inspectionId: evidenceRefForDetails.inspectionId,
+                                resourceIds: [resource.resourceId],
+                            }, checks, usedEvidence, invalidations)),
+                        };
+                    }
+                    if (sha256OfString(preWriteContent) !== currentSha) {
+                        diagnostics.push(`stale re-read for ${canonicalTarget} (sha changed during apply)`);
+                        return {
+                            content: [{ type: "text" as const, text: `rejected: stale (${group.rawPath})` }],
+                            details: finalize(makeRejected(toolCallId, "stale", diagnostics, {
+                                inspectionId: evidenceRefForDetails.inspectionId,
+                                resourceIds: [resource.resourceId],
+                            }, checks, usedEvidence, invalidations)),
+                        };
+                    }
+                }
+
                 // Atomic write.
                 try {
                     await atomicWrite(canonicalTarget, newContent);
@@ -747,6 +913,19 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         }, checks, diagnostics, usedEvidence, invalidations)),
                     };
                 }
+
+                // Fix #3: record the invalidation right after the write, before
+                // post-write verify. This way, every later failure path
+                // (including post-write read/hash failures) reports the file
+                // as actually changed on disk.
+                const newSha = sha256OfString(newContent);
+                invalidations.push({
+                    resourceId: resource.resourceId,
+                    canonicalPath: resource.canonicalPath,
+                    fullFileSha256: currentSha,
+                    newFullFileSha256: newSha,
+                    coverage: resource.coverage,
+                });
 
                 // Post-write verify.
                 let postContent: string;
@@ -777,14 +956,10 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     };
                 }
 
-                const invalidation: ResourceInvalidation = {
-                    resourceId: resource.resourceId,
-                    canonicalPath: resource.canonicalPath,
-                    fullFileSha256: currentSha,
-                    newFullFileSha256: postSha,
-                    coverage: resource.coverage,
-                };
-                invalidations.push(invalidation);
+                // Fix #3: the invalidation was already recorded immediately after
+                // atomicWrite succeeded, so we don't push it again here. We only
+                // compute post-write metadata (sha, line count, diff) for the
+                // PatchDetails response.
                 const newLines = postContent.split("\n");
                 const postEditEvidence: PostEditEvidence = {
                     fullFileSha256: postSha,
@@ -792,6 +967,8 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     byteLength: Buffer.byteLength(postContent, "utf8"),
                 };
                 postEditEvidenceByPath.set(canonicalTarget, postEditEvidence);
+                const generatedDiff = generateDiffString(currentContent, postContent).diff;
+                displayDiffs.push({ path: group.rawPath, diff: generatedDiff });
                 appliedFiles.push(group.rawPath);
                 stream(`  ✓ wrote ${group.rawPath}`);
             }
@@ -807,10 +984,15 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             // emitted per file via the postEditEvidenceByPath map, and the
             // top-level postEditEvidence is the last (or only) file's value
             // for backward compatibility with v1 single-file consumers.
-            const lastCanonical = appliedFiles.length > 0 ? realpathSync(pathResolve(ctx.cwd, appliedFiles[appliedFiles.length - 1]!)) : "";
+            const lastAppliedFile = appliedFiles.at(-1);
+            const lastCanonical = lastAppliedFile ? realpathSync(pathResolve(ctx.cwd, lastAppliedFile)) : "";
             const lastPost = lastCanonical ? postEditEvidenceByPath.get(lastCanonical) : undefined;
 
-            const details: PatchDetails = {
+            const singleDiff = displayDiffs.length === 1 ? displayDiffs[0] : undefined;
+            const combinedDiff = singleDiff
+                ? singleDiff.diff
+                : displayDiffs.map((entry) => `${entry.path}\n${entry.diff}`).join("\n\n");
+            const details: PatchToolDetails = {
                 tool: "patch",
                 status: { kind: "applied" },
                 toolCallId,
@@ -820,6 +1002,8 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 postEditEvidence: lastPost,
                 checks: freezeChecks(checks),
                 diagnostics,
+                diff: combinedDiff,
+                diffs: displayDiffs,
             };
             const summary = appliedFiles.length === 1
                 ? `applied ${groups[0]?.edits.length ?? 0} edit(s) to ${appliedFiles[0]}`

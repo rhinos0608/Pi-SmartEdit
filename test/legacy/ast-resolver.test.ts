@@ -19,14 +19,14 @@ import {
   disposeParseResult,
   type EditAnchor,
   type SymbolRef,
-} from "../.pi/extensions/smart-edit/src/core/ast-resolver";
+} from "../../src/core/ast-resolver";
 
 import {
   loadGrammar,
   getSupportedExtensions,
   clearGrammarCache,
   resetParser,
-} from "../.pi/extensions/smart-edit/src/core/grammar-loader";
+} from "../../src/core/grammar-loader";
 
 // ─── Helpers ────────────────────────────────────────────────────────
 

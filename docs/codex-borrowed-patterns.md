@@ -2,7 +2,7 @@
 
 > **Status**: All 7 patterns implemented (May 2026)
 > Original analysis based on reading `github.com/openai/codex` source (May 2026)
-> and the SmartEdit extension at `.pi/extensions/smart-edit/`.
+> and the SmartEdit extension in this repository.
 
 All patterns identified in the original analysis were implemented across two sprints. This document serves as a retrospective: what was borrowed, how it was implemented, and what the actual cost was.
 

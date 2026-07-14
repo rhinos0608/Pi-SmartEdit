@@ -97,7 +97,11 @@ async function ensureAstGrep(): Promise<any> {
   if (initError !== null) return null;
 
   try {
-    moduleRef = await import("@ast-grep/napi");
+    const imported: unknown = await import("@ast-grep/napi");
+    if (typeof imported !== "object" || imported === null || !("parse" in imported) || typeof imported.parse !== "function") {
+      throw new Error("@ast-grep/napi does not export parse()");
+    }
+    moduleRef = imported;
     ASTGREP_AVAILABLE = true;
     return moduleRef;
   } catch (err) {

@@ -7,10 +7,10 @@
 import { readFileSync } from 'fs';
 import { join } from 'path';
 
-import { detectInputFormat } from '../.pi/extensions/smart-edit/src/formats/format-detector';
-import { parseSearchReplace } from '../.pi/extensions/smart-edit/src/formats/search-replace';
-import { parseUnifiedDiffToEditItems, parseUnifiedDiff } from '../.pi/extensions/smart-edit/src/formats/unified-diff';
-import { parseOpenAIPatch, openAIPatchToEditItem } from '../.pi/extensions/smart-edit/src/formats/openai-patch';
+import { detectInputFormat } from '../src/formats/format-detector';
+import { parseSearchReplace } from '../src/formats/search-replace';
+import { parseUnifiedDiffToEditItems, parseUnifiedDiff } from '../src/formats/unified-diff';
+import { parseOpenAIPatch, openAIPatchToEditItem } from '../src/formats/openai-patch';
 
 // ─── Helpers ────────────────────────────────────────────────────────
 

@@ -10,7 +10,7 @@ import { join } from "path";
 import { randomBytes } from "crypto";
 
 // Import the module under test
-import { recordRead, checkStale, clearCache } from "../.pi/extensions/smart-edit/src/core/read-cache";
+import { recordRead, checkStale, clearCache } from "../../src/core/read-cache";
 
 // ─── Helpers ────────────────────────────────────────────────────────
 

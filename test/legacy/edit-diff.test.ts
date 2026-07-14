@@ -22,9 +22,9 @@ import {
   stripBom,
   generateDiffString,
   preserveQuoteStyle,
-} from "../.pi/extensions/smart-edit/src/core/edit-diff";
+} from "../../src/core/edit-diff";
 
-import type { SearchScope } from "../.pi/extensions/smart-edit/src/core/types";
+import type { SearchScope } from "../../src/core/types";
 
 // ─── Helpers ────────────────────────────────────────────────────────
 

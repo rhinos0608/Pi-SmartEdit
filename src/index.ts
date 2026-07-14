@@ -6,10 +6,11 @@
  * richer diagnostics.
  *
  * Installation: copy to ~/.pi/agent/extensions/smart-edit.ts
- *   or place in .pi/extensions/smart-edit/src/index.ts for project-local use.
+ *   or load ./src/index.ts for repository-local use.
  */
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
+import { truncateToWidth, visibleWidth, type Component } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
 
 import { constants, statSync } from "fs";
@@ -35,23 +36,17 @@ import { deferredDiagnostics } from "./lsp/deferred-diagnostics";
 import { getCompilerForLanguage } from "./lsp/diagnostic-dispatcher";
 import type { DiagnosticResult } from "./lsp/diagnostic-dispatcher";
 
-import { runPostEditEvidencePipeline } from "./verification/post-edit-evidence";
-import type { PostEditEvidenceResult } from "./verification/types";
-import { scopeDiagnosticsToChangedTargets } from "./verification/scoped-diagnostics";
-import type { ScopedDiagnostic } from "./verification/scoped-diagnostics";
 import { recordBreakage, recordCoChange } from "./smartread-bridge";
 import { getSmartEditRuntimeConfig } from "./edit-mode";
-import { checkEditSafety } from "./safety/approval-gating";
 import { saveUndoState } from "./undo/edit-history";
 import { atomicWrite } from "./undo/atomic-write";
-import { checkContextGuardSimilarity } from "./safety/context-guard";
 import { MatchError } from "./core/errors";
 import { runAutoValidation, formatValidationFeedback, resetRetryCounts, checkStructural, incrementRetryCount as incRetryCount } from "./verification/auto-validate";
 import { applySymbolicEdits, buildSymbolicEditGuidance, resolveSymbolicEditLineRange } from "./symbolic-edits";
 import type { SymbolicEditRequest } from "./symbolic-edits";
 import { computeAnchorDelta, formatAnchorDeltaForModel, ANCHOR_CHURN_THRESHOLD, type AnchorDelta } from "./anchor-registry";
 import { isAstGrepAvailable, findWithPattern, replaceWithPattern } from "./astgrep-anchor";
-import { createPatchTool, type PatchToolDeps } from "./patch.js";
+import { createPatchTool, type PatchToolDeps, type PatchToolDetails } from "./patch.js";
 import { createRpcClient, RPC_CHANNELS } from "@rhinos0608/pi-workspace-protocol";
 
 import type {
@@ -166,6 +161,97 @@ const editSchema = Type.Object(
 
 export function resolveEditPath(cwd: string, targetPath: string): string {
   return resolve(cwd, targetPath);
+}
+
+type EditRenderArgs = {
+  path?: unknown;
+  edits?: unknown;
+};
+
+type EditRenderResult = {
+  content: Array<{ type: string; text?: string }>;
+  details?: PatchToolDetails;
+};
+
+class EditTextComponent implements Component {
+  constructor(private readonly text: string, private readonly paddingX = 0) {}
+
+  render(width: number): string[] {
+    const padding = " ".repeat(this.paddingX);
+    return this.text.split("\n").map((line) => {
+      const renderedLine = `${padding}${line}`;
+      return visibleWidth(renderedLine) <= width
+        ? renderedLine
+        : truncateToWidth(renderedLine, width);
+    });
+  }
+
+  invalidate(): void {}
+}
+
+function renderEditDiff(diff: string, theme: Theme): string {
+  return diff.split("\n").map((line) => {
+    if (line.startsWith("+")) return theme.fg("toolDiffAdded", line);
+    if (line.startsWith("-")) return theme.fg("toolDiffRemoved", line);
+    return theme.fg("toolDiffContext", line);
+  }).join("\n");
+}
+
+export function getEditDisplayPaths(args: unknown): string[] {
+  if (!args || typeof args !== "object") return [];
+  const input = args as EditRenderArgs;
+  const defaultPath = typeof input.path === "string" ? input.path : undefined;
+  const edits = Array.isArray(input.edits) ? input.edits : [];
+  const paths = edits
+    .map((edit) => {
+      if (!edit || typeof edit !== "object") return defaultPath;
+      const itemPath = (edit as { path?: unknown }).path;
+      return typeof itemPath === "string" ? itemPath : defaultPath;
+    })
+    .filter((path): path is string => Boolean(path));
+
+  if (paths.length === 0 && defaultPath) paths.push(defaultPath);
+  return [...new Set(paths)];
+}
+
+export function renderEditCall(args: unknown, theme: Theme): Component {
+  const paths = getEditDisplayPaths(args);
+  const pathText = paths.length > 0
+    ? theme.fg("accent", paths.join(", "))
+    : theme.fg("error", "missing path");
+  return new EditTextComponent(`${theme.fg("toolTitle", theme.bold("edit"))} ${pathText}`);
+}
+
+export function renderEditResult(
+  result: EditRenderResult,
+  options: { isPartial: boolean },
+  theme: Theme,
+): Component {
+  if (options.isPartial) {
+    return new EditTextComponent(theme.fg("warning", "Editing..."), 1);
+  }
+
+  const details = result.details;
+  const diffs = details?.diffs?.filter(
+    (entry) => typeof entry.path === "string" && typeof entry.diff === "string" && entry.diff.length > 0,
+  );
+  if (diffs && diffs.length > 0) {
+    const output = diffs
+      .map((entry) => `${theme.fg("accent", entry.path)}\n${renderEditDiff(entry.diff, theme)}`)
+      .join("\n\n");
+    return new EditTextComponent(output, 1);
+  }
+  if (typeof details?.diff === "string" && details.diff.length > 0) {
+    return new EditTextComponent(renderEditDiff(details.diff, theme), 1);
+  }
+
+  const text = result.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text ?? "")
+    .filter(Boolean)
+    .join("\n");
+  const failed = details?.status.kind !== "applied";
+  return new EditTextComponent(theme.fg(failed ? "error" : "success", text || (failed ? "Edit failed" : "Applied")), 1);
 }
 
 type ToolEditResult = {
@@ -544,6 +630,10 @@ export default function smartEdit(pi: ExtensionAPI) {
     (pi.registerTool as (t: unknown) => void)({
       ...patchTool,
       name: "edit",
+      label: "edit",
+      renderShell: "self",
+      renderCall: renderEditCall,
+      renderResult: renderEditResult,
 
       // Compatibility shim for resumed sessions with stored `edit` calls
       // using flat oldText/newText instead of edits array.

@@ -2,7 +2,7 @@
 
 > **Status**: Implemented
 > **Spec Reference**: [hashline-spec.md](./hashline-spec.md)
-> **Codebase**: `Pi-Edit/extensions/smart-edit`
+> **Codebase**: repository root
 > **Actual LOC**: ~5,000+
 > **Phases**: 5 (all complete)
 

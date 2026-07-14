@@ -4,7 +4,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, realpathSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, realpathSync, mkdirSync, readFileSync, unlinkSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -15,6 +15,7 @@ import {
     resourceIdFor,
     type WorkspaceEvidenceEnvelope,
     type InspectedResource,
+    type PatchDetails,
 } from "@rhinos0608/pi-workspace-protocol";
 
 import {
@@ -537,6 +538,42 @@ test("end-to-end: toolCallId is not required in the wire payload (Pi supplies it
     assert.equal(d.toolCallId, "tc-from-harness");
 });
 
+test("end-to-end: successful multi-file patch returns renderable diffs for every file", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-")));
+    const file1 = join(workdir, "a.ts");
+    const file2 = join(workdir, "b.ts");
+    writeFileSync(file1, "alpha\nbeta\n", "utf8");
+    writeFileSync(file2, "gamma\ndelta\n", "utf8");
+
+    const deps: PatchToolDeps = {
+        getRpcClient: () => { throw new Error("auto-inspect must not use RPC"); },
+        getSessionFilePath: () => "/sessions/a.jsonl",
+        getCanonicalWorkspaceRoot: () => workdir,
+    };
+    const res = await createPatchTool(deps).execute(
+        "tc-diffs",
+        { edits: [
+            { path: "a.ts", oldText: "alpha", newText: "ALPHA" },
+            { path: "b.ts", oldText: "gamma", newText: "GAMMA" },
+        ] },
+        undefined,
+        undefined,
+        makeCtx(workdir),
+    );
+
+    const details = res.details as PatchDetails & {
+        diff?: string;
+        diffs?: Array<{ path: string; diff: string }>;
+    };
+    assert.equal(details.status.kind, "applied");
+    assert.equal(details.diffs?.length, 2);
+    assert.deepEqual(details.diffs?.map((entry) => entry.path), ["a.ts", "b.ts"]);
+    assert.match(details.diffs?.[0]?.diff ?? "", /-1 alpha/);
+    assert.match(details.diffs?.[0]?.diff ?? "", /\+1 ALPHA/);
+    assert.match(details.diff ?? "", /a\.ts/);
+    assert.match(details.diff ?? "", /b\.ts/);
+});
+
 test("end-to-end: multi-file mid-batch failure reports files already applied in changedResources (not empty), and earlier writes are not silently hidden", async () => {
     const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-")));
     mkdirSync(workdir, { recursive: true });
@@ -736,4 +773,297 @@ test("resolvePatchAuthorization: rejects weak coverage even when a resourceId ma
         targetLineRange: { startLine: 1, endLine: 1 },
     });
     assert.equal(auth.ok, false);
+});
+
+// ─── Fix #1: replaceAll bypasses line-range authorization ──────────────
+
+test("end-to-end: replaceAll coverage is enforced per-occurrence under line-range", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-replaceall-")));
+    mkdirSync(workdir, { recursive: true });
+    const before = "foo\nbar\nfoo\nqux\nfoo\n";
+    // allowedRanges only covers line 3. The first and third "foo" occurrences
+    // are on lines 1 and 5, outside the allowed range. With replaceAll the
+    // per-occurrence coverage check should reject the entire batch.
+    const { res } = await runApply({
+        workdir,
+        fileContent: before,
+        envelopeContent: before,
+        fullFile: false,
+        range: { startLine: 3, endLine: 3 },
+        edits: [{ oldText: "foo", newText: "FOO", replaceAll: true }],
+        rpc: (env) => ({ ok: true, payload: env }),
+    });
+    const d = res.details as any;
+    assert.equal(d.status.kind, "rejected");
+    assert.equal(d.status.reason, "coverage");
+    assert.ok(
+        String(d.diagnostics ?? "").includes("occurrence"),
+        "diagnostics should mention occurrences outside allowed range",
+    );
+});
+
+test("end-to-end: replaceAll succeeds when every occurrence is inside allowedRanges", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-replaceall-ok-")));
+    mkdirSync(workdir, { recursive: true });
+    const before = "foo\nbar\nfoo\nqux\nfoo\n";
+    // Allow the full file's range — every "foo" occurrence is within.
+    const { res, canonicalFile } = await runApply({
+        workdir,
+        fileContent: before,
+        envelopeContent: before,
+        fullFile: false,
+        range: { startLine: 1, endLine: 5 },
+        edits: [{ oldText: "foo", newText: "FOO", replaceAll: true }],
+        rpc: (env) => ({ ok: true, payload: env }),
+    });
+    const d = res.details as any;
+    assert.equal(d.status.kind, "applied");
+    assert.equal(readFileSync(canonicalFile, "utf8"), "FOO\nbar\nFOO\nqux\nFOO\n");
+});
+
+// ─── Fix #2: Auto-inspect new-file creation ───────────────────────────
+
+test("end-to-end: missing file with empty oldText is treated as new-file creation", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-newfile-")));
+    mkdirSync(workdir, { recursive: true });
+    const newFile = join(workdir, "fresh.ts");
+    assert.equal(existsSync(newFile), false, "fixture: new file should not exist yet");
+    const sessionFilePath = "/sessions/new.jsonl";
+    const deps: PatchToolDeps = {
+        getRpcClient: () => ({
+            request: async () => ({
+                kind: "reply" as const,
+                schemaVersion: PROTOCOL_SCHEMA_VERSION,
+                requestId: "r1",
+                ok: true,
+                payload: {},
+            }),
+            dispose: () => {},
+        }),
+        getSessionFilePath: () => sessionFilePath,
+        getCanonicalWorkspaceRoot: () => workdir,
+    };
+    const tool = createPatchTool(deps);
+    const res = await tool.execute(
+        "tc-newfile",
+        {
+            path: "fresh.ts",
+            edits: [{ oldText: "", newText: "export const created = true;\n" }],
+            toolCallId: "tc-newfile",
+        },
+        undefined,
+        undefined,
+        makeCtx(workdir),
+    );
+    const d = res.details as any;
+    assert.equal(d.status.kind, "applied", `expected applied, got ${JSON.stringify(d.status)}`);
+    assert.ok(existsSync(newFile), "new file should have been created on disk");
+    assert.equal(readFileSync(newFile, "utf8"), "export const created = true;\n");
+    assert.equal(d.changedResources.length, 1);
+    assert.equal(d.changedResources[0].canonicalPath, newFile);
+    unlinkSync(newFile);
+});
+
+test("end-to-end: missing file with non-empty oldText returns actionable error", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-missing-")));
+    mkdirSync(workdir, { recursive: true });
+    const sessionFilePath = "/sessions/missing.jsonl";
+    const deps: PatchToolDeps = {
+        getRpcClient: () => ({
+            request: async () => ({
+                kind: "reply" as const,
+                schemaVersion: PROTOCOL_SCHEMA_VERSION,
+                requestId: "r1",
+                ok: true,
+                payload: {},
+            }),
+            dispose: () => {},
+        }),
+        getSessionFilePath: () => sessionFilePath,
+        getCanonicalWorkspaceRoot: () => workdir,
+    };
+    const tool = createPatchTool(deps);
+    const res = await tool.execute(
+        "tc-missing",
+        {
+            path: "does-not-exist.ts",
+            edits: [{ oldText: "anything", newText: "new" }],
+            toolCallId: "tc-missing",
+        },
+        undefined,
+        undefined,
+        makeCtx(workdir),
+    );
+    const d = res.details as any;
+    assert.equal(d.status.kind, "failed");
+    assert.equal(d.status.phase, "stage");
+    const errStr = JSON.stringify(d);
+    assert.ok(errStr.includes("does-not-exist.ts"), "error should include path");
+    assert.ok(
+        errStr.includes("write tool") || errStr.includes("oldText"),
+        "error should suggest a fix",
+    );
+});
+
+// ─── Fix #3: post-write invalidation is recorded even if a later stage fails ──
+
+test("end-to-end: post-write invalidation is recorded when the write succeeds", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-postwrite-")));
+    mkdirSync(workdir, { recursive: true });
+    const before = "alpha\nbeta\n";
+    const { res, canonicalFile } = await runApply({
+        workdir,
+        fileContent: before,
+        envelopeContent: before,
+        fullFile: true,
+        edits: [{ oldText: "beta", newText: "BETA" }],
+        rpc: (env) => ({ ok: true, payload: env }),
+        checks: [{ id: "lint", kind: "advisory", run: async () => ({ outcome: "pass" as const }) }],
+    });
+    const d = res.details as any;
+    assert.equal(d.status.kind, "applied");
+    assert.equal(d.changedResources.length, 1, "changedResources must record the write");
+    assert.equal(d.changedResources[0].canonicalPath, canonicalFile);
+    assert.equal(readFileSync(canonicalFile, "utf8"), "alpha\nBETA\n");
+});
+
+// ─── Fix #4: blocking verifier that throws (not a timeout) blocks the write ──
+
+test("end-to-end: blocking verifier that throws blocks the write (fail, not timeout)", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-throw-")));
+    mkdirSync(workdir, { recursive: true });
+    const before = "alpha\nbeta\n";
+    const { res, canonicalFile } = await runApply({
+        workdir,
+        fileContent: before,
+        envelopeContent: before,
+        fullFile: true,
+        edits: [{ oldText: "beta", newText: "BETA" }],
+        rpc: (env) => ({ ok: true, payload: env }),
+        checks: [
+            {
+                id: "crash",
+                kind: "blocking",
+                run: async () => {
+                    throw new Error("verifier exploded");
+                },
+            },
+        ],
+    });
+    const d = res.details as any;
+    // The blocking verifier threw — the write gate rejects it as "approval".
+    assert.equal(d.status.kind, "rejected");
+    assert.equal(d.status.reason, "approval");
+    // File must not have been changed.
+    assert.equal(readFileSync(canonicalFile, "utf8"), before);
+    // The thrown check must be in blocking + fail.
+    const checks = d.checks as { blocking: Array<{ id: string; outcome: string }> };
+    const blockingCrash = checks.blocking.find((c) => c.id.startsWith("crash:"));
+    assert.ok(blockingCrash, "crash check should appear in blocking");
+    assert.equal(blockingCrash.outcome, "fail", "thrown error should be classified as fail");
+});
+
+// ─── Fix #5: pre-write error classification ──────────────────────────
+
+test("end-to-end: missing oldText/newText returns failed/stage (not failed/write)", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-shape-")));
+    mkdirSync(workdir, { recursive: true });
+    const before = "alpha\nbeta\n";
+    const { res, canonicalFile } = await runApply({
+        workdir,
+        fileContent: before,
+        envelopeContent: before,
+        fullFile: true,
+        edits: [{ description: "noop" } as any],
+        rpc: (env) => ({ ok: true, payload: env }),
+    });
+    const d = res.details as any;
+    assert.equal(d.status.kind, "failed");
+    assert.equal(d.status.phase, "stage", "missing fields should be pre-write, so phase=stage");
+    assert.equal(readFileSync(canonicalFile, "utf8"), before);
+});
+
+test("end-to-end: oldText not found returns failed/stage (truthful pre-write stage)", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-notfound-")));
+    mkdirSync(workdir, { recursive: true });
+    const before = "alpha\nbeta\n";
+    const { res, canonicalFile } = await runApply({
+        workdir,
+        fileContent: before,
+        envelopeContent: before,
+        fullFile: true,
+        edits: [{ oldText: "DOES NOT EXIST", newText: "replacement" }],
+        rpc: (env) => ({ ok: true, payload: env }),
+    });
+    const d = res.details as any;
+    assert.equal(d.status.kind, "failed");
+    assert.equal(d.status.phase, "stage", "oldText not found is a pre-write error");
+    assert.match(
+        res.content[0]?.text ?? "",
+        /re-inspect the file and retry/i,
+        "stale exact-match failures should tell the caller how to recover",
+    );
+    assert.equal(readFileSync(canonicalFile, "utf8"), before);
+});
+
+// ─── Fix #6: SHA TOCTOU re-check before write ─────────────────────────
+
+test("end-to-end: SHA changed between initial check and write is rejected as stale", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-stale-")));
+    mkdirSync(workdir, { recursive: true });
+    const before = "alpha\nbeta\n";
+    const newFile = join(workdir, "x.ts");
+    writeFileSync(newFile, before, "utf8");
+    const canonicalFile = realpathSync(newFile);
+    const sessionFilePath = "/sessions/t.jsonl";
+    const envelope = makeEnvelope({
+        sessionFilePath,
+        canonicalRoot: workdir,
+        resources: [
+            makeResource({
+                canonicalPath: canonicalFile,
+                full: true,
+                content: before,
+            }),
+        ],
+    });
+    const resource = envelope.resources[0]!;
+    // Simulate a concurrent writer by mutating the file when the RPC request
+    // fires (which is the moment patch resolves the envelope). This races the
+    // pre-write re-SHA guard.
+    const deps: PatchToolDeps = {
+        getRpcClient: () => ({
+            request: async () => {
+                writeFileSync(canonicalFile, "alpha\nbeta\nGAMMA\n", "utf8");
+                return {
+                    kind: "reply" as const,
+                    schemaVersion: PROTOCOL_SCHEMA_VERSION,
+                    requestId: "r1",
+                    ok: true,
+                    payload: envelope,
+                };
+            },
+            dispose: () => {},
+        }),
+        getSessionFilePath: () => sessionFilePath,
+        getCanonicalWorkspaceRoot: () => workdir,
+    };
+    const tool = createPatchTool(deps);
+    const res = await tool.execute(
+        "tc-stale",
+        {
+            path: "x.ts",
+            edits: [{ oldText: "beta", newText: "BETA" }],
+            evidenceRef: { inspectionId: envelope.inspectionId, resourceIds: [resource.resourceId] },
+            toolCallId: "tc-stale",
+        },
+        undefined,
+        undefined,
+        makeCtx(workdir),
+    );
+    const d = res.details as any;
+    assert.equal(d.status.kind, "rejected");
+    assert.equal(d.status.reason, "stale");
+    // File must not have been overwritten by the patch — only by the simulated writer.
+    assert.equal(readFileSync(canonicalFile, "utf8"), "alpha\nbeta\nGAMMA\n");
 });

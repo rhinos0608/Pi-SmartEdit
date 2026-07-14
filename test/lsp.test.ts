@@ -12,10 +12,10 @@
 
 import { resolve } from "path";
 
-import { LSPConnection } from "../.pi/extensions/smart-edit/src/lsp/lsp-connection";
-import { LSPManager } from "../.pi/extensions/smart-edit/src/lsp/lsp-manager";
-import { checkPostEditDiagnostics } from "../.pi/extensions/smart-edit/src/lsp/diagnostics";
-import { goToDefinition, findReferences, getHoverInfo } from "../.pi/extensions/smart-edit/src/lsp/semantic-nav";
+import { LSPConnection } from "../src/lsp/lsp-connection";
+import { LSPManager } from "../src/lsp/lsp-manager";
+import { checkPostEditDiagnostics } from "../src/lsp/diagnostics";
+import { goToDefinition, findReferences, getHoverInfo } from "../src/lsp/semantic-nav";
 
 // ─── Helpers ──────────────────────────────────────────────────────
 
