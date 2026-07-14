@@ -511,6 +511,60 @@ export default function smartEdit(pi: ExtensionAPI) {
       }
     }
 
+    // ── Shared single-file read+record+validation helper ──
+    // Used by both write and edit post-processing paths. Returns undefined when
+    // the file is empty, validation passed, or no feedback was produced.
+    const validateFileAndBuildFeedback = async (
+      filePath: string,
+      cwd: string,
+    ): Promise<
+      | {
+          path: string;
+          feedback: string;
+          retryCount: number;
+          shouldDecompose: boolean;
+        }
+      | undefined
+    > => {
+      const resolvedPath = resolve(cwd, filePath);
+      const content = (await fsReadFile(resolvedPath)).toString("utf-8");
+      if (!content) {
+        // Empty files are recorded as reads but skip validation; this matches
+        // the existing write-path behavior and makes edit-path behavior consistent.
+        return undefined;
+      }
+
+      recordRead(filePath, cwd, content);
+      const lines = content.split("\n");
+      recordReadSession(filePath, cwd, 1, -1, lines.length, "edit");
+
+      // ── Auto-validation hook (SmallCode-inspired) ──
+      // After a write/edit, run structural + compiler/linter validation.
+      // Feed errors back as structured data on the event for the model to see.
+      //
+      // VALIDATION IS ADVISORY: runAutoValidation runs asynchronously and may
+      // complete after this handler returns. Consumers MUST NOT rely on
+      // event.validationFeedback being present synchronously. The promise is
+      // intentionally fire-and-forget so write/edit results are not blocked by
+      // validation overhead — the model receives diagnostics as a later signal
+      // rather than a blocking response. See formatValidationFeedback for the
+      // shape of validation feedback that gets attached to the event object.
+      const validationResult = await runAutoValidation(filePath, content, {
+        cwd,
+        maxRetries: 3,
+        enabled: true,
+      });
+      if (validationResult.passed) return undefined;
+      const feedback = formatValidationFeedback(validationResult);
+      if (!feedback) return undefined;
+      return {
+        path: filePath,
+        feedback,
+        retryCount: validationResult.retryCount,
+        shouldDecompose: validationResult.shouldDecompose,
+      };
+    };
+
     // ── Track writes so write-then-edit flow doesn't trigger stale-file guard ──
     const writePath = (event.input as { path?: string } | undefined)?.path;
     if (
@@ -519,47 +573,76 @@ export default function smartEdit(pi: ExtensionAPI) {
       writePath
     ) {
       try {
-        // Read the file from disk to get what was actually written
-        const resolvedPath = resolve(toolCwd, writePath);
-        const content = (await fsReadFile(resolvedPath)).toString("utf-8");
-        if (content) {
-          recordRead(writePath, toolCwd, content);
-
-          // Track write as a read (write-then-edit flow bypasses stale guard)
-          const lines = content.split("\n");
-          recordReadSession(writePath, toolCwd, 1, -1, lines.length, "write");
-
-          // ── Auto-validation hook (SmallCode-inspired) ──
-          // After a write, run structural + compiler/linter validation.
-          // Feed errors back as structured data on the event for the model to see.
-          //
-          // VALIDATION IS ADVISORY: runAutoValidation runs asynchronously and may
-          // complete after this handler returns. Consumers MUST NOT rely on
-          // event.validationFeedback being present synchronously. The promise is
-          // intentionally fire-and-forget so write results are not blocked by
-          // validation overhead — the model receives diagnostics as a later signal
-          // rather than a blocking response. See formatValidationFeedback for the
-          // shape of validation feedback that gets attached to the event object.
-          runAutoValidation(writePath, content, {
-            cwd: toolCwd,
-            maxRetries: 3,
-            enabled: true,
-          }).then((validationResult) => {
-            if (!validationResult.passed) {
-              const feedback = formatValidationFeedback(validationResult);
-              if (feedback) {
-                const ev = event as unknown as Record<string, unknown>;
-                ev.validationFeedback = feedback;
-                ev.validationRetries = validationResult.retryCount;
-                ev.shouldDecompose = validationResult.shouldDecompose;
-              }
-            }
-          }).catch(() => {
+        validateFileAndBuildFeedback(writePath, toolCwd)
+          .then((entry) => {
+            if (!entry) return;
+            const ev = event as unknown as Record<string, unknown>;
+            ev.validationFeedback = entry.feedback;
+            ev.validationRetries = entry.retryCount;
+            ev.shouldDecompose = entry.shouldDecompose;
+          })
+          .catch(() => {
             // Validation is advisory — silent degradation
           });
-        }
       } catch {
         // File might not exist yet or can't be read — skip silently
+      }
+    }
+
+    // ── Track edits so edit-then-edit flow doesn't trigger stale-file guard ──
+    // Also mirrors the write advisory auto-validation hook for multi-file edits.
+    if (
+      event.toolName === "edit" &&
+      !event.isError
+    ) {
+      try {
+        const details = (event as unknown as { details?: PatchToolDetails }).details;
+        if (
+          details?.status?.kind === "applied" &&
+          Array.isArray(details.diffs) &&
+          details.diffs.length > 0
+        ) {
+          const uniquePaths = [
+            ...new Set(
+              details.diffs
+                .map((d) => d.path)
+                .filter((p): p is string => typeof p === "string"),
+            ),
+          ];
+          if (uniquePaths.length > 0) {
+            Promise.allSettled(uniquePaths.map((p) => validateFileAndBuildFeedback(p, toolCwd)))
+              .then((results) => {
+                const entries = results
+                  .map((r) => (r.status === "fulfilled" ? r.value : undefined))
+                  .filter(
+                    (
+                      v,
+                    ): v is {
+                      path: string;
+                      feedback: string;
+                      retryCount: number;
+                      shouldDecompose: boolean;
+                    } => !!v,
+                  );
+                if (entries.length === 0) return;
+                const ev = event as unknown as Record<string, unknown>;
+                if (entries.length === 1) {
+                  ev.validationFeedback = entries[0].feedback;
+                } else {
+                  ev.validationFeedback = entries
+                    .map((e) => `${e.path}:\n${e.feedback}`)
+                    .join("\n\n");
+                }
+                ev.validationRetries = Math.max(...entries.map((e) => e.retryCount));
+                ev.shouldDecompose = entries.some((e) => e.shouldDecompose);
+              })
+              .catch(() => {
+                // Validation is advisory — silent degradation
+              });
+          }
+        }
+      } catch {
+        // Edit post-validation is advisory — silent degradation
       }
     }
   });
