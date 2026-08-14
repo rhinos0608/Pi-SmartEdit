@@ -275,7 +275,7 @@ npx tsx --test test/<file>  # e.g., test/symbolic-edits.test.ts
 |---|---|---|---|
 | `SMART_EDIT_USE_HASHLINE_EDITING` | `1`/`true`/`yes`/`on` | off | Enable hashline edit mode |
 | `SMART_EDIT_HASHLINE_EXPERIMENTAL` | same | off | Alias for hashline toggle |
-| `SMART_EDIT_APPROVAL_LEVEL` | `never_prompt` / `prompt_on_dangerous` / `prompt_always` | `never_prompt` | Safety check verbosity |
+| `SMART_EDIT_APPROVAL_LEVEL` | `never_prompt` / `prompt_on_dangerous` / `prompt_always` | `prompt_on_dangerous` | Safety check verbosity |
 | `SMART_EDIT_REPAIR_ENABLED` | `1`/`true`/`yes`/`on` | **on** | Enable edit repair loop (Aider-style retry) |
 | `SMART_EDIT_REPAIR_ENABLED=0`/`false` | disable | — | Disable the repair loop (defaults to on) |
 | `SMART_EDIT_REPAIR_MAX_RETRIES` | integer | `3` | Max retry attempts in the repair loop |

@@ -30,7 +30,7 @@ Three levels, controlled by the environment variable `SMART_EDIT_APPROVAL_LEVEL`
 | **prompt_on_dangerous** | `"prompt_on_dangerous"` | Only emits warnings when dangerous file paths, symbol patterns, or critical line ranges are detected. Safe edits produce no output. |
 | **prompt_always** | `"prompt_always"` | Emits warnings for every edit. On safe edits, a generic "approval prompt" note is added. On dangerous edits, the specific warnings are included. |
 
-Default: `never_prompt` (backward-compatible — existing users see no change).
+Default: `prompt_on_dangerous` (checks run silently; only warns on dangerous patterns).
 
 ---
 
@@ -175,7 +175,7 @@ Read via `process.env` directly in the module (following the same pattern as `SM
 
 | Case | Behavior |
 |---|---|
-| `SMART_EDIT_APPROVAL_LEVEL` unset or invalid | Default to `never_prompt` (no change in behavior) |
+| `SMART_EDIT_APPROVAL_LEVEL` unset or invalid | Default to `prompt_on_dangerous` |
 | Empty edits array | No symbol checks possible; file path check still runs |
 | File path doesn't exist yet (new file) | Path check runs on the target path before creation |
 | Multiple edits, some dangerous | All warnings for all dangerous edits are collected and emitted together |
