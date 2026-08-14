@@ -560,6 +560,22 @@ export default function smartEdit(pi: ExtensionAPI) {
       };
     };
 
+    // ── Lightweight read-cache refresh (no validation) ──
+    // Used by the edit post-processing path below. Unlike
+    // validateFileAndBuildFeedback, this does NOT run runAutoValidation —
+    // see the comment on the "edit" branch for why the edit tool's own
+    // synchronous lanes (pre-write repair + post-write runFinalSuccessLanes,
+    // both wired through patch.ts) already cover compiler/lint diagnostics
+    // for edits, making a second async validation pass pure duplicate work.
+    const refreshReadCacheAfterEdit = async (filePath: string, cwd: string): Promise<void> => {
+      const resolvedPath = resolve(cwd, filePath);
+      const content = (await fsReadFile(resolvedPath)).toString("utf-8");
+      if (!content) return;
+      recordRead(filePath, cwd, content);
+      const lines = content.split("\n");
+      recordReadSession(filePath, cwd, 1, -1, lines.length, "edit");
+    };
+
     // ── Track writes so write-then-edit flow doesn't trigger stale-file guard ──
     const writePath = (event.input as { path?: string } | undefined)?.path;
     if (
@@ -585,7 +601,36 @@ export default function smartEdit(pi: ExtensionAPI) {
     }
 
     // ── Track edits so edit-then-edit flow doesn't trigger stale-file guard ──
-    // Also mirrors the write advisory auto-validation hook for multi-file edits.
+    //
+    // This branch used to also run a second, fully independent
+    // runAutoValidation pass per edited file (compiler + eslint + fake-logic
+    // + structural-diff + format-equivalence), mirroring the write path's
+    // advisory hook. For the `edit` tool that pass was pure duplicate work:
+    //
+    //   1. The edit tool already runs the SAME runAutoValidation pipeline
+    //      synchronously, pre-write, via the repair loop (patch.ts's
+    //      deps.runRepair -> runRepairLoop -> runAutoValidation).
+    //   2. The edit tool also runs LSP + compiler diagnostics synchronously,
+    //      post-write, via deps.runFinalSuccessLanes (see below in this
+    //      file), whose results are returned in the tool's own `details`.
+    //   3. This handler's mutations to `event.validationFeedback` /
+    //      `validationRetries` / `shouldDecompose` were never actually
+    //      consumed anywhere: nothing in this repo reads them, and the
+    //      pi-coding-agent extension runner's emitToolResult only honors a
+    //      tool_result handler's RETURN value (content/details/isError) —
+    //      never later mutations to the event object passed in — and this
+    //      handler never returns anything. The fire-and-forget promise chain
+    //      (not awaited before the handler resolves) also races the
+    //      framework reading the event, so even a returned value would be
+    //      too late.
+    //
+    // So the second validation pass cost a real tsc/eslint subprocess spawn
+    // on every edit for zero observable benefit. Only the read-cache refresh
+    // (needed so a later edit to the same file doesn't trip the stale-file
+    // guard) is preserved here; see refreshReadCacheAfterEdit above.
+    //
+    // The `write` tool's advisory hook below is unrelated and unchanged: it
+    // is the only diagnostic lane for `write`, so no duplication applies.
     if (
       event.toolName === "edit" &&
       !event.isError
@@ -604,40 +649,14 @@ export default function smartEdit(pi: ExtensionAPI) {
                 .filter((p): p is string => typeof p === "string"),
             ),
           ];
-          if (uniquePaths.length > 0) {
-            Promise.allSettled(uniquePaths.map((p) => validateFileAndBuildFeedback(p, toolCwd)))
-              .then((results) => {
-                const entries = results
-                  .map((r) => (r.status === "fulfilled" ? r.value : undefined))
-                  .filter(
-                    (
-                      v,
-                    ): v is {
-                      path: string;
-                      feedback: string;
-                      retryCount: number;
-                      shouldDecompose: boolean;
-                    } => !!v,
-                  );
-                if (entries.length === 0) return;
-                const ev = event as unknown as Record<string, unknown>;
-                if (entries.length === 1) {
-                  ev.validationFeedback = entries[0].feedback;
-                } else {
-                  ev.validationFeedback = entries
-                    .map((e) => `${e.path}:\n${e.feedback}`)
-                    .join("\n\n");
-                }
-                ev.validationRetries = Math.max(...entries.map((e) => e.retryCount));
-                ev.shouldDecompose = entries.some((e) => e.shouldDecompose);
-              })
-              .catch(() => {
-                // Validation is advisory — silent degradation
-              });
+          for (const p of uniquePaths) {
+            refreshReadCacheAfterEdit(p, toolCwd).catch(() => {
+              // File might not exist or can't be read — skip silently
+            });
           }
         }
       } catch {
-        // Edit post-validation is advisory — silent degradation
+        // Edit post-processing is advisory — silent degradation
       }
     }
   });
@@ -718,7 +737,23 @@ export default function smartEdit(pi: ExtensionAPI) {
       getSnapshot: (path) => (currentCwd ? getSnapshot(path, currentCwd) : null),
       // The coordinator owns acceptance and evidence reauthorization; the
       // extension only supplies the session-bound repair implementation.
-      runRepair: ({ path, content, cwd }) => runRepairLoop(path, content, {}, cwd),
+      //
+      // maxRetries is capped at 1 here (runRepairLoop's own default is 3).
+      // runRepairLoop only advances its staged content when a repair attempt
+      // actually passes validation — and when that happens it breaks out of
+      // the loop immediately. So whenever the first attempt fails and the
+      // narrow auto-repair heuristics (brace/bracket balance, indentation,
+      // trailing whitespace, blank lines) don't fix it, every subsequent
+      // retry re-validates byte-identical content and is guaranteed to
+      // reach the same pass/fail outcome — it cannot converge differently.
+      // Each retry still pays for a full runAutoValidation pass (a real
+      // tsc/eslint subprocess spawn apiece), so the default of 3 retries
+      // means up to 3x redundant compiler/linter spawns, synchronously,
+      // before the edit is even written. Repair is advisory-only (failures
+      // never block the write — see repair-loop.ts), so capping retries at
+      // 1 does not change what gets accepted or what content lands on disk;
+      // it only removes provably-wasted synchronous spawns on the hot path.
+      runRepair: ({ path, content, cwd }) => runRepairLoop(path, content, { maxRetries: 1 }, cwd),
       // These lanes are invoked by patch only after a successful commit.  The
       // extension supplies session-owned LSP state; the coordinator owns the
       // ordering and result assembly.
