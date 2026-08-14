@@ -100,8 +100,18 @@ export interface PlannedTextEdits {
   newContent: string;
   /** Actual resolved match spans (byte offsets into LF-normalized, BOM-stripped content). */
   matchSpans: MatchSpan[];
-  /** Actual affected preimage line ranges (1-based inclusive), one per match span. */
+  /** Actual affected preimage line ranges (1-based inclusive), one per match span.
+   *  Coordinate space: the PRE-edit snapshot. Use this to check authorization
+   *  against evidence `allowedRanges`, which were also captured pre-edit. */
   preimageLineRanges: LineRange[];
+  /** Actual affected postimage line ranges (1-based inclusive), one per match
+   *  span, index-aligned with preimageLineRanges/matchSpans. Coordinate
+   *  space: the POST-edit content (`newContent`). An edit that inserts or
+   *  deletes lines shifts every later mutation's line numbers relative to
+   *  the preimage, so callers that scope diagnostics/evidence against the
+   *  post-edit content (not the pre-edit content) MUST use these ranges
+   *  instead of preimageLineRanges. */
+  postimageLineRanges: LineRange[];
   /** Human-readable match notes from the matching engines. */
   matchNotes: string[];
   /** Capabilities exercised by this plan. */
@@ -500,6 +510,17 @@ export async function planTextEdits(args: PlanTextEditsArgs): Promise<PlannedTex
     byteSpanToLineRange(newlineOffsets, m.startByte, m.endByte - m.startByte),
   );
 
+  // Postimage ranges live in a different coordinate space than preimage
+  // ranges: an earlier mutation that inserts/deletes lines shifts the line
+  // numbers of every mutation after it in the final text. Compute each
+  // mutation's postimage byte span by accumulating the length delta of every
+  // mutation that lands before it (by startByte, then by requestIndex for
+  // same-position inserts) — the same ordering applyMutations uses to build
+  // newContentNormalized — then map those spans to line numbers against the
+  // POST-edit snapshot.
+  const postNewlineOffsets = buildNewlineOffsets(newContentNormalized);
+  const postimageLineRanges = computePostimageLineRanges(mutations, postNewlineOffsets);
+
   const capabilities: EditCapability[] = [];
   if (textEdits.length > 0) capabilities.push("oldText");
   if (args.edits.some((e) => e.replaceAll)) capabilities.push("replaceAll");
@@ -512,9 +533,40 @@ export async function planTextEdits(args: PlanTextEditsArgs): Promise<PlannedTex
     newContent,
     matchSpans,
     preimageLineRanges,
+    postimageLineRanges,
     matchNotes,
     capabilities,
   };
+}
+
+/**
+ * Map each mutation's preimage byte span to its postimage line range.
+ * Mutations are processed in ascending (startByte, requestIndex) order — the
+ * same tie-break applyMutations uses when splicing same-position zero-length
+ * inserts — while accumulating the running length delta so every mutation's
+ * postimage start byte reflects every earlier mutation's net size change.
+ * Results are returned index-aligned with the input `mutations` array (not
+ * in the ascending order used internally to compute them).
+ */
+function computePostimageLineRanges(
+  mutations: ResolvedMutation[],
+  postNewlineOffsets: number[],
+): LineRange[] {
+  const order = mutations.map((_, i) => i).sort((a, b) => {
+    const byStart = mutations[a].startByte - mutations[b].startByte;
+    if (byStart !== 0) return byStart;
+    return mutations[a].requestIndex - mutations[b].requestIndex;
+  });
+  const result: LineRange[] = new Array<LineRange>(mutations.length);
+  let delta = 0;
+  for (const idx of order) {
+    const m = mutations[idx];
+    const postStart = m.startByte + delta;
+    const postLength = m.replacement.length;
+    result[idx] = byteSpanToLineRange(postNewlineOffsets, postStart, postLength);
+    delta += postLength - (m.endByte - m.startByte);
+  }
+  return result;
 }
 
 /**

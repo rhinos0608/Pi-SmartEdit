@@ -165,11 +165,27 @@ function escapeRegex(str: string): string {
  * engines that expose only single-node captures. Never throws.
  */
 /* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-assignment */
-function resolveMultiCapture(node: any, name: string): string {
+function resolveMultiCapture(node: any, name: string, content: string): string {
   try {
     if (typeof node.getMultipleMatches === "function") {
       const nodes: any[] = node.getMultipleMatches(name) ?? [];
       if (Array.isArray(nodes) && nodes.length > 0) {
+        // Reconstruct from the first captured node's start through the last
+        // captured node's end so intervening source (spaces, commas,
+        // comments) is preserved — concatenating node.text() would drop it
+        // (e.g. `logger(a, b)` with $$$ARGS would become "ab").
+        const ranges = nodes
+          .map((n: any) => n?.range?.())
+          .filter((r: any) => r?.start?.index != null && r?.end?.index != null);
+        if (ranges.length > 0) {
+          const startByte = Math.min(...ranges.map((r: any) => r.start.index));
+          const endByte = Math.max(...ranges.map((r: any) => r.end.index));
+          const encoded = Buffer.from(content, "utf8");
+          return content.slice(
+            utf8ByteOffsetToStringIndex(encoded, startByte),
+            utf8ByteOffsetToStringIndex(encoded, endByte),
+          );
+        }
         return nodes.map((n: any) => n?.text?.() ?? "").join("");
       }
     }
@@ -333,7 +349,7 @@ export async function resolvePatternEdits(
       // Resolve $$$ multi-node wildcards first — they contain the single-capture
       // marker ($) and would otherwise be partially rewritten.
       for (const name of metaVarNames.multi) {
-        const capturedText = resolveMultiCapture(node, name);
+        const capturedText = resolveMultiCapture(node, name, content);
         const escapedName = escapeRegex(name);
         resolved = resolved.replace(
           new RegExp(`\\$\\$\\$${escapedName}(?![a-zA-Z0-9_])`, "g"),

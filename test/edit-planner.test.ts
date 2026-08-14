@@ -585,6 +585,24 @@ test("real structural resolution handles Unicode offsets and captured dollar tex
   assert.equal(edits[0].text, 'logger.info("$&")');
 });
 
+test("structural $$$ARGS replacement retains source gaps between captured nodes", async (t) => {
+  const content = "const x = logger(a, b);\n";
+  const edits = await resolvePatternEdits(
+    content,
+    "typescript",
+    "logger($$$ARGS)",
+    "wrapper($$$ARGS)",
+  );
+  if (!edits) {
+    t.skip("ast-grep native addon unavailable on this platform");
+    return;
+  }
+  assert.equal(edits.length, 1);
+  // Multi-node wildcard text must preserve the comma + space between the
+  // captured argument nodes instead of concatenating them.
+  assert.equal(edits[0].text, "wrapper(a, b)");
+});
+
 test("structural unavailable engine yields actionable diagnostic", async () => {
   await assert.rejects(
     planTextEdits({
@@ -796,4 +814,31 @@ test("symbolic edits preserve BOM and CRLF", async () => {
     r.newContent,
     "\uFEFFfunction alpha() { return 1; }\r\nfunction beta() { return 20; }\r\n",
   );
+});
+
+test("postimage line ranges account for line-count shifts from earlier edits (Bug 4 regression)", async () => {
+  // A first edit inserts 3 new lines before a later, unrelated edit further
+  // down the file. The later edit's PREIMAGE line (line 4, before the
+  // insert) is not where it ends up in the POST-edit content (line 7, after
+  // the 3-line insert above it). A consumer scoping diagnostics/evidence
+  // against the post-edit content (the only content it has) must use the
+  // postimage line number, not the preimage one.
+  const content = "line1\nline2\nline3\nTARGET\nline5\n";
+  const r = await planTextEdits({
+    content,
+    edits: [
+      { oldText: "line2\n", newText: "line2\nNEW_A\nNEW_B\nNEW_C\n" },
+      { oldText: "TARGET", newText: "CHANGED" },
+    ],
+    filePath: "x.ts",
+    astResolver: null,
+  });
+  assert.equal(
+    r.newContent,
+    "line1\nline2\nNEW_A\nNEW_B\nNEW_C\nline3\nCHANGED\nline5\n",
+  );
+  const targetSpanIndex = r.matchSpans.findIndex((s) => s.editIndex === 1);
+  assert.notEqual(targetSpanIndex, -1);
+  assert.deepEqual(r.preimageLineRanges[targetSpanIndex], { startLine: 4, endLine: 4 });
+  assert.deepEqual(r.postimageLineRanges[targetSpanIndex], { startLine: 7, endLine: 7 });
 });
