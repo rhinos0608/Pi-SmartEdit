@@ -20,23 +20,49 @@ const ESLINT_CONFIG_FILES = [
   ".eslintrc",
 ];
 
+/**
+ * Cache of resolved ESLint config directory per (file directory, cwd) pair.
+ *
+ * `findEslintConfigDir` walks ancestor directories (trying every candidate
+ * config filename) on every call. With no caching, every edit re-does the
+ * same filesystem walk from scratch even though config discovery is stable
+ * for the lifetime of a session. A "no config found" result (`null`) is
+ * cached too. No TTL/invalidation: scoped to the process lifetime, matching
+ * the equivalent tsconfig cache in diagnostic-dispatcher.ts.
+ */
+const eslintConfigDirCache = new Map<string, string | null>();
+
 async function findEslintConfigDir(
   filePath: string,
   cwd: string,
 ): Promise<string | null> {
+  const cacheKey = `${dirname(filePath)}::${cwd}`;
+  const cached = eslintConfigDirCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
   const fileDir = dirname(filePath);
+  let result: string | null = null;
 
   for (const configName of ESLINT_CONFIG_FILES) {
     const dir = await findAncestorDirWithFile(fileDir, configName);
-    if (dir) return dir;
+    if (dir) {
+      result = dir;
+      break;
+    }
   }
 
-  for (const configName of ESLINT_CONFIG_FILES) {
-    const dir = await findAncestorDirWithFile(cwd, configName);
-    if (dir) return dir;
+  if (!result) {
+    for (const configName of ESLINT_CONFIG_FILES) {
+      const dir = await findAncestorDirWithFile(cwd, configName);
+      if (dir) {
+        result = dir;
+        break;
+      }
+    }
   }
 
-  return null;
+  eslintConfigDirCache.set(cacheKey, result);
+  return result;
 }
 
 interface EslintMessage {

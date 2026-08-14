@@ -84,20 +84,37 @@ export function parsePyrightOutput(output: string): Diagnostic[] {
 }
 
 /**
+ * Cache of resolved tsconfig.json path per (file directory, cwd) pair.
+ *
+ * `findNearestTsconfig` walks ancestor directories on every call — with no
+ * caching, every single edit re-does the same filesystem walk from scratch
+ * even though tsconfig discovery is stable for the lifetime of a session.
+ * A missing tsconfig (`null`) is cached too, so repeated edits to files
+ * outside any TS project don't re-walk on every call. No TTL/invalidation:
+ * this cache is scoped to the process lifetime (per-session), matching how
+ * the rest of the diagnostic dispatcher already assumes a stable workspace.
+ */
+const tsconfigResolutionCache = new Map<string, string | null>();
+
+/**
  * Spawn a command asynchronously with timeout support.
  */
 async function findNearestTsconfig(filePath: string, cwd: string): Promise<string | null> {
+  const cacheKey = `${dirname(filePath)}::${cwd}`;
+  const cached = tsconfigResolutionCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+
   const fromFile = await findAncestorDirWithFile(dirname(filePath), "tsconfig.json");
+  let result: string | null;
   if (fromFile) {
-    return resolve(fromFile, "tsconfig.json");
+    result = resolve(fromFile, "tsconfig.json");
+  } else {
+    const fromCwd = await findAncestorDirWithFile(cwd, "tsconfig.json");
+    result = fromCwd ? resolve(fromCwd, "tsconfig.json") : null;
   }
 
-  const fromCwd = await findAncestorDirWithFile(cwd, "tsconfig.json");
-  if (fromCwd) {
-    return resolve(fromCwd, "tsconfig.json");
-  }
-
-  return null;
+  tsconfigResolutionCache.set(cacheKey, result);
+  return result;
 }
 
 function resolveDiagnosticPath(candidate: string, cwd: string, tsconfigPath: string | null): string[] {
