@@ -402,10 +402,13 @@ describe("edit-history", () => {
     const hash = (s: string) => createHash("sha256").update(s).digest("hex");
     const id = "tx-incomplete";
     const make = (path: string, before: string) => ({ path, originalContent: Buffer.from(before).toString("base64"), timestamp: new Date().toISOString(), editCount: 1, snapshotHash: hash(before).slice(0, 16), changedSymbols: [], version: 2 as const, beforeSha: hash(before), afterSha: hash(before + "x"), beforeMode: 0o644, afterMode: 0o644, existed: true, afterExists: true, operation: "text" as const, transactionId: id });
-    const a = await writeTestFile(cwd, "a.txt", "A");
-    const b = await writeTestFile(cwd, "b.txt", "B");
-    const c = await writeTestFile(cwd, "c.txt", "C");
-    await saveTransactionUndoRecords(cwd, [make(a, "A"), make(b, "B"), make(c, "C")]);
+    const a = await writeTestFile(cwd, "a.txt", "A x");
+    const b = await writeTestFile(cwd, "b.txt", "B x");
+    const c = await writeTestFile(cwd, "c.txt", "C x");
+    // Records' after-images are before + "x", matching the files written above,
+    // so the after-image hash validation passes and execution reaches the
+    // record-count guard below (which is the scenario under test).
+    await saveTransactionUndoRecords(cwd, [make(a, "A "), make(b, "B "), make(c, "C ")]);
     const jsonFiles = (await fsReaddir(undoDir)).filter((f) => f.endsWith(".json"));
     assert.equal(jsonFiles.length, 3);
     await fsRm(join(undoDir, jsonFiles[0]!), { force: true });

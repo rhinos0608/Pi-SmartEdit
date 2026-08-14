@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { after, test } from "node:test";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -30,6 +31,20 @@ async function waitFor(fn: () => boolean, label: string): Promise<void> {
     if (Date.now() > deadline) throw new Error(`timed out waiting for: ${label}`);
     await new Promise((r) => setTimeout(r, 10));
   }
+}
+
+/** Spawns and waits for a trivial child process to exit, then returns its
+ *  now-dead PID — a reliable, portable way to get a PID guaranteed not to
+ *  name a live process for the (short) remainder of the test. */
+async function getDeadPid(): Promise<number> {
+  return new Promise((resolvePid, reject) => {
+    const child = spawn(process.execPath, ["-e", "process.exit(0)"]);
+    child.on("exit", () => {
+      if (child.pid === undefined) { reject(new Error("child had no pid")); return; }
+      resolvePid(child.pid);
+    });
+    child.on("error", reject);
+  });
 }
 
 test("two-update failure restores first file", async () => {
@@ -157,4 +172,118 @@ test("writing to a path whose parent directory is gone fails with ENOENT", async
   await import("node:fs/promises").then(({ rm }) => rm(sub, { recursive: true, force: true }));
   await assert.rejects(() => tx.write(file, "b"), /ENOENT/);
   await tx.rollback();
+});
+
+// ─── Bug 1: commit-before-undo race ────────────────────────────────────
+
+test("Bug 1 regression: capturing undo records before commit() protects afterSha from a post-commit interloper write", async () => {
+  const dir = await makeTempDir("smart-edit-tx-race-");
+  const file = join(dir, "f.txt");
+  await writeFile(file, "alpha");
+  const sha = (s: string) => createHash("sha256").update(s).digest("hex");
+
+  const tx = await EditTransaction.begin([file]);
+  await tx.write(file, "beta");
+
+  // Correct discipline (mirrors src/patch.ts's fixed commit/getUndoRecords
+  // ordering): capture undo records — which snapshot post-write disk
+  // content for afterSha — BEFORE commit() releases the lock.
+  const records = await tx.getUndoRecords();
+  await tx.commit();
+
+  // A second, uncoordinated writer mutates the file the instant the lock is
+  // released. Because afterSha was already captured while the lock was
+  // still held, this interloper write must be invisible to the already
+  // computed undo record.
+  await writeFile(file, "interloper-content");
+
+  assert.equal(records.length, 1);
+  assert.equal(records[0].afterSha, sha("beta"), "afterSha must reflect SmartEdit's own committed content");
+  assert.notEqual(records[0].afterSha, sha("interloper-content"), "afterSha must not observe the post-release interloper write");
+});
+
+// ─── Bug 2: stale-lock recovery and awaited release ────────────────────
+
+test("Bug 2 regression: a lock file with a dead owner PID is reclaimed promptly instead of waiting the full timeout", async () => {
+  const dir = await makeTempDir("smart-edit-tx-stale-");
+  const file = join(dir, "f.txt");
+  await writeFile(file, "a");
+  const lockFile = lockFileFor(file);
+  await mkdir(LOCK_DIR, { recursive: true });
+
+  const deadPid = await getDeadPid();
+  await writeFile(lockFile, JSON.stringify({ pid: deadPid, acquiredAt: Date.now() }));
+
+  const start = Date.now();
+  const tx = await EditTransaction.begin([file]);
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed < 2000, `stale lock owned by a dead PID should be reclaimed quickly, took ${elapsed}ms`);
+
+  await tx.write(file, "b");
+  await tx.commit();
+  assert.equal(await readFile(file, "utf8"), "b");
+});
+
+test("Bug 2 regression: an old, unparseable lock file (legacy/corrupt content) is reclaimed via the age fallback", async () => {
+  const dir = await makeTempDir("smart-edit-tx-stale-legacy-");
+  const file = join(dir, "f.txt");
+  await writeFile(file, "a");
+  const lockFile = lockFileFor(file);
+  await mkdir(LOCK_DIR, { recursive: true });
+
+  // No parseable {pid, acquiredAt} JSON — simulates a legacy or corrupt lock
+  // file. Its mtime is old enough to trip the age-based fallback.
+  await writeFile(lockFile, "not json");
+  const oldTime = new Date(Date.now() - 60_000);
+  await import("node:fs/promises").then(({ utimes }) => utimes(lockFile, oldTime, oldTime));
+
+  const start = Date.now();
+  const tx = await EditTransaction.begin([file]);
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed < 2000, `old unparseable lock file should be reclaimed quickly, took ${elapsed}ms`);
+  await tx.rollback();
+});
+
+test("Bug 2 regression: a lock held by a live process is never reclaimed, even if old", async () => {
+  const dir = await makeTempDir("smart-edit-tx-live-");
+  const file = join(dir, "f.txt");
+  await writeFile(file, "a");
+  const lockFile = lockFileFor(file);
+  await mkdir(LOCK_DIR, { recursive: true });
+
+  // Our own test process is unquestionably alive; an old acquiredAt must not
+  // matter — a live owner's lock is never force-reclaimed.
+  await writeFile(lockFile, JSON.stringify({ pid: process.pid, acquiredAt: Date.now() - 60_000 }));
+
+  let resolved = false;
+  const pending = EditTransaction.begin([file]).then((tx) => { resolved = true; return tx; });
+  await new Promise((r) => setTimeout(r, 300));
+  assert.equal(resolved, false, "a lock owned by a live process must not be reclaimed");
+
+  // Release the fake lock manually (simulating the "real" owner finishing)
+  // so the still-polling begin() can proceed normally, then clean up.
+  await rm(lockFile, { force: true });
+  const tx = await pending;
+  await tx.rollback();
+});
+
+test("Bug 2 regression: commit() and rollback() await lock-file cleanup before resolving (no fire-and-forget)", async () => {
+  const dir = await makeTempDir("smart-edit-tx-await-release-");
+  const file = join(dir, "f.txt");
+  await writeFile(file, "a");
+  const lockFile = lockFileFor(file);
+  await mkdir(LOCK_DIR, { recursive: true });
+
+  const tx = await EditTransaction.begin([file]);
+  assert.equal(existsSync(lockFile), true);
+  await tx.write(file, "b");
+  await tx.commit();
+  // No polling: release must already be complete by the time commit()
+  // resolves, since it is now awaited internally rather than fire-and-forget.
+  assert.equal(existsSync(lockFile), false, "lock file must be gone immediately after commit() resolves");
+
+  const tx2 = await EditTransaction.begin([file]);
+  await tx2.write(file, "c");
+  await tx2.rollback();
+  assert.equal(existsSync(lockFile), false, "lock file must be gone immediately after rollback() resolves");
 });

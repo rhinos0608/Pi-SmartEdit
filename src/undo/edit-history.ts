@@ -242,11 +242,10 @@ export async function restoreUndoState(
       return await restoreTransactionUndoState(cwd, entry.transactionId);
     }
 
-    // Decode original content
-    const storedOriginalContent = Buffer.from(
-      entry.originalContent,
-      "base64",
-    ).toString("utf-8");
+    // Decode original content, retaining raw bytes: the file may not be
+    // valid UTF-8, and a string round-trip would corrupt it. The same buffer
+    // feeds the atomic restore below byte-exact.
+    const storedOriginalContent = Buffer.from(entry.originalContent, "base64");
 
     const isVersioned = entry.version === 2;
     const operation = entry.operation ?? "text";
@@ -353,9 +352,9 @@ export async function restoreTransactionUndoState(cwd: string, transactionId: st
         await fsRm(targetPath);
         if (entry.beforeMode !== undefined) await fsChmod(oldPath, entry.beforeMode);
       } else if (entry.operation === "delete") {
-        await atomicCreate(targetPath, Buffer.from(entry.originalContent, "base64").toString("utf8"), entry.beforeMode === undefined ? undefined : { mode: entry.beforeMode });
+        await atomicCreate(targetPath, Buffer.from(entry.originalContent, "base64"), entry.beforeMode === undefined ? undefined : { mode: entry.beforeMode });
       } else {
-        await atomicWrite(targetPath, Buffer.from(entry.originalContent, "base64").toString("utf8"), { mode: entry.beforeMode });
+        await atomicWrite(targetPath, Buffer.from(entry.originalContent, "base64"), { mode: entry.beforeMode });
         if (entry.beforeMode !== undefined) await fsChmod(targetPath, entry.beforeMode);
       }
     }

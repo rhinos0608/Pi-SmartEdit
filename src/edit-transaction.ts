@@ -20,18 +20,96 @@ const locks = new Map<string, Promise<void>>();
 const LOCK_DIR = join(tmpdir(), "pi-smartedit-locks");
 const LOCK_TIMEOUT_MS = 30_000;
 const LOCK_RETRY_MS = 25;
+/**
+ * Staleness threshold used ONLY as a fallback when a lock file's owner
+ * content cannot be parsed (legacy lock, or a read racing the writer's
+ * initial `writeFile`). Materially shorter than LOCK_TIMEOUT_MS so an
+ * abandoned lock is reclaimed quickly, but long enough that a brand-new
+ * lock file (age ~0) is never mistaken for abandoned.
+ */
+const LOCK_STALE_MS = 5_000;
 
 function lockFilePath(key: string): string {
   const hash = createHash("sha256").update(key).digest("hex").slice(0, 32);
   return join(LOCK_DIR, `${hash}.lock`);
 }
 
+interface LockFileInfo { pid: number; acquiredAt: number; }
+
+/** True if `pid` names a live process we can (at least in principle) signal. */
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM: the process exists but we lack permission to signal it -> alive.
+    // Any other error (typically ESRCH): no such process -> dead.
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function readLockFileInfo(lockPath: string): Promise<{ info: LockFileInfo | null; ageMs: number | null }> {
+  try {
+    const [content, st] = await Promise.all([readFile(lockPath, "utf8"), stat(lockPath)]);
+    let info: LockFileInfo | null = null;
+    try {
+      const parsed: unknown = JSON.parse(content);
+      if (
+        parsed && typeof parsed === "object" &&
+        typeof (parsed as Record<string, unknown>).pid === "number" &&
+        typeof (parsed as Record<string, unknown>).acquiredAt === "number"
+      ) {
+        info = parsed as LockFileInfo;
+      }
+    } catch {
+      // Corrupt or partially-written content (e.g. read racing the holder's
+      // initial writeFile); fall through with info=null and let the age
+      // check decide.
+    }
+    return { info, ageMs: Date.now() - st.mtimeMs };
+  } catch {
+    // Lock file vanished between our EEXIST and this read — the holder just
+    // released it. Nothing to reclaim; the next open() attempt will succeed.
+    return { info: null, ageMs: null };
+  }
+}
+
+/**
+ * A lock file left behind by a crashed process would otherwise block every
+ * subsequent transaction for the full LOCK_TIMEOUT_MS on every acquisition
+ * attempt, forever (nothing else ever removes it). Detect an abandoned lock
+ * — its recorded owner PID is no longer alive — and remove it so acquisition
+ * can retry immediately instead of waiting out the deadline. A live owner's
+ * lock is never reclaimed, no matter how old; only when owner info cannot be
+ * determined at all do we fall back to a conservative age threshold.
+ */
+async function reclaimIfAbandoned(lockPath: string): Promise<boolean> {
+  const { info, ageMs } = await readLockFileInfo(lockPath);
+  if (info) {
+    if (isProcessAlive(info.pid)) return false;
+    await rm(lockPath, { force: true }).catch(() => {});
+    return true;
+  }
+  if (ageMs !== null && ageMs > LOCK_STALE_MS) {
+    await rm(lockPath, { force: true }).catch(() => {});
+    return true;
+  }
+  return false;
+}
+
 /**
  * Acquire an exclusive filesystem lock for a resolved path. Uses O_EXCL
  * creation of a per-path lock file in a per-user temp dir, polling until
- * acquired or timed out. The returned release deletes the lock file.
+ * acquired or timed out. The lock file's content records the acquiring
+ * process's PID and acquisition time so a later acquirer can detect and
+ * reclaim an abandoned lock (see `reclaimIfAbandoned`) rather than waiting
+ * out the full timeout. The returned release is awaited by callers so a
+ * crash between "release resolves" and "unlink completes" cannot happen
+ * mid-await, and callers get a real guarantee the lock is gone before
+ * proceeding.
  */
-async function acquireFileLock(key: string): Promise<() => void> {
+async function acquireFileLock(key: string): Promise<() => Promise<void>> {
   await mkdir(LOCK_DIR, { recursive: true });
   const lockPath = lockFilePath(key);
   const deadline = Date.now() + LOCK_TIMEOUT_MS;
@@ -39,15 +117,18 @@ async function acquireFileLock(key: string): Promise<() => void> {
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
       handle = await open(lockPath, "wx");
+      const info: LockFileInfo = { pid: process.pid, acquiredAt: Date.now() };
+      await handle.writeFile(JSON.stringify(info));
       let released = false;
-      return () => {
+      return async () => {
         if (released) return;
         released = true;
-        void handle?.close().catch(() => {});
-        void rm(lockPath, { force: true }).catch(() => {});
+        await handle?.close().catch(() => {});
+        await rm(lockPath, { force: true }).catch(() => {});
       };
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      if (await reclaimIfAbandoned(lockPath)) continue; // retry acquisition immediately
       if (Date.now() > deadline) {
         throw new Error(`timed out acquiring filesystem lock for ${key} (${lockPath})`);
       }
@@ -62,9 +143,9 @@ async function acquireFileLock(key: string): Promise<() => void> {
  * cooperating transactions serialize on a shared filesystem view, both within
  * this process (promise chain) and across processes (per-path lock file).
  */
-async function acquire(paths: string[]): Promise<() => void> {
+async function acquire(paths: string[]): Promise<() => Promise<void>> {
   const keys = [...new Set(paths.map(path => resolve(path)))].sort();
-  const releases: Array<() => void> = [];
+  const releases: Array<() => Promise<void> | void> = [];
   try {
     for (const key of keys) {
       const prior = locks.get(key) ?? Promise.resolve();
@@ -75,9 +156,11 @@ async function acquire(paths: string[]): Promise<() => void> {
       releases.push(() => { release(); if (locks.get(key) === next) locks.delete(key); });
       releases.push(await acquireFileLock(key));
     }
-    return () => { releases.reverse().forEach(r => { r(); }); };
+    return async () => {
+      for (const r of releases.reverse()) { await r(); }
+    };
   } catch (err) {
-    releases.reverse().forEach(r => { r(); });
+    for (const r of releases.reverse()) { await r(); }
     throw err;
   }
 }
@@ -108,13 +191,15 @@ export class EditTransaction {
    *
    * Limits: the filesystem lock is advisory (only cooperating callers honor
    * it); it is not a POSIX flock and does not coordinate with non-EditTransaction
-   * writers. Cleanup is best-effort — a hard process kill can leave a stale
-   * lock file, which blocks acquisition until its 30s timeout; no stale-lock
-   * ownership recovery is attempted. Lock acquisition is polling-based.
+   * writers. A hard process kill can leave a stale lock file; a later
+   * acquirer detects the dead owner PID (or, failing that, the lock file's
+   * age) and reclaims it rather than waiting out the full 30s timeout. Lock
+   * acquisition is polling-based. Release is awaited end-to-end (handle
+   * close + lock file unlink) before commit()/rollback() resolve.
    */
   readonly paths: string[];
   readonly outcome: TransactionOutcome = { attempted: [], ok: [], restored: [], failed: [] };
-  private release?: () => void;
+  private release?: () => Promise<void>;
   private initialized = false;
   private snapshots = new Map<string, Snapshot>();
   private mutations: Mutation[] = [];
@@ -137,7 +222,7 @@ export class EditTransaction {
       tx.initialized = true;
       return tx;
     } catch (err) {
-      release();
+      await release();
       tx.release = undefined;
       throw err;
     }
@@ -145,6 +230,7 @@ export class EditTransaction {
 
   private ensureLock(): void {
     if (!this.initialized) throw new Error("transaction is not initialized");
+    if (this.done) throw new Error("transaction is already completed (commit or rollback)");
   }
 
   getSnapshot(path: string): Snapshot | undefined {
@@ -256,14 +342,14 @@ export class EditTransaction {
     this.outcome.ok = this.outcome.ok.filter(
       (p) => !this.outcome.restored.includes(p) && !this.outcome.failed.includes(p),
     );
-    this.done = true; this.release?.(); this.release = undefined;
+    this.done = true; await this.release?.(); this.release = undefined;
     return this.outcome;
   }
 
   async commit(): Promise<TransactionOutcome> {
     if (!this.done) {
       this.done = true;
-      this.release?.();
+      await this.release?.();
       this.release = undefined;
     }
     return this.outcome;
