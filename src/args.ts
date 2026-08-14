@@ -303,6 +303,14 @@ export function prepareArguments(input: Record<string, unknown>, useHashlineEdit
 
   const args = { ...input } as Record<string, unknown>;
 
+  // Canonical raw patch calls carry their path(s) inside the patch content
+  // (e.g. `--- a/path` / `+++ b/path` headers), so a missing top-level path
+  // is not an error. Return them unchanged: validation and normalization
+  // happen in validateEditRequest and the patch adapter.
+  if (typeof args.raw === "string" && args.raw.length > 0) {
+    return args;
+  }
+
   // ── Early validation for missing required fields ────────────
   // The built-in schema validation rejects these with a terse generic error
   // like "must have required properties path". We catch them here with

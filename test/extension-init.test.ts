@@ -432,6 +432,25 @@ test("prepareArguments does not merge - flat fields overwrite edits", () => {
   assert.equal(result.edits[0].newText, "new");
 });
 
+test("prepareArguments passes raw unified diffs through without a top-level path", () => {
+  const pi = createMockPI();
+  init(pi);
+  const editTool = pi._tools.get("edit")!;
+  const prepare = editTool.prepareArguments!;
+
+  // Canonical raw call: the patch's path(s) live inside the diff headers, so
+  // a missing top-level path must not fail preparation — the patch adapter
+  // validates and normalizes the raw content at execution time.
+  const rawCall = {
+    raw: "--- a/one.ts\n+++ b/one.ts\n@@ -1 +1 @@\n-a\n+b",
+    toolCallId: "raw-call",
+  };
+  const result = prepare(rawCall) as Record<string, unknown>;
+  assert.equal(result.raw, rawCall.raw, "raw patch must pass through unchanged");
+  assert.equal(result.path, undefined, "no top-level path required for raw calls");
+  assert.equal(result.toolCallId, "raw-call");
+});
+
 test("extension registers event handlers", () => {
   const pi = createMockPI();
   init(pi);

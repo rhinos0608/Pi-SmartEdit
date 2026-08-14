@@ -76,7 +76,10 @@ export function normalizeRawEdit(raw: string, defaultPath?: string): NormalizedR
               }
             }
             const joined = addLines.join("\n");
-            intents.push({ kind: "add", path: newPath, content: noNewline ? joined : `${joined}\n` });
+            // An added file with no added lines is an empty file; do not append
+            // the trailing newline an empty diff would imply.
+            const content = addLines.length === 0 ? "" : (noNewline ? joined : `${joined}\n`);
+            intents.push({ kind: "add", path: newPath, content });
           } else if (oldPath && !newPath) intents.push({ kind: "delete", path: oldPath });
           else {
             for (const h of patch.hunks) {

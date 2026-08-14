@@ -43,6 +43,7 @@ import { runPostEditEvidencePipeline } from "./verification/post-edit-evidence";
 import { recordBreakage, recordCoChange } from "./smartread-bridge";
 import { createPatchTool, type PatchToolDeps, type PatchToolDetails } from "./patch.js";
 import { normalizeLegacyEditRequest } from "./edit-contract.js";
+import { normalizeRawEdit } from "./edit-intents.js";
 import { createPriorAuthorityStore, type PriorAuthorityStore } from "./evidence-authority.js";
 import { createRpcClient, RPC_CHANNELS } from "@rhinos0608/pi-workspace-protocol";
 
@@ -95,6 +96,7 @@ export function resolveEditPath(cwd: string, targetPath: string): string {
 type EditRenderArgs = {
   path?: unknown;
   edits?: unknown;
+  raw?: unknown;
 };
 
 type EditRenderResult = {
@@ -126,21 +128,65 @@ function renderEditDiff(diff: string, theme: Theme): string {
   }).join("\n");
 }
 
+/**
+ * Extract display paths from a raw patch string (unified diff, search/replace,
+ * OpenAI/Codex patch, Atomic Patch, etc.) by reusing the same intent parsing
+ * the edit tool applies at execution time. A raw call can legitimately have
+ * neither a top-level `path` nor an `edits` array — the path(s) live inside
+ * the raw diff content itself (e.g. `--- a/path` / `+++ b/path` headers).
+ * Never throws: parse failures simply yield no paths, so the caller falls
+ * back to its existing "missing path" display.
+ */
+function getRawEditDisplayPaths(raw: string, defaultPath: string | undefined): string[] {
+  try {
+    const normalized = normalizeRawEdit(raw, defaultPath);
+    const paths = normalized.intents.flatMap((intent): (string | undefined)[] => {
+      switch (intent.kind) {
+        case "text":
+          return [intent.operation.path];
+        case "add":
+        case "delete":
+          return [intent.path];
+        case "rename":
+          return [intent.newPath, intent.oldPath];
+        default:
+          return [];
+      }
+    });
+    return [...new Set(paths.filter((path): path is string => Boolean(path)))];
+  } catch {
+    return [];
+  }
+}
+
 export function getEditDisplayPaths(args: unknown): string[] {
   if (!args || typeof args !== "object") return [];
   const input = args as EditRenderArgs;
   const defaultPath = typeof input.path === "string" ? input.path : undefined;
   const edits = Array.isArray(input.edits) ? input.edits : [];
-  const paths = edits
-    .map((edit) => {
-      if (!edit || typeof edit !== "object") return defaultPath;
-      const itemPath = (edit as { path?: unknown }).path;
-      return typeof itemPath === "string" ? itemPath : defaultPath;
-    })
-    .filter((path): path is string => Boolean(path));
 
-  if (paths.length === 0 && defaultPath) paths.push(defaultPath);
-  return [...new Set(paths)];
+  if (edits.length > 0) {
+    const paths = edits
+      .map((edit) => {
+        if (!edit || typeof edit !== "object") return defaultPath;
+        const itemPath = (edit as { path?: unknown }).path;
+        return typeof itemPath === "string" ? itemPath : defaultPath;
+      })
+      .filter((path): path is string => Boolean(path));
+
+    if (paths.length === 0 && defaultPath) paths.push(defaultPath);
+    return [...new Set(paths)];
+  }
+
+  // No `edits` array — a raw patch call carries its path(s) inside the raw
+  // diff content instead of top-level fields. Parse it the same way the
+  // tool does at execution time rather than falling straight to "missing path".
+  if (typeof input.raw === "string" && input.raw.length > 0) {
+    const rawPaths = getRawEditDisplayPaths(input.raw, defaultPath);
+    if (rawPaths.length > 0) return rawPaths;
+  }
+
+  return defaultPath ? [defaultPath] : [];
 }
 
 export function renderEditCall(args: unknown, theme: Theme): Component {

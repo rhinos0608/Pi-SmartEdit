@@ -256,6 +256,14 @@ describe("prepareArguments", () => {
     assert.deepStrictEqual(prepared.edits, [{ path: "src/foo.ts", oldText: "old", newText: "new" }]);
   });
 
+  test("passes canonical raw patches through unchanged before path validation", () => {
+    // A raw patch carries its path(s) inside the diff content, so a missing
+    // top-level path is not an error at prepare time — validateEditRequest
+    // and the patch adapter handle it.
+    const raw = "--- a/one.ts\n+++ b/one.ts\n@@ -1 +1 @@\n-a\n+b";
+    assert.deepStrictEqual(prepareArguments({ raw }, false), { raw });
+  });
+
   test("rejects legacy raw topology formats before filesystem access", () => {
     assert.throws(
       () => prepareArguments({

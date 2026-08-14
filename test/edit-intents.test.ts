@@ -39,6 +39,14 @@ describe("raw edit normalization", () => {
     );
   });
 
+  it("produces empty content for an added file with no hunk content", () => {
+    // Zero added lines must yield an empty file, not a single newline.
+    assert.deepEqual(
+      normalizeRawEdit("--- /dev/null\n+++ b/empty.ts\n@@ -0,0 +0,0 @@\n").intents,
+      [{ kind: "add", path: "empty.ts", content: "" }],
+    );
+  });
+
   it("preserves topology and operation ordering across patch dialects", () => {
     assert.deepEqual(
       normalizeRawEdit("*** Begin Patch\n*** Delete File: old.ts\n*** End Patch").intents,
