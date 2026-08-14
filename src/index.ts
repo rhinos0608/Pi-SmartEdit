@@ -11,11 +11,10 @@
 
 import type { ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth, visibleWidth, type Component } from "@mariozechner/pi-tui";
-import { Type } from "typebox";
 
-import { constants, statSync } from "fs";
-import { access as fsAccess, readFile as fsReadFile, stat as fsStat } from "fs/promises";
-import { dirname, resolve } from "path";
+import { realpathSync, statSync } from "fs";
+import { readFile as fsReadFile } from "fs/promises";
+import { resolve } from "path";
 import { sortHashlineEditsForApplication, formatHashlineBatchSummary } from "./hashline-batching.js";
 import {
   prepareArguments,
@@ -27,38 +26,30 @@ import { createConflictDetector, defaultConflictConfig } from "./core/conflict-d
 import { createAstResolver } from "./core/ast-resolver";
 
 import { recordRead, recordReadSession, getSnapshot } from "./core/read-cache";
-import type { HashlineEditInput } from "./core/hashline-edit";
+
 import { buildHashlineAnchors } from "./core/hashline";
 
 import { LSPManager } from "./lsp/lsp-manager";
 import { checkPostEditDiagnostics } from "./lsp/diagnostics";
-import { deferredDiagnostics } from "./lsp/deferred-diagnostics";
 import { getCompilerForLanguage } from "./lsp/diagnostic-dispatcher";
-import type { DiagnosticResult } from "./lsp/diagnostic-dispatcher";
+import { detectLanguageFromExtension } from "./lsp/language-id";
 
-import { recordBreakage, recordCoChange } from "./smartread-bridge";
+
+
 import { getSmartEditRuntimeConfig } from "./edit-mode";
-import { saveUndoState } from "./undo/edit-history";
-import { atomicWrite } from "./undo/atomic-write";
-import { MatchError } from "./core/errors";
-import { runAutoValidation, formatValidationFeedback, resetRetryCounts, checkStructural, incrementRetryCount as incRetryCount } from "./verification/auto-validate";
-import { applySymbolicEdits, buildSymbolicEditGuidance, resolveSymbolicEditLineRange } from "./symbolic-edits";
-import type { SymbolicEditRequest } from "./symbolic-edits";
-import { computeAnchorDelta, formatAnchorDeltaForModel, ANCHOR_CHURN_THRESHOLD, type AnchorDelta } from "./anchor-registry";
-import { isAstGrepAvailable, findWithPattern, replaceWithPattern } from "./astgrep-anchor";
+import { runAutoValidation, formatValidationFeedback, resetRetryCounts } from "./verification/auto-validate";
+import { runRepairLoop } from "./verification/repair-loop";
+import { runPostEditEvidencePipeline } from "./verification/post-edit-evidence";
+import { recordBreakage, recordCoChange } from "./smartread-bridge";
 import { createPatchTool, type PatchToolDeps, type PatchToolDetails } from "./patch.js";
+import { normalizeLegacyEditRequest } from "./edit-contract.js";
+import { createPriorAuthorityStore, type PriorAuthorityStore } from "./evidence-authority.js";
 import { createRpcClient, RPC_CHANNELS } from "@rhinos0608/pi-workspace-protocol";
 
 import type {
-  EditTarget,
-  EditItem,
-  EditInput,
   EditResult,
   EditCapability,
-  MatchSpan,
-  SearchScope,
 } from "./core/types";
-import { MatchTier } from "./core/types";
 
 const smartEditRuntimeConfig = getSmartEditRuntimeConfig();
 
@@ -75,89 +66,27 @@ function coerceText(value: unknown): string {
   }
 }
 
+function lineRangeToOffsets(content: string, range: { startLine: number; endLine: number }): { startIndex: number; endIndex: number } {
+  const lines = content.split("\n");
+  const offsetForLine = (line: number): number => lines.slice(0, Math.max(line - 1, 0)).reduce((offset, value) => offset + value.length + 1, 0);
+  return {
+    startIndex: offsetForLine(range.startLine),
+    endIndex: Math.min(offsetForLine(range.endLine + 1), content.length),
+  };
+}
+
+function omitAgentEvidenceRef(args: Record<string, unknown>): Record<string, unknown> {
+  if (!Object.prototype.hasOwnProperty.call(args, "evidenceRef")) return args;
+  const { evidenceRef: _ignored, ...toolOwnedArgs } = args;
+  return toolOwnedArgs;
+}
+
 // ─── Schema ───────────────────────────────────────────────────────
-// Rich edit metadata is validated directly. Legacy path-encoded metadata
-// remains decode-only compatibility input during migration.
+// The canonical edit request schema lives in src/edit-contract.ts
+// (EDIT_PARAMETERS) and is the single registration source. Rich edit
+// metadata is validated there. Legacy path-encoded metadata remains
+// decode-only compatibility input during migration.
 
-
-const editItemSchema = Type.Object(
-  {
-    path: Type.Optional(Type.String({ description: "File path for this edit. Required on every item in a multi-file call." })),
-    oldText: Type.Optional(Type.String()),
-    newText: Type.Optional(Type.String()),
-    description: Type.Optional(Type.String({ description: "Optional label echoed in diagnostics for self-reference." })),
-    replaceAll: Type.Optional(Type.Boolean({
-      description: "Replace every non-overlapping occurrence for this edit. Overrides top-level replaceAll.",
-    })),
-    hashline: Type.Optional(Type.Object(
-      {
-        range: Type.Object({
-          pos: Type.String({ description: "Start hashline anchor, optionally with :before or :after." }),
-          end: Type.String({ description: "End hashline anchor." }),
-        }),
-        content: Type.Optional(Type.Union([
-          Type.Array(Type.String()),
-          Type.String(),
-          Type.Null(),
-        ])),
-        symbol: Type.Optional(Type.Object({
-          name: Type.String(),
-          kind: Type.Optional(Type.String()),
-          line: Type.Optional(Type.Number()),
-        })),
-      },
-      { description: "Freshness-checked hashline edit metadata." },
-    )),
-    target: Type.Optional(Type.Object(
-      {
-        name: Type.Optional(Type.String({ description: "Symbol name to target (e.g., function name, class name)." })),
-        namePath: Type.Optional(Type.String({ description: "Qualified symbol path; the final component is matched by AST name (e.g., 'MyClass.myMethod')." })),
-        kind: Type.Optional(Type.String({ description: "AST node kind hint (e.g., 'function_declaration', 'class_declaration')." })),
-        line: Type.Optional(Type.Number({ description: "1-based line hint for disambiguation when multiple symbols share a name." })),
-        replaceBody: Type.Optional(Type.String({ description: "Replace the entire AST symbol definition with this text." })),
-        insertBefore: Type.Optional(Type.String({ description: "Insert this text immediately before the AST symbol definition." })),
-        insertAfter: Type.Optional(Type.String({ description: "Insert this text immediately after the AST symbol definition." })),
-        description: Type.Optional(Type.String({ description: "Optional target label for diagnostics." })),
-        pattern: Type.Optional(Type.String({ description: "ast-grep structural pattern." })),
-        replacement: Type.Optional(Type.String({ description: "Replacement for ast-grep pattern matches." })),
-      },
-      {
-        description:
-          "AST symbol target. When used with oldText/newText, scopes the text search within the symbol's byte range. " +
-          "When used with replaceBody/insertBefore/insertAfter, operates on the whole symbol. " +
-          "Provide at most one of replaceBody, insertBefore, or insertAfter.",
-      },
-    )),
-  },
-);
-
-const editSchema = Type.Object(
-  {
-    path: Type.Optional(Type.String({
-      description: "Default file path for single-file edits. May be omitted when each edit includes its own path.",
-    })),
-    replaceAll: Type.Optional(
-      Type.Boolean({
-        description:
-          "When true, replaces every non-overlapping occurrence of oldText in each edit. " +
-          "Default: false (requires unique match).",
-      }),
-    ),
-    edits: Type.Union([
-      Type.Array(editItemSchema, {
-        description:
-          "One or more targeted edits using oldText/newText or symbol targets. " +
-          "Edits are matched against the original file, not incrementally. " +
-          "\nDo not include overlapping or nested edits — merge nearby changes into one edit.",
-      }),
-      Type.String({
-        description:
-          "JSON string of edits array. Accepted for compatibility with models " +
-          "that serialize the array into a string somewhere in the tool-calling pipeline.",
-      }),
-    ]),
-  },
-);
 
 export function resolveEditPath(cwd: string, targetPath: string): string {
   return resolve(cwd, targetPath);
@@ -236,9 +165,11 @@ export function renderEditResult(
     (entry) => typeof entry.path === "string" && typeof entry.diff === "string" && entry.diff.length > 0,
   );
   if (diffs && diffs.length > 0) {
-    const output = diffs
-      .map((entry) => `${theme.fg("accent", entry.path)}\n${renderEditDiff(entry.diff, theme)}`)
-      .join("\n\n");
+    const output = diffs.length === 1
+      ? renderEditDiff(diffs[0].diff, theme)
+      : diffs
+          .map((entry) => `${theme.fg("accent", entry.path)}\n${renderEditDiff(entry.diff, theme)}`)
+          .join("\n\n");
     return new EditTextComponent(output, 1);
   }
   if (typeof details?.diff === "string" && details.diff.length > 0) {
@@ -311,7 +242,6 @@ let conflictDetector: ReturnType<typeof createConflictDetector> | null = null;
 /** LSP manager instance, created once per session. */
 let lspManager: LSPManager | null = null;
 
-
 /**
  * Compute the containing line range for a set of edits from their oldText.
  * Returns [startLine, endLine] (1-based) or null if oldText can't be located.
@@ -327,9 +257,28 @@ export { sortHashlineEditsForApplication, formatHashlineBatchSummary };
 // ─── Extension entry point ──────────────────────────────────────────
 
 export default function smartEdit(pi: ExtensionAPI) {
+  /** Per-extension, per-session authority; never shared across Pi instances. */
+  let priorAuthorityStore: PriorAuthorityStore | null = null;
+
   // ── Populate read cache on every successful read ──
   pi.on("tool_result", async (event, _ctx) => {
     const toolCwd = process.cwd();
+
+    // ── Ingest SmartRead workspace evidence into prior authority store ──
+    // Tool-owned evidence policy B: validated `details.workspaceEvidence`
+    // envelopes are recorded as they arrive; the store indexes the latest
+    // strong resource per canonical path and ignores weak evidence.
+    try {
+      const wsEvidence = !event.isError
+        ? (event.details as { workspaceEvidence?: unknown } | undefined)?.workspaceEvidence
+        : undefined;
+      if (wsEvidence) {
+        priorAuthorityStore?.record(wsEvidence);
+      }
+    } catch {
+      /* silently ignore evidence ingestion errors */
+    }
+
     if (
       event.toolName === "read" &&
       !event.isError &&
@@ -650,9 +599,11 @@ export default function smartEdit(pi: ExtensionAPI) {
   // ── Initialize per-session state ──
   let currentSessionFilePath: string | null = null;
   let currentCanonicalWorkspaceRoot: string | null = null;
+  let currentCwd: string | null = null;
 
   pi.on("session_start", async (_event, ctx) => {
     const sessionCwd = process.cwd();
+    currentCwd = sessionCwd;
     // Create AST resolver (returns null if Tree-sitter unavailable)
     astResolver = createAstResolver();
 
@@ -687,12 +638,20 @@ export default function smartEdit(pi: ExtensionAPI) {
     } catch {
       currentCanonicalWorkspaceRoot = null;
     }
+
+    // Create the per-session prior-authority store bound to this session.
+    priorAuthorityStore = createPriorAuthorityStore({
+      sessionFilePath: currentSessionFilePath ?? "",
+      canonicalWorkspaceRoot: currentCanonicalWorkspaceRoot ?? "",
+    });
   });
 
   // ── Shutdown on session end ──
   pi.on("session_shutdown", async () => {
     await lspManager?.shutdown();
     lspManager = null;
+    priorAuthorityStore?.clear();
+    priorAuthorityStore = null;
   });
 
 
@@ -708,26 +667,111 @@ export default function smartEdit(pi: ExtensionAPI) {
       getRpcClient: () => createRpcClient({ bus, channel: RPC_CHANNELS.inspectPatch, timeoutMs: 2000 }),
       getSessionFilePath: () => currentSessionFilePath,
       getCanonicalWorkspaceRoot: () => currentCanonicalWorkspaceRoot ?? "",
+      getPriorAuthority: () => priorAuthorityStore,
+      getAstResolver: () => astResolver,
+      getSnapshot: (path) => (currentCwd ? getSnapshot(path, currentCwd) : null),
+      // The coordinator owns acceptance and evidence reauthorization; the
+      // extension only supplies the session-bound repair implementation.
+      runRepair: ({ path, content, cwd }) => runRepairLoop(path, content, {}, cwd),
+      // These lanes are invoked by patch only after a successful commit.  The
+      // extension supplies session-owned LSP state; the coordinator owns the
+      // ordering and result assembly.
+      runFinalSuccessLanes: async ({ cwd, files }) => {
+        const diagnostics: string[] = [];
+        const checks: Array<{ id: string; outcome: "pass" | "fail" | "skipped" | "timeout"; detail?: string }> = [];
+        const evidence: unknown[] = [];
+        for (const file of files) {
+          const languageId = detectLanguageFromExtension(file.path);
+          if (!languageId) {
+            checks.push({ id: `diagnostics:${file.path}`, outcome: "skipped", detail: "no language diagnostic lane" });
+            continue;
+          }
+          if (lspManager) {
+            const lsp = await checkPostEditDiagnostics(file.path, file.content, languageId, lspManager);
+            const lspHasError = lsp.diagnostics.some((d) => d.severity === 1);
+            checks.push({ id: `lsp:${file.path}`, outcome: lspHasError ? "fail" : "pass", detail: `${lsp.diagnostics.length} diagnostic(s), ${lsp.source}` });
+            diagnostics.push(...lsp.diagnostics.map((d) => `lsp ${file.path}:${d.range.start.line + 1}: ${d.message}`));
+          }
+          const compiler = getCompilerForLanguage(languageId);
+          if (compiler) {
+            const result = await compiler(file.path, cwd);
+            const compilerHasError = result.diagnostics.some((d) => d.severity === 1);
+            checks.push({ id: `compiler:${file.path}`, outcome: compilerHasError ? "fail" : "pass", detail: `${result.diagnostics.length} diagnostic(s), ${result.source}` });
+            diagnostics.push(...result.diagnostics.map((d) => `${d.source} ${file.path}:${d.range.start.line + 1}: ${d.message}`));
+            for (const diagnostic of result.diagnostics) {
+              if (!diagnostic.filePath) continue;
+              // Canonicalize the compiler-reported path before recording a
+              // breakage edge (realpath resolves symlinks), while preserving
+              // the edited-file and context arguments.
+              let canonicalDiagPath: string;
+              try {
+                canonicalDiagPath = realpathSync(resolve(cwd, diagnostic.filePath));
+              } catch {
+                canonicalDiagPath = resolve(cwd, diagnostic.filePath);
+              }
+              if (canonicalDiagPath !== file.path) {
+                recordBreakage(cwd, file.path, canonicalDiagPath, diagnostic.message);
+              }
+            }
+          }
+          const post = await runPostEditEvidencePipeline({
+            cwd,
+            path: file.path,
+            content: file.content,
+            oldContent: file.oldContent,
+            languageId,
+            matchSpans: file.changedLineRanges.map((range) => lineRangeToOffsets(file.content, range)),
+            editedPaths: files.map((entry) => entry.path),
+            lspManager: lspManager as unknown as { getServer(languageId: string): unknown } | null,
+            config: { repair: { enabled: false, maxRetries: 0, autoRepair: false, notifyOnRetry: false } },
+          });
+          evidence.push(post);
+          diagnostics.push(...post.notes);
+        }
+        for (let i = 0; i < files.length; i++) {
+          for (let j = i + 1; j < files.length; j++) {
+            recordCoChange(cwd, files[i].path, files[j].path, "committed in one SmartEdit transaction");
+          }
+        }
+        return { diagnostics, checks, evidence };
+      },
     };
     const patchTool = createPatchTool(patchDeps);
     (pi.registerTool as (t: unknown) => void)({
       ...patchTool,
       name: "edit",
       label: "edit",
+      // Canonical schema (EDIT_PARAMETERS) already omits `evidenceRef` and
+      // carries the canonical description unchanged.
+      parameters: patchTool.parameters,
       renderShell: "self",
       renderCall: renderEditCall,
       renderResult: renderEditResult,
+
+      execute(
+        toolCallId: string,
+        params: Record<string, unknown>,
+        signal: AbortSignal | undefined,
+        onUpdate: ((u: { content: Array<{ type: "text"; text: string }> }) => void) | undefined,
+        ctx: { cwd: string; hasUI?: boolean; ui?: unknown; [k: string]: unknown },
+      ) {
+        return patchTool.execute(
+          toolCallId,
+          omitAgentEvidenceRef(params),
+          signal,
+          onUpdate,
+          ctx,
+        );
+      },
 
       // Compatibility shim for resumed sessions with stored `edit` calls
       // using flat oldText/newText instead of edits array.
       prepareArguments(args: Record<string, unknown> | undefined): Record<string, unknown> {
         if (!args || typeof args !== "object") return args ?? {};
-        const input = args as { oldText?: unknown; newText?: unknown };
-        if (typeof input.oldText !== "string" || typeof input.newText !== "string") {
-          return args;
-        }
-        // Migrate flat single oldText/newText to edits array.
-        return { ...args, edits: [{ oldText: input.oldText, newText: input.newText }] };
+        const toolOwnedArgs = omitAgentEvidenceRef(args);
+        // Migrate flat single oldText/newText to edits array via the canonical
+        // contract normalizer (flat fields are authoritative).
+        return normalizeLegacyEditRequest(toolOwnedArgs);
       },
     } as unknown);
   }

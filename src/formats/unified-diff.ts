@@ -267,6 +267,7 @@ export function rebaseHunkContext(oldText: string, newText: string, fileContent:
   // Find the closest matching window in the file for our hunk
   let bestStart = -1;
   let bestScore = 0;
+  let ambiguousWindowCount = 0;
   for (let i = 0; i <= fileLines.length - oldLines.length; i++) {
     const window = fileLines.slice(i, i + oldLines.length);
     let matches = 0;
@@ -274,11 +275,13 @@ export function rebaseHunkContext(oldText: string, newText: string, fileContent:
       if (oldLines[j].trimEnd() === window[j]?.trimEnd()) matches++;
     }
     const score = matches / oldLines.length;
-    if (score > bestScore) { bestScore = score; bestStart = i; }
+    if (score > bestScore) { bestScore = score; bestStart = i; ambiguousWindowCount = 1; }
+    else if (score === bestScore && score >= 0.7) { ambiguousWindowCount++; }
   }
 
   // If we found a high-similarity window (>= 0.7), rebase to actual file lines
-  if (bestScore >= 0.7 && bestStart !== -1) {
+  // If multiple windows score at or above threshold, fall through (ambiguous)
+  if (bestScore >= 0.7 && bestStart !== -1 && ambiguousWindowCount <= 1) {
     const rebasedLines = fileLines.slice(bestStart, bestStart + oldLines.length);
     const rebasedOld = rebasedLines.join('\n');
     if (fileContent.includes(rebasedOld)) {

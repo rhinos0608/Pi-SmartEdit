@@ -14,10 +14,13 @@ import {
   stat as fsStat,
   chmod as fsChmod,
   rename as fsRename,
+  link as fsLink,
   unlink as fsUnlink,
   writeFile as fsWriteFile,
 } from "fs/promises";
 import { resolve, dirname, basename } from "path";
+
+export type AtomicWriteContent = string | Uint8Array;
 
 export interface AtomicWriteOptions {
   /** Mode bits to apply to the new file */
@@ -25,6 +28,33 @@ export interface AtomicWriteOptions {
 
   /** Path to read mode bits from (alternative to mode) */
   modeSource?: string;
+}
+
+/** Create file atomically without replacing a concurrent creator. */
+export async function atomicCreate(
+  filePath: string,
+  content: AtomicWriteContent,
+  options?: AtomicWriteOptions,
+): Promise<void> {
+  const dir = dirname(filePath);
+  const base = basename(filePath);
+  const tmpPath = resolve(dir, `.${base}.smart_edit_create_${randomBytes(6).toString("hex")}`);
+  try {
+    await fsWriteFile(tmpPath, content, { encoding: "utf-8", mode: options?.mode ?? 0o600, flag: "wx" });
+    if (options?.mode !== undefined) await fsChmod(tmpPath, options.mode);
+    try {
+      await fsLink(tmpPath, filePath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+        throw Object.assign(new Error(`create conflict: ${filePath}`), { code: "EEXIST" });
+      }
+      throw err;
+    }
+    await fsUnlink(tmpPath).catch(() => {});
+  } catch (err) {
+    await fsUnlink(tmpPath).catch(() => {});
+    throw err;
+  }
 }
 
 /**
@@ -36,7 +66,7 @@ export interface AtomicWriteOptions {
  */
 export async function atomicWrite(
   filePath: string,
-  content: string,
+  content: AtomicWriteContent,
   options?: AtomicWriteOptions,
 ): Promise<void> {
   const dir = dirname(filePath);
@@ -68,7 +98,11 @@ export async function atomicWrite(
     }
 
     // Write to temp with restrictive mode (0o600) for security
-    await fsWriteFile(tmpPath, content, { encoding: "utf-8", mode: 0o600 });
+    await fsWriteFile(
+      tmpPath,
+      content,
+      typeof content === "string" ? { encoding: "utf-8", mode: 0o600 } : { mode: 0o600 },
+    );
 
     // Read mode immediately before chmod (after write, in case file was replaced)
     if (mode !== undefined) {
@@ -107,7 +141,11 @@ export async function atomicWrite(
       const targetTmpPath = resolve(dir, targetTmpName);
 
       // Write with restrictive mode
-      await fsWriteFile(targetTmpPath, content, { encoding: "utf-8", mode: 0o600 });
+      await fsWriteFile(
+        targetTmpPath,
+        content,
+        typeof content === "string" ? { encoding: "utf-8", mode: 0o600 } : { mode: 0o600 },
+      );
 
       // Apply mode if we determined one earlier
       if (effectiveMode !== undefined) {

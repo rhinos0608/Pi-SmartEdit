@@ -1,13 +1,14 @@
-import type { EditItem, SearchScope } from "./core/types";
+import type { EditItem, EditAnchor, SearchScope, LineRange } from "./core/types";
 import type { ParseResult } from "./core/ast-resolver";
+import { lineRangeToByteRange, validateLineRange } from "./core/edit-diff.js";
 
 /**
  * The shape of the AST resolver object used by anchor resolution.
  * Matches the return type of createAstResolver() in ast-resolver.ts.
  */
-interface AstResolverLike {
+export interface AstResolverLike {
   parseFile(content: string, filePath: string): Promise<ParseResult | null>;
-  findSymbolNode(tree: { rootNode?: unknown; walk?: () => unknown }, anchor: { symbolName?: string; symbolKind?: string; symbolLine?: number }): unknown;
+  findSymbolNode(tree: { rootNode?: unknown; walk?: () => unknown }, anchor: { symbolName?: string; symbolNamePath?: string; symbolKind?: string; symbolLine?: number }): unknown;
   disposeParseResult(result: ParseResult): void;
 }
 
@@ -98,49 +99,131 @@ export function computeEditContainingRange(
 }
 
 /**
+ * Derive an AST anchor from an edit's `target` (name/namePath/kind/line) or
+ * legacy `anchor` field. Returns null when the edit carries no AST identifier.
+ * `namePath` is resolved by matching its final component against the AST name.
+ */
+export function anchorFromEdit(edit: EditItem): EditAnchor | null {
+  const t = edit.target;
+  if (t) {
+    const namePathParts = t.namePath?.split(/[/.#]/).filter(Boolean) ?? [];
+    const name = t.name ?? namePathParts[namePathParts.length - 1];
+    if (!name && t.line == null) return null;
+    return {
+      symbolName: name,
+      symbolNamePath: namePathParts.length > 0 ? namePathParts.join(".") : undefined,
+      symbolKind: t.kind,
+      symbolLine: t.line,
+    };
+  }
+  const a = edit.anchor;
+  if (a) {
+    if (!a.symbolName && a.symbolLine == null) return null;
+    return { symbolName: a.symbolName, symbolKind: a.symbolKind, symbolLine: a.symbolLine };
+  }
+  return null;
+}
+
+/**
+ * Optional diagnostics surfaced from anchor resolution so callers (e.g. the
+ * edit planner) can distinguish a parser/AST failure from a genuine
+ * symbol-not-found result.
+ */
+export interface AnchorResolutionDiagnostics {
+  /** Set when the AST parser failed or the tree reports syntax errors. */
+  parseError?: string;
+}
+
+/**
  * Resolve an edit's anchor/lineRange to a SearchScope for narrowing.
  * Called per-edit before matching.
+ *
+ * Returns null when the edit has no AST identifier, when no AST resolver is
+ * available, or when the AST target cannot be resolved. Callers that require
+ * an explicit scope must treat a null result for a target-bearing edit as a
+ * resolution failure (never fall back to whole-file matching).
+ *
+ * When provided, `diagnostics` is populated with a `parseError` describing
+ * parser/AST failures, so callers can distinguish those from a symbol that
+ * simply could not be found. Unresolved (null) and finally-disposal behavior
+ * are preserved.
  */
 export async function resolveAnchorToScope(
   edit: EditItem,
   content: string,
   filePath: string,
   astResolver: AstResolverLike | null,
+  diagnostics?: AnchorResolutionDiagnostics,
 ): Promise<SearchScope | null> {
-  // Priority 1: AST anchor by symbol name (from target.name)
-  if (edit.target?.name && astResolver) {
-    let parseResult: ParseResult | null = null;
-    try {
-      parseResult = await astResolver.parseFile(content, filePath);
-      if (parseResult) {
-        const anchor = {
-          symbolName: edit.target.name,
-          symbolKind: edit.target.kind,
-          symbolLine: edit.target.line,
+  const anchor = anchorFromEdit(edit);
+  if (!anchor) return null;
+  if (!astResolver) return null;
+  let parseResult: ParseResult | null = null;
+  try {
+    parseResult = await astResolver.parseFile(content, filePath);
+    if (parseResult) {
+      if (parseResult.diagnostic && diagnostics) {
+        diagnostics.parseError = parseResult.diagnostic;
+      }
+      const targetNode = astResolver.findSymbolNode(
+        parseResult.tree,
+        anchor,
+      );
+      if (targetNode) {
+        const node = targetNode as { startIndex: number; endIndex: number; type: string };
+        return {
+          startIndex: node.startIndex,
+          endIndex: node.endIndex,
+          description: `${node.type} "${anchor.symbolName ?? anchor.symbolLine}"`,
+          source: "anchor",
         };
-        const targetNode = astResolver.findSymbolNode(
-          parseResult.tree,
-          anchor,
-        );
-        if (targetNode) {
-          const node = targetNode as { startIndex: number; endIndex: number; type: string };
-          const scope: SearchScope = {
-            startIndex: node.startIndex,
-            endIndex: node.endIndex,
-            description: `${node.type} "${edit.target.name}"`,
-            source: "anchor",
-          };
-          return scope;
-        }
       }
-    } catch {
-      // AST resolution failed
-    } finally {
-      if (parseResult) {
-        astResolver?.disposeParseResult(parseResult);
-      }
+    } else if (diagnostics) {
+      diagnostics.parseError =
+        "AST parser could not parse the file (unsupported language, missing grammar, or parse error).";
+    }
+  } catch (err) {
+    // AST resolution failed — surface a diagnostic when requested.
+    if (diagnostics) {
+      diagnostics.parseError =
+        err instanceof Error ? err.message : String(err);
+    }
+  } finally {
+    if (parseResult) {
+      astResolver?.disposeParseResult(parseResult);
     }
   }
-
   return null;
+}
+
+/**
+ * Convert a 1-based inclusive line range to a byte-range SearchScope.
+ * Returns null when the range is out of bounds for the content.
+ */
+export function lineRangeToScope(content: string, range: LineRange): SearchScope | null {
+  const totalLines = content.split("\n").length;
+  const err = validateLineRange(range, totalLines);
+  if (err) return null;
+  const { startIndex, endIndex } = lineRangeToByteRange(content, range);
+  return {
+    startIndex,
+    endIndex,
+    description: `lines ${range.startLine}-${range.endLine}`,
+    source: "lineRange",
+  };
+}
+
+/**
+ * Intersect two byte-range scopes. Returns null when they do not overlap.
+ */
+export function intersectScopes(a: SearchScope, b: SearchScope): SearchScope | null {
+  const startIndex = Math.max(a.startIndex, b.startIndex);
+  const endIndex = Math.min(a.endIndex, b.endIndex);
+  if (startIndex >= endIndex) return null;
+  return {
+    startIndex,
+    endIndex,
+    description: `${a.description} ∩ ${b.description}`,
+    source: "intersection",
+  };
 }

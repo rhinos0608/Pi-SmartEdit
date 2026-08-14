@@ -53,6 +53,8 @@ export interface RepairLoopResult {
   finalValidation: ValidationResult | null;
   /** Digest of what went wrong for logging/UI */
   summary: string;
+  /** Repaired candidate content, when validation accepted a repair. */
+  repairedContent: string | null;
 }
 
 /** Callback type for repair hook notifications */
@@ -164,6 +166,7 @@ export async function runRepairLoop(
     attempts,
     finalValidation,
     summary,
+    repairedContent,
   };
 }
 

@@ -42,6 +42,9 @@ export interface ParseResult {
 
   /** The content that was parsed */
   content: string;
+
+  /** Optional diagnostic describing why AST resolution may be unreliable. */
+  diagnostic?: string;
 }
 
 // ─── Parse Cache (LRU, 10 entries) ─────────────────────────────────
@@ -437,6 +440,9 @@ export async function parseFile(
       language: ext,
       hasErrors: tree.rootNode.hasError,
       content,
+      diagnostic: tree.rootNode.hasError
+        ? "The file contains syntax errors; AST anchor resolution may be unreliable."
+        : undefined,
     };
 
     return result;
@@ -477,7 +483,12 @@ export function findSymbolNode(
   // Skip if tree has errors — anchor resolution is unreliable
   if (root.hasError) return null;
 
-  const candidates: Array<{ node: Parser.SyntaxNode; nameLine: number; containmentScore: number }> = [];
+  let candidates: Array<{
+    node: Parser.SyntaxNode;
+    nameLine: number;
+    containmentScore: number;
+    namePath?: string;
+  }> = [];
 
   // Walk all nodes looking for symbol containers
   walkTree(root, (node) => {
@@ -498,6 +509,7 @@ export function findSymbolNode(
         node,
         nameLine: nameNode.startPosition.row + 1,
         containmentScore: 0,
+        namePath: symbolNamePath(node),
       });
     } else if (anchor.symbolLine != null) {
       // Line-only resolution: find symbols whose range contains the target line
@@ -515,10 +527,23 @@ export function findSymbolNode(
     }
   });
 
+  if (anchor.symbolNamePath) {
+    // Match the qualified path either exactly or by trailing ancestor component
+    // sequence (e.g. anchor "Foo.bar" matches candidate "Outer.Foo.bar"). Final
+    // name matching above is unchanged.
+    candidates = candidates.filter((candidate) => {
+      if (!candidate.namePath) return false;
+      return (
+        candidate.namePath === anchor.symbolNamePath ||
+        candidate.namePath.endsWith(`.${anchor.symbolNamePath}`)
+      );
+    });
+  }
   if (candidates.length === 0) return null;
 
   if (anchor.symbolName) {
-    // Name-based: prefer closest to symbolLine hint when disambiguating
+    if (candidates.length > 1 && anchor.symbolLine == null) return null;
+    // Name-based: prefer closest to symbolLine hint when disambiguating.
     if (anchor.symbolLine != null && candidates.length > 1) {
       const targetLine = anchor.symbolLine;
       candidates.sort(
@@ -526,6 +551,10 @@ export function findSymbolNode(
           Math.abs(a.nameLine - targetLine) -
           Math.abs(b.nameLine - targetLine),
       );
+      if (
+        Math.abs(candidates[0].nameLine - targetLine) ===
+        Math.abs(candidates[1].nameLine - targetLine)
+      ) return null;
     }
   } else {
     // Line-only: prefer the tightest containment (innermost symbol)
@@ -695,6 +724,23 @@ export function createAstResolver() {
  */
 function isSymbolNode(node: Parser.SyntaxNode): boolean {
   return node.isNamed && SYMBOL_NODE_TYPES.has(node.type);
+}
+
+function symbolNamePath(node: Parser.SyntaxNode): string | undefined {
+  const names: string[] = [];
+  let current: Parser.SyntaxNode | null = node;
+  while (current) {
+    if (isSymbolNode(current)) {
+      const name = findNameChild(current)?.text;
+      // Deduplicate same-name ancestor wrappers (e.g. an arrow function nested
+      // inside a method of the same name) so the path collapses to one component.
+      if (name && (names.length === 0 || names[names.length - 1] !== name)) {
+        names.push(name);
+      }
+    }
+    current = current.parent;
+  }
+  return names.length > 0 ? names.reverse().join(".") : undefined;
 }
 
 /**

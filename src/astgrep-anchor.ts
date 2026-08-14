@@ -32,6 +32,16 @@ export interface AstGrepReplaceResult {
   matchCount: number;
 }
 
+/** One resolved structural replacement using JavaScript string indices. */
+export interface ResolvedPatternEdit {
+  /** UTF-16 string index of match start (field name retained for compatibility). */
+  startByte: number;
+  /** UTF-16 string index of match end (field name retained for compatibility). */
+  endByte: number;
+  /** Replacement text with $NAME captures resolved to matched text. */
+  text: string;
+}
+
 // ─── Internal State ──────────────────────────────────────────────
 
 // @ast-grep/napi is a native addon loaded dynamically.  All its types are
@@ -115,33 +125,31 @@ async function ensureAstGrep(): Promise<any> {
 
 /**
  * Extract meta-variable names from an ast-grep pattern.
- * Returns e.g. ["X", "Y"] for pattern "const $X = $Y".
- * Multi-node captures ($$$ARGS) are excluded — they aren't suitable
- * for simple text substitution.
+ * Returns single-node captures (`$X`) and multi-node wildcards (`$$$ARGS`)
+ * separately so each can be resolved correctly during substitution.
  */
-function extractMetaVarNames(pattern: string): string[] {
-  const names: string[] = [];
+function extractMetaVarNames(pattern: string): { single: string[]; multi: string[] } {
+  const multi: string[] = [];
+  const single: string[] = [];
 
-  // Collect multi-node wildcard names ($$$NAME) for exclusion.
-  // These are not suitable for simple text substitution.
-  const multiNames = new Set<string>();
+  // Collect multi-node wildcard names ($$$NAME).
   const multiRe = /\$\$\$(\w+)/g;
   let m: RegExpExecArray | null;
   while ((m = multiRe.exec(pattern)) !== null) {
-    multiNames.add(m[1]);
+    if (!multi.includes(m[1])) multi.push(m[1]);
   }
 
   // Collect single-node captures ($NAME), excluding names that belong
-  // to $$$ multi-wildcards.  Use a lookbehind to match $ that is NOT
+  // to $$$ multi-wildcards. Use a lookbehind to match $ that is NOT
   // preceded by another $, so that "$$$NAME" is not double-counted.
   const singleRe = /(?<!\$)\$(\w+)/g;
   while ((m = singleRe.exec(pattern)) !== null) {
-    if (!multiNames.has(m[1]) && !names.includes(m[1])) {
-      names.push(m[1]);
+    if (!multi.includes(m[1]) && !single.includes(m[1])) {
+      single.push(m[1]);
     }
   }
 
-  return names;
+  return { single, multi };
 }
 
 /**
@@ -149,6 +157,34 @@ function extractMetaVarNames(pattern: string): string[] {
  */
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Resolve a $$$ multi-node wildcard capture to its full matched text.
+ * Prefers `getMultipleMatches` (multi-node); falls back to `getMatch` for
+ * engines that expose only single-node captures. Never throws.
+ */
+/* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-assignment */
+function resolveMultiCapture(node: any, name: string): string {
+  try {
+    if (typeof node.getMultipleMatches === "function") {
+      const nodes: any[] = node.getMultipleMatches(name) ?? [];
+      if (Array.isArray(nodes) && nodes.length > 0) {
+        return nodes.map((n: any) => n?.text?.() ?? "").join("");
+      }
+    }
+    const single = node.getMatch?.(name);
+    if (single?.text) return single.text();
+  } catch {
+    // fall through to literal placeholder
+  }
+  return `$$$${name}`;
+}
+/* eslint-enable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-assignment */
+
+function utf8ByteOffsetToStringIndex(encoded: Buffer, byteOffset: number): number {
+  if (byteOffset <= 0) return 0;
+  return encoded.subarray(0, byteOffset).toString("utf8").length;
 }
 
 // ─── Public Functions ────────────────────────────────────────────
@@ -226,13 +262,42 @@ export async function findWithPattern(
  * When no matches are found, returns `{ newContent: content, matchCount: 0 }`.
  * Never throws.
  */
-/* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-assignment */
 export async function replaceWithPattern(
   content: string,
   languageId: string,
   pattern: string,
   replacement: string,
 ): Promise<AstGrepReplaceResult | null> {
+  const edits = await resolvePatternEdits(content, languageId, pattern, replacement);
+  if (edits === null) return null;
+  if (edits.length === 0) return { newContent: content, matchCount: 0 };
+
+  // Apply edits in descending byte order so earlier indices stay valid.
+  // Slice-based replacement (no split/splice) keeps text and offsets intact.
+  let newContent = content;
+  for (const edit of [...edits].sort((a, b) => b.startByte - a.startByte)) {
+    newContent =
+      newContent.slice(0, edit.startByte) +
+      edit.text +
+      newContent.slice(edit.endByte);
+  }
+
+  return { newContent, matchCount: edits.length };
+}
+
+/**
+ * Resolve a pattern-based replacement into per-match byte spans with literal
+ * replacement text ($NAME captures resolved to captured text). Returns null on
+ * any error or if ast-grep is unavailable; returns an empty array when the
+ * pattern matches nothing. Never throws.
+ */
+/* eslint-disable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-assignment */
+export async function resolvePatternEdits(
+  content: string,
+  languageId: string,
+  pattern: string,
+  replacement: string,
+): Promise<ResolvedPatternEdit[] | null> {
   const mod = await ensureAstGrep();
   if (!mod) return null;
 
@@ -245,48 +310,55 @@ export async function replaceWithPattern(
     const rootNode = sgRoot.root();
 
     const nodes: any[] = rootNode.findAll(pattern) ?? [];
-    if (nodes.length === 0) {
-      return { newContent: content, matchCount: 0 };
-    }
+    if (nodes.length === 0) return [];
 
     // Extract capture names from the pattern for substitution
     const metaVarNames = extractMetaVarNames(pattern);
 
-    // Build edits with meta-variables resolved to captured values.
-    // ast-grep v0.42.1 replace() creates an edit with literal replacement text
-    // (it does not resolve meta-variables), so we manually substitute captures
-    // using node.getMatch().
-    type Edit = { start: number; end: number; text: string };
-    const edits: Edit[] = [];
+    // Pre-encode the content once; both start and end offsets share it.
+    const encoded = Buffer.from(content, "utf8");
 
+    const edits: ResolvedPatternEdit[] = [];
     for (const node of nodes) {
       const rng = node.range();
       const start: number = rng?.start?.index ?? 0;
       const end: number = rng?.end?.index ?? 0;
 
-      // Resolve $NAME captures in the replacement template
+      // Resolve capture names in the replacement template. ast-grep v0.42.1
+      // replace() creates an edit with literal replacement text (it does not
+      // resolve meta-variables), so we manually substitute captures using
+      // node.getMatch() / node.getMultipleMatches().
       let resolved = replacement;
-      for (const name of metaVarNames) {
-        const captured = node.getMatch(name);
-        const capturedText: string = captured?.text?.() ?? `$${name}`;
-        // Replace all occurrences of $name (word boundary at end)
+
+      // Resolve $$$ multi-node wildcards first — they contain the single-capture
+      // marker ($) and would otherwise be partially rewritten.
+      for (const name of metaVarNames.multi) {
+        const capturedText = resolveMultiCapture(node, name);
         const escapedName = escapeRegex(name);
         resolved = resolved.replace(
-          new RegExp(`\\$${escapedName}(?![a-zA-Z0-9_])`, "g"),
-          capturedText,
+          new RegExp(`\\$\\$\\$${escapedName}(?![a-zA-Z0-9_])`, "g"),
+          () => capturedText,
         );
       }
 
-      edits.push({ start, end, text: resolved });
+      for (const name of metaVarNames.single) {
+        const captured = node.getMatch(name);
+        const capturedText: string = captured?.text?.() ?? `$${name}`;
+        const escapedName = escapeRegex(name);
+        resolved = resolved.replace(
+          new RegExp(`\\$${escapedName}(?![a-zA-Z0-9_])`, "g"),
+          () => capturedText,
+        );
+      }
+
+      edits.push({
+        startByte: utf8ByteOffsetToStringIndex(encoded, start),
+        endByte: utf8ByteOffsetToStringIndex(encoded, end),
+        text: resolved,
+      });
     }
 
-    // Apply edits in reverse byte order to preserve positions
-    const chars = content.split("");
-    for (const edit of [...edits].sort((a, b) => b.start - a.start)) {
-      chars.splice(edit.start, edit.end - edit.start, edit.text);
-    }
-
-    return { newContent: chars.join(""), matchCount: nodes.length };
+    return edits;
   } catch {
     return null;
   }

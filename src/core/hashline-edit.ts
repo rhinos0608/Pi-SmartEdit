@@ -1326,6 +1326,9 @@ export function reconstructOldText(
     }
   }
 
+  // Validate completeness: every line in range must have an anchor entry
+  if (lines.length !== endLine - startLine + 1) return null;
+
   return lines.join("\n");
 }
 

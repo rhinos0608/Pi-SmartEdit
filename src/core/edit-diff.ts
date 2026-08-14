@@ -1876,7 +1876,7 @@ export async function applyEdits(
   matchSpans: MatchSpan[];
 }> {
   // Normalize edit texts to LF. Metadata-only edits are routed before this pipeline.
-  const normalizedEdits: EditItem[] = [];
+  const normalizedEdits: Array<EditItem & { oldText: string; newText: string }> = [];
   for (let i = 0; i < edits.length; i++) {
     const edit = edits[i];
     if (typeof edit.oldText !== "string") {
@@ -1983,6 +1983,11 @@ export async function applyEdits(
       }
     }
 
+    const searchScope = searchScopes[i];
+    const scopedContent = searchScope
+      ? normalizedContent.slice(searchScope.startIndex, searchScope.endIndex)
+      : normalizedContent;
+
     if (edit.replaceAll) {
       // Find all occurrences
       const match = findText(
@@ -1995,7 +2000,7 @@ export async function applyEdits(
       );
       if (!match.found) {
         // Idempotency: if the replacement is already in place, treat as no-op
-        if (checkIdempotency(normalizedContent, edit.oldText, edit.newText, path, i, edit.description)) {
+        if (checkIdempotency(scopedContent, edit.oldText, edit.newText, path, i, edit.description)) {
           matchNotes.push(
             `edits[${i}]${edit.description ? ` (${edit.description})` : ''}: ` +
             `replacement text already present in ${path} — edit is a no-op.`,
@@ -2076,7 +2081,7 @@ export async function applyEdits(
 
       if (!match.found) {
         // Idempotency: if the replacement is already in place, treat as no-op
-        if (checkIdempotency(normalizedContent, edit.oldText, edit.newText, path, i, edit.description)) {
+        if (checkIdempotency(scopedContent, edit.oldText, edit.newText, path, i, edit.description)) {
           matchNotes.push(
             `edits[${i}]${edit.description ? ` (${edit.description})` : ''}: ` +
             `replacement text already present in ${path} — edit is a no-op.`,
@@ -2091,8 +2096,9 @@ export async function applyEdits(
 
       // Check for ambiguity across all tiers
       if (match.tier === MatchTier.UNICODE) {
-        // Unicode tier: count occurrences in fuzzy-normalized space
-        const fuzzyContent = normalizeForFuzzyMatch(normalizedContent);
+        // Unicode tier: count occurrences in fuzzy-normalized space, scoped to
+        // the search scope when one is set (scopedContent already computed above).
+        const fuzzyContent = normalizeForFuzzyMatch(scopedContent);
         const fuzzyOldText = normalizeForFuzzyMatch(edit.oldText);
         let fuzzyCount = 0;
         let pos = 0;
@@ -2110,7 +2116,7 @@ export async function applyEdits(
         // using the same sliding-window approach as trySimilarityMatch.
         // Also track best/second-best scores for dominant-fuzzy auto-accept.
         const { count: similarityCount, bestScore, secondBestScore } = countSimilarityOccurrences(
-          normalizedContent,
+          scopedContent,
           edit.oldText,
         );
         if (similarityCount > 1) {
@@ -2130,10 +2136,12 @@ export async function applyEdits(
           }
         }
       } else {
-        // Exact and indentation tiers: count occurrences using stripped text
-        // (remove leading whitespace to handle indent-level shifts)
+        // Exact and indentation tiers: count occurrences using stripped text,
+        // scoped to the search scope when one is set (so a scoped edit is not
+        // rejected for duplicates outside its scope). scopedContent is already
+        // computed above.
         const strippedOld = edit.oldText.replace(/^[\t ]+/gm, '');
-        const strippedContent = normalizedContent.replace(/^[\t ]+/gm, '');
+        const strippedContent = scopedContent.replace(/^[\t ]+/gm, '');
         const exactCount = countOccurrences(strippedContent, strippedOld);
         if (exactCount > 1) {
           throw getAmbiguousError(

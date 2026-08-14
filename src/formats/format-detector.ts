@@ -51,11 +51,6 @@ export function detectInputFormat(input: string): InputFormat {
     return 'atomic_patch';
   }
 
-  // Check for atomic patch envelope first (more specific than codex patch)
-  if (firstLine.startsWith('*** Begin Atomic Patch') || firstLine.startsWith('***Begin Atomic Patch')) {
-    return 'atomic_patch';
-  }
-
   if (firstLine.startsWith('*** Begin Patch') || firstLine.startsWith('***Begin Patch')) {
     // Check if patch contains Codex-specific markers that require the grammar parser
     const hasCodexMarkers =

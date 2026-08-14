@@ -1,16 +1,12 @@
-import { readFileSync } from "fs";
 import { relative, isAbsolute, resolve } from "path";
 import { Buffer } from "buffer";
 import type { EditItem, EditInput } from "./core/types";
 import { isSymbolicEdit } from "./symbolic-edits.js";
 import { HASHLINE_CONTENT_SEPARATOR } from "./core/hashline";
 import { detectInputFormat } from "./formats/format-detector.js";
-import { parseSearchReplace } from "./formats/search-replace.js";
-import { parseUnifiedDiffToEditItems } from "./formats/unified-diff.js";
-import { parseOpenAIPatch, openAIPatchToEditItem } from "./formats/openai-patch.js";
-import { parseCodexPatch, codexHunkToEditItem } from "./formats/codex-patch.js";
-import { parseAtomicPatchEnvelope } from "./formats/atomic-patch.js";
 import { repairJson } from "./formats/forgiving-parser.js";
+import { normalizeLegacyEditRequest } from "./edit-contract.js";
+import { normalizeRawEdit } from "./edit-intents.js";
 
 // ─── Hashline display prefix stripping ───────────────────────────────
 
@@ -351,6 +347,39 @@ export function prepareArguments(input: Record<string, unknown>, useHashlineEdit
       );
     }
 
+    // Legacy raw-format strings use the same pure normalization as the
+    // registered tool. File-topology intents cannot be safely represented by
+    // this pre-Task-7 adapter, so reject them rather than reading or mutating
+    // files while parsing.
+    if (detectInputFormat(raw) !== "raw_edits") {
+      const normalized = normalizeRawEdit(raw, typeof args.path === "string" ? args.path : undefined);
+      if (normalized.diagnostics.length > 0 || normalized.intents.length === 0) {
+        throw formatEditError(
+          `Failed to parse raw edit input: ${[...normalized.diagnostics, ...normalized.warnings].join("; ")}`,
+          "Ensure the raw patch contains at least one valid text update.",
+        );
+      }
+      const topology = normalized.intents.filter((intent) => intent.kind !== "text");
+      if (topology.length > 0) {
+        const operations = topology.map((intent) =>
+          intent.kind === "rename"
+            ? `rename ${intent.oldPath} -> ${intent.newPath}`
+            : `${intent.kind} ${intent.path}`,
+        );
+        throw formatEditError(
+          `Raw edit contains ${operations.join(", ")} requiring transaction support; no files were changed.`,
+          "Use text-only updates until failure-atomic add/delete/rename support is available.",
+        );
+      }
+      return prepareArguments({
+        ...args,
+        edits: normalized.intents.map((intent) => {
+          if (intent.kind !== "text") throw new Error("unreachable non-text raw intent");
+          return intent.operation;
+        }),
+      }, useHashlineEditing);
+    }
+
     // Attempt first parse, then try recovery strategies for common
     // edge cases (literal newlines in string values, truncation, etc.)
     let parsed: unknown;
@@ -377,140 +406,30 @@ export function prepareArguments(input: Record<string, unknown>, useHashlineEdit
     }
 
     // Validate parsed result is an array — clear diagnostic with snippet.
-    // If it's not a valid JSON array, try multi-format detection first since
-    // the input could be a search/replace block, unified diff, OpenAI/Codex patch, or Atomic Patch.
+    // Non-raw_edits formats (search/replace, unified diff, OpenAI/Codex patch,
+    // Atomic Patch) are normalized to raw edits earlier via
+    // detectInputFormat → normalizeRawEdit and return before this point, so
+    // only the raw_edits path is reachable here.
     if (!Array.isArray(parsed)) {
-      const format = detectInputFormat(raw);
-
-      if (format !== 'raw_edits') {
-        try {
-          let parsedEdits: Array<{ path?: string; oldText: string; newText: string }> = [];
-
-          switch (format) {
-            case 'search_replace': {
-              const blocks = parseSearchReplace(raw);
-              parsedEdits = blocks.map(block => ({
-                path: block.path,
-                oldText: block.oldText,
-                newText: block.newText,
-              }));
-              break;
-            }
-            case 'unified_diff': {
-              parsedEdits = parseUnifiedDiffToEditItems(raw);
-              break;
-            }
-            case 'openai_patch': {
-              const patches = parseOpenAIPatch(raw);
-              parsedEdits = patches.map(patch => openAIPatchToEditItem(patch));
-              break;
-            }
-            case 'codex_patch': {
-              const codexResult = parseCodexPatch(raw, 'lenient');
-              // Convert each hunk to EditItem-compatible format
-              for (const hunk of codexResult.hunks) {
-                // Read file old contents for DeleteFile operations
-                let fileOldContents: string | undefined;
-                if (hunk.kind === 'DeleteFile' && hunk.path) {
-                  try {
-                    fileOldContents = readFileSync(hunk.path, 'utf-8');
-                  } catch {
-                    // File doesn't exist — nothing to delete, skip silently
-                    continue;
-                  }
-                }
-                const items = codexHunkToEditItem(hunk, fileOldContents);
-                parsedEdits.push(...items);
-              }
-              break;
-            }
-            case 'atomic_patch': {
-              // Atomic patches are handled via enqueueAtomicPatch in the edit flow
-              // For now, extract path hints from the envelope for multi-file support
-              const { envelope } = parseAtomicPatchEnvelope(raw);
-
-              // Collect unique paths from the envelope
-              const paths = new Set<string>();
-              for (const op of envelope.operations) {
-                if (op.kind === 'AddFile' || op.kind === 'DeleteFile' || op.kind === 'UpdateFile') {
-                  paths.add(op.path);
-                }
-                if (op.kind === 'UpdateFile' && op.movePath) {
-                  paths.add(op.movePath);
-                }
-                if (op.kind === 'RenameFile') {
-                  paths.add(op.oldPath);
-                  paths.add(op.newPath);
-                }
-              }
-
-              // If no path hint from args, use first path from envelope
-              if (paths.size > 0 && !args.path) {
-                args.path = Array.from(paths)[0];
-              }
-
-              // Extract first UpdateFile's patches as edit items
-              for (const op of envelope.operations) {
-                if (op.kind === 'UpdateFile') {
-                  for (const patch of op.patches) {
-                    parsedEdits.push({
-                      path: op.movePath ?? op.path,
-                      oldText: patch.oldText,
-                      newText: patch.newText,
-                    });
-                  }
-                }
-              }
-              break;
-            }
-          }
-
-          if (parsedEdits.length > 0) {
-            // If a parsed format contained a path hint and none was provided, use it
-            const pathHint = parsedEdits.find(e => e.path)?.path;
-            if (pathHint && !args.path) {
-              args.path = pathHint;
-            }
-
-            parsed = parsedEdits.map(e => ({
-              oldText: e.oldText,
-              newText: e.newText,
-            })) as unknown[];
-          } else {
-            throw formatEditError(
-              `edits was received as a ${format} string but parsed into zero edits.`,
-              `Ensure the ${format} block contains at least one valid oldText/newText pair.`
-            );
-          }
-        } catch (formatError) {
-          if (formatError instanceof Error && formatError.message.startsWith('❌')) {
-            throw formatError;
-          }
-          throw formatEditError(
-            `Failed to parse ${format} format input: ${(formatError as Error).message}`,
-          );
-        }
+      const snippet = raw.length > 120
+        ? raw.slice(0, 80) + "..." + raw.slice(-30)
+        : raw;
+      let typeDesc: string;
+      if (parsed === undefined) {
+        typeDesc = "(unparseable — not valid JSON)";
+      } else if (typeof parsed === "string") {
+        typeDesc = `a string ("${parsed.slice(0, 60)}${parsed.length > 60 ? "..." : ""}")`;
       } else {
-        const snippet = raw.length > 120
-          ? raw.slice(0, 80) + "..." + raw.slice(-30)
-          : raw;
-        let typeDesc: string;
-        if (parsed === undefined) {
-          typeDesc = "(unparseable — not valid JSON)";
-        } else if (typeof parsed === "string") {
-          typeDesc = `a string ("${parsed.slice(0, 60)}${parsed.length > 60 ? "..." : ""}")`;
-        } else {
-          typeDesc = typeof parsed;
-        }
-        throw formatEditError(
-          `edits was received as a JSON string but parsed into ${typeDesc}, not an array.`,
-          `edits must be an array of edit objects with oldText/newText fields.\n` +
-          `Raw value (${raw.length} chars) starts with:\n  ${snippet}\n\n` +
-          `This typically happens when the JSON is improperly escaped or truncated.\n` +
-          `Automatic repair was attempted but could not recover a valid edits array.\n` +
-          `Fix: ensure edits is sent as a proper JSON array, not a string.`
-        );
+        typeDesc = typeof parsed;
       }
+      throw formatEditError(
+        `edits was received as a JSON string but parsed into ${typeDesc}, not an array.`,
+        `edits must be an array of edit objects with oldText/newText fields.\n` +
+        `Raw value (${raw.length} chars) starts with:\n  ${snippet}\n\n` +
+        `This typically happens when the JSON is improperly escaped or truncated.\n` +
+        `Automatic repair was attempted but could not recover a valid edits array.\n` +
+        `Fix: ensure edits is sent as a proper JSON array, not a string.`
+      );
     }
 
     // Validate each item is an object with required fields.
@@ -623,12 +542,8 @@ export function prepareArguments(input: Record<string, unknown>, useHashlineEdit
   ) {
     const { text: oldText } = stripHashlineDisplayPrefixes(legacy.oldText as string, useHashlineEditing);
     const { text: newText } = stripHashlineDisplayPrefixes(legacy.newText as string, useHashlineEditing);
-    const edits: EditItem[] = Array.isArray(legacy.edits)
-      ? [...(legacy.edits as EditItem[])]
-      : [];
-    edits.push({ oldText, newText });
-    const { oldText: _, newText: __, ...rest } = legacy;
-    return { ...rest, edits };
+    // Canonical flat->edits conversion (flat fields are authoritative).
+    return normalizeLegacyEditRequest({ ...legacy, oldText, newText });
   }
 
   // ── Edits missing check (after legacy normalization, which returns early) ──

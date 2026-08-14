@@ -14,13 +14,16 @@ import {
   mkdir as fsMkdir,
   rmdir as fsRmdir,
   stat as fsStat,
+  rm as fsRm,
 } from "fs/promises";
 import { resolve, join, dirname } from "path";
-import { randomBytes } from "crypto";
+import { randomBytes, createHash } from "crypto";
 
 import {
   saveUndoState,
   restoreUndoState,
+  restoreTransactionUndoState,
+  saveTransactionUndoRecords,
   getUndoHistory,
   clearUndoHistory,
 } from "../src/undo/edit-history";
@@ -255,6 +258,50 @@ describe("edit-history", () => {
     assert.equal(result, false);
   });
 
+  it("V2 transaction undo restores text, add, delete, rename, and modes", async () => {
+    const { cwd } = freshCwd();
+    const original = await writeTestFile(cwd, "original.txt", "before");
+    const added = resolve(cwd, "added.txt");
+    const deleted = await writeTestFile(cwd, "deleted.txt", "gone");
+    const oldPath = await writeTestFile(cwd, "old.txt", "moved");
+    const newPath = resolve(cwd, "new.txt");
+    await fsWriteFile(original, "after");
+    const { rm } = await import("fs/promises");
+    await rm(deleted);
+    await rm(oldPath);
+    await fsWriteFile(newPath, "moved");
+    const hash = (s: string) => createHash("sha256").update(s).digest("hex");
+    const id = "tx-regression";
+    const record = (path: string, before: string, after: string | undefined, operation: "text" | "add" | "delete" | "rename", extra: Record<string, unknown> = {}) => ({ path, originalContent: Buffer.from(before).toString("base64"), timestamp: new Date().toISOString(), editCount: 1, snapshotHash: hash(before).slice(0, 16), changedSymbols: [], version: 2 as const, beforeSha: hash(before), afterSha: after === undefined ? undefined : hash(after), beforeMode: 0o644, afterMode: 0o644, existed: operation !== "add", afterExists: after !== undefined, operation, transactionId: id, ...extra });
+    await saveTransactionUndoRecords(cwd, [
+      record(original, "before", "after", "text"),
+      record(added, "", "", "add"),
+      record(deleted, "gone", undefined, "delete"),
+      record(oldPath, "moved", "moved", "rename", { oldPath, newPath }),
+    ]);
+    await fsWriteFile(added, "");
+    assert.equal(await restoreTransactionUndoState(cwd, id), true);
+    assert.equal(await fsReadFile(original, "utf8"), "before");
+    assert.equal(await fsReadFile(deleted, "utf8"), "gone");
+    assert.equal(await fsReadFile(oldPath, "utf8"), "moved");
+    await assert.rejects(() => fsReadFile(added), /ENOENT/);
+    await assert.rejects(() => fsReadFile(newPath), /ENOENT/);
+  });
+
+  it("V2 transaction preflight drift leaves all files and records intact", async () => {
+    const { cwd, undoDir } = freshCwd();
+    const first = await writeTestFile(cwd, "first.txt", "before");
+    const second = await writeTestFile(cwd, "second.txt", "before2");
+    const hash = (s: string) => createHash("sha256").update(s).digest("hex");
+    const id = "tx-drift";
+    const make = (path: string, before: string, after: string) => ({ path, originalContent: Buffer.from(before).toString("base64"), timestamp: new Date().toISOString(), editCount: 1, snapshotHash: hash(before).slice(0, 16), changedSymbols: [], version: 2 as const, beforeSha: hash(before), afterSha: hash(after), beforeMode: 0o644, afterMode: 0o644, existed: true, afterExists: true, operation: "text" as const, transactionId: id });
+    await saveTransactionUndoRecords(cwd, [make(first, "before", "after"), make(second, "before2", "after2")]);
+    await fsWriteFile(first, "after"); await fsWriteFile(second, "drift");
+    assert.equal(await restoreTransactionUndoState(cwd, id), false);
+    assert.equal(await fsReadFile(first, "utf8"), "after");
+    assert.equal(await undoFileCount(undoDir), 2);
+  });
+
   it("clearUndoHistory removes all undo files and directory", async () => {
     const { cwd, undoDir } = freshCwd();
     const filePath = await writeTestFile(cwd, "test9.ts", "clear test");
@@ -316,5 +363,70 @@ describe("edit-history", () => {
     for (const fp of files) {
       assert.ok(paths.includes(fp), `should have entry for ${fp}`);
     }
+  });
+
+  it("standalone V2 rename restore applies beforeMode to the old path", async () => {
+    const { cwd, undoDir } = freshCwd();
+    const oldPath = await writeTestFile(cwd, "old.txt", "moved");
+    const newPath = resolve(cwd, "new.txt");
+    await fsWriteFile(newPath, "moved");
+    await fsRm(oldPath, { force: true });
+    const hash = (s: string) => createHash("sha256").update(s).digest("hex");
+    const entry = {
+      path: newPath,
+      originalContent: Buffer.from("moved").toString("base64"),
+      timestamp: new Date().toISOString(),
+      editCount: 1,
+      snapshotHash: hash("moved").slice(0, 16),
+      changedSymbols: [],
+      version: 2,
+      beforeSha: hash("moved"),
+      afterSha: hash("moved"),
+      beforeMode: 0o600,
+      afterMode: 0o644,
+      existed: true,
+      afterExists: true,
+      operation: "rename",
+      oldPath,
+      newPath,
+    };
+    await fsMkdir(undoDir, { recursive: true });
+    await fsWriteFile(join(undoDir, `${hash("moved").slice(0, 8)}-rename.json`), JSON.stringify(entry), "utf8");
+    assert.equal(await restoreUndoState(cwd, newPath), true);
+    const mode = (await fsStat(oldPath)).mode & 0o7777;
+    assert.equal(mode, 0o600, "old path should be restored with beforeMode");
+  });
+
+  it("restoreTransactionUndoState rejects an incomplete persisted transaction (recordCount mismatch)", async () => {
+    const { cwd, undoDir } = freshCwd();
+    const hash = (s: string) => createHash("sha256").update(s).digest("hex");
+    const id = "tx-incomplete";
+    const make = (path: string, before: string) => ({ path, originalContent: Buffer.from(before).toString("base64"), timestamp: new Date().toISOString(), editCount: 1, snapshotHash: hash(before).slice(0, 16), changedSymbols: [], version: 2 as const, beforeSha: hash(before), afterSha: hash(before + "x"), beforeMode: 0o644, afterMode: 0o644, existed: true, afterExists: true, operation: "text" as const, transactionId: id });
+    const a = await writeTestFile(cwd, "a.txt", "A");
+    const b = await writeTestFile(cwd, "b.txt", "B");
+    const c = await writeTestFile(cwd, "c.txt", "C");
+    await saveTransactionUndoRecords(cwd, [make(a, "A"), make(b, "B"), make(c, "C")]);
+    const jsonFiles = (await fsReaddir(undoDir)).filter((f) => f.endsWith(".json"));
+    assert.equal(jsonFiles.length, 3);
+    await fsRm(join(undoDir, jsonFiles[0]!), { force: true });
+    assert.equal(
+      await restoreTransactionUndoState(cwd, id),
+      false,
+      "incomplete transaction must be rejected when the persisted count is not fully present",
+    );
+  });
+
+  it("old count-less transaction records remain restorable (compatibility)", async () => {
+    const { cwd, undoDir } = freshCwd();
+    const hash = (s: string) => createHash("sha256").update(s).digest("hex");
+    const id = "tx-legacy";
+    const a = await writeTestFile(cwd, "a.txt", "A");
+    await fsWriteFile(a, "AX");
+    // No recordCount field — simulates a legacy transaction record.
+    const entry = { path: a, originalContent: Buffer.from("A").toString("base64"), timestamp: new Date().toISOString(), editCount: 1, snapshotHash: hash("A").slice(0, 16), changedSymbols: [], version: 2, beforeSha: hash("A"), afterSha: hash("AX"), beforeMode: 0o644, afterMode: 0o644, existed: true, afterExists: true, operation: "text", transactionId: id };
+    await fsMkdir(undoDir, { recursive: true });
+    await fsWriteFile(join(undoDir, "legacy.json"), JSON.stringify(entry), "utf8");
+    assert.equal(await restoreTransactionUndoState(cwd, id), true);
+    assert.equal(await fsReadFile(a, "utf8"), "A", "legacy count-less records should still restore");
   });
 });

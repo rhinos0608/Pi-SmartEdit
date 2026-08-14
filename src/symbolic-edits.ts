@@ -48,7 +48,7 @@ export interface SymbolicGuidanceInput {
 
 interface AstResolverForSymbolic {
   parseFile(content: string, filePath: string): Promise<ParseResult | null>;
-  findSymbolNode(tree: Parser.Tree, anchor: { symbolName?: string; symbolKind?: string; symbolLine?: number }): Parser.SyntaxNode | null;
+  findSymbolNode(tree: Parser.Tree, anchor: { symbolName?: string; symbolNamePath?: string; symbolKind?: string; symbolLine?: number }): Parser.SyntaxNode | null;
   findEnclosingSymbols?(tree: Parser.Tree, startByte: number, endByte: number): SymbolRef[];
   disposeParseResult(result: ParseResult): void;
 }
@@ -279,9 +279,11 @@ function getOperationBody(target: EditTarget, operation: AppliedSymbolicEdit["op
   return body;
 }
 
-function targetToAnchor(target: EditTarget): { symbolName?: string; symbolKind?: string; symbolLine?: number } {
+function targetToAnchor(target: EditTarget): { symbolName?: string; symbolNamePath?: string; symbolKind?: string; symbolLine?: number } {
+  const namePathParts = target.namePath?.split(/[/.#]/).filter(Boolean) ?? [];
   return {
-    symbolName: target.name,
+    symbolName: target.name ?? namePathParts[namePathParts.length - 1],
+    symbolNamePath: namePathParts.length > 0 ? namePathParts.join(".") : undefined,
     symbolKind: target.kind,
     symbolLine: target.line,
   };

@@ -18,11 +18,12 @@ import {
   rmdir as fsRmdir,
 } from "fs/promises";
 import { resolve as pathResolve, dirname, join } from "path";
-import { randomBytes } from "crypto";
+import { randomBytes, createHash } from "crypto";
+import { chmod as fsChmod, link as fsLink, stat as fsStat, rm as fsRm } from "fs/promises";
 
 import { fastHash } from "../core/types";
 
-import { atomicWrite } from "./atomic-write";
+import { atomicWrite, atomicCreate } from "./atomic-write";
 import type { AtomicWriteOptions } from "./atomic-write";
 
 // ─── Constants ──────────────────────────────────────────────────────
@@ -30,6 +31,32 @@ import type { AtomicWriteOptions } from "./atomic-write";
 const UNDO_DIR = ".smart-edit-undo";
 
 // ─── Types ──────────────────────────────────────────────────────────
+
+export type UndoOperation = "text" | "add" | "delete" | "rename";
+
+/** Versioned transaction record. Content remains base64 for on-disk compatibility. */
+export interface TransactionUndoRecord {
+  path: string;
+  originalContent: string;
+  timestamp: string;
+  editCount: number;
+  snapshotHash: string;
+  changedSymbols: string[];
+  version: 2;
+  beforeSha: string;
+  afterSha?: string;
+  beforeMode?: number;
+  afterMode?: number;
+  existed: boolean;
+  afterExists: boolean;
+  operation: UndoOperation;
+  transactionId: string;
+  oldPath?: string;
+  newPath?: string;
+  /** Total records in this transaction; persisted so incomplete transactions
+   *  are detectable on restore. Absent on legacy records (still restorable). */
+  recordCount?: number;
+}
 
 export interface UndoEntry {
   /** Absolute file path that was edited */
@@ -49,6 +76,19 @@ export interface UndoEntry {
 
   /** Top-level symbols that were changed, if AST data was available */
   changedSymbols: string[];
+  /** Version 2 transaction fields. Optional to preserve legacy entries exactly. */
+  version?: 2;
+  beforeSha?: string;
+  afterSha?: string;
+  beforeMode?: number;
+  afterMode?: number;
+  existed?: boolean;
+  afterExists?: boolean;
+  operation?: UndoOperation;
+  transactionId?: string;
+  oldPath?: string;
+  newPath?: string;
+  recordCount?: number;
 }
 
 /**
@@ -57,6 +97,23 @@ export interface UndoEntry {
 export interface DecodedUndoEntry extends Omit<UndoEntry, "originalContent"> {
   /** Decoded pre-edit content */
   originalContent: string;
+}
+
+const sha256 = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex");
+
+/** Persist successful transaction records. Save failures are advisory and never throw. */
+export async function saveTransactionUndoRecords(cwd: string, records: readonly TransactionUndoRecord[]): Promise<void> {
+  try {
+    const undoDir = getUndoDir(cwd);
+    await fsMkdir(undoDir, { recursive: true });
+    for (const entry of records) {
+      const stamp = formatTimestamp(new Date(entry.timestamp));
+      const filename = buildEntryFilename(entry.afterSha ?? entry.beforeSha, `${stamp}-${randomBytes(4).toString("hex")}`);
+      await fsWriteFile(join(undoDir, filename), JSON.stringify({ ...entry, recordCount: records.length }, null, 2), "utf8");
+    }
+  } catch (err) {
+    console.warn("[smart-edit] Failed to save transaction undo state:", err instanceof Error ? err.message : "unknown error");
+  }
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -181,6 +238,9 @@ export async function restoreUndoState(
     );
 
     const { entry, filename } = matching[0];
+    if (entry.version === 2 && entry.transactionId) {
+      return await restoreTransactionUndoState(cwd, entry.transactionId);
+    }
 
     // Decode original content
     const storedOriginalContent = Buffer.from(
@@ -188,25 +248,35 @@ export async function restoreUndoState(
       "base64",
     ).toString("utf-8");
 
-    // Read the CURRENT file from disk to verify user hasn't modified it since undo was saved
-    let currentFileContent: string;
-    try {
-      currentFileContent = await fsReadFile(pathResolve(filePath), "utf-8");
-    } catch {
-      // File may have been deleted — cannot verify, skip restore
+    const isVersioned = entry.version === 2;
+    const operation = entry.operation ?? "text";
+    const targetPath = pathResolve(entry.newPath ?? filePath);
+    const currentExists = await fsStat(targetPath).then(() => true).catch(() => false);
+    let currentFileContent = "";
+    if (currentExists) {
+      try { currentFileContent = await fsReadFile(targetPath, "utf-8"); } catch { return false; }
+    }
+    // Legacy entries intentionally retain old pre-edit hash behavior.
+    if (isVersioned) {
+      if ((entry.afterExists ?? true) !== currentExists) return false;
+      if (currentExists && sha256(currentFileContent) !== entry.afterSha) return false;
+    } else if (!currentExists || fastHash(currentFileContent) !== entry.snapshotHash) {
       return false;
     }
-
-    // Compare current file hash against stored snapshot hash
-    // If they match, the file is unchanged and we can safely restore
-    const currentHash = fastHash(currentFileContent);
-    if (currentHash !== entry.snapshotHash) {
-      // File has been modified since undo was saved — user may have intentionally changed it
-      return false;
+    if (isVersioned && operation === "add") {
+      await fsRm(targetPath);
+    } else if (isVersioned && operation === "rename") {
+      const oldPath = pathResolve(entry.oldPath ?? filePath);
+      if (await fsStat(oldPath).then(() => true).catch(() => false)) return false;
+      await fsLink(targetPath, oldPath);
+      await fsRm(targetPath);
+      if (entry.beforeMode !== undefined) await fsChmod(oldPath, entry.beforeMode);
+    } else if (isVersioned && operation === "delete") {
+      await atomicCreate(targetPath, storedOriginalContent, entry.beforeMode === undefined ? undefined : { mode: entry.beforeMode });
+    } else {
+      await atomicWrite(targetPath, storedOriginalContent, { ...options, mode: entry.beforeMode ?? options?.mode });
+      if (entry.beforeMode !== undefined) await fsChmod(targetPath, entry.beforeMode);
     }
-
-    // Write original content back via atomicWrite
-    await atomicWrite(filePath, storedOriginalContent, options);
 
     // Delete the undo file after successful restore
     try {
@@ -219,6 +289,84 @@ export async function restoreUndoState(
   } catch {
     return false;
   }
+}
+
+/** Restore every record in transaction atomically from undo's perspective. */
+export async function restoreTransactionUndoState(cwd: string, transactionId: string): Promise<boolean> {
+  const undoDir = getUndoDir(cwd);
+  const files: string[] = await fsReaddir(undoDir).catch(() => []);
+  const records: Array<{ entry: TransactionUndoRecord; filename: string }> = [];
+  for (const filename of files) {
+    if (!filename.endsWith(".json")) continue;
+    try {
+      const entry = JSON.parse(await fsReadFile(join(undoDir, filename), "utf8")) as TransactionUndoRecord;
+      if (entry.version === 2 && entry.transactionId === transactionId) records.push({ entry, filename });
+    } catch { /* ignore corrupt entries */ }
+  }
+  if (records.length === 0) return false;
+
+  // Incomplete transaction guard: when a count was persisted, restore must
+  // observe exactly that many records. Legacy count-less records skip the
+  // check and remain restorable.
+  const recordCounts = records.map(({ entry }) => entry.recordCount);
+  const expectedCount = recordCounts.find((count): count is number => typeof count === "number");
+  if (expectedCount !== undefined) {
+    if (recordCounts.some((count) => count !== expectedCount) || records.length !== expectedCount) return false;
+  }
+
+  const exists = async (path: string) => fsStat(path).then(() => true).catch(() => false);
+  const content = async (path: string) => fsReadFile(path, "utf8");
+  const target = (entry: TransactionUndoRecord) => pathResolve(entry.operation === "rename" ? (entry.newPath ?? entry.path) : entry.path);
+  const paths = new Set<string>();
+  for (const { entry } of records) {
+    paths.add(target(entry));
+    if (entry.operation === "rename") paths.add(pathResolve(entry.oldPath ?? entry.path));
+  }
+  for (const { entry } of records) {
+    const targetPath = target(entry);
+    const present = await exists(targetPath);
+    if ((entry.afterExists ?? true) !== present) return false;
+    if (present && sha256(await content(targetPath)) !== entry.afterSha) return false;
+    if (entry.operation === "rename" && await exists(pathResolve(entry.oldPath ?? entry.path))) return false;
+  }
+
+  const beforeUndo = new Map<string, { exists: boolean; content?: string; mode?: number }>();
+  for (const path of paths) {
+    try {
+      const st = await fsStat(path);
+      beforeUndo.set(path, { exists: true, content: await content(path), mode: st.mode & 0o7777 });
+    } catch { beforeUndo.set(path, { exists: false }); }
+  }
+  const restoreSnapshot = async (path: string, state: { exists: boolean; content?: string; mode?: number }) => {
+    if (state.exists) {
+      await atomicWrite(path, state.content ?? "", { mode: state.mode });
+      if (state.mode !== undefined) await fsChmod(path, state.mode);
+    } else if (await exists(path)) await fsRm(path);
+  };
+  try {
+    for (const { entry } of records) {
+      const targetPath = target(entry);
+      if (entry.operation === "add") await fsRm(targetPath);
+      else if (entry.operation === "rename") {
+        const oldPath = pathResolve(entry.oldPath ?? entry.path);
+        await fsLink(targetPath, oldPath);
+        await fsRm(targetPath);
+        if (entry.beforeMode !== undefined) await fsChmod(oldPath, entry.beforeMode);
+      } else if (entry.operation === "delete") {
+        await atomicCreate(targetPath, Buffer.from(entry.originalContent, "base64").toString("utf8"), entry.beforeMode === undefined ? undefined : { mode: entry.beforeMode });
+      } else {
+        await atomicWrite(targetPath, Buffer.from(entry.originalContent, "base64").toString("utf8"), { mode: entry.beforeMode });
+        if (entry.beforeMode !== undefined) await fsChmod(targetPath, entry.beforeMode);
+      }
+    }
+  } catch {
+    try { for (const [path, state] of beforeUndo) await restoreSnapshot(path, state); } catch { /* best effort */ }
+    return false;
+  }
+  for (const { filename } of records) {
+    try { await fsUnlink(join(undoDir, filename)); } catch { /* advisory cleanup */ }
+  }
+  return true;
 }
 
 /**
@@ -263,6 +411,17 @@ export async function getUndoHistory(
         editCount: entry.editCount,
         snapshotHash: entry.snapshotHash,
         changedSymbols: entry.changedSymbols,
+        version: entry.version,
+        beforeSha: entry.beforeSha,
+        afterSha: entry.afterSha,
+        beforeMode: entry.beforeMode,
+        afterMode: entry.afterMode,
+        existed: entry.existed,
+        afterExists: entry.afterExists,
+        operation: entry.operation,
+        transactionId: entry.transactionId,
+        oldPath: entry.oldPath,
+        newPath: entry.newPath,
       });
     } catch {
       // Skip unparseable files

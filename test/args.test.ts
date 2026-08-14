@@ -248,4 +248,20 @@ describe("prepareArguments", () => {
       /Top-level path conflicts/,
     );
   });
+
+  test("normalizes legacy raw text formats without dropping their paths", () => {
+    const prepared = prepareArguments({
+      edits: "src/foo.ts\n<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE",
+    }, false);
+    assert.deepStrictEqual(prepared.edits, [{ path: "src/foo.ts", oldText: "old", newText: "new" }]);
+  });
+
+  test("rejects legacy raw topology formats before filesystem access", () => {
+    assert.throws(
+      () => prepareArguments({
+        edits: "*** Begin Atomic Patch\n*** Delete File: src/foo.ts\n*** End Atomic Patch",
+      }, false),
+      /requiring transaction support/i,
+    );
+  });
 });

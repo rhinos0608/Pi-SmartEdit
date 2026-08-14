@@ -10,7 +10,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, realpathSync } from "node:fs";
+import { mkdtempSync, writeFileSync, realpathSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -19,12 +19,40 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { visibleWidth } from "@mariozechner/pi-tui";
 import smartEdit from "../src/index.js";
 import { createPatchTool, type PatchToolDeps, type PatchTool } from "../src/patch.js";
-import { PROTOCOL_SCHEMA_VERSION } from "@rhinos0608/pi-workspace-protocol";
+import { PROTOCOL_SCHEMA_VERSION, hashSessionFilePath, resourceIdFor, type WorkspaceEvidenceEnvelope, type InspectedResource } from "@rhinos0608/pi-workspace-protocol";
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
 function sha256(s: string): string {
   return createHash("sha256").update(s, "utf8").digest("hex");
+}
+
+function makeLineRangeEnvelope(args: {
+  sessionFilePath: string;
+  canonicalRoot: string;
+  canonicalFile: string;
+  content: string;
+}): WorkspaceEvidenceEnvelope {
+  const range = { startLine: 1, endLine: 2 };
+  const resource: InspectedResource = {
+    resourceId: resourceIdFor({ canonicalPath: args.canonicalFile, kind: "range", range }),
+    canonicalPath: args.canonicalFile,
+    kind: "range",
+    coverage: "line-range",
+    allowedRanges: [range],
+    fullFileSha256: sha256(args.content),
+    fresh: true,
+    lineCount: 2,
+  };
+  return {
+    schemaVersion: PROTOCOL_SCHEMA_VERSION,
+    inspectionId: sha256(`inspection:${args.sessionFilePath}:${args.canonicalFile}`),
+    sessionId: hashSessionFilePath(args.sessionFilePath),
+    workspaceRoot: args.canonicalRoot,
+    canonicalWorkspaceRoot: args.canonicalRoot,
+    createdAt: new Date().toISOString(),
+    resources: [resource],
+  };
 }
 
 type PreparedArguments = Record<string, unknown> & {
@@ -144,6 +172,27 @@ test("edit tool has prepareArguments compatibility shim", () => {
   const editTool = pi._tools.get("edit")!;
   assert.equal(typeof editTool.prepareArguments, "function",
     "edit tool must have prepareArguments for session resume compat");
+});
+
+test("edit tool advertises canonical contract schema (raw, rich fields, no evidenceRef)", () => {
+  const pi = createMockPI();
+  init(pi);
+
+  const editTool = pi._tools.get("edit")!;
+  const params = editTool.parameters as { properties: Record<string, unknown> };
+  const props = params.properties;
+
+  assert.ok(props.raw, "schema must advertise mutually exclusive `raw` input");
+  assert.ok(props.edits, "schema must advertise `edits` array");
+
+  const edits = props.edits as { items?: { properties?: Record<string, unknown> } };
+  const editProps = edits.items?.properties ?? {};
+  assert.ok(editProps.target, "edit items must advertise `target`");
+  assert.ok(editProps.lineRange, "edit items must advertise `lineRange`");
+  assert.ok(editProps.hashline, "edit items must advertise `hashline`");
+
+  assert.ok(!("evidenceRef" in props),
+    "agent-visible schema must not advertise `evidenceRef` (tool-owned authority)");
 });
 
 test("edit renderer names paths supplied only on multi-file edit items", () => {
@@ -391,4 +440,98 @@ test("extension registers event handlers", () => {
   assert.ok(pi._events.has("session_start"), "must handle session_start");
   assert.ok(pi._events.has("session_shutdown"), "must handle session_shutdown");
   assert.ok(pi._events.has("tool_result"), "must handle tool_result");
+});
+
+test("tool_result with details.workspaceEvidence is recorded into prior authority store", async () => {
+  // Setup: temp file with known content.
+  const tmpDir = realpathSync(mkdtempSync(join(tmpdir(), "edit-evidence-ingest-")));
+  const filePath = join(tmpDir, "a.ts");
+  const content = "l1\nl2\nl3\nl4\nl5\n";
+  writeFileSync(filePath, content, "utf8");
+  const canonicalFile = realpathSync(filePath);
+
+  const pi = createMockPI();
+  init(pi);
+
+  // Emit session_start so the per-session prior-authority store is created.
+  const sessionFilePath = "/sessions/evidence.jsonl";
+  const sessionStart = [...pi._events.get("session_start")!][0];
+  await sessionStart({}, {
+    sessionManager: { getSessionFile: () => sessionFilePath },
+  });
+
+  // Build a representative SmartRead line-range envelope for the file.
+  const canonicalRoot = realpathSync(process.cwd());
+  const envelope = makeLineRangeEnvelope({
+    sessionFilePath,
+    canonicalRoot,
+    canonicalFile,
+    content,
+  });
+
+  // Emit a SmartRead tool_result carrying the envelope.
+  const toolResult = [...pi._events.get("tool_result")!][0];
+  await toolResult(
+    { toolName: "inspect", isError: false, details: { workspaceEvidence: envelope } },
+    {},
+  );
+
+  // Execute an out-of-range edit through the registered `edit` tool. If the
+  // envelope was recorded, the prior line-range authority (lines 1-2) rejects
+  // the line-4 edit without widening. If it was NOT recorded, auto-inspection
+  // would synthesize full-file authority and apply — so rejection proves the
+  // store ingested the tool_result envelope.
+  const editTool = pi._tools.get("edit")!;
+  const result = await editTool.execute(
+    "tc-evidence",
+    { path: filePath, edits: [{ oldText: "l4", newText: "L4" }] },
+    undefined,
+    undefined,
+    { cwd: tmpDir },
+  );
+  const d = result.details as unknown as { status: { kind: string; reason?: string }; diagnostics?: string[] };
+  assert.equal(d.status.kind, "rejected", "out-of-range edit must be rejected by recorded prior authority");
+  assert.equal(d.status.reason, "coverage");
+  assert.ok(
+    String(d.diagnostics ?? "").includes("fresh full-file read"),
+    "diagnostics should require a fresh full-file read to widen authority",
+  );
+  assert.equal(readFileSync(filePath, "utf8"), content, "file must be unchanged");
+});
+
+test("errored tool_result workspace evidence does not authorize", async () => {
+  const tmpDir = realpathSync(mkdtempSync(join(tmpdir(), "edit-evidence-error-")));
+  const filePath = join(tmpDir, "a.ts");
+  const content = "l1\nl2\nl3\nl4\nl5\n";
+  writeFileSync(filePath, content, "utf8");
+  const canonicalFile = realpathSync(filePath);
+
+  const pi = createMockPI();
+  init(pi);
+  const sessionFilePath = "/sessions/evidence-error.jsonl";
+  const sessionStart = [...pi._events.get("session_start")!][0];
+  await sessionStart({}, { sessionManager: { getSessionFile: () => sessionFilePath } });
+
+  const envelope = makeLineRangeEnvelope({
+    sessionFilePath,
+    canonicalRoot: realpathSync(process.cwd()),
+    canonicalFile,
+    content,
+  });
+  const toolResult = [...pi._events.get("tool_result")!][0];
+  await toolResult(
+    { toolName: "inspect", isError: true, details: { workspaceEvidence: envelope } },
+    {},
+  );
+
+  const editTool = pi._tools.get("edit")!;
+  const result = await editTool.execute(
+    "tc-error-evidence",
+    { path: filePath, edits: [{ oldText: "l4", newText: "L4" }] },
+    undefined,
+    undefined,
+    { cwd: tmpDir },
+  );
+  assert.equal(result.details.status.kind, "applied", "errored result evidence must be ignored");
+  assert.equal(readFileSync(filePath, "utf8"), "l1\nl2\nl3\nL4\nl5\n");
 });

@@ -6,6 +6,12 @@
  * - description: echoed in error messages for model self-reference
  */
 
+/** 1-based inclusive line range (startLine <= endLine). */
+export interface LineRange {
+  startLine: number;
+  endLine: number;
+}
+
 /** Search scope that narrows where findText searches for oldText */
 export interface SearchScope {
   /** Byte offset into the content where searching begins */
@@ -86,8 +92,10 @@ export interface HashlineEditMetadata {
 
 export interface EditItem {
   path?: string;
-  oldText: string;
-  newText: string;
+  /** Exact text to find for replacement. Absent for symbolic/structural edits. */
+  oldText?: string;
+  /** Replacement text. Absent for symbolic/structural edits. */
+  newText?: string;
   replaceAll?: boolean;
   description?: string;
   hashline?: HashlineEditMetadata;
@@ -97,6 +105,12 @@ export interface EditItem {
    *  Symbolic: replaceBody/insertBefore/insertAfter operate on the whole symbol.
    *  Backwards compat: old anchor/symbol fields are converted to target in prepareArguments(). */
   target?: EditTarget;
+
+  /** 1-based inclusive line-range scope for this edit. Intersects with `target` scope. */
+  lineRange?: LineRange;
+
+  /** Legacy compatibility anchor; converted to `target` scope at execution time. */
+  anchor?: EditAnchor;
 }
 
 export interface EditInput {
@@ -315,6 +329,7 @@ export function fastHash(content: string): string {
 /** Backwards-compatible AST anchor shape used by hashline scoped fallback. */
 export interface EditAnchor {
   symbolName?: string;
+  symbolNamePath?: string;
   symbolKind?: string;
   symbolLine?: number;
 }
