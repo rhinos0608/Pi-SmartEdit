@@ -25,3 +25,30 @@ Pi-SmartEdit is the Pi coding agent's `edit`/`write` extension. It relies on two
 ## Coordination note
 
 `@rhinos0608/pi-workspace-protocol` has no independent versioning gate beyond the git tag pin in `package.json`. Changes to shared types (`WorkspaceEvidenceEnvelope`, `InspectedResource`, `EvidenceRef`, etc.) must be version-bumped and accompanied by compatible consumer updates in both Pi-SmartEdit and Pi-SmartRead.
+
+## Operational Contracts and Invariants
+
+### Approval gating is WARN-ONLY / ADVISORY — never blocks edits
+`src/safety/approval-gating.ts:checkEditSafety` is wired into the patch pipeline (`src/patch.ts:903-913`) and emits advisory warnings into `checks.advisory` with outcome `"pass"`. It was accidentally lost in the refactor that removed the legacy edit tool (git-confirmed regression at `a7548f6`). It was restored in the most recent review cycle.
+
+**Do NOT wire `assertEditableFile`** (the blocking companion function in the same file). That would silently start blocking edits — a product-scope decision requiring explicit approval, not a routine bug fix.
+
+Default `SMART_EDIT_APPROVAL_LEVEL` is `prompt_on_dangerous` (not `never_prompt` as docs previously stated — corrected).
+
+### atomicWrite — single source of truth
+`src/patch.ts` imports `atomicWrite` from `src/undo/atomic-write.ts` (which preserves file mode bits, handles EXDEV cross-device fallback, and uses security-restrictive 0o600 on temp files). Do not re-create a local `atomicWrite` implementation — mode-bit loss on patch writes is a real risk for scripts with execute permission.
+
+### String.replace() with user-controlled replacement text is banned in edit paths
+`String.prototype.replace(string, replacement)` interprets `$-patterns` (`$&`, `` $` ``, `$'`, `$$`) in the replacement string. Slice-based or split/join replacement is required. Fixed in `src/patch.ts:814-818` (slice-based). The `edit-diff.ts` pipeline uses slice-based replacement throughout — keep it that way.
+
+### reconstructOldText completeness validation
+`src/core/hashline-edit.ts:1329-1330` validates that every line in the anchor range has a corresponding entry before returning reconstructed text. If the anchor coverage is incomplete, return `null` (fuzzy fallback). Identical pattern at line 1357 in `reconstructOldTextByLine`. New anchor-reconstruction functions must follow the same completeness-check pattern.
+
+### Evidence contract (shared with Pi-Workspace-Protocol, Pi-SmartRead)
+Pi-SmartEdit is the **consumer** side of the workspace-evidence contract. `src/patch.ts` requests `resolve_evidence` over `RPC_CHANNELS.inspectPatch`, then validates:
+- `sessionId` via `hashSessionFilePath`
+- `canonicalWorkspaceRoot` match
+- Resource coverage (`full-file` → strong; `line-range` → strong for covered range; `search-match` / `metadata-only` → weak, requires re-read)
+- `fullFileSha256` freshness against current file content (for `full-file` coverage only)
+
+The `canonicalPath` in received envelopes MUST be a true `realpathSync` result (Pi-Workspace-Protocol's contract — symlinks resolved). If Pi-SmartRead sends a non-canonical path, SHA-256 freshness checks will fail or authorize edits against the wrong file.
