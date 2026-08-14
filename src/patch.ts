@@ -36,8 +36,7 @@
  *   patch before the write — it is not merely advisory.
  * - Returns a discriminated `details` with the full lifecycle.
  */
-import { createHash, randomUUID } from "node:crypto";
-import { readFile as fsReadFile, writeFile as fsWriteFile, stat as fsStat, rename as fsRename, mkdir as fsMkdir } from "node:fs/promises";
+import { readFile as fsReadFile, stat as fsStat, mkdir as fsMkdir } from "node:fs/promises";
 import { resolve as pathResolve, dirname as pathDirname } from "node:path";
 import { realpathSync, existsSync } from "node:fs";
 
@@ -166,6 +165,37 @@ function freezeChecks(c: MutableChecks): PatchDetails["checks"] {
         skipped: c.skipped.slice(),
         timedOut: c.timedOut.slice(),
     };
+}
+
+/** Shared timeout budget for both the pre-commit and post-write verifier
+ *  loops, so a verifier cannot hold the transaction lock (post-write runs
+ *  before commit()) or block the write indefinitely (pre-commit). */
+const VERIFIER_TIMEOUT_MS = 5000;
+
+/** Runs one verifier against a race with a timeout so a hung verifier can
+ *  never block the caller forever. A thrown error that is not the timeout
+ *  itself is classified as "fail" (a verifier crash is a hard fail); the
+ *  timeout itself is classified as "timeout" so callers can gate on it. */
+async function runVerifierCheck(
+    v: VerificationCheck,
+    ctx: { path: string; content: string; toolCallId: string },
+): Promise<{ outcome: CheckOutcome["outcome"]; detail?: string }> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        const result = await Promise.race([
+            v.run(ctx),
+            new Promise<never>((_r, rej) => {
+                timer = setTimeout(() => { rej(new Error("timeout")); }, VERIFIER_TIMEOUT_MS);
+            }),
+        ]);
+        return result.detail === undefined ? { outcome: result.outcome } : { outcome: result.outcome, detail: result.detail };
+    } catch (err) {
+        const outcome = err instanceof Error && err.message === "timeout" ? "timeout" : "fail";
+        const detail = err instanceof Error ? err.message : String(err);
+        return { outcome, detail };
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
 }
 
 // ── Authorization ───────────────────────────────────────────────────
@@ -563,16 +593,44 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             }
             const groups = grouping.groups;
             // Include topology source/destination paths in evidence and transaction plan.
+            // A second topology op targeting the same absolutePath as a group
+            // that already carries a topology is a hard conflict (e.g. delete
+            // old.ts, then rename old.ts -> moved.ts, in the same call):
+            // silently letting the later op overwrite the earlier one drops
+            // caller intent without telling them. Collect every such conflict
+            // and reject the whole batch atomically — before any lock is
+            // acquired or file touched — rather than attempt a full ordered
+            // multi-op-per-path execution engine.
+            const topologyConflicts: Array<{ path: string; existingKind: string; newKind: string }> = [];
             for (const op of rawTopology) {
                 const entries = op.kind === "rename" ? [[op.oldPath, op], [op.newPath, undefined]] : [[op.path, op]];
                 for (const [rawPath, topology] of entries as Array<[string, RawTopology | undefined]>) {
                     const absolutePath = pathResolve(ctx.cwd, rawPath);
                     const existingIdx = groups.findIndex((g) => g.absolutePath === absolutePath);
                     if (existingIdx >= 0) {
-                        // Replace immutably, preserving the group's existing fields.
-                        if (topology) groups[existingIdx] = { ...groups[existingIdx], topology };
+                        const existingTopology = groups[existingIdx].topology;
+                        if (topology) {
+                            if (existingTopology) {
+                                topologyConflicts.push({ path: rawPath, existingKind: existingTopology.kind, newKind: topology.kind });
+                            } else {
+                                // Replace immutably, preserving the group's existing fields.
+                                groups[existingIdx] = { ...groups[existingIdx], topology };
+                            }
+                        }
                     } else groups.push({ absolutePath, rawPath, edits: [], ...(topology ? { topology } : {}) });
                 }
+            }
+            if (topologyConflicts.length > 0) {
+                const message = topologyConflicts
+                    .map((c) => `conflicting topology operations for path '${c.path}': ${c.existingKind} vs ${c.newKind}`)
+                    .join("; ");
+                return {
+                    content: [{ type: "text" as const, text: `rejected: ${message}` }],
+                    details: makeRejected(toolCallId, "conflict", [message], {
+                        inspectionId: requestEvidenceRef?.inspectionId ?? "",
+                        resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [],
+                    }, freshChecks()),
+                };
             }
             const checks: MutableChecks = freshChecks();
             const diagnostics: string[] = [...rawWarnings];
@@ -708,17 +766,42 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             const finalizedFiles: FinalSuccessFile[] = [];
             const appliedFiles: string[] = [];
             const appliedCanonical: string[] = [];
+            const appliedSummaries: string[] = [];
             const displayDiffs: PatchDisplayDiff[] = [];
-            const transactionPaths = groups.map((group) => {
-                if (newFileCanonicals.has(group.absolutePath)) return group.absolutePath;
+            // One canonicalization for transaction planning and every mutation:
+            // new files keep their raw resolved path (no on-disk file to
+            // realpath), existing files resolve symlinks — so every path passed
+            // to EditTransaction.before() was included during begin().
+            const canonicalTxPath = (absolutePath: string): string => {
+                if (newFileCanonicals.has(absolutePath)) return absolutePath;
                 try {
-                    return realpathSync(group.absolutePath);
+                    return realpathSync(absolutePath);
                 } catch {
-                    return group.absolutePath;
+                    return absolutePath;
                 }
-            });
-            const transaction = await EditTransaction.begin(transactionPaths);
+            };
+            const transactionPaths = groups.map((group) => canonicalTxPath(group.absolutePath));
+            let transaction: EditTransaction;
+            try {
+                transaction = await EditTransaction.begin(transactionPaths);
+            } catch (err) {
+                // begin() can throw (lock-timeout, or a snapshot failure while
+                // reading a target path). It runs before any per-group work, so
+                // there is nothing to roll back yet — just report a typed
+                // failure rather than letting the rejection propagate past the
+                // tool boundary as an uncaught promise rejection.
+                const msg = err instanceof Error ? err.message : String(err);
+                diagnostics.push(`failed to begin transaction: ${msg}`);
+                return {
+                    content: [{ type: "text" as const, text: `failed: begin transaction (${msg})` }],
+                    details: finalize(makeFailed(toolCallId, "stage", `failed to begin transaction: ${msg}`, {
+                        inspectionId: evidenceRefForDetails.inspectionId,
+                        resourceIds: [],
+                    }, checks, diagnostics, usedEvidence, invalidations)),
+                };
+            }
             let committed = false;
+            let rollbackInfo: { ok: boolean; reason?: string } | undefined;
 
             try {
             for (const group of groups) {
@@ -727,6 +810,11 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 // Resolve canonical path for this group.
                 let canonicalTarget: string;
                 let isNewFileGroup = false;
+                // Display/applied path for this group; reassigned to the new
+                // path after a successful rename so downstream diffs, applied
+                // lists, and finalization all reference where the file now
+                // lives (the old path no longer exists once renamed).
+                let displayPath: string = group.rawPath;
                 if (newFileCanonicals.has(group.absolutePath)) {
                     // Synthesized new-file: there's no on-disk file to resolve, so
                     // skip realpath and remember this fact for the rest of the loop.
@@ -843,40 +931,71 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     };
                 }
 
-                // Topology-only groups still use normal evidence/freshness checks,
-                // then stage mutation through shared transaction engine.
-                if (group.topology && group.edits.length === 0) {
+                const hasTextEdits = group.edits.length > 0;
+
+                // DELETE: there is no post-edit content to lint/typecheck.
+                // Perform the delete through the shared transaction, invalidate
+                // the resource, emit a diff entry, and count it in the applied
+                // total/changedResources — but skip evidence/diagnostics
+                // generation for this path (the reviewer's carved-out exception:
+                // add/rename flow through the full pipeline below, delete does
+                // not).
+                if (!hasTextEdits && group.topology?.kind === "delete") {
                     try {
-                        if (group.topology.kind === "add") await transaction.create(group.absolutePath, group.topology.content);
-                        else if (group.topology.kind === "delete") await transaction.remove(group.absolutePath);
-                        else await transaction.rename(
-                            pathResolve(ctx.cwd, group.topology.oldPath),
-                            pathResolve(ctx.cwd, group.topology.newPath),
-                        );
-                        appliedFiles.push(group.rawPath);
-                        appliedCanonical.push(canonicalTarget);
+                        await transaction.remove(canonicalTxPath(group.absolutePath));
                     } catch (err) {
                         // Return a write-phase failure so the outer finally still
                         // runs the transaction rollback for any earlier mutations.
-                        diagnostics.push(`topology ${group.topology.kind} failed: ${err instanceof Error ? err.message : String(err)}`);
+                        diagnostics.push(`topology delete failed: ${err instanceof Error ? err.message : String(err)}`);
                         return {
-                            content: [{ type: "text" as const, text: `failed: ${group.topology.kind} ${group.rawPath}` }],
-                            details: finalize(makeFailed(toolCallId, "write", `${group.topology.kind} failed: ${group.rawPath}`, {
+                            content: [{ type: "text" as const, text: `failed: delete ${group.rawPath}` }],
+                            details: finalize(makeFailed(toolCallId, "write", `delete failed: ${group.rawPath}`, {
                                 inspectionId: evidenceRefForDetails.inspectionId,
-                                resourceIds: resource ? [resource.resourceId] : evidenceRefForDetails.resourceIds,
+                                resourceIds: [resource.resourceId],
                             }, checks, diagnostics, usedEvidence, invalidations)),
                         };
                     }
+                    invalidations.push({
+                        resourceId: resource.resourceId,
+                        canonicalPath: resource.canonicalPath,
+                        fullFileSha256: currentSha,
+                        coverage: resource.coverage,
+                    });
+                    const generatedDiff = generateDiffString(currentContent, "").diff;
+                    displayDiffs.push({ path: displayPath, diff: generatedDiff });
+                    appliedFiles.push(displayPath);
+                    appliedCanonical.push(canonicalTarget);
+                    appliedSummaries.push(`delete of ${displayPath}`);
+                    stream(`  ✓ deleted ${displayPath}`);
                     continue;
                 }
-                if (group.edits.length === 0) continue;
+
+                // A group with neither topology nor edits is a bookkeeping
+                // placeholder (e.g. a rename's destination path, included only
+                // so the transaction locks/snapshots it) — nothing to apply.
+                if (!hasTextEdits && !group.topology) continue;
 
                 // Stage edits through the planner (no writes). The planner routes
                 // text edits through applyEdits (fuzzy tiers, replaceAll, AST/lineRange
                 // scopes, literal $ replacement) and returns actual resolved spans.
+                // ADD and topology-only RENAME groups skip the planner — their
+                // content is already fully determined — but still flow through
+                // the exact same write/verify/evidence/finalization machinery
+                // below as a text edit would, rather than an early-exit
+                // shortcut that bypasses the compiler/LSP/post-edit pipeline.
                 let newContent: string;
                 let preimageLineRanges: ReadonlyArray<LineRange> = [];
-                if (isNewFileGroup) {
+                let postimageLineRanges: ReadonlyArray<LineRange> = [];
+                if (!hasTextEdits && group.topology?.kind === "add") {
+                    newContent = group.topology.content;
+                    postimageLineRanges = [{ startLine: 1, endLine: Math.max(1, newContent.split("\n").length) }];
+                } else if (!hasTextEdits && group.topology?.kind === "rename") {
+                    // Content is unchanged; the rename itself happens further
+                    // below (after post-write verify), which reassigns
+                    // canonicalTarget/displayPath to the new path before any
+                    // evidence/finalization records anything against it.
+                    newContent = currentContent;
+                } else if (isNewFileGroup) {
                     // New-file creation: the empty oldText is implicit at offset 0
                     // of the (empty) current content. applyEdits rejects empty
                     // oldText, so this path stays separate.
@@ -914,6 +1033,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         }
                     }
                     preimageLineRanges = [{ startLine: 1, endLine: 1 }];
+                    postimageLineRanges = [{ startLine: 1, endLine: Math.max(1, newContent.split("\n").length) }];
                 } else {
                     try {
                         const planned = await planTextEdits({
@@ -926,6 +1046,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         });
                         newContent = planned.newContent;
                         preimageLineRanges = planned.preimageLineRanges;
+                        postimageLineRanges = planned.postimageLineRanges;
                         for (const note of planned.matchNotes) diagnostics.push(note);
                     } catch (err) {
                         const msg = err instanceof Error ? err.message : String(err);
@@ -985,14 +1106,19 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     const repairRanges = changedLineRanges(newContent, repair.repairedContent);
                     // Repair ranges are computed in staged (post-edit) coordinates,
                     // so they cannot be compared against the resource's pre-edit
-                    // allowedRanges. Instead, accept a repair only when it stays
+                    // allowedRanges. Map each repair span back to original
+                    // coordinates via the edit mapping, then require it to stay
                     // within the edit's already-authorized preimage footprint.
-                    // Full-file grants accept any in-file repair.
+                    // Full-file grants accept any in-file repair; a repair that
+                    // cannot be re-authorized is skipped.
                     const confinedToPreimage =
                         resource.coverage === "full-file" ||
-                        (preimageLineRanges.length > 0 &&
-                            repairRanges.every((r) =>
-                                preimageLineRanges.some((p) => r.startLine >= p.startLine && r.endLine <= p.endLine)));
+                        (repairRanges.length > 0 &&
+                            repairRanges.every((r) => {
+                                const mapped = mapRepairSpanToPreimage(r, preimageLineRanges, postimageLineRanges);
+                                return mapped !== null &&
+                                    preimageLineRanges.some((p) => mapped.startLine >= p.startLine && mapped.endLine <= p.endLine);
+                            }));
                     if (confinedToPreimage) {
                         newContent = repair.repairedContent;
                         diagnostics.push(`repair: accepted staged repair for ${canonicalTarget}`);
@@ -1011,42 +1137,30 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 // the pre-write content and mis-record them.
                 const verifiers = deps.getVerificationChecks?.() ?? [];
                 for (const v of verifiers.filter((candidate) => candidate.phase !== "postwrite")) {
-                    let outcome: "pass" | "fail" | "skipped" | "timeout" = "pass";
-                    let detail: string | undefined;
-                    let timer: ReturnType<typeof setTimeout> | undefined;
-                    try {
-                        const result = await Promise.race([
-                            v.run({ path: canonicalTarget, content: newContent, toolCallId }),
-                            new Promise<never>((_r, rej) => {
-                                timer = setTimeout(() => { rej(new Error("timeout")); }, 5000);
-                            }),
-                        ]);
-                        outcome = result.outcome;
-                        if (result.detail) detail = result.detail;
-                    } catch (err) {
-                        // Only the racing timer maps to "timeout". A blocking
-                        // verifier that throws for any other reason is treated
-                        // as a hard fail so the gate below actually blocks the
-                        // write.
-                        if (err instanceof Error && err.message === "timeout") {
-                            outcome = "timeout";
-                        } else {
-                            outcome = "fail";
-                        }
-                        detail = err instanceof Error ? err.message : String(err);
-                    } finally {
-                        if (timer) clearTimeout(timer);
-                    }
+                    // Only the racing timer maps to "timeout". A blocking
+                    // verifier that throws for any other reason is treated
+                    // as a hard fail so the gate below actually blocks the
+                    // write.
+                    const { outcome, detail } = await runVerifierCheck(v, { path: canonicalTarget, content: newContent, toolCallId });
                     const check = makeCheck(`${v.id}:${group.rawPath}`, outcome, detail);
-                    if (outcome === "timeout") checks.timedOut.push(check);
-                    else if (v.kind === "blocking") checks.blocking.push(check);
-                    else checks.advisory.push(check);
                     checks.completed.push(check);
+                    if (outcome === "timeout") {
+                        // A timed-out BLOCKING verifier must still be visible to
+                        // the gate below (it also stays in timedOut for
+                        // observability) — a timeout is not merely advisory, it
+                        // must block the write exactly like an outright failure.
+                        checks.timedOut.push(check);
+                        if (v.kind === "blocking") checks.blocking.push(check);
+                    } else if (v.kind === "blocking") {
+                        checks.blocking.push(check);
+                    } else {
+                        checks.advisory.push(check);
+                    }
                 }
 
-                // A failing blocking check must prevent the write — recording
-                // it in checks.blocking is not itself a gate.
-                const failedBlocking = checks.blocking.find((c) => c.outcome === "fail");
+                // A failing (or timed-out) blocking check must prevent the
+                // write — recording it in checks.blocking is not itself a gate.
+                const failedBlocking = checks.blocking.find((c) => c.outcome === "fail" || c.outcome === "timeout");
                 if (failedBlocking) {
                     diagnostics.push(`blocking check failed: ${failedBlocking.id}${failedBlocking.detail ? ` (${failedBlocking.detail})` : ""}`);
                     return {
@@ -1114,20 +1228,26 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     }
                 }
 
-                // Atomic write.
+                // Atomic write. Skipped when content is unchanged (a
+                // topology-only rename with no text edits) — there is nothing
+                // new to persist at canonicalTarget before the rename below
+                // moves the file to its destination.
                 try {
-                    // Ensure parent directory exists before atomic write
-                    await fsMkdir(pathDirname(canonicalTarget), { recursive: true });
-                    await transaction.write(canonicalTarget, newContent);
+                    if (newContent !== currentContent) {
+                        // Ensure parent directory exists before atomic write
+                        await fsMkdir(pathDirname(canonicalTarget), { recursive: true });
+                        await transaction.write(canonicalTarget, newContent);
+                    }
                 } catch (err) {
                     diagnostics.push(`write failed: ${err instanceof Error ? err.message : String(err)}`);
-                    await transaction.rollback();
+                    const rollback = await transaction.rollback();
+                    const rollbackInfo = buildRollbackInfo(transaction.transactionId, rollback);
                     return {
                         content: [{ type: "text" as const, text: `failed: write ${group.rawPath}` }],
                         details: finalize(makeFailed(toolCallId, "write", `write failed: ${group.rawPath}`, {
                             inspectionId: evidenceRefForDetails.inspectionId,
                             resourceIds: [resource.resourceId],
-                        }, checks, diagnostics, usedEvidence, invalidations)),
+                        }, checks, diagnostics, usedEvidence, invalidations, rollbackInfo)),
                     };
                 }
 
@@ -1174,18 +1294,13 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     };
                 }
 
-                // Post-write checks execute under transaction lock; blocking failure rolls back.
+                // Post-write checks execute under transaction lock (this runs
+                // before commit()); blocking failure rolls back. Wrapped in the
+                // same timeout mechanism as the pre-commit loop so a hung
+                // post-write verifier cannot hold the transaction lock forever
+                // — a timeout here is treated exactly like a blocking failure.
                 for (const v of verifiers.filter((candidate) => candidate.phase === "postwrite")) {
-                    let outcome: "pass" | "fail" | "skipped" | "timeout" = "pass";
-                    let detail: string | undefined;
-                    try {
-                        const result = await v.run({ path: canonicalTarget, content: postContent, toolCallId });
-                        outcome = result.outcome;
-                        detail = result.detail;
-                    } catch (err) {
-                        outcome = "fail";
-                        detail = err instanceof Error ? err.message : String(err);
-                    }
+                    const { outcome, detail } = await runVerifierCheck(v, { path: canonicalTarget, content: postContent, toolCallId });
                     const check = makeCheck(`${v.id}:${group.rawPath}`, outcome, detail);
                     checks.completed.push(check);
                     if (v.kind === "advisory") checks.advisory.push(check);
@@ -1205,8 +1320,8 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 if (group.topology?.kind === "rename") {
                     try {
                         await transaction.rename(
-                            pathResolve(ctx.cwd, group.topology.oldPath),
-                            pathResolve(ctx.cwd, group.topology.newPath),
+                            canonicalTxPath(pathResolve(ctx.cwd, group.topology.oldPath)),
+                            canonicalTxPath(pathResolve(ctx.cwd, group.topology.newPath)),
                         );
                     } catch (err) {
                         diagnostics.push(`rename failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -1218,6 +1333,18 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                             }, checks, diagnostics, usedEvidence, invalidations)),
                         };
                     }
+                    // The old path no longer exists on disk. Every downstream
+                    // use — post-edit evidence, finalizedFiles (and therefore
+                    // the LSP/compiler finalization lanes), the displayed diff
+                    // path, and the applied-file lists — must reference the
+                    // file at its NEW location, not the deleted old path.
+                    const renamedAbsolute = pathResolve(ctx.cwd, group.topology.newPath);
+                    try {
+                        canonicalTarget = realpathSync(renamedAbsolute);
+                    } catch {
+                        canonicalTarget = renamedAbsolute;
+                    }
+                    displayPath = group.topology.newPath;
                 }
 
                 const newLines = postContent.split("\n");
@@ -1231,19 +1358,36 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     path: canonicalTarget,
                     oldContent: currentContent,
                     content: postContent,
-                    changedLineRanges: preimageLineRanges,
+                    // Postimage ranges: paired with post-edit `postContent` so
+                    // downstream consumers (index.ts's lineRangeToOffsets) scope
+                    // diagnostics/evidence against the same coordinate space as
+                    // the content itself, not the pre-edit line numbering.
+                    changedLineRanges: postimageLineRanges,
                 });
                 const generatedDiff = generateDiffString(currentContent, postContent).diff;
-                displayDiffs.push({ path: group.rawPath, diff: generatedDiff });
-                appliedFiles.push(group.rawPath);
+                displayDiffs.push({ path: displayPath, diff: generatedDiff });
+                appliedFiles.push(displayPath);
                 appliedCanonical.push(canonicalTarget);
-                stream(`  ✓ wrote ${group.rawPath}`);
+                appliedSummaries.push(
+                    !hasTextEdits && group.topology?.kind === "add" ? `add of ${displayPath}`
+                        : !hasTextEdits && group.topology?.kind === "rename" ? `rename of ${group.rawPath} to ${displayPath}`
+                            : `${group.edits.length} edit(s) to ${displayPath}`,
+                );
+                stream(`  ✓ wrote ${displayPath}`);
             }
 
+            // Capture undo records (which snapshot post-write disk content for
+            // afterSha) BEFORE commit() releases the lock. commit()'s only
+            // side effect is releasing the lock — every write already landed
+            // on disk atomically earlier in this loop — so reading undo state
+            // while the lock is still held closes the window where a second,
+            // concurrent SmartEdit transaction could mutate the file between
+            // release and a fresh post-commit disk read, which would corrupt
+            // afterSha with someone else's write.
+            const undoRecords = await transaction.getUndoRecords().catch(() => []);
             await transaction.commit();
             committed = true;
             try {
-                const undoRecords = await transaction.getUndoRecords().catch(() => []);
                 await saveTransactionUndoRecords(ctx.cwd, undoRecords);
             } catch (err) {
                 // Undo persistence is best-effort and must never turn a durable
@@ -1253,6 +1397,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             } finally {
                 if (!committed) {
                     const rollback = await transaction.rollback();
+                    rollbackInfo = buildRollbackInfo(transaction.transactionId, rollback);
                     const failedRollbackPaths = new Set(rollback.failed);
                     invalidations.splice(
                         0,
@@ -1322,9 +1467,14 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 diffs: displayDiffs,
                 repairs: Object.fromEntries(repairsByPath),
                 finalization,
+                rollback: rollbackInfo,
             };
-            const summary = appliedFiles.length === 1
-                ? `applied ${groups[0]?.edits.length ?? 0} edit(s) to ${appliedFiles[0]}`
+            // Built from appliedSummaries (recorded per applied group at the
+            // point it was applied) rather than indexing groups[0], which does
+            // not necessarily correspond to appliedFiles[0] and previously
+            // reported "applied 0 edit(s)" for a topology-only group.
+            const summary = appliedSummaries.length === 1
+                ? `applied ${appliedSummaries[0]}`
                 : `applied edits to ${appliedFiles.length} file(s): ${appliedFiles.join(", ")}`;
             return {
                 content: [{ type: "text" as const, text: summary }],
@@ -1340,6 +1490,33 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
  * can reject a repair that a finer diff could allow, but can never widen a
  * line-range grant.
  */
+/**
+ * Map a line span from staged (post-edit) coordinates back to the original
+ * file's coordinates using the planner's preimage/postimage ranges. Lines
+ * outside edited regions map 1:1 with the accumulated line-count delta;
+ * lines inside an edited region map to that region's preimage start. Returns
+ * null when the mapping cannot be established (no or mismatched planner
+ * ranges) so the caller skips the repair rather than mis-authorizing it.
+ */
+function mapRepairSpanToPreimage(
+    span: LineRange,
+    preimage: ReadonlyArray<LineRange>,
+    postimage: ReadonlyArray<LineRange>,
+): LineRange | null {
+    if (preimage.length === 0 || preimage.length !== postimage.length) return null;
+    const mapLine = (line: number): number => {
+        let shift = 0;
+        for (let i = 0; i < postimage.length; i++) {
+            const post = postimage[i]!;
+            const pre = preimage[i]!;
+            if (line >= post.startLine && line <= post.endLine) return pre.startLine;
+            if (line > post.endLine) shift += (pre.endLine - pre.startLine) - (post.endLine - post.startLine);
+        }
+        return line + shift;
+    };
+    return { startLine: mapLine(span.startLine), endLine: mapLine(span.endLine) };
+}
+
 function changedLineRanges(before: string, after: string): ReadonlyArray<LineRange> {
     if (before === after) return [];
     let prefix = 0;
@@ -1357,6 +1534,17 @@ function changedLineRanges(before: string, after: string): ReadonlyArray<LineRan
 }
 
 // ── helpers ──
+
+function buildRollbackInfo(transactionId: string, outcome: { attempted: string[]; ok: string[]; restored: string[]; failed: string[] }): { ok: boolean; reason?: string } {
+    const success = outcome.failed.length === 0;
+    if (success) {
+        const reason = `transaction ${transactionId}: restored ${outcome.restored.length}/${outcome.attempted.length} path(s)`;
+        return { ok: true, reason };
+    } else {
+        const reason = `transaction ${transactionId}: rollback failed for ${outcome.failed.join(", ")}`;
+        return { ok: false, reason };
+    }
+}
 
 function makeRejected(
     toolCallId: string,
@@ -1388,6 +1576,7 @@ function makeFailed(
     diagnostics: string[],
     usedEvidence: ReadonlyArray<string> = [],
     changedResources: ReadonlyArray<ResourceInvalidation> = [],
+    rollback?: { ok: boolean; reason?: string },
 ): PatchDetails {
     return {
         tool: "patch",
@@ -1399,6 +1588,7 @@ function makeFailed(
         checks: freezeChecks(checks),
         diagnostics,
         error: message,
+        ...(rollback ? { rollback } : {}),
     };
 }
 

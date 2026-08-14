@@ -775,3 +775,122 @@ describe("raw formats through public execute", () => {
     }
   });
 });
+
+// ── Topology ops flow through the same pipeline as text edits ───────
+
+test("public: raw add of a new file flows through the full pipeline (finalization, evidence, applied count)", async () => {
+  const workdir = realpathSync(mkdtempSync(join(tmpdir(), "cap-topo-add-")));
+  let finalizationCalls = 0;
+  const raw = "*** Begin Atomic Patch\n*** Add File: new.ts\nconst x = 1;\nconst y = 2;\n*** End Atomic Patch";
+  const { res } = await runTool({
+    workdir,
+    fileContent: "unrelated\n",
+    raw,
+    runFinalSuccessLanes: async ({ files }) => {
+      finalizationCalls++;
+      assert.equal(files.length, 1);
+      assert.equal(files[0].path, join(workdir, "new.ts"));
+      assert.equal(files[0].content, "const x = 1;\nconst y = 2;");
+      assert.equal(files[0].oldContent, "");
+      assert.ok(files[0].changedLineRanges.length > 0, "added content must carry a non-empty changed range for scoping");
+      return { diagnostics: [], checks: [], evidence: { lane: "add-test" } };
+    },
+  });
+  const details = res.details as {
+    status: { kind: string };
+    changedResources: readonly unknown[];
+    diffs?: ReadonlyArray<{ path: string; diff: string }>;
+    finalization?: unknown;
+  };
+  assert.equal(details.status.kind, "applied");
+  assert.equal(finalizationCalls, 1, "runFinalSuccessLanes must run for a topology-only add, not be skipped");
+  assert.equal(details.changedResources.length, 1, "add must be counted in changedResources");
+  assert.ok(details.diffs && details.diffs.length === 1);
+  assert.equal(details.diffs![0].path, "new.ts");
+  assert.match(details.diffs![0].diff, /const x = 1/);
+  assert.deepEqual(details.finalization, { lane: "add-test" });
+  assert.doesNotMatch(res.content[0].text, /applied 0 edit/, "a topology-only add must not report 'applied 0 edit(s)'");
+  assert.match(res.content[0].text, /add/i);
+});
+
+test("public: topology delete emits an invalidation and diff entry but skips evidence/finalization", async () => {
+  const workdir = realpathSync(mkdtempSync(join(tmpdir(), "cap-topo-delete-")));
+  let finalizationCalls = 0;
+  const raw = "*** Begin Atomic Patch\n*** Delete File: a.ts\n*** End Atomic Patch";
+  const { res } = await runTool({
+    workdir,
+    fileContent: "old\n",
+    raw,
+    runFinalSuccessLanes: async () => {
+      finalizationCalls++;
+      return { diagnostics: [], checks: [], evidence: null };
+    },
+  });
+  const details = res.details as {
+    status: { kind: string };
+    changedResources: readonly { canonicalPath: string; newFullFileSha256?: string }[];
+    diffs?: ReadonlyArray<{ path: string; diff: string }>;
+  };
+  assert.equal(details.status.kind, "applied");
+  assert.equal(finalizationCalls, 0, "delete has no post-edit content to lint/typecheck — finalization must not run");
+  assert.equal(details.changedResources.length, 1, "delete must still be counted as a changed resource");
+  assert.equal(details.changedResources[0].newFullFileSha256, undefined);
+  assert.ok(details.diffs && details.diffs.length === 1);
+  assert.equal(details.diffs![0].path, "a.ts");
+  assert.match(details.diffs![0].diff, /-\d+ old/, "diff must show the deleted content as removed");
+  assert.match(res.content[0].text, /delete/i);
+});
+
+test("public: rename + text edit finalizes evidence/diagnostics against the new path, not the deleted old path", async () => {
+  const workdir = realpathSync(mkdtempSync(join(tmpdir(), "cap-topo-rename-edit-")));
+  let finalizationCalls = 0;
+  const raw = "*** Begin Atomic Patch\n*** Update File: a.ts\n@@\n-old\n+new\n*** Rename File: a.ts -> moved.ts\n*** End Atomic Patch";
+  const { res } = await runTool({
+    workdir,
+    fileContent: "old\n",
+    raw,
+    runFinalSuccessLanes: async ({ files }) => {
+      finalizationCalls++;
+      assert.equal(files.length, 1);
+      assert.equal(files[0].path, join(workdir, "moved.ts"), "finalization must reference the NEW path, not the deleted old path");
+      assert.equal(files[0].content, "new\n");
+      return { diagnostics: [], checks: [], evidence: null };
+    },
+  });
+  assert.equal(res.details.status.kind, "applied");
+  assert.equal(finalizationCalls, 1, "rename+edit must still finalize exactly once, against the new path");
+  assert.equal(existsSync(join(workdir, "a.ts")), false);
+  assert.equal(readFileSync(join(workdir, "moved.ts"), "utf8"), "new\n");
+  const details = res.details as { diffs?: ReadonlyArray<{ path: string; diff: string }> };
+  assert.ok(details.diffs && details.diffs.length === 1);
+  assert.equal(details.diffs![0].path, "moved.ts", "displayed diff path should reflect the renamed destination, not the old path");
+});
+
+test("public: conflicting topology operations on the same path are rejected before any write", async () => {
+  const workdir = realpathSync(mkdtempSync(join(tmpdir(), "cap-topo-conflict-")));
+  const raw = [
+    "*** Begin Atomic Patch",
+    "*** Add File: new.ts",
+    "hello",
+    "*** Delete File: old.ts",
+    "*** Rename File: old.ts -> moved.ts",
+    "*** End Atomic Patch",
+  ].join("\n");
+  const { res } = await runTool({
+    workdir,
+    fileContent: "a-content\n",
+    additionalFiles: { "old.ts": "old-content\n" },
+    raw,
+  });
+  const details = res.details as { status: { kind: string; reason?: string }; diagnostics: readonly string[] };
+  assert.equal(details.status.kind, "rejected");
+  assert.equal(details.status.reason, "conflict");
+  const diagnosticText = details.diagnostics.join("\n");
+  assert.match(diagnosticText, /old\.ts/);
+  assert.match(diagnosticText, /delete/i);
+  assert.match(diagnosticText, /rename/i);
+  // Rejection must be atomic and clean: nothing on disk was touched.
+  assert.equal(readFileSync(join(workdir, "old.ts"), "utf8"), "old-content\n");
+  assert.equal(existsSync(join(workdir, "new.ts")), false);
+  assert.equal(existsSync(join(workdir, "moved.ts")), false);
+});

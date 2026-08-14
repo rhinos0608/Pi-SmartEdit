@@ -1413,3 +1413,105 @@ test("topology delete failure returns failed/write (not an uncaught throw) and r
     assert.equal(d.status.phase, "write", "topology failure must be a write-phase failure");
     assert.equal(existsSync(join(workdir, "missing.ts")), false);
 });
+
+// ─── Bug 3: EditTransaction.begin() failure must return a typed result ────
+
+test("Bug 3 regression: EditTransaction.begin() failure returns a typed failed result, not an uncaught rejection", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-begin-fail-")));
+    mkdirSync(workdir, { recursive: true });
+    // A directory (not a file) at the target path makes EditTransaction.begin's
+    // internal snapshot() throw EISDIR (stat succeeds, then readFile fails with
+    // a non-ENOENT error) — exactly the "snapshot failure inside begin" case
+    // called out by the bug report, and reachable without waiting out a real
+    // lock timeout.
+    const dirPath = join(workdir, "not-a-file");
+    mkdirSync(dirPath);
+    const canonicalDir = realpathSync(dirPath);
+    const sessionFilePath = "/sessions/begin-fail.jsonl";
+
+    // A strong prior authority for the target skips auto-inspect and RPC
+    // entirely, so execution reaches EditTransaction.begin() without ever
+    // reading the directory's content first (which would otherwise fail
+    // earlier, during auto-inspect, and never reach begin() at all).
+    const store = createPriorAuthorityStore({ sessionFilePath, canonicalWorkspaceRoot: workdir });
+    store.record(makeEnvelope({
+        sessionFilePath,
+        canonicalRoot: workdir,
+        resources: [makeResource({ canonicalPath: canonicalDir, full: true, content: "" })],
+    }));
+
+    const deps: PatchToolDeps = {
+        getRpcClient: () => ({ request: async () => { throw new Error("rpc must not be called: prior authority covers the only group"); }, dispose: () => {} }),
+        getSessionFilePath: () => sessionFilePath,
+        getCanonicalWorkspaceRoot: () => workdir,
+        getPriorAuthority: () => store,
+    };
+    const tool = createPatchTool(deps);
+
+    // Must resolve normally (not reject) even though begin() throws internally.
+    const res = await tool.execute(
+        "tc-begin-fail",
+        { path: "not-a-file", edits: [{ oldText: "x", newText: "y" }], toolCallId: "tc-begin-fail" },
+        undefined,
+        undefined,
+        makeCtx(workdir),
+    );
+    const d = res.details as any;
+    assert.equal(d.status.kind, "failed", `expected a typed failed result, got ${JSON.stringify(d.status)}`);
+    assert.equal(d.status.phase, "stage");
+});
+
+// ─── Bug 4: verifier timeout semantics ─────────────────────────────────
+
+test("Bug 4a regression: a blocking verifier that times out blocks the write (timeout is not silently ignored)", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-blocking-timeout-")));
+    mkdirSync(workdir, { recursive: true });
+    const before = "alpha\nbeta\n";
+    const { res, canonicalFile } = await runApply({
+        workdir,
+        fileContent: before,
+        envelopeContent: before,
+        fullFile: true,
+        edits: [{ oldText: "beta", newText: "BETA" }],
+        rpc: (env) => ({ ok: true, payload: env }),
+        checks: [{
+            id: "hangs",
+            kind: "blocking",
+            run: () => new Promise(() => { /* never resolves */ }),
+        }],
+    });
+    const d = res.details as any;
+    assert.equal(d.status.kind, "rejected", `expected the timeout to block the write, got ${JSON.stringify(d.status)}`);
+    assert.equal(d.status.reason, "approval");
+    assert.equal(readFileSync(canonicalFile, "utf8"), before, "file must remain unmodified");
+    const checks = d.checks as { blocking: Array<{ id: string; outcome: string }>; timedOut: Array<{ id: string; outcome: string }> };
+    const blockingTimeout = checks.blocking.find((c) => c.id.startsWith("hangs:"));
+    assert.ok(blockingTimeout, "a timed-out blocking verifier must be visible to the gate in checks.blocking");
+    assert.equal(blockingTimeout.outcome, "timeout");
+    const timedOutRecord = checks.timedOut.find((c) => c.id.startsWith("hangs:"));
+    assert.ok(timedOutRecord, "the timeout must also remain visible in checks.timedOut for observability");
+});
+
+test("Bug 4b regression: a hung post-write verifier times out and is treated as a failure instead of hanging forever", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-postwrite-timeout-")));
+    mkdirSync(workdir, { recursive: true });
+    const before = "alpha\nbeta\n";
+    const { res, canonicalFile } = await runApply({
+        workdir,
+        fileContent: before,
+        envelopeContent: before,
+        fullFile: true,
+        edits: [{ oldText: "beta", newText: "BETA" }],
+        rpc: (env) => ({ ok: true, payload: env }),
+        checks: [{
+            id: "hangs-post",
+            kind: "blocking",
+            phase: "postwrite",
+            run: () => new Promise(() => { /* never resolves; must not hold the transaction lock forever */ }),
+        }],
+    });
+    const details = res.details as { status: { kind: string; phase?: string } };
+    assert.equal(details.status.kind, "failed", `expected the hung post-write verifier to time out as a failure, got ${JSON.stringify(details.status)}`);
+    assert.equal(details.status.phase, "verify");
+    assert.equal(readFileSync(canonicalFile, "utf8"), before, "hung post-write verifier must not hold the write; file must be restored");
+});
