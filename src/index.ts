@@ -570,7 +570,6 @@ export default function smartEdit(pi: ExtensionAPI) {
     const refreshReadCacheAfterEdit = async (filePath: string, cwd: string): Promise<void> => {
       const resolvedPath = resolve(cwd, filePath);
       const content = (await fsReadFile(resolvedPath)).toString("utf-8");
-      if (!content) return;
       recordRead(filePath, cwd, content);
       const lines = content.split("\n");
       recordReadSession(filePath, cwd, 1, -1, lines.length, "edit");
@@ -650,7 +649,7 @@ export default function smartEdit(pi: ExtensionAPI) {
             ),
           ];
           for (const p of uniquePaths) {
-            refreshReadCacheAfterEdit(p, toolCwd).catch(() => {
+            await refreshReadCacheAfterEdit(p, toolCwd).catch(() => {
               // File might not exist or can't be read — skip silently
             });
           }

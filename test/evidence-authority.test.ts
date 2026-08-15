@@ -1,9 +1,12 @@
 /**
  * PriorAuthorityStore unit tests — tool-owned evidence policy B.
  *
- * Verifies: latest strong wins by arrival order, newer line-range supersedes
- * older full-file, later full-file widens again, weak evidence does not
- * authorize, session/root mismatch ignored, invalid envelope ignored, clear().
+ * Verifies: same-content evidence accumulates (a narrower read never narrows
+ * an existing full-file grant; two line-range reads of the same unchanged
+ * file union their ranges), a later full-file read still widens authority,
+ * a genuine content change (differing sha) replaces rather than merges, weak
+ * evidence does not authorize, session/root mismatch ignored, invalid
+ * envelope ignored, clear().
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -109,22 +112,63 @@ function makeStore() {
     return createPriorAuthorityStore({ sessionFilePath: SESSION, canonicalWorkspaceRoot: ROOT });
 }
 
-test("record: latest strong wins by arrival order (newer line-range supersedes older full-file)", () => {
+test("record: a narrower same-content read does not narrow an existing full-file grant", () => {
+    const store = makeStore();
+    const path = "/ws/a.ts";
+    const content = "l1\nl2\nl3\nl4\nl5\n";
+    store.record(makeEnvelope({
+        sessionFilePath: SESSION,
+        canonicalRoot: ROOT,
+        resources: [makeResource({ canonicalPath: path, coverage: "full-file", content })],
+    }));
+    store.record(makeEnvelope({
+        sessionFilePath: SESSION,
+        canonicalRoot: ROOT,
+        resources: [makeResource({ canonicalPath: path, coverage: "line-range", range: { startLine: 1, endLine: 2 }, content })],
+    }));
+    const selected = store.select(path);
+    assert.ok(selected, "must select a resource");
+    assert.equal(selected!.coverage, "full-file", "a windowed read of the same unchanged file must not narrow an existing full-file grant");
+    assert.deepEqual(selected!.allowedRanges, [{ startLine: 1, endLine: 6 }], "full-file range must remain intact");
+});
+
+test("record: two line-range reads of the same unchanged file accumulate (union), not replace", () => {
+    const store = makeStore();
+    const path = "/ws/a.ts";
+    const content = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\n";
+    store.record(makeEnvelope({
+        sessionFilePath: SESSION,
+        canonicalRoot: ROOT,
+        resources: [makeResource({ canonicalPath: path, coverage: "line-range", range: { startLine: 1, endLine: 2 }, content })],
+    }));
+    store.record(makeEnvelope({
+        sessionFilePath: SESSION,
+        canonicalRoot: ROOT,
+        resources: [makeResource({ canonicalPath: path, coverage: "line-range", range: { startLine: 10, endLine: 12 }, content })],
+    }));
+    const selected = store.select(path);
+    assert.ok(selected, "must select a resource");
+    assert.equal(selected!.coverage, "line-range");
+    const ranges = [...selected!.allowedRanges].sort((a, b) => a.startLine - b.startLine);
+    assert.deepEqual(ranges, [{ startLine: 1, endLine: 2 }, { startLine: 10, endLine: 12 }], "both windows read this session must remain authorized");
+});
+
+test("record: a genuine content change (differing sha) replaces rather than merges", () => {
     const store = makeStore();
     const path = "/ws/a.ts";
     store.record(makeEnvelope({
         sessionFilePath: SESSION,
         canonicalRoot: ROOT,
-        resources: [makeResource({ canonicalPath: path, coverage: "full-file", content: "l1\nl2\nl3\nl4\nl5\n" })],
+        resources: [makeResource({ canonicalPath: path, coverage: "line-range", range: { startLine: 1, endLine: 2 }, content: "old l1\nold l2\n" })],
     }));
     store.record(makeEnvelope({
         sessionFilePath: SESSION,
         canonicalRoot: ROOT,
-        resources: [makeResource({ canonicalPath: path, coverage: "line-range", range: { startLine: 1, endLine: 2 } })],
+        resources: [makeResource({ canonicalPath: path, coverage: "line-range", range: { startLine: 10, endLine: 12 }, content: "new content, file changed on disk\n" })],
     }));
     const selected = store.select(path);
     assert.ok(selected, "must select a resource");
-    assert.equal(selected!.coverage, "line-range", "newer line-range must supersede older full-file");
+    assert.deepEqual(selected!.allowedRanges, [{ startLine: 10, endLine: 12 }], "stale range from the since-modified file must not be trusted or merged");
 });
 
 test("record: later full-file read widens authority again", () => {

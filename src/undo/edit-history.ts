@@ -252,13 +252,19 @@ export async function restoreUndoState(
     const targetPath = pathResolve(entry.newPath ?? filePath);
     const currentExists = await fsStat(targetPath).then(() => true).catch(() => false);
     let currentFileContent = "";
+    let currentFileBuffer: Buffer | undefined;
     if (currentExists) {
-      try { currentFileContent = await fsReadFile(targetPath, "utf-8"); } catch { return false; }
+      try {
+        currentFileBuffer = await fsReadFile(targetPath);
+        currentFileContent = currentFileBuffer.toString("utf-8");
+      } catch {
+        return false;
+      }
     }
     // Legacy entries intentionally retain old pre-edit hash behavior.
     if (isVersioned) {
       if ((entry.afterExists ?? true) !== currentExists) return false;
-      if (currentExists && sha256(currentFileContent) !== entry.afterSha) return false;
+      if (currentExists && currentFileBuffer && createHash("sha256").update(currentFileBuffer).digest("hex") !== entry.afterSha) return false;
     } else if (!currentExists || fastHash(currentFileContent) !== entry.snapshotHash) {
       return false;
     }

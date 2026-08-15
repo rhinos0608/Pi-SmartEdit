@@ -616,6 +616,9 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                                 // Replace immutably, preserving the group's existing fields.
                                 groups[existingIdx] = { ...groups[existingIdx], topology };
                             }
+                        } else if (existingTopology && op.kind === "rename") {
+                            // Rename destination conflicts with existing group's topology
+                            topologyConflicts.push({ path: rawPath, existingKind: existingTopology.kind, newKind: op.kind });
                         }
                     } else groups.push({ absolutePath, rawPath, edits: [], ...(topology ? { topology } : {}) });
                 }
@@ -805,6 +808,10 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
 
             try {
             for (const group of groups) {
+                // Skip bookkeeping placeholders (e.g. rename destination paths) that have
+                // no text edits and no topology — nothing to apply.
+                if (group.edits.length === 0 && !group.topology) continue;
+
                 stream(`  ${group.rawPath} — ${group.edits.length} edit(s)`);
 
                 // Resolve canonical path for this group.
@@ -933,6 +940,18 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
 
                 const hasTextEdits = group.edits.length > 0;
 
+                // Reject patches combining text edits with delete topology.
+                if (hasTextEdits && group.topology?.kind === "delete") {
+                    diagnostics.push(`text edits combined with delete topology for ${group.rawPath}: cannot edit and delete the same file in one group`);
+                    return {
+                        content: [{ type: "text" as const, text: `rejected: conflicting operations (${group.rawPath})` }],
+                        details: finalize(makeRejected(toolCallId, "conflict", diagnostics, {
+                            inspectionId: evidenceRefForDetails.inspectionId,
+                            resourceIds: [resource.resourceId],
+                        }, checks, usedEvidence, invalidations)),
+                    };
+                }
+
                 // DELETE: there is no post-edit content to lint/typecheck.
                 // Perform the delete through the shared transaction, invalidate
                 // the resource, emit a diff entry, and count it in the applied
@@ -969,11 +988,6 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     stream(`  ✓ deleted ${displayPath}`);
                     continue;
                 }
-
-                // A group with neither topology nor edits is a bookkeeping
-                // placeholder (e.g. a rename's destination path, included only
-                // so the transaction locks/snapshots it) — nothing to apply.
-                if (!hasTextEdits && !group.topology) continue;
 
                 // Stage edits through the planner (no writes). The planner routes
                 // text edits through applyEdits (fuzzy tiers, replaceAll, AST/lineRange
@@ -1231,9 +1245,10 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 // Atomic write. Skipped when content is unchanged (a
                 // topology-only rename with no text edits) — there is nothing
                 // new to persist at canonicalTarget before the rename below
-                // moves the file to its destination.
+                // moves the file to its destination. New files are always written
+                // even if empty.
                 try {
-                    if (newContent !== currentContent) {
+                    if (newContent !== currentContent || isNewFileGroup) {
                         // Ensure parent directory exists before atomic write
                         await fsMkdir(pathDirname(canonicalTarget), { recursive: true });
                         await transaction.write(canonicalTarget, newContent);
@@ -1241,7 +1256,8 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 } catch (err) {
                     diagnostics.push(`write failed: ${err instanceof Error ? err.message : String(err)}`);
                     const rollback = await transaction.rollback();
-                    const rollbackInfo = buildRollbackInfo(transaction.transactionId, rollback);
+                    rollbackInfo = buildRollbackInfo(transaction.transactionId, rollback);
+                    committed = true;
                     return {
                         content: [{ type: "text" as const, text: `failed: write ${group.rawPath}` }],
                         details: finalize(makeFailed(toolCallId, "write", `write failed: ${group.rawPath}`, {
@@ -1475,7 +1491,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             // reported "applied 0 edit(s)" for a topology-only group.
             const summary = appliedSummaries.length === 1
                 ? `applied ${appliedSummaries[0]}`
-                : `applied edits to ${appliedFiles.length} file(s): ${appliedFiles.join(", ")}`;
+                : `applied: ${appliedSummaries.join("; ")}`;
             return {
                 content: [{ type: "text" as const, text: summary }],
                 details,

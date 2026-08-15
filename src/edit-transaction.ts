@@ -127,6 +127,10 @@ async function acquireFileLock(key: string): Promise<() => Promise<void>> {
         await rm(lockPath, { force: true }).catch(() => {});
       };
     } catch (err) {
+      if (handle) {
+        await handle.close().catch(() => {});
+        await rm(lockPath, { force: true }).catch(() => {});
+      }
       if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
       if (await reclaimIfAbandoned(lockPath)) continue; // retry acquisition immediately
       if (Date.now() > deadline) {
@@ -239,6 +243,7 @@ export class EditTransaction {
   }
 
   async getUndoRecords(): Promise<TransactionUndoRecord[]> {
+    this.ensureLock();
     const sha = (b: Buffer) => createHash("sha256").update(b).digest("hex");
     const records: TransactionUndoRecord[] = [];
     const seen = new Set<string>();

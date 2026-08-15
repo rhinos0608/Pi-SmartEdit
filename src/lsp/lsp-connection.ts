@@ -116,8 +116,16 @@ export class LSPConnection {
       this.process.removeListener("error", onError);
     });
 
-    // Allow Node event loop to exit even if this child is still running
+    // Allow Node event loop to exit even if this child is still running.
+    // unref()-ing the ChildProcess alone is not enough: its stdio pipes are
+    // separate handles that stay ref'd (actively read stdout/stderr keep
+    // their PipeWrap alive) regardless of the child's own unref state, so an
+    // abandoned connection nobody called shutdown() on can still block
+    // process exit indefinitely. Unref every stdio stream too.
     this.process.unref();
+    for (const stream of [this.process.stdin, this.process.stdout, this.process.stderr]) {
+      (stream as unknown as { unref?: () => void } | null)?.unref?.();
+    }
   }
 
   isRunning(): boolean {
