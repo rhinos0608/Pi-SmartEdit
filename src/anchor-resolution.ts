@@ -99,29 +99,22 @@ export function computeEditContainingRange(
 }
 
 /**
- * Derive an AST anchor from an edit's `target` (name/namePath/kind/line) or
- * legacy `anchor` field. Returns null when the edit carries no AST identifier.
+ * Derive an AST anchor from an edit's `target` (name/namePath/kind/line).
+ * Returns null when the edit carries no AST identifier.
  * `namePath` is resolved by matching its final component against the AST name.
  */
 export function anchorFromEdit(edit: EditItem): EditAnchor | null {
   const t = edit.target;
-  if (t) {
-    const namePathParts = t.namePath?.split(/[/.#]/).filter(Boolean) ?? [];
-    const name = t.name ?? namePathParts[namePathParts.length - 1];
-    if (!name && t.line == null) return null;
-    return {
-      symbolName: name,
-      symbolNamePath: namePathParts.length > 0 ? namePathParts.join(".") : undefined,
-      symbolKind: t.kind,
-      symbolLine: t.line,
-    };
-  }
-  const a = edit.anchor;
-  if (a) {
-    if (!a.symbolName && a.symbolLine == null) return null;
-    return { symbolName: a.symbolName, symbolKind: a.symbolKind, symbolLine: a.symbolLine };
-  }
-  return null;
+  if (!t) return null;
+  const namePathParts = t.namePath?.split(/[/.#]/).filter(Boolean) ?? [];
+  const name = t.name ?? namePathParts[namePathParts.length - 1];
+  if (!name && t.line == null) return null;
+  return {
+    symbolName: name,
+    symbolNamePath: namePathParts.length > 0 ? namePathParts.join(".") : undefined,
+    symbolKind: t.kind,
+    symbolLine: t.line,
+  };
 }
 
 /**

@@ -57,7 +57,8 @@ import {
     type RpcMethod,
 } from "@rhinos0608/pi-workspace-protocol";
 import { formatBoundedDiagnostics, appendDiagnosticsToContent } from "./post-mutation.js";
-import { generateDiffString } from "./core/edit-diff.js";
+import { generateDiffString, stripBom, normalizeToLF } from "./core/edit-diff.js";
+import { resolveSourceRange, buildTransferInsertEdit, buildTransferDeleteEdit } from "./transfer-edit.js";
 import { checkEditSafety } from "./safety/approval-gating.js";
 import { EDIT_PARAMETERS, validateEditRequest, type EditOperation } from "./edit-contract.js";
 import { normalizeRawEdit } from "./edit-intents.js";
@@ -67,7 +68,7 @@ import { EditTransaction } from "./edit-transaction.js";
 import { saveTransactionUndoRecords } from "./undo/edit-history.js";
 import { MatchError } from "./core/errors.js";
 import type { AstResolverLike } from "./anchor-resolution.js";
-import type { EditItem, EditTarget, EditAnchor, FileSnapshot, HashlineEditMetadata } from "./core/types.js";
+import type { EditItem, EditTarget, FileSnapshot, HashlineEditMetadata } from "./core/types.js";
 import type { RepairLoopResult } from "./verification/repair-loop.js";
 
 // ── Public surface ──────────────────────────────────────────────────
@@ -313,7 +314,6 @@ interface GroupedEdit {
     readonly replaceAll?: boolean;
     readonly target?: EditTarget;
     readonly lineRange?: LineRange;
-    readonly anchor?: EditAnchor;
     readonly hashline?: HashlineEditMetadata;
 }
 
@@ -352,7 +352,6 @@ function groupEditsByPath(
             replaceAll: e.replaceAll,
             target: e.target,
             lineRange: e.lineRange,
-            anchor: e.anchor,
             hashline: e.hashline,
         };
         if (existing) {
@@ -375,6 +374,7 @@ async function buildAutoInspectEnvelope(args: {
     sessionFilePath: string;
     canonicalRoot: string;
     groups: ReadonlyArray<EditGroup>;
+    newFileAllowed?: ReadonlySet<string>;
 }): Promise<{
     ok: true;
     envelope: WorkspaceEvidenceEnvelope;
@@ -390,8 +390,11 @@ async function buildAutoInspectEnvelope(args: {
     for (const g of args.groups) {
         const fileExists = existsSync(g.absolutePath);
         if (!fileExists) {
-            // New-file creation is only valid when every edit has empty oldText.
-            const allEmpty = g.edits.every(
+            // New-file creation is only valid when every edit has empty oldText,
+            // or the group is a transfer-op destination explicitly allowed to
+            // create a new file (its synthesized edit uses the EOF append
+            // branch, not oldText, so it wouldn't satisfy the .every() below).
+            const allEmpty = (args.newFileAllowed?.has(g.absolutePath) ?? false) || g.edits.every(
                 (e) => typeof e.oldText === "string" && e.oldText.length === 0,
             );
             if (!allEmpty) {
@@ -579,10 +582,17 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 requestEdits = normalized.intents.flatMap((intent) => intent.kind === "text" ? [intent.operation] : []);
             }
 
+            // Split transfer (copy/move) ops out of the plain-edit path so
+            // groupEditsByPath's existing behavior for text/symbolic/structural/
+            // hashline edits stays byte-for-byte unchanged. Raw patches never
+            // produce `op`, so this is a no-op split when v.value.raw was used.
+            const transferOps = requestEdits.filter((e) => e.op !== undefined);
+            const textOps = requestEdits.filter((e) => e.op === undefined);
+
             // Group edits by file path (per-edit path overrides top-level).
             // v.value.path may be undefined when every edit supplies its own
             // path (validator enforces this invariant).
-            const grouping = groupEditsByPath(ctx.cwd, v.value.path ?? "", requestEdits);
+            const grouping = groupEditsByPath(ctx.cwd, v.value.path ?? "", textOps);
             if (!grouping.ok) {
                 return {
                     content: [{ type: "text" as const, text: `rejected: ${grouping.error}` }],
@@ -645,6 +655,85 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             const editWord = totalEdits === 1 ? "edit" : "edits";
             stream(`patch — ${totalEdits} ${editWord} across ${groups.length} ${fileWord}`);
 
+            // ── Transfer (copy/move) ops: resolve from/to canonical paths ──
+            // Both files must already exist (no create-via-transfer in v1).
+            // Reserve a bucket in `groups` for the `to` path (and, for `move`,
+            // the `from` path too) so evidence resolution and the transaction
+            // path list cover them — mirrors the rename-destination placeholder
+            // pattern above. `copy`'s source deliberately does NOT get a group
+            // (it produces no mutation; authorized separately below).
+            const resolvedTransfers: Array<{
+                op: "copy" | "move";
+                canonicalFrom: string;
+                canonicalTo: string;
+                range: { pos: string; end: string };
+                after: string | undefined;
+                rawFrom: string;
+                rawTo: string;
+                toIsNewFile: boolean;
+            }> = [];
+            // Transfer destinations that don't exist yet: allowed to be created
+            // by the transfer (the append_file / EOF branch), authorized the
+            // same way as an oldText:"" new-file group.
+            const transferNewFileCanonicals = new Set<string>();
+            // `copy`'s source deliberately does not get a `groups` bucket (no
+            // mutation happens there), but its content must still be snapshotted
+            // by the transaction for resolveSourceRange/staleness to read it.
+            const copySourceOnlyPaths = new Set<string>();
+            for (const transferOp of transferOps) {
+                const op = transferOp.op as "copy" | "move";
+                const rawFrom = transferOp.from as string;
+                const rawTo = transferOp.to as string;
+                const range = transferOp.range as { pos: string; end: string };
+                const after = transferOp.after as string | undefined;
+
+                let canonicalFrom: string;
+                try {
+                    canonicalFrom = realpathSync(pathResolve(ctx.cwd, rawFrom));
+                } catch (err) {
+                    const message = `transfer source not found: ${rawFrom} (${err instanceof Error ? err.message : String(err)})`;
+                    return {
+                        content: [{ type: "text" as const, text: `rejected: ${message}` }],
+                        details: makeRejected(toolCallId, "coverage", [message], {
+                            inspectionId: requestEvidenceRef?.inspectionId ?? "",
+                            resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [],
+                        }, checks),
+                    };
+                }
+                let canonicalTo: string;
+                let toIsNewFile = false;
+                try {
+                    canonicalTo = realpathSync(pathResolve(ctx.cwd, rawTo));
+                } catch (err) {
+                    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+                        canonicalTo = pathResolve(ctx.cwd, rawTo);
+                        toIsNewFile = true;
+                    } else {
+                        const message = `transfer destination not found: ${rawTo} (${err instanceof Error ? err.message : String(err)})`;
+                        return {
+                            content: [{ type: "text" as const, text: `rejected: ${message}` }],
+                            details: makeRejected(toolCallId, "coverage", [message], {
+                                inspectionId: requestEvidenceRef?.inspectionId ?? "",
+                                resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [],
+                            }, checks),
+                        };
+                    }
+                }
+                if (toIsNewFile) transferNewFileCanonicals.add(canonicalTo);
+
+                resolvedTransfers.push({ op, canonicalFrom, canonicalTo, range, after, rawFrom, rawTo, toIsNewFile });
+
+                const buckets: Array<[string, string]> = op === "move"
+                    ? [[canonicalTo, rawTo], [canonicalFrom, rawFrom]]
+                    : [[canonicalTo, rawTo]];
+                for (const [absolutePath, rawPath] of buckets) {
+                    if (!groups.some((g) => g.absolutePath === absolutePath)) {
+                        groups.push({ absolutePath, rawPath, edits: [] });
+                    }
+                }
+                if (op === "copy") copySourceOnlyPaths.add(canonicalFrom);
+            }
+
             // ── Acquire envelope ──────────────────────────────────────
             // Tool-owned evidence policy B: a strong prior authority for a
             // target path is selected before auto-inspection and never falls
@@ -681,6 +770,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     sessionFilePath,
                     canonicalRoot,
                     groups: groupsNeedingEnvelope,
+                    newFileAllowed: transferNewFileCanonicals,
                 });
                 if (!built.ok) {
                     diagnostics.push(built.error);
@@ -784,7 +874,10 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     return absolutePath;
                 }
             };
-            const transactionPaths = groups.map((group) => canonicalTxPath(group.absolutePath));
+            const transactionPaths = [...new Set([
+                ...groups.map((group) => canonicalTxPath(group.absolutePath)),
+                ...copySourceOnlyPaths,
+            ])];
             let transaction: EditTransaction;
             try {
                 transaction = await EditTransaction.begin(transactionPaths);
@@ -808,6 +901,107 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             let rollbackInfo: { ok: boolean; reason?: string } | undefined;
 
             try {
+            // ── Resolve transfer (copy/move) ops against the pre-transaction
+            // snapshot, then fill in the reserved groups' edits with the
+            // synthesized hashline EditItems. Runs before the main per-group
+            // loop (which then treats these exactly like any other hashline
+            // group) and inside this try so an early rejection here still
+            // triggers the finally-block rollback below.
+            for (const rt of resolvedTransfers) {
+                const snapshot = transaction.getSnapshot(rt.canonicalFrom);
+                if (!snapshot || !snapshot.exists) {
+                    diagnostics.push(`transfer source does not exist: ${rt.rawFrom}`);
+                    return {
+                        content: [{ type: "text" as const, text: `failed: transfer source does not exist: ${rt.rawFrom}` }],
+                        details: finalize(makeFailed(toolCallId, "stage", `transfer source does not exist: ${rt.rawFrom}`, evidenceRefForDetails, checks, diagnostics, usedEvidence, invalidations)),
+                    };
+                }
+                const rawSourceContent = snapshot.content ? snapshot.content.toString("utf8") : "";
+                const { text: strippedSource } = stripBom(rawSourceContent);
+                const sourceContent = normalizeToLF(strippedSource);
+
+                const resolved = resolveSourceRange(sourceContent, rt.range.pos, rt.range.end);
+                if (!resolved.ok) {
+                    diagnostics.push(`transfer: ${resolved.error} (${rt.rawFrom})`);
+                    return {
+                        content: [{ type: "text" as const, text: `failed: transfer range resolution (${rt.rawFrom})` }],
+                        details: finalize(makeFailed(toolCallId, "stage", `${resolved.error} (${rt.rawFrom})`, evidenceRefForDetails, checks, diagnostics, usedEvidence, invalidations)),
+                    };
+                }
+
+                if (rt.op === "copy") {
+                    // `move`'s source becomes a real deletion group below and is
+                    // authorized through the main loop's existing per-group
+                    // pipeline; `copy` produces no mutation at the source, so it
+                    // never becomes a group and needs this standalone check.
+                    let sourceResource: InspectedResource | null = null;
+                    let usedPriorSourceAuthority = false;
+                    if (priorStore) {
+                        sourceResource = priorStore.select(rt.canonicalFrom);
+                        usedPriorSourceAuthority = sourceResource !== null;
+                    }
+                    if (!sourceResource && envelope) {
+                        sourceResource = findResourceForCanonicalPath(envelope, rt.canonicalFrom, evidenceRefForDetails.resourceIds);
+                    }
+                    if (!sourceResource) {
+                        diagnostics.push(`coverage: no authority for copy source ${rt.rawFrom}`);
+                        return {
+                            content: [{ type: "text" as const, text: `rejected: coverage (copy source ${rt.rawFrom})` }],
+                            details: finalize(makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations)),
+                        };
+                    }
+                    const coverageError = checkResourceCoverage(sourceResource, [{ startLine: resolved.value.startLine, endLine: resolved.value.endLine }]);
+                    if (coverageError) {
+                        diagnostics.push(`${coverageError} for copy source ${rt.rawFrom}`);
+                        return {
+                            content: [{ type: "text" as const, text: `rejected: coverage (copy source ${rt.rawFrom})` }],
+                            details: finalize(makeRejected(toolCallId, "coverage", diagnostics, {
+                                inspectionId: evidenceRefForDetails.inspectionId,
+                                resourceIds: [sourceResource.resourceId],
+                            }, checks, usedEvidence, invalidations)),
+                        };
+                    }
+                    if (usedPriorSourceAuthority && sourceResource.coverage === "line-range" && typeof sourceResource.fullFileSha256 !== "string") {
+                        diagnostics.push(`coverage: prior line-range authority for ${rt.rawFrom} is missing fullFileSha256; a fresh full-file read is required to authorize`);
+                        return {
+                            content: [{ type: "text" as const, text: `rejected: coverage (missing sha for copy source ${rt.rawFrom})` }],
+                            details: finalize(makeRejected(toolCallId, "coverage", diagnostics, {
+                                inspectionId: evidenceRefForDetails.inspectionId,
+                                resourceIds: [sourceResource.resourceId],
+                            }, checks, usedEvidence, invalidations)),
+                        };
+                    }
+                    if (typeof sourceResource.fullFileSha256 === "string" && sourceResource.fullFileSha256 !== sha256OfString(sourceContent)) {
+                        diagnostics.push(`stale: copy source ${rt.rawFrom} sha mismatch`);
+                        return {
+                            content: [{ type: "text" as const, text: `rejected: stale (copy source ${rt.rawFrom})` }],
+                            details: finalize(makeRejected(toolCallId, "stale", diagnostics, {
+                                inspectionId: evidenceRefForDetails.inspectionId,
+                                resourceIds: [sourceResource.resourceId],
+                            }, checks, usedEvidence, invalidations)),
+                        };
+                    }
+                }
+
+                if (!rt.toIsNewFile && rt.after === undefined) {
+                    const message = `transfer destination ${rt.rawTo} already exists; \`after\` is required to choose an insertion point`;
+                    diagnostics.push(message);
+                    return {
+                        content: [{ type: "text" as const, text: `rejected: ${message}` }],
+                        details: finalize(makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations)),
+                    };
+                }
+
+                const description = `${rt.op} from ${rt.rawFrom}:${rt.range.pos}-${rt.range.end}`;
+                const toIdx = groups.findIndex((g) => g.absolutePath === rt.canonicalTo);
+                groups[toIdx] = { ...groups[toIdx], edits: [...groups[toIdx].edits, buildTransferInsertEdit(rt.toIsNewFile ? undefined : rt.after, resolved.value.lines, description)] };
+
+                if (rt.op === "move") {
+                    const fromIdx = groups.findIndex((g) => g.absolutePath === rt.canonicalFrom);
+                    groups[fromIdx] = { ...groups[fromIdx], edits: [...groups[fromIdx].edits, buildTransferDeleteEdit(rt.range, description)] };
+                }
+            }
+
             for (const group of groups) {
                 // Skip bookkeeping placeholders (e.g. rename destination paths) that have
                 // no text edits and no topology — nothing to apply.
@@ -1018,10 +1212,14 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     // canonicalTarget/displayPath to the new path before any
                     // evidence/finalization records anything against it.
                     newContent = currentContent;
-                } else if (isNewFileGroup) {
-                    // New-file creation: the empty oldText is implicit at offset 0
-                    // of the (empty) current content. applyEdits rejects empty
-                    // oldText, so this path stays separate.
+                } else if (isNewFileGroup && group.edits.every((e) => typeof e.oldText === "string")) {
+                    // New-file creation via oldText:"": the empty oldText is implicit
+                    // at offset 0 of the (empty) current content. applyEdits rejects
+                    // empty oldText, so this path stays separate. A new-file group
+                    // built from a transfer op carries a hashline (append_file) edit
+                    // instead, which falls through to the planTextEdits branch below
+                    // (it operates on `currentContent` generically and needs no
+                    // special-casing for an empty starting file).
                     newContent = currentContent;
                     for (const edit of group.edits) {
                         if (typeof edit.oldText !== "string" || typeof edit.newText !== "string") {

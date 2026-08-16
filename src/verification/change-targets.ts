@@ -17,9 +17,6 @@ import type { ChangedTarget } from "./types";
 import { byteOffsetToLine } from "./byte-offset";
 import { simpleGlobMatch } from "./glob-match";
 
-// Re-export for backward compatibility (used by tests)
-export { byteOffsetToLine, simpleGlobMatch };
-
 // ─── Symbol kind mapping ────────────────────────────────────────────
 
 /**

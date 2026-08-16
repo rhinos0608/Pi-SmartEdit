@@ -1,11 +1,10 @@
 import { relative, isAbsolute, resolve } from "path";
-import { Buffer } from "buffer";
 import type { EditItem, EditInput } from "./core/types";
 import { isSymbolicEdit } from "./symbolic-edits.js";
 import { HASHLINE_CONTENT_SEPARATOR } from "./core/hashline";
 import { detectInputFormat } from "./formats/format-detector.js";
 import { repairJson } from "./formats/forgiving-parser.js";
-import { normalizeLegacyEditRequest } from "./edit-contract.js";
+import { normalizeFlatEditRequest } from "./edit-contract.js";
 import { normalizeRawEdit } from "./edit-intents.js";
 
 // ─── Hashline display prefix stripping ───────────────────────────────
@@ -135,83 +134,6 @@ function tryExtractPartialEdits(raw: string): unknown[] {
   return results;
 }
 
-const LEGACY_EXTRA_MARKER = "??smartEditExtra=";
-
-export interface LegacyEditMetadata {
-  replaceAllFlags?: boolean[] | null;
-  targetData?: Array<Record<string, unknown> | null> | null;
-  hashlineData?: Array<Record<string, unknown> | null> | null;
-}
-
-export interface ResolvedEditMetadata {
-  replaceAllFlags: boolean[];
-  targetData: Array<Record<string, unknown> | undefined>;
-  hashlineData: Array<Record<string, unknown> | undefined>;
-}
-
-export function decodeLegacyPathMetadata(path: string): {
-  path: string;
-  metadata: LegacyEditMetadata | null;
-} {
-  const markerIndex = path.indexOf(LEGACY_EXTRA_MARKER);
-  if (markerIndex === -1) return { path, metadata: null };
-
-  const cleanPath = path.slice(0, markerIndex);
-  try {
-    const decoded = JSON.parse(
-      Buffer.from(path.slice(markerIndex + LEGACY_EXTRA_MARKER.length), "base64url").toString("utf8"),
-    ) as Record<string, unknown>;
-    if (!decoded || typeof decoded !== "object" || Array.isArray(decoded)) {
-      return { path, metadata: null };
-    }
-
-    const replaceAllFlags = decoded.replaceAllFlags;
-    const targetData = decoded.targetData;
-    const hashlineData = decoded.hashlineData;
-    const validFlags = replaceAllFlags == null ||
-      (Array.isArray(replaceAllFlags) && replaceAllFlags.every((flag) => typeof flag === "boolean"));
-    const validObjects = (value: unknown) => value == null ||
-      (Array.isArray(value) && value.every((item) => item == null ||
-        (typeof item === "object" && !Array.isArray(item))));
-    if (!validFlags || !validObjects(targetData) || !validObjects(hashlineData)) {
-      return { path, metadata: null };
-    }
-
-    return {
-      path: cleanPath,
-      metadata: {
-        replaceAllFlags: replaceAllFlags as boolean[] | null | undefined,
-        targetData: targetData as Array<Record<string, unknown> | null> | null | undefined,
-        hashlineData: hashlineData as Array<Record<string, unknown> | null> | null | undefined,
-      },
-    };
-  } catch {
-    return { path, metadata: null };
-  }
-}
-
-export function resolveEditMetadata(
-  edits: Array<Record<string, unknown>>,
-  legacy: LegacyEditMetadata | null = null,
-): ResolvedEditMetadata {
-  return {
-    replaceAllFlags: edits.map((edit, index) =>
-      typeof edit.replaceAll === "boolean"
-        ? edit.replaceAll
-        : legacy?.replaceAllFlags?.[index] === true,
-    ),
-    targetData: edits.map((edit, index) =>
-      edit.target && typeof edit.target === "object" && !Array.isArray(edit.target)
-        ? edit.target as Record<string, unknown>
-        : legacy?.targetData?.[index] ?? undefined,
-    ),
-    hashlineData: edits.map((edit, index) =>
-      edit.hashline && typeof edit.hashline === "object" && !Array.isArray(edit.hashline)
-        ? edit.hashline as Record<string, unknown>
-        : legacy?.hashlineData?.[index] ?? undefined,
-    ),
-  };
-}
 
 export function splitMultiFileEditInput(
   input: Record<string, unknown>,
@@ -296,7 +218,7 @@ function inferPathFromEditItems(args: Record<string, unknown>): EditPathMode {
   return "single";
 }
 
-// ─── Legacy input compatibility ─────────────────────────────────────
+// ─── Resumed-session / flat-input compatibility ─────────────────────────────────────
 
 export function prepareArguments(input: Record<string, unknown>, useHashlineEditing: boolean): Record<string, unknown> {
   if (!input || typeof input !== "object") return input;
@@ -315,9 +237,9 @@ export function prepareArguments(input: Record<string, unknown>, useHashlineEdit
   // The built-in schema validation rejects these with a terse generic error
   // like "must have required properties path". We catch them here with
   // descriptive, actionable messages before schema validation runs.
-  // IMPORTANT: This must come BEFORE legacy format normalization (which
+  // IMPORTANT: This must come BEFORE flat-shorthand normalization (which
   // converts {path, oldText, newText} to {path, edits: [...]}) but the
-  // edits-missing check must come AFTER that normalization, since legacy
+  // edits-missing check must come AFTER that normalization, since flat
   // calls don't have an edits field.
 
   if (!args.path && !args.edits) {
@@ -355,10 +277,10 @@ export function prepareArguments(input: Record<string, unknown>, useHashlineEdit
       );
     }
 
-    // Legacy raw-format strings use the same pure normalization as the
-    // registered tool. File-topology intents cannot be safely represented by
-    // this pre-Task-7 adapter, so reject them rather than reading or mutating
-    // files while parsing.
+    // Non-canonical raw-format strings (not the `raw_edits` shape) go through
+    // the same pure normalization as the registered tool. File-topology intents
+    // cannot be safely represented by this string-based adapter, so reject them
+    // rather than reading or mutating files while parsing.
     if (detectInputFormat(raw) !== "raw_edits") {
       const normalized = normalizeRawEdit(raw, typeof args.path === "string" ? args.path : undefined);
       if (normalized.diagnostics.length > 0 || normalized.intents.length === 0) {
@@ -542,21 +464,22 @@ export function prepareArguments(input: Record<string, unknown>, useHashlineEdit
     );
   }
 
-  // Legacy single-edit format: { path, oldText, newText, edits?: [...] }
-  const legacy = args as Record<string, unknown>;
+  // Flat single-edit shorthand: { path, oldText, newText, edits?: [...] }.
+  // Still sent by resumed sessions with stored calls predating the edits array.
+  const flatInput = args as Record<string, unknown>;
   if (
-    typeof legacy.oldText === "string" &&
-    typeof legacy.newText === "string"
+    typeof flatInput.oldText === "string" &&
+    typeof flatInput.newText === "string"
   ) {
-    const { text: oldText } = stripHashlineDisplayPrefixes(legacy.oldText as string, useHashlineEditing);
-    const { text: newText } = stripHashlineDisplayPrefixes(legacy.newText as string, useHashlineEditing);
+    const { text: oldText } = stripHashlineDisplayPrefixes(flatInput.oldText as string, useHashlineEditing);
+    const { text: newText } = stripHashlineDisplayPrefixes(flatInput.newText as string, useHashlineEditing);
     // Canonical flat->edits conversion (flat fields are authoritative).
-    return normalizeLegacyEditRequest({ ...legacy, oldText, newText });
+    return normalizeFlatEditRequest({ ...flatInput, oldText, newText });
   }
 
-  // ── Edits missing check (after legacy normalization, which returns early) ──
-  // By this point, edits is not a string (handled above) and not a legacy format
-  // (returned early). If it's still missing, provide an actionable error.
+  // ── Edits missing check (after flat-shorthand normalization, which returns early) ──
+  // By this point, edits is not a string (handled above) and not the flat
+  // shorthand (returned early). If it's still missing, provide an actionable error.
   if (args.edits === undefined || args.edits === null) {
     throw formatEditError(
       `Edit tool is missing the required "edits" field.`,
@@ -569,9 +492,7 @@ export function prepareArguments(input: Record<string, unknown>, useHashlineEdit
   }
 
   // Normalize edit metadata without moving it out of the validated edit object.
-  // Legacy anchor/symbol shapes remain accepted and are converted to target.
   if (Array.isArray(args.edits)) {
-    const topLevelReplaceAll = args.replaceAll === true;
     const clonedEdits = (args.edits as Array<Record<string, unknown>>).map((edit) => ({ ...edit }));
     args.edits = clonedEdits;
 
@@ -583,46 +504,6 @@ export function prepareArguments(input: Record<string, unknown>, useHashlineEdit
         edit.newText = stripHashlineDisplayPrefixes(edit.newText, useHashlineEditing).text;
       }
 
-      let target = edit.target && typeof edit.target === "object" && !Array.isArray(edit.target)
-        ? { ...(edit.target as Record<string, unknown>) }
-        : undefined;
-
-      if (edit.anchor && typeof edit.anchor === "object" && !Array.isArray(edit.anchor)) {
-        const anchor = edit.anchor as Record<string, unknown>;
-        target = {
-          ...target,
-          name: anchor.symbolName ?? target?.name,
-          kind: anchor.symbolKind ?? target?.kind,
-          line: anchor.symbolLine ?? target?.line,
-        };
-        delete edit.anchor;
-      }
-
-      if (edit.symbol && typeof edit.symbol === "object" && !Array.isArray(edit.symbol)) {
-        const symbol = edit.symbol as Record<string, unknown>;
-        target = {
-          ...target,
-          name: symbol.name ?? target?.name,
-          namePath: symbol.namePath ?? target?.namePath,
-          kind: symbol.kind ?? target?.kind,
-          line: symbol.line ?? target?.line,
-        };
-        delete edit.symbol;
-      }
-
-      for (const operation of ["replaceBody", "insertBefore", "insertAfter"] as const) {
-        if (edit[operation] !== undefined) {
-          target = { ...target, [operation]: edit[operation] };
-          delete edit[operation];
-        }
-      }
-
-      if (target && Object.values(target).some((value) => value !== undefined)) {
-        edit.target = target;
-      }
-      if (typeof edit.replaceAll !== "boolean" && topLevelReplaceAll) {
-        edit.replaceAll = true;
-      }
     }
   }
 

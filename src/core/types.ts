@@ -90,6 +90,12 @@ export interface HashlineEditMetadata {
   symbol?: { name: string; kind?: string; line?: number };
 }
 
+/** Anchor range for a transfer (copy/move) edit's source span. */
+export interface TransferRange {
+  pos: string;
+  end: string;
+}
+
 export interface EditItem {
   path?: string;
   /** Exact text to find for replacement. Absent for symbolic/structural edits. */
@@ -102,15 +108,20 @@ export interface EditItem {
 
   /** Unified target: anchor scoping (name/kind/line) + optional symbolic operation.
    *  Anchor: oldText/newText matched within the symbol's byte range.
-   *  Symbolic: replaceBody/insertBefore/insertAfter operate on the whole symbol.
-   *  Backwards compat: old anchor/symbol fields are converted to target in prepareArguments(). */
+   *  Symbolic: replaceBody/insertBefore/insertAfter operate on the whole symbol. */
   target?: EditTarget;
 
   /** 1-based inclusive line-range scope for this edit. Intersects with `target` scope. */
   lineRange?: LineRange;
 
-  /** Legacy compatibility anchor; converted to `target` scope at execution time. */
-  anchor?: EditAnchor;
+  /** Transfer (copy/move) fields: relocate an existing observed range by
+   *  reference instead of reproducing it in newText. Mutually exclusive
+   *  with oldText/newText/target/lineRange/hashline. */
+  op?: "copy" | "move";
+  from?: string;
+  range?: TransferRange;
+  to?: string;
+  after?: string;
 }
 
 export interface EditInput {
@@ -326,7 +337,7 @@ import { createHash } from "crypto";
 export function fastHash(content: string): string {
   return createHash("sha256").update(content).digest("hex").slice(0, 16);
 }
-/** Backwards-compatible AST anchor shape used by hashline scoped fallback. */
+/** Canonical AST-symbol identifier (name/kind/line) used to scope an edit to a node. */
 export interface EditAnchor {
   symbolName?: string;
   symbolNamePath?: string;

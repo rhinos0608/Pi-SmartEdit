@@ -863,8 +863,9 @@ export function findTextWithTelemetry(
 }
 
 /**
- * Standard findText — kept for backward compatibility.
  * Core 4-tier matching pipeline: exact → indentation → unicode → similarity.
+ * Thin wrapper over findTextWithTelemetry for callers that don't need
+ * per-match tier/telemetry details.
  */
 export function findText(
   originalContent: string,

@@ -133,8 +133,6 @@ The format is auto-detected; pass the text as the `raw` parameter.
 
 This is the default path. Edit metadata such as `replaceAll`, `target`, and `hashline` stays on each edit object and is validated directly; paths remain plain filesystem paths.
 
-Legacy callers that append `??smartEditExtra=` metadata to `path` remain accepted during migration, but Smart Edit no longer produces encoded paths.
-
 ### Multi-file edit
 
 Omit top-level `path` and provide `path` on every edit. Multi-file, raw, and topology edits share a single failure-atomic transaction: handled failures roll back the whole request. Atomic Patch is one input format for this same transaction — it is not the only atomic mode.
@@ -217,6 +215,60 @@ Only use this after enabling `SMART_EDIT_USE_HASHLINE_EDITING=1`.
   ]
 }
 ```
+
+### Transfer edit (copy/move)
+
+Relocate existing observed text by reference instead of reproducing it in `newText`. `copy` leaves the source intact; `move` deletes it after transfer. `from`/`range` are pre-edit anchors from the last read of `from`; `to`/`after` is the pre-edit destination anchor to insert immediately after.
+
+Same-file copy:
+
+```json
+{
+  "path": "src/foo.ts",
+  "edits": [
+    {
+      "op": "copy",
+      "from": "src/foo.ts",
+      "range": { "pos": "10ab", "end": "12cd" },
+      "to": "src/foo.ts",
+      "after": "40ef"
+    }
+  ]
+}
+```
+
+Cross-file move:
+
+```json
+{
+  "edits": [
+    {
+      "op": "move",
+      "from": "src/parser.ts",
+      "range": { "pos": "10ab", "end": "12cd" },
+      "to": "src/shared.ts",
+      "after": "5gh"
+    }
+  ]
+}
+```
+
+New-file destination: omit `after` when `to` does not exist yet — the transferred content is appended to the newly created file.
+
+```json
+{
+  "edits": [
+    {
+      "op": "copy",
+      "from": "src/parser.ts",
+      "range": { "pos": "10ab", "end": "12cd" },
+      "to": "src/generated.ts"
+    }
+  ]
+}
+```
+
+Transfer text comes from retained observed content, never model regeneration; the source range and destination must have prior read authority. An edit in the same call cannot target text a transfer just created — use a follow-up edit to modify transferred content. Stale or ambiguous anchors fail closed with a corrective re-read message.
 
 ## Architecture
 

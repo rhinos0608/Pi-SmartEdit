@@ -43,7 +43,7 @@ import { recordBreakage, recordCoChange } from "./smartread-bridge";
 import { claimDiagnosticsOwner, releaseDiagnosticsOwner } from "./mutation-ownership.js";
 import { appendDiagnosticsToContent } from "./post-mutation.js";
 import { createPatchTool, type PatchToolDeps, type PatchToolDetails } from "./patch.js";
-import { normalizeLegacyEditRequest } from "./edit-contract.js";
+import { normalizeFlatEditRequest } from "./edit-contract.js";
 import { normalizeRawEdit } from "./edit-intents.js";
 import { createPriorAuthorityStore, type PriorAuthorityStore } from "./evidence-authority.js";
 import { createRpcClient, RPC_CHANNELS } from "@rhinos0608/pi-workspace-protocol";
@@ -86,8 +86,7 @@ function omitAgentEvidenceRef(args: Record<string, unknown>): Record<string, unk
 // ─── Schema ───────────────────────────────────────────────────────
 // The canonical edit request schema lives in src/edit-contract.ts
 // (EDIT_PARAMETERS) and is the single registration source. Rich edit
-// metadata is validated there. Legacy path-encoded metadata remains
-// decode-only compatibility input during migration.
+// metadata is validated there.
 
 
 export function resolveEditPath(cwd: string, targetPath: string): string {
@@ -872,7 +871,7 @@ export default function smartEdit(pi: ExtensionAPI) {
         const toolOwnedArgs = omitAgentEvidenceRef(args);
         // Migrate flat single oldText/newText to edits array via the canonical
         // contract normalizer (flat fields are authoritative).
-        return normalizeLegacyEditRequest(toolOwnedArgs);
+        return normalizeFlatEditRequest(toolOwnedArgs);
       },
     } as unknown);
   }

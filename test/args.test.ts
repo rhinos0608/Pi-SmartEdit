@@ -1,9 +1,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert";
 import {
-  decodeLegacyPathMetadata,
   prepareArguments,
-  resolveEditMetadata,
   splitMultiFileEditInput,
 } from "../src/args";
 
@@ -54,46 +52,6 @@ describe("prepareArguments", () => {
     ]);
   });
 
-  test("preserves top-level replaceAll as first-class per-edit metadata", () => {
-    const result = prepareArguments(
-      {
-        path: "src/foo.ts",
-        replaceAll: true,
-        edits: [
-          { oldText: "old", newText: "new" },
-          { oldText: "x", newText: "y" },
-        ],
-      },
-      false,
-    );
-
-    assert.strictEqual(result.path, "src/foo.ts");
-    assert.deepStrictEqual(result.edits, [
-      { oldText: "old", newText: "new", replaceAll: true },
-      { oldText: "x", newText: "y", replaceAll: true },
-    ]);
-  });
-
-  test("lets per-edit replaceAll override top-level replaceAll", () => {
-    const result = prepareArguments(
-      {
-        path: "src/foo.ts",
-        replaceAll: true,
-        edits: [
-          { oldText: "old", newText: "new", replaceAll: false },
-          { oldText: "x", newText: "y" },
-        ],
-      },
-      false,
-    );
-
-    assert.strictEqual(result.path, "src/foo.ts");
-    assert.deepStrictEqual(result.edits, [
-      { oldText: "old", newText: "new", replaceAll: false },
-      { oldText: "x", newText: "y", replaceAll: true },
-    ]);
-  });
-
   test("keeps target and hashline metadata on edit objects", () => {
     const target = { name: "run", replaceBody: "function run() {}" };
     const hashline = {
@@ -110,55 +68,6 @@ describe("prepareArguments", () => {
 
     assert.strictEqual(result.path, "src/foo.ts");
     assert.deepStrictEqual(result.edits, [{ target }, { hashline }]);
-  });
-
-  test("resolves direct metadata before legacy side-channel metadata", () => {
-    const edits = [
-      {
-        oldText: "old",
-        newText: "new",
-        replaceAll: false,
-        target: { name: "direct" },
-        hashline: { range: { pos: "1ab", end: "1ab" } },
-      },
-    ];
-    const metadata = resolveEditMetadata(edits, {
-      replaceAllFlags: [true],
-      targetData: [{ name: "legacy" }],
-      hashlineData: [{ range: { pos: "2cd", end: "2cd" } }],
-    });
-
-    assert.deepStrictEqual(metadata.replaceAllFlags, [false]);
-    assert.deepStrictEqual(metadata.targetData, [{ name: "direct" }]);
-    assert.deepStrictEqual(metadata.hashlineData, [{ range: { pos: "1ab", end: "1ab" } }]);
-  });
-
-  test("decodes legacy path metadata without producing new encoded paths", () => {
-    const encoded = Buffer.from(JSON.stringify({
-      replaceAllFlags: [true],
-      targetData: [null],
-      hashlineData: [null],
-    })).toString("base64url");
-
-    assert.deepStrictEqual(
-      decodeLegacyPathMetadata(`src/foo.ts??smartEditExtra=${encoded}`),
-      {
-        path: "src/foo.ts",
-        metadata: {
-          replaceAllFlags: [true],
-          targetData: [null],
-          hashlineData: [null],
-        },
-      },
-    );
-    assert.deepStrictEqual(decodeLegacyPathMetadata("src/foo.ts"), {
-      path: "src/foo.ts",
-      metadata: null,
-    });
-    assert.deepStrictEqual(decodeLegacyPathMetadata("src/file??smartEditExtra=not-json.ts"), {
-      path: "src/file??smartEditExtra=not-json.ts",
-      metadata: null,
-    });
   });
 
   test("allows distinct edit paths for multi-file execution", () => {

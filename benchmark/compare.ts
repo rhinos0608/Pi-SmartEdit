@@ -18,7 +18,6 @@ import {
   resolveHashlineEdits,
   validateHashlineEdits,
   applyHashlineEdits,
-  detectEditFormat,
   type HashlineEditInput,
 } from "../src/core/hashline-edit";
 import { findText, detectIndentation } from "../src/core/edit-diff";

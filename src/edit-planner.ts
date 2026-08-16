@@ -524,7 +524,7 @@ export async function planTextEdits(args: PlanTextEditsArgs): Promise<PlannedTex
   const capabilities: EditCapability[] = [];
   if (textEdits.length > 0) capabilities.push("oldText");
   if (args.edits.some((e) => e.replaceAll)) capabilities.push("replaceAll");
-  if (args.edits.some((e) => e.target || e.anchor)) capabilities.push("astAnchor");
+  if (args.edits.some((e) => e.target)) capabilities.push("astAnchor");
   if (symbolicEdits.length > 0) capabilities.push("symbolicEdit");
   if (structuralEdits.length > 0) capabilities.push("astGrepAnchor");
   if (hashlineEdits.length > 0) capabilities.push("hashline");
@@ -586,7 +586,7 @@ async function resolveEditScope(
   const hasAstIdentifier =
     !!t &&
     (t.name !== undefined || t.namePath !== undefined || t.line !== undefined || t.kind !== undefined);
-  const hasTarget = hasAstIdentifier || !!edit.anchor;
+  const hasTarget = hasAstIdentifier;
   const hasLineRange = !!edit.lineRange;
   if (!hasTarget && !hasLineRange) return undefined;
 

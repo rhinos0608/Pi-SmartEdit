@@ -2,7 +2,7 @@
  * Unit tests for hashline edit application (src/core/hashline-edit.ts).
  *
  * Covers: parseTag, tryRebaseAnchor, resolveHashlineEdits, applyHashlineEdits,
- * HashlineMismatchError, detectEditFormat.
+ * HashlineMismatchError.
  *
  * Tests the core hashline-anchored editing pipeline:
  * - Anchor parsing and validation
@@ -32,8 +32,6 @@ import {
   applyHashlineEdits,
   // Error
   HashlineMismatchError,
-  // Format detection
-  detectEditFormat,
   // Types for test data
   type Anchor,
   type HashlineEditOp,
@@ -713,25 +711,6 @@ describe("HashlineMismatchError", () => {
     const err = new HashlineMismatchError(mismatches, ["x"], false);
     assert.strictEqual(err.mismatches.length, 1);
     assert.strictEqual(err.mismatches[0].line, 1);
-  });
-});
-
-// ─── detectEditFormat ─────────────────────────────────────────────────────
-
-describe("detectEditFormat", () => {
-  it("returns 'hashline' for hashline format", () => {
-    const edit = { anchor: { range: { pos: "42ab", end: "45cd" } }, content: ["x"] };
-    assert.strictEqual(detectEditFormat(edit), "hashline");
-  });
-
-  it("returns 'legacy' for oldText format", () => {
-    const edit = { oldText: "old", newText: "new" };
-    assert.strictEqual(detectEditFormat(edit), "legacy");
-  });
-
-  it("throws on unknown format", () => {
-    const edit = { something: "else" };
-    assert.throws(() => detectEditFormat(edit), /Unknown edit format/);
   });
 });
 

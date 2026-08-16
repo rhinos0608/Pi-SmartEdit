@@ -1,9 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import {
-  buildChangedTargets,
-  byteOffsetToLine,
-} from "../../src/verification/change-targets.js";
+import { buildChangedTargets } from "../../src/verification/change-targets.js";
+import { byteOffsetToLine } from "../../src/verification/byte-offset.js";
 import { defaultTraceabilityConfig } from "../../src/verification/config.js";
 
 describe("change-targets", () => {

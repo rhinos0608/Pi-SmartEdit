@@ -778,6 +778,13 @@ function applySingleEdit(
       if (linesEqual(existingTail, edit.lines)) {
         return { noop: true, current: edit.lines.join("\n") };
       }
+      // A genuinely empty file splits to a single "" line; pushing onto it
+      // would leave a spurious leading blank line ahead of the appended
+      // content, so replace rather than append in that one case.
+      if (fileLines.length === 1 && fileLines[0] === "") {
+        fileLines.splice(0, 1, ...edit.lines);
+        return { noop: false, firstChangedLine: 1 };
+      }
       fileLines.push(...edit.lines);
       return { noop: false, firstChangedLine: fileLines.length - edit.lines.length + 1 };
     }
@@ -1355,29 +1362,4 @@ export function reconstructOldTextByLine(
   }
 
   return lines.length === endLine - startLine + 1 ? lines.join("\n") : null;
-}
-
-// ─── Format detection ─────────────────────────────────────────────────────────
-
-/**
- * Detect whether a raw edit object uses the hashline format or legacy format.
- */
-export type EditFormat = "hashline" | "legacy";
-
-export function detectEditFormat(edit: Record<string, unknown>): EditFormat {
-  if (
-    edit.anchor &&
-    typeof edit.anchor === "object" &&
-    "range" in (edit.anchor as Record<string, unknown>)
-  ) {
-    return "hashline";
-  }
-  if (typeof edit.oldText === "string") {
-    return "legacy";
-  }
-  throw new Error(
-    `Unknown edit format. Expected either:\n` +
-    `  hashline: { anchor: { range: { pos: "42ab", end: "45cd" } }, content: [...] }\n` +
-    `  legacy:   { oldText: "...", newText: "..." }`
-  );
 }

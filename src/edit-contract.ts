@@ -4,8 +4,7 @@
  * This is the single source of truth for the agent-visible `edit` tool
  * schema and the runtime request validator. It accepts current targeted
  * edits (path/oldText/newText/description/replaceAll) plus rich fields
- * (target/lineRange/hashline), a legacy `anchor` compatibility field, and
- * a mutually exclusive `raw` input.
+ * (target/lineRange/hashline) and a mutually exclusive `raw` input.
  *
  * Authority policy: the agent-visible schema omits `evidenceRef` and the
  * validator does not require it — authority is tool-owned. The runtime
@@ -14,7 +13,7 @@
  * advertised contract.
  */
 import { validateEvidenceRef } from "@rhinos0608/pi-workspace-protocol";
-import type { EditTarget, HashlineEditMetadata, LineRange } from "./core/types.js";
+import type { EditTarget, HashlineEditMetadata, LineRange, TransferRange } from "./core/types.js";
 
 /** One targeted edit operation. */
 export interface EditOperation {
@@ -28,22 +27,25 @@ export interface EditOperation {
     description?: string;
     /** Replace every non-overlapping occurrence. */
     replaceAll?: boolean;
-    /** Legacy compatibility anchor (symbolName/symbolKind/symbolLine). */
-    anchor?: { symbolName?: string; symbolKind?: string; symbolLine?: number };
     /** AST symbol target; scopes text search or drives symbolic operations. */
     target?: EditTarget;
     /** 1-based line-range scope for this edit. */
     lineRange?: LineRange;
     /** Freshness-checked hashline edit metadata. */
     hashline?: HashlineEditMetadata;
+    /** Transfer (copy/move) operation: relocate an existing observed range by
+     *  reference. Mutually exclusive with every other edit field. */
+    op?: "copy" | "move";
+    from?: string;
+    range?: TransferRange;
+    to?: string;
+    after?: string;
 }
 
 /** Canonical edit request accepted by the registered `edit` tool. */
 export interface EditRequest {
     /** Default target file path. May be omitted when every edit provides its own. */
     path?: string;
-    /** Compatibility default for edit items that omit `replaceAll`. */
-    replaceAll?: boolean;
     /** One or more targeted edits. Mutually exclusive with `raw`. */
     edits?: EditOperation[];
     /** Raw patch text in a supported format. Mutually exclusive with `edits`. */
@@ -76,19 +78,6 @@ function firstUnknownKey(value: Record<string, unknown>, allowed: ReadonlySet<st
     return Object.keys(value).find((key) => !allowed.has(key)) ?? null;
 }
 
-function validateAnchor(a: Record<string, unknown>, i: number): string | null {
-    const unknown = firstUnknownKey(a, new Set(["symbolName", "symbolKind", "symbolLine"]));
-    if (unknown) return `edit.edits[${i}].anchor.${unknown} is not supported`;
-    const { symbolName, symbolKind, symbolLine } = a;
-    if (symbolName !== undefined && typeof symbolName !== "string")
-        return `edit.edits[${i}].anchor.symbolName must be a string if present`;
-    if (symbolKind !== undefined && typeof symbolKind !== "string")
-        return `edit.edits[${i}].anchor.symbolKind must be a string if present`;
-    if (symbolLine !== undefined && !isPositiveInteger(symbolLine))
-        return `edit.edits[${i}].anchor.symbolLine must be a positive integer if present`;
-    return null;
-}
-
 function validateTarget(t: Record<string, unknown>, i: number): string | null {
     const unknown = firstUnknownKey(t, new Set([
         "name", "namePath", "kind", "line", "replaceBody", "insertBefore",
@@ -119,19 +108,25 @@ function validateTarget(t: Record<string, unknown>, i: number): string | null {
     return null;
 }
 
+function validatePosEndRange(range: Record<string, unknown>, i: number, field: string): string | null {
+    const unknownRangeKey = firstUnknownKey(range, new Set(["pos", "end"]));
+    if (unknownRangeKey) return `edit.edits[${i}].${field}.${unknownRangeKey} is not supported`;
+    const { pos, end } = range;
+    if (typeof pos !== "string" || pos.length === 0)
+        return `edit.edits[${i}].${field}.pos must be a non-empty string`;
+    if (typeof end !== "string" || end.length === 0)
+        return `edit.edits[${i}].${field}.end must be a non-empty string`;
+    return null;
+}
+
 function validateHashline(h: Record<string, unknown>, i: number): string | null {
     const unknown = firstUnknownKey(h, new Set(["range", "content", "symbol"]));
     if (unknown) return `edit.edits[${i}].hashline.${unknown} is not supported`;
     const { range, content, symbol } = h;
     if (!isPlainObject(range))
         return `edit.edits[${i}].hashline.range must be an object`;
-    const unknownRangeKey = firstUnknownKey(range, new Set(["pos", "end"]));
-    if (unknownRangeKey) return `edit.edits[${i}].hashline.range.${unknownRangeKey} is not supported`;
-    const { pos, end } = range;
-    if (typeof pos !== "string" || pos.length === 0)
-        return `edit.edits[${i}].hashline.range.pos must be a non-empty string`;
-    if (typeof end !== "string" || end.length === 0)
-        return `edit.edits[${i}].hashline.range.end must be a non-empty string`;
+    const rangeErr = validatePosEndRange(range, i, "hashline.range");
+    if (rangeErr) return rangeErr;
     if (content !== undefined) {
         const validContent = Array.isArray(content)
             ? content.every((c) => typeof c === "string")
@@ -158,10 +153,10 @@ function validateHashline(h: Record<string, unknown>, i: number): string | null 
 function validateEditOperation(e: Record<string, unknown>, i: number): string | null {
     const unknown = firstUnknownKey(e, new Set([
         "path", "oldText", "newText", "description", "replaceAll", "target",
-        "lineRange", "hashline", "anchor",
+        "lineRange", "hashline", "op", "from", "range", "to", "after",
     ]));
     if (unknown) return `edit.edits[${i}].${unknown} is not supported`;
-    const { path, oldText, newText, description, replaceAll, target, lineRange, hashline, anchor } = e;
+    const { path, oldText, newText, description, replaceAll, target, lineRange, hashline, op, from, range, to, after } = e;
     if (path !== undefined && (typeof path !== "string" || path.length === 0))
         return `edit.edits[${i}].path must be a non-empty string if present`;
     if (oldText !== undefined && typeof oldText !== "string")
@@ -172,12 +167,6 @@ function validateEditOperation(e: Record<string, unknown>, i: number): string | 
         return `edit.edits[${i}].description must be a string if present`;
     if (replaceAll !== undefined && typeof replaceAll !== "boolean")
         return `edit.edits[${i}].replaceAll must be a boolean if present`;
-    if (anchor !== undefined) {
-        if (!isPlainObject(anchor))
-            return `edit.edits[${i}].anchor must be an object if present`;
-        const err = validateAnchor(anchor, i);
-        if (err) return err;
-    }
     if (target !== undefined) {
         if (!isPlainObject(target))
             return `edit.edits[${i}].target must be an object if present`;
@@ -202,12 +191,35 @@ function validateEditOperation(e: Record<string, unknown>, i: number): string | 
         if (err) return err;
     }
 
+    // Transfer (copy/move) op: self-contained and mutually exclusive with
+    // every other edit shape. A valid transfer op is unconditionally
+    // actionable, so it returns early rather than falling into the
+    // oldText/newText/symbolic/structural/hashline actionable-boundary check.
+    if (op !== undefined) {
+        if (op !== "copy" && op !== "move")
+            return `edit.edits[${i}].op must be "copy" or "move"`;
+        if (path !== undefined || oldText !== undefined || newText !== undefined
+            || target !== undefined || lineRange !== undefined || hashline !== undefined)
+            return `edit.edits[${i}]: op is mutually exclusive with path, oldText, newText, target, lineRange, and hashline`;
+        if (typeof from !== "string" || from.length === 0)
+            return `edit.edits[${i}].from must be a non-empty string`;
+        if (typeof to !== "string" || to.length === 0)
+            return `edit.edits[${i}].to must be a non-empty string`;
+        if (after !== undefined && (typeof after !== "string" || after.length === 0))
+            return `edit.edits[${i}].after must be a non-empty string if present`;
+        if (!isPlainObject(range))
+            return `edit.edits[${i}].range must be an object`;
+        const rangeErr = validatePosEndRange(range, i, "range");
+        if (rangeErr) return rangeErr;
+        return null;
+    }
+
     // Actionable-operation boundary: a text edit needs both oldText and newText;
     // otherwise the item must be self-actionable via a symbolic/structural target
     // or hashline. A description-only or empty item is rejected with a precise
-    // error naming the missing requirement. A scoping-only target or legacy anchor
-    // (identifier without a symbolic/structural op and without oldText/newText) is
-    // not actionable on its own.
+    // error naming the missing requirement. A scoping-only target (identifier
+    // without a symbolic/structural op and without oldText/newText) is not
+    // actionable on its own.
     const hasText = typeof oldText === "string" && typeof newText === "string";
     const targetObj = (target !== undefined && isPlainObject(target))
         ? (target as Record<string, unknown>)
@@ -239,19 +251,17 @@ export function validateEditRequest(
     input: unknown,
 ): { ok: true; value: EditRequest } | { ok: false; error: string } {
     if (!isPlainObject(input)) return fail("edit request must be an object");
-    const normalized = normalizeLegacyEditRequest(input);
+    const normalized = normalizeFlatEditRequest(input);
     const unknown = firstUnknownKey(normalized, new Set([
-        "path", "replaceAll", "edits", "raw", "toolCallId", "evidenceRef",
+        "path", "edits", "raw", "toolCallId", "evidenceRef",
     ]));
     if (unknown) return fail(`edit.${unknown} is not supported`);
-    const { path, replaceAll, edits, raw, toolCallId, evidenceRef } = normalized;
+    const { path, edits, raw, toolCallId, evidenceRef } = normalized;
 
     if (path !== undefined && (typeof path !== "string" || path.length === 0))
         return fail("edit.path, if present, must be a non-empty string");
     if (toolCallId !== undefined && (typeof toolCallId !== "string" || toolCallId.length === 0))
         return fail("edit.toolCallId must be a non-empty string");
-    if (replaceAll !== undefined && typeof replaceAll !== "boolean")
-        return fail("edit.replaceAll must be a boolean if present");
 
     const hasEdits = edits !== undefined;
     const hasRaw = raw !== undefined;
@@ -261,8 +271,6 @@ export function validateEditRequest(
         return fail("edit requires either edits (array) or raw (string)");
     if (hasRaw && (typeof raw !== "string" || raw.length === 0))
         return fail("edit.raw must be a non-empty string");
-    if (hasRaw && replaceAll !== undefined)
-        return fail("edit.replaceAll is only valid with edits");
 
     if (hasEdits) {
         if (!Array.isArray(edits) || edits.length === 0)
@@ -291,32 +299,19 @@ export function validateEditRequest(
 }
 
 /**
- * Normalize a legacy flat `{path, oldText, newText}` request into the
+ * Normalize a flat `{path, oldText, newText}` request (the single-edit
+ * shorthand still sent by resumed sessions with stored calls) into the
  * canonical `edits` array shape. Flat fields are authoritative and overwrite
  * any existing `edits`. Non-flat requests pass through unchanged.
  *
- * The generated item carries the flat `oldText`/`newText` and, when present,
- * the top-level `replaceAll` (moved into the item). Stale top-level
- * `oldText`/`newText`/`replaceAll` are removed from the result.
+ * Stale top-level `oldText`/`newText` are removed from the result.
  */
-export function normalizeLegacyEditRequest(args: Record<string, unknown>): Record<string, unknown> {
+export function normalizeFlatEditRequest(args: Record<string, unknown>): Record<string, unknown> {
     if (!args || typeof args !== "object") return args ?? {};
     const input = args as { oldText?: unknown; newText?: unknown };
     if (typeof input.oldText === "string" && typeof input.newText === "string") {
-        const { oldText, newText, replaceAll, ...rest } = args;
-        const item: Record<string, unknown> = { oldText, newText };
-        if (replaceAll !== undefined) item.replaceAll = replaceAll;
-        return { ...rest, edits: [item] };
-    }
-    if (Array.isArray(args.edits) && typeof args.replaceAll === "boolean") {
-        const { replaceAll, ...rest } = args;
-        return {
-            ...rest,
-            edits: args.edits.map((edit) => {
-                if (!isPlainObject(edit) || edit.replaceAll !== undefined) return edit;
-                return { ...edit, replaceAll };
-            }),
-        };
+        const { oldText, newText, ...rest } = args;
+        return { ...rest, edits: [{ oldText, newText }] };
     }
     return args;
 }
@@ -336,10 +331,6 @@ export const EDIT_PARAMETERS = {
     additionalProperties: false,
     properties: {
         path: { type: "string", description: "Default target file path. May be omitted when every edit provides its own path." },
-        replaceAll: {
-            type: "boolean",
-            description: "Compatibility: when true, applies to every edit whose item does not set its own `replaceAll`.",
-        },
         edits: {
             type: "array",
             description: "One or more targeted edits. Mutually exclusive with `raw`.",
@@ -352,16 +343,6 @@ export const EDIT_PARAMETERS = {
                     newText: { type: "string" },
                     description: { type: "string" },
                     replaceAll: { type: "boolean" },
-                    anchor: {
-                        type: "object",
-                        additionalProperties: false,
-                        description: "Legacy compatibility anchor; converted to `target` at execution time.",
-                        properties: {
-                            symbolName: { type: "string" },
-                            symbolKind: { type: "string" },
-                            symbolLine: { type: "integer", minimum: 1 },
-                        },
-                    },
                     target: {
                         type: "object",
                         additionalProperties: false,
@@ -425,6 +406,25 @@ export const EDIT_PARAMETERS = {
                         },
                         required: ["range"],
                     },
+                    op: {
+                        type: "string",
+                        enum: ["copy", "move"],
+                        description:
+                            "Relocate existing observed text by reference instead of reproducing it in newText. Prefer `copy`/`move` over duplicating text in newText when the text already exists and should stay substantially unchanged. `copy` leaves the source intact; `move` deletes it after transfer. `from`/`range` are pre-edit anchors from the last read of `from`; `to`/`after` is the pre-edit destination anchor to insert immediately after. If `to` does not exist, the transfer creates it with exactly the transferred content and `after` is not needed (omit it); if `to` already exists, `after` is required. An edit in the SAME call cannot target text a transfer just created — use a follow-up `edit` call to modify transferred content. Use oldText/newText/target/hashline edits instead when content must be substantially rewritten, not transfer. Examples: same-file copy {\"op\":\"copy\",\"from\":\"a.ts\",\"range\":{\"pos\":\"10ab\",\"end\":\"12cd\"},\"to\":\"a.ts\",\"after\":\"40ef\"}; cross-file copy {\"op\":\"copy\",\"from\":\"src/a.ts\",\"range\":{\"pos\":\"10ab\",\"end\":\"12cd\"},\"to\":\"src/b.ts\",\"after\":\"5gh\"}; cross-file move {\"op\":\"move\",\"from\":\"src/a.ts\",\"range\":{\"pos\":\"10ab\",\"end\":\"12cd\"},\"to\":\"src/b.ts\",\"after\":\"5gh\"}; copy into a new file {\"op\":\"copy\",\"from\":\"src/a.ts\",\"range\":{\"pos\":\"10ab\",\"end\":\"12cd\"},\"to\":\"src/new-file.ts\"}; transfer then modify: send the move, then a follow-up edit call with hashline/oldText targeting the destination's new content.",
+                    },
+                    from: { type: "string", description: "Source file path for a transfer op. Not used otherwise (path is used instead)." },
+                    range: {
+                        type: "object",
+                        additionalProperties: false,
+                        description: "Transfer op source anchor range in `from`, pre-edit coordinates from the last read.",
+                        properties: {
+                            pos: { type: "string", minLength: 1, description: "Start hashline anchor of the source span." },
+                            end: { type: "string", minLength: 1, description: "End hashline anchor of the source span." },
+                        },
+                        required: ["pos", "end"],
+                    },
+                    to: { type: "string", description: "Destination file path for a transfer op." },
+                    after: { type: "string", minLength: 1, description: "Destination hashline anchor (pre-edit) to insert the transferred content immediately after. Required when `to` already exists; omit when `to` should be created as a new file." },
                 },
                 // An edit item must be actionable: a text pair (oldText+newText) or
                 // a self-actionable target (symbolic op or structural pattern+replacement)
@@ -446,6 +446,7 @@ export const EDIT_PARAMETERS = {
                         },
                     },
                     { required: ["hashline"] },
+                    { required: ["op", "from", "range", "to"] },
                 ],
             },
         },

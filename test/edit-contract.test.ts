@@ -8,7 +8,7 @@
  *   - The agent-visible schema omits `evidenceRef` (tool-owned authority).
  *   - `validateEditRequest` accepts current edit arrays and rich fields,
  *     rejects `raw`+`edits`, and does not require `evidenceRef`.
- *   - `normalizeLegacyEditRequest` preserves flat/resumed compatibility.
+ *   - `normalizeFlatEditRequest` preserves flat/resumed compatibility.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -16,7 +16,7 @@ import assert from "node:assert/strict";
 import smartEdit from "../src/index.js";
 import {
     validateEditRequest,
-    normalizeLegacyEditRequest,
+    normalizeFlatEditRequest,
 } from "../src/edit-contract.js";
 
 // ── Minimal mock capturing registration ─────────────────────────────
@@ -124,18 +124,6 @@ test("registered edit schema advertises nested lineRange and hashline fields", (
     assert.ok(hashlineProps.symbol, "hashline must advertise symbol");
 });
 
-test("registered edit schema advertises legacy anchor compatibility field", () => {
-    const params = registeredEditParams();
-    const properties = params.properties as Record<string, unknown>;
-    const edits = properties.edits as { items?: { properties?: Record<string, unknown> } };
-    const anchor = edits.items?.properties?.anchor as { properties?: Record<string, unknown> };
-    assert.ok(anchor, "edit items must advertise legacy `anchor` compatibility field");
-    const anchorProps = anchor.properties ?? {};
-    assert.ok(anchorProps.symbolName, "anchor must advertise symbolName");
-    assert.ok(anchorProps.symbolKind, "anchor must advertise symbolKind");
-    assert.ok(anchorProps.symbolLine, "anchor must advertise symbolLine");
-});
-
 test("registered edit schema omits top-level oneOf for Anthropic input_schema compat", () => {
     const params = registeredEditParams();
     assert.ok(!("oneOf" in params), "top-level oneOf is rejected by the Anthropic API");
@@ -215,21 +203,21 @@ test("validateEditRequest rejects malformed lineRange", () => {
     assert.ok(!v.ok, "endLine < startLine must be rejected");
 });
 
-// ── normalizeLegacyEditRequest ──────────────────────────────────────
+// ── normalizeFlatEditRequest ─────────────────────────────
 
-test("normalizeLegacyEditRequest converts flat oldText/newText to edits array", () => {
-    const result = normalizeLegacyEditRequest({ path: "a.ts", oldText: "x", newText: "y" });
+test("normalizeFlatEditRequest converts flat oldText/newText to edits array", () => {
+    const result = normalizeFlatEditRequest({ path: "a.ts", oldText: "x", newText: "y" });
     assert.deepEqual(result.edits, [{ oldText: "x", newText: "y" }]);
     assert.equal(result.path, "a.ts");
 });
 
-test("normalizeLegacyEditRequest passes through edits-array calls unchanged", () => {
+test("normalizeFlatEditRequest passes through edits-array calls unchanged", () => {
     const input = { path: "a.ts", edits: [{ oldText: "x", newText: "y" }] };
-    assert.equal(normalizeLegacyEditRequest(input), input);
+    assert.equal(normalizeFlatEditRequest(input), input);
 });
 
-test("normalizeLegacyEditRequest flat fields overwrite existing edits", () => {
-    const result = normalizeLegacyEditRequest({
+test("normalizeFlatEditRequest flat fields overwrite existing edits", () => {
+    const result = normalizeFlatEditRequest({
         path: "a.ts",
         oldText: "legacy",
         newText: "new",
@@ -241,36 +229,11 @@ test("normalizeLegacyEditRequest flat fields overwrite existing edits", () => {
     assert.equal(edits[0].newText, "new");
 });
 
-test("normalizeLegacyEditRequest moves top-level replaceAll into generated item", () => {
-    const result = normalizeLegacyEditRequest({
-        path: "a.ts",
-        oldText: "x",
-        newText: "y",
-        replaceAll: true,
-    });
-    assert.deepEqual(result.edits, [{ oldText: "x", newText: "y", replaceAll: true }]);
-    assert.ok(!("replaceAll" in result), "top-level replaceAll must be moved into the item, not left ignored");
-});
-
-test("normalizeLegacyEditRequest removes stale top-level oldText/newText", () => {
-    const result = normalizeLegacyEditRequest({ path: "a.ts", oldText: "x", newText: "y" });
+test("normalizeFlatEditRequest removes stale top-level oldText/newText", () => {
+    const result = normalizeFlatEditRequest({ path: "a.ts", oldText: "x", newText: "y" });
     assert.ok(!("oldText" in result), "stale top-level oldText must be removed");
     assert.ok(!("newText" in result), "stale top-level newText must be removed");
     assert.deepEqual(result.edits, [{ oldText: "x", newText: "y" }]);
-});
-
-test("top-level replaceAll defaults only edit items that omit it", () => {
-    const v = validateEditRequest({
-        path: "a.ts",
-        replaceAll: true,
-        edits: [
-            { oldText: "x", newText: "y" },
-            { oldText: "a", newText: "b", replaceAll: false },
-        ],
-    });
-    assert.ok(v.ok, `top-level replaceAll request must validate (got: ${v.ok ? "" : v.error})`);
-    assert.equal(v.value.replaceAll, undefined, "compatibility field must be consumed");
-    assert.deepEqual(v.value.edits?.map((edit) => edit.replaceAll), [true, false]);
 });
 
 // ── Malformed rich-field rejection ──────────────────────────────────
@@ -374,19 +337,6 @@ test("validateEditRequest rejects unknown nested fields", () => {
     assert.match(badTarget.error, /target\.unexpected is not supported/);
 });
 
-test("validateEditRequest accepts valid legacy anchor and rejects malformed anchor", () => {
-    const valid = validateEditRequest({ path: "a.ts", edits: [{ oldText: "x", newText: "y", anchor: { symbolName: "f", symbolKind: "function", symbolLine: 3 } }] });
-    assert.ok(valid.ok, "valid legacy anchor must be accepted");
-
-    const badName = validateEditRequest({ path: "a.ts", edits: [{ oldText: "x", newText: "y", anchor: { symbolName: 42 } }] });
-    assert.ok(!badName.ok, "anchor.symbolName must be a string");
-    assert.match(badName.error, /anchor\.symbolName must be a string/);
-
-    const badLine = validateEditRequest({ path: "a.ts", edits: [{ oldText: "x", newText: "y", anchor: { symbolLine: 0 } }] });
-    assert.ok(!badLine.ok, "anchor.symbolLine must be a positive integer");
-    assert.match(badLine.error, /anchor\.symbolLine must be a positive integer/);
-});
-
 test("validateEditRequest rejects unknown lineRange keys", () => {
     const v = validateEditRequest({
         path: "a.ts",
@@ -421,4 +371,103 @@ test("validateEditRequest requires oldText and newText together for a text edit"
     // Symbolic target alone is self-actionable.
     const symbolic = validateEditRequest({ path: "a.ts", edits: [{ target: { name: "foo", replaceBody: "bar" } }], toolCallId: "t" });
     assert.ok(symbolic.ok, "symbolic target must be self-actionable");
+});
+
+// ── Transfer (copy/move) ops ─────────────────────────────────────────
+
+test("validateEditRequest accepts a well-formed transfer op", () => {
+    const v = validateEditRequest({
+        path: "unused.ts",
+        edits: [{ op: "copy", from: "a.ts", range: { pos: "5aa", end: "6bb" }, to: "b.ts", after: "18cd" }],
+        toolCallId: "t",
+    });
+    assert.ok(v.ok, `well-formed transfer op must validate (got: ${v.ok ? "" : v.error})`);
+});
+
+test("validateEditRequest rejects transfer op with invalid op value", () => {
+    const v = validateEditRequest({
+        path: "unused.ts",
+        edits: [{ op: "duplicate", from: "a.ts", range: { pos: "5aa", end: "6bb" }, to: "b.ts", after: "18cd" }],
+        toolCallId: "t",
+    });
+    assert.ok(!v.ok, "invalid op value must be rejected");
+    assert.match(v.error, /op must be "copy" or "move"/);
+});
+
+test("validateEditRequest rejects transfer op missing from/to/range", () => {
+    const base = { op: "copy" as const, from: "a.ts", range: { pos: "5aa", end: "6bb" }, to: "b.ts", after: "18cd" };
+    for (const omit of ["from", "to", "range"] as const) {
+        const edit: Record<string, unknown> = { ...base };
+        delete edit[omit];
+        const v = validateEditRequest({ path: "unused.ts", edits: [edit], toolCallId: "t" });
+        assert.ok(!v.ok, `transfer op missing ${omit} must be rejected`);
+    }
+});
+
+test("validateEditRequest accepts a transfer op with `to`/`from`/`range`/`op` but no `after` (new-file destination)", () => {
+    const v = validateEditRequest({
+        path: "unused.ts",
+        edits: [{ op: "copy", from: "a.ts", range: { pos: "5aa", end: "6bb" }, to: "new.ts" }],
+        toolCallId: "t",
+    });
+    assert.ok(v.ok, `transfer op without \`after\` must validate (got: ${v.ok ? "" : v.error})`);
+});
+
+test("validateEditRequest rejects transfer op combined with oldText/newText/target/lineRange/hashline", () => {
+    const base = { op: "copy" as const, from: "a.ts", range: { pos: "5aa", end: "6bb" }, to: "b.ts", after: "18cd" };
+    const conflictingFields: Array<Record<string, unknown>> = [
+        { oldText: "x", newText: "y" },
+        { path: "a.ts" },
+        { target: { name: "foo" } },
+        { lineRange: { startLine: 1, endLine: 2 } },
+        { hashline: { range: { pos: "1ab", end: "1ab" } } },
+    ];
+    for (const extra of conflictingFields) {
+        const v = validateEditRequest({ path: "unused.ts", edits: [{ ...base, ...extra }], toolCallId: "t" });
+        assert.ok(!v.ok, `transfer op combined with ${JSON.stringify(extra)} must be rejected`);
+        assert.match(v.error, /op is mutually exclusive with/);
+    }
+});
+
+test("validateEditRequest rejects malformed transfer range", () => {
+    const cases: Array<{ range: unknown; match: RegExp }> = [
+        { range: undefined, match: /range must be an object/ },
+        { range: {}, match: /range\.pos must be a non-empty string/ },
+        { range: { pos: "5aa" }, match: /range\.end must be a non-empty string/ },
+        { range: { pos: "", end: "6bb" }, match: /range\.pos must be a non-empty string/ },
+    ];
+    for (const c of cases) {
+        const edit: Record<string, unknown> = { op: "copy", from: "a.ts", to: "b.ts", after: "18cd" };
+        if (c.range !== undefined) edit.range = c.range;
+        const v = validateEditRequest({ path: "unused.ts", edits: [edit], toolCallId: "t" });
+        assert.ok(!v.ok, `transfer range ${JSON.stringify(c.range)} must be rejected`);
+        assert.match(v.error, c.match);
+    }
+});
+
+test("registered edit schema advertises op/from/range/to/after and a copy/move enum", () => {
+    const params = registeredEditParams();
+    const properties = params.properties as Record<string, unknown>;
+    const edits = properties.edits as { items?: { properties?: Record<string, unknown>; anyOf?: Array<{ required?: string[] }> } };
+    const editProps = edits.items?.properties ?? {};
+
+    const op = editProps.op as { type?: string; enum?: string[] };
+    assert.ok(op, "edit items must advertise `op`");
+    assert.deepEqual(op.enum, ["copy", "move"]);
+    assert.equal(op.type, "string");
+
+    assert.ok(editProps.from, "edit items must advertise `from`");
+    assert.ok(editProps.to, "edit items must advertise `to`");
+    assert.ok(editProps.after, "edit items must advertise `after`");
+
+    const range = editProps.range as { properties?: Record<string, unknown>; required?: string[] };
+    assert.ok(range, "edit items must advertise `range`");
+    assert.ok(range.properties?.pos, "transfer range must advertise pos");
+    assert.ok(range.properties?.end, "transfer range must advertise end");
+
+    const anyOf = edits.items?.anyOf ?? [];
+    const transferBranch = anyOf.find((branch) =>
+        branch.required && ["op", "from", "range", "to"].every((k) => branch.required!.includes(k)));
+    assert.ok(transferBranch, "schema must include an anyOf branch requiring op/from/range/to");
+    assert.ok(!transferBranch!.required!.includes("after"), "`after` must not be in the required tuple (optional for new-file destinations)");
 });
