@@ -1112,18 +1112,18 @@ test("approval-gating: dangerous edit content adds advisory check, does not bloc
     });
     const d = res.details as unknown as { status: { kind: string }; checks: { advisory: Array<{ id: string; detail?: string }> } };
     // Must still apply (non-blocking)
-    assert.equal(d.status.kind, "applied", "dangerous edit must still apply — approval gating is advisory");
-    // Advisory checks must include approval-gating
-    const approvalChecks = d.checks.advisory.filter((c) => c.id === "approval-gating");
-    assert.ok(approvalChecks.length >= 1, "should have at least one approval-gating advisory check");
-    const detail = approvalChecks[0].detail ?? "";
+    assert.equal(d.status.kind, "applied", "dangerous edit must still apply — risk warnings are advisory");
+    // Advisory checks must include risk-warning
+    const riskChecks = d.checks.advisory.filter((c) => c.id === "risk-warning");
+    assert.ok(riskChecks.length >= 1, "should have at least one risk-warning advisory check");
+    const detail = riskChecks[0].detail ?? "";
     assert.ok(
         detail.includes("main") || detail.includes("dangerous"),
-        `approval-gating advisory detail should mention dangerous pattern (got: ${detail})`,
+        `risk-warning advisory detail should mention dangerous pattern (got: ${detail})`,
     );
 });
 
-test("approval-gating: safe edit has no approval-gating advisory checks", async () => {
+test("approval-gating: safe edit has no risk-warning advisory checks", async () => {
     const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-safe-")));
     mkdirSync(workdir, { recursive: true });
     const before = "alpha\nbeta\ngamma\n";
@@ -1137,8 +1137,8 @@ test("approval-gating: safe edit has no approval-gating advisory checks", async 
     });
     const d = res.details as unknown as { status: { kind: string }; checks: { advisory: Array<{ id: string }> } };
     assert.equal(d.status.kind, "applied");
-    const approvalChecks = d.checks.advisory.filter((c) => c.id === "approval-gating");
-    assert.equal(approvalChecks.length, 0, "safe edits should not produce approval-gating checks");
+    const riskChecks = d.checks.advisory.filter((c) => c.id === "risk-warning");
+    assert.equal(riskChecks.length, 0, "safe edits should not produce risk-warning checks");
 });
 
 // ─── Tool-owned prior authority (evidence policy B) ───────────────────
@@ -1412,6 +1412,60 @@ test("topology delete failure returns failed/write (not an uncaught throw) and r
     assert.equal(d.status.kind, "failed");
     assert.equal(d.status.phase, "write", "topology failure must be a write-phase failure");
     assert.equal(existsSync(join(workdir, "missing.ts")), false);
+});
+
+test("risk-warning: topology-only add runs path warnings and scans add-file content", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-topo-add-")));
+    mkdirSync(workdir, { recursive: true });
+    const sessionFilePath = "/sessions/topo-add.jsonl";
+    const deps: PatchToolDeps = {
+        getRpcClient: () => ({ request: async () => { throw new Error("unused"); }, dispose: () => {} }),
+        getSessionFilePath: () => sessionFilePath,
+        getCanonicalWorkspaceRoot: () => workdir,
+    };
+    const res = await createPatchTool(deps).execute(
+        "tc-topo-add",
+        { raw: "*** Begin Atomic Patch\n*** Add File: main.ts\nfunction main() { return 1; }\n*** End Atomic Patch\n", toolCallId: "tc-topo-add" } as any,
+        undefined,
+        undefined,
+        makeCtx(workdir),
+    );
+    const d = res.details as any;
+    assert.equal(d.status.kind, "applied", "add must apply — risk warnings are advisory");
+    assert.equal(existsSync(join(workdir, "main.ts")), true, "add file should be created");
+    const advisory = (d.checks as { advisory?: Array<{ id: string; detail?: string }> } | undefined)?.advisory ?? [];
+    const riskChecks = advisory.filter((c) => c.id === "risk-warning");
+    assert.ok(riskChecks.length >= 1, "topology-only add should emit risk-warning checks");
+    const detail = riskChecks.map((c) => c.detail ?? "").join("\n");
+    assert.ok(detail.includes("main.ts"), "path risk warning should mention main.ts");
+    assert.ok(detail.includes("main() function"), "add-file content should be scanned for dangerous symbols");
+});
+
+test("risk-warning: topology-only delete runs path risk warnings", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-topo-del-warn-")));
+    mkdirSync(workdir, { recursive: true });
+    writeFileSync(join(workdir, "main.ts"), "x\n", "utf8");
+    const sessionFilePath = "/sessions/topo-del-warn.jsonl";
+    const deps: PatchToolDeps = {
+        getRpcClient: () => ({ request: async () => { throw new Error("unused"); }, dispose: () => {} }),
+        getSessionFilePath: () => sessionFilePath,
+        getCanonicalWorkspaceRoot: () => workdir,
+    };
+    const res = await createPatchTool(deps).execute(
+        "tc-topo-del-warn",
+        { raw: "*** Begin Atomic Patch\n*** Delete File: main.ts\n*** End Atomic Patch\n", toolCallId: "tc-topo-del-warn" } as any,
+        undefined,
+        undefined,
+        makeCtx(workdir),
+    );
+    const d = res.details as any;
+    assert.equal(d.status.kind, "applied", "delete must apply — risk warnings are advisory");
+    assert.equal(existsSync(join(workdir, "main.ts")), false, "delete should remove the file");
+    const advisory = (d.checks as { advisory?: Array<{ id: string; detail?: string }> } | undefined)?.advisory ?? [];
+    const riskChecks = advisory.filter((c) => c.id === "risk-warning");
+    assert.ok(riskChecks.length >= 1, "topology-only delete should emit risk-warning checks");
+    const detail = riskChecks.map((c) => c.detail ?? "").join("\n");
+    assert.ok(detail.includes("main.ts"), "path risk warning should mention main.ts");
 });
 
 // ─── Bug 3: EditTransaction.begin() failure must return a typed result ────

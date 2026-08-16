@@ -1,12 +1,14 @@
 /**
- * Lightweight approval gating for SmartEdit.
+ * Risk-warning checks for SmartEdit.
  *
  * Checks file paths, edit content, and line ranges against
- * dangerous patterns to surface warnings. Never blocks edits —
- * all checks emit warnings as matchNotes.
+ * dangerous patterns to surface advisory warnings. Never blocks or
+ * prompts for approval — all checks emit warnings as matchNotes.
  *
- * Approval level is controlled by the SMART_EDIT_APPROVAL_LEVEL
+ * The effective level is controlled by the SMART_EDIT_APPROVAL_LEVEL
  * environment variable (never_prompt | prompt_on_dangerous | prompt_always).
+ * The env/type names are kept for compatibility; the behavior is
+ * advisory risk warnings only, never a blocking approval gate.
  */
 
 import type { EditItem } from "../core/types";
@@ -19,11 +21,11 @@ import { loadConfig } from "../config/schema.js";
 export type ApprovalLevel = "never_prompt" | "prompt_on_dangerous" | "prompt_always";
 
 export interface ApprovalConfig {
-  /** Approval level controlling when checks are active */
+  /** Level controlling when risk-warning checks are active */
   level: ApprovalLevel;
   /** Glob-style patterns for dangerous file paths */
   dangerousPathPatterns: readonly string[];
-  /** Regex patterns to search for in edit oldText/newText */
+  /** Regex patterns to search for in edit text (old/new, symbolic, structural) */
   dangerousSymbolPatterns: ReadonlyArray<{ name: string; regex: RegExp }>;
   /** First N lines of entry-point files are considered critical */
   criticalLineRange: number;
@@ -32,9 +34,9 @@ export interface ApprovalConfig {
 export interface SafetyCheckResult {
   /** True when no dangerous patterns were matched */
   safe: boolean;
-  /** Human-readable warning messages */
+  /** Human-readable risk-warning messages (advisory, never blocking) */
   warnings: string[];
-  /** Effective approval level used */
+  /** Effective level used */
   level: ApprovalLevel;
 }
 
@@ -274,41 +276,51 @@ interface SymbolMatch {
   editIndex: number;
 }
 
-type SymbolicEditText = Partial<Pick<NonNullable<EditItem["target"]>, "replaceBody" | "insertBefore" | "insertAfter">>;
-
 /**
  * Scan all edits for dangerous symbol patterns.
  * Deduplicates so the same pattern across multiple edits is reported once.
+ *
+ * Covers every text-bearing edit form:
+ *  - oldText / newText (text replacement)
+ *  - target.replaceBody / insertBefore / insertAfter (symbolic edits)
+ *  - target.pattern / target.replacement (structural ast-grep edits)
+ * plus any extra content (e.g. add-file bodies) passed separately.
  */
 function scanEditsForDangerousSymbols(
   edits: readonly EditItem[],
   patterns: ReadonlyArray<{ name: string; regex: RegExp }> = DANGEROUS_SYMBOL_PATTERNS,
+  extraContent: readonly string[] = [],
 ): SymbolMatch[] {
   const seen = new Set<string>();
   const results: SymbolMatch[] = [];
+
+  const checkText = (text: string, editIndex: number): void => {
+    for (const pattern of patterns) {
+      if (seen.has(pattern.name)) continue; // already reported
+      if (pattern.regex.test(text)) {
+        seen.add(pattern.name);
+        results.push({ name: pattern.name, editIndex });
+      }
+    }
+  };
 
   for (let i = 0; i < edits.length; i++) {
     const edit = edits[i];
     const textsToCheck: string[] = [];
 
-    const symbolic = edit as EditItem & SymbolicEditText;
     if (edit.oldText) textsToCheck.push(edit.oldText);
     if (edit.newText) textsToCheck.push(edit.newText);
-    if (symbolic.replaceBody) textsToCheck.push(symbolic.replaceBody);
-    if (symbolic.insertBefore) textsToCheck.push(symbolic.insertBefore);
-    if (symbolic.insertAfter) textsToCheck.push(symbolic.insertAfter);
+    const t = edit.target;
+    if (t?.replaceBody) textsToCheck.push(t.replaceBody);
+    if (t?.insertBefore) textsToCheck.push(t.insertBefore);
+    if (t?.insertAfter) textsToCheck.push(t.insertAfter);
+    if (t?.pattern) textsToCheck.push(t.pattern);
+    if (t?.replacement) textsToCheck.push(t.replacement);
 
-    for (const text of textsToCheck) {
-      for (const pattern of patterns) {
-        if (seen.has(pattern.name)) continue; // already reported
-        if (pattern.regex.test(text)) {
-          seen.add(pattern.name);
-          results.push({ name: pattern.name, editIndex: i });
-          if (seen.size === patterns.length) return results;
-        }
-      }
-    }
+    for (const text of textsToCheck) checkText(text, i);
   }
+
+  for (const text of extraContent) checkText(text, -1);
 
   return results;
 }
@@ -327,19 +339,23 @@ function defaultConfig(): ApprovalConfig {
 // ─── Main entry point ──────────────────────────────────────────────────
 
 /**
- * Check edit safety for a given file path and edit items.
+ * Run risk-warning checks for a given file path and edit items.
  *
  * Three levels of checking:
  *   1. File path against dangerous path patterns
- *   2. Edit content against dangerous symbol patterns
+ *   2. Edit content against dangerous symbol patterns (all text forms)
  *   3. Edit span within critical first-N lines of entry points (optional)
  *
  * Returns a SafetyCheckResult with warnings (never throws for danger).
+ * These are advisory risk warnings only — they never block or prompt.
+ *
+ * @param extraContent Additional text to scan (e.g. add-file bodies).
  */
 export async function checkEditSafety(
   filePath: string,
   edits: readonly EditItem[],
   config?: Partial<ApprovalConfig>,
+  extraContent: readonly string[] = [],
 ): Promise<SafetyCheckResult> {
   const cfg: ApprovalConfig = { ...defaultConfig(), ...config };
 
@@ -361,7 +377,7 @@ export async function checkEditSafety(
   const matchedPath = await matchesDangerousPath(resolvedPath, cfg.dangerousPathPatterns);
   if (matchedPath) {
     warnings.push(
-      `⚠️ Danger: editing "${filePath}" matches dangerous path pattern "${matchedPath}". ` +
+      `⚠️ Risk warning: editing "${filePath}" matches dangerous path pattern "${matchedPath}". ` +
         `Review this change carefully before proceeding.`,
     );
   }
@@ -370,16 +386,16 @@ export async function checkEditSafety(
   const autoGenerated = await isAutoGenerated(resolvedPath);
   if (autoGenerated) {
     warnings.push(
-      `⚠️ File appears auto-generated. Editing it may cause build artifacts to diverge.`,
+      `⚠️ Risk warning: file appears auto-generated. Editing it may cause build artifacts to diverge.`,
     );
   }
 
   // ── 2. Check edit content against dangerous symbol patterns ───
-  const symbolMatches = scanEditsForDangerousSymbols(edits, cfg.dangerousSymbolPatterns);
+  const symbolMatches = scanEditsForDangerousSymbols(edits, cfg.dangerousSymbolPatterns, extraContent);
   if (symbolMatches.length > 0) {
     const patternsList = symbolMatches.map((m) => m.name).join(", ");
     warnings.push(
-      `⚠️ Danger: edit content matches dangerous patterns: ${patternsList}. ` +
+      `⚠️ Risk warning: edit content matches dangerous patterns: ${patternsList}. ` +
       `Review these changes carefully before proceeding.`,
     );
   }
@@ -387,7 +403,7 @@ export async function checkEditSafety(
   // ── 3. For prompt_always, emit a generic note on safe edits ───
   if (cfg.level === "prompt_always" && warnings.length === 0) {
     warnings.push(
-      `ℹ️ Approval check: editing "${filePath}" — no dangerous patterns detected. Proceed with standard caution.`,
+      `ℹ️ Risk check: editing "${filePath}" — no dangerous patterns detected. Proceed with standard caution.`,
     );
   }
 

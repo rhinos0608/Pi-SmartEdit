@@ -19,6 +19,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { visibleWidth } from "@mariozechner/pi-tui";
 import smartEdit from "../src/index.js";
 import { createPatchTool, type PatchToolDeps, type PatchTool } from "../src/patch.js";
+import { claimDiagnosticsOwner, isDiagnosticsClaimed, resetDiagnosticsOwnership } from "../src/mutation-ownership.js";
 import { PROTOCOL_SCHEMA_VERSION, hashSessionFilePath, resourceIdFor, type WorkspaceEvidenceEnvelope, type InspectedResource } from "@rhinos0608/pi-workspace-protocol";
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -553,4 +554,97 @@ test("errored tool_result workspace evidence does not authorize", async () => {
   );
   assert.equal(result.details.status.kind, "applied", "errored result evidence must be ignored");
   assert.equal(readFileSync(filePath, "utf8"), "l1\nl2\nl3\nL4\nl5\n");
+});
+
+// ── Post-mutation diagnostics ownership + write-tool diagnostics ──────
+
+test("tool_call claims post-mutation diagnostics ownership for write and edit", () => {
+  resetDiagnosticsOwnership();
+  const pi = createMockPI();
+  init(pi);
+  assert.ok(pi._events.has("tool_call"), "must handle tool_call");
+
+  const toolCall = [...pi._events.get("tool_call")!][0];
+  toolCall({ toolName: "write", toolCallId: "claim-write" });
+  toolCall({ toolName: "edit", toolCallId: "claim-edit" });
+  toolCall({ toolName: "read", toolCallId: "claim-read" });
+
+  assert.equal(isDiagnosticsClaimed("claim-write"), true);
+  assert.equal(isDiagnosticsClaimed("claim-edit"), true);
+  assert.equal(isDiagnosticsClaimed("claim-read"), false, "non-mutation tools must not claim ownership");
+});
+
+test("a failed write/edit tool_result releases its ownership claim", async () => {
+  resetDiagnosticsOwnership();
+  const pi = createMockPI();
+  init(pi);
+  claimDiagnosticsOwner("failed-write");
+  claimDiagnosticsOwner("failed-edit");
+  assert.equal(isDiagnosticsClaimed("failed-write"), true);
+  assert.equal(isDiagnosticsClaimed("failed-edit"), true);
+
+  const toolResult = [...pi._events.get("tool_result")!][0];
+  await toolResult({ toolName: "write", toolCallId: "failed-write", isError: true, input: {}, content: [] }, {});
+  await toolResult({ toolName: "edit", toolCallId: "failed-edit", isError: true, input: {}, content: [] }, {});
+
+  assert.equal(isDiagnosticsClaimed("failed-write"), false);
+  assert.equal(isDiagnosticsClaimed("failed-edit"), false);
+});
+
+test("a successful native write with structural diagnostics returns them in content, not just a dead event mutation", async () => {
+  const tmpDir = realpathSync(mkdtempSync(join(tmpdir(), "write-diagnostics-")));
+  // .txt is not mapped to any compiler in language-id.ts, so
+  // runAutoValidation's compiler lane is skipped deterministically — no
+  // subprocess spawn — while checkStructural (language-agnostic) still
+  // flags the TODO placeholder, giving a fast, deterministic failure.
+  const filePath = join(tmpDir, "a.txt");
+  writeFileSync(filePath, "some content\n// TODO: implement\n", "utf8");
+
+  const pi = createMockPI();
+  init(pi);
+
+  const toolResult = [...pi._events.get("tool_result")!][0];
+  const result = await toolResult(
+    {
+      toolName: "write",
+      toolCallId: "write-with-diagnostics",
+      isError: false,
+      input: { path: filePath },
+      content: [{ type: "text", text: `Successfully wrote to ${filePath}` }],
+    },
+    {},
+  ) as { content: Array<{ type: string; text?: string }>; details: Record<string, unknown> } | undefined;
+
+  assert.ok(result, "handler must return a result when diagnostics are found");
+  const text = result!.content.map((c) => c.text ?? "").join("\n");
+  assert.match(text, /Successfully wrote to/, "original content must be preserved");
+  assert.match(text, /Post-write diagnostics:/);
+  assert.match(text, /TODO/i);
+  assert.equal(
+    (result!.details as { postEditDiagnostics?: { checked?: boolean } }).postEditDiagnostics?.checked,
+    true,
+  );
+});
+
+test("a successful native write with no diagnostics does not modify the result", async () => {
+  const tmpDir = realpathSync(mkdtempSync(join(tmpdir(), "write-no-diagnostics-")));
+  const filePath = join(tmpDir, "a.txt");
+  writeFileSync(filePath, "clean content, nothing to flag\n", "utf8");
+
+  const pi = createMockPI();
+  init(pi);
+
+  const toolResult = [...pi._events.get("tool_result")!][0];
+  const result = await toolResult(
+    {
+      toolName: "write",
+      toolCallId: "write-clean",
+      isError: false,
+      input: { path: filePath },
+      content: [{ type: "text", text: "Successfully wrote" }],
+    },
+    {},
+  );
+
+  assert.equal(result, undefined, "a clean write must not mutate the tool result");
 });

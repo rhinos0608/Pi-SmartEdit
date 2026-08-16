@@ -21,6 +21,8 @@ The original plan scoped three features. All were completed, followed by a secon
    - Per-file baseline capture
    - Configurable on-conflict behavior (warn/error)
 
+   > **Historical note:** The cross-call semantic conflict detector was later removed as dead code (see `src/index.ts`). Only intra-request byte-overlap protection remains.
+
 3. **Line-Range Targeting** — P1, Low complexity
    - Read-range coverage validation
    - Edit range scoping for hashline, symbolic, and legacy edits

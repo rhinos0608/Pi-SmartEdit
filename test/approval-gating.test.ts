@@ -182,6 +182,71 @@ describe("checkEditSafety — symbol patterns", () => {
   });
 });
 
+// ─── Scanner coverage: all text operation forms ───────────────────────
+
+describe("checkEditSafety — scanner covers all text forms", () => {
+  it("scans symbolic target.replaceBody", async () => {
+    const result = await checkEditSafety(
+      "src/worker.ts",
+      [{ target: { name: "main", replaceBody: "function main() { return 1; }" } }],
+      { level: "prompt_on_dangerous" },
+    );
+    assert.ok(!result.safe, "replaceBody should be scanned");
+    assert.ok(result.warnings.some((w) => w.includes("main() function")));
+  });
+
+  it("scans symbolic target.insertBefore", async () => {
+    const result = await checkEditSafety(
+      "src/worker.ts",
+      [{ target: { name: "setup", insertBefore: "function init() { return true; }" } }],
+      { level: "prompt_on_dangerous" },
+    );
+    assert.ok(!result.safe, "insertBefore should be scanned");
+    assert.ok(result.warnings.some((w) => w.includes("init() function")));
+  });
+
+  it("scans symbolic target.insertAfter", async () => {
+    const result = await checkEditSafety(
+      "src/worker.ts",
+      [{ target: { name: "boot", insertAfter: "process.env.NODE_ENV" } }],
+      { level: "prompt_on_dangerous" },
+    );
+    assert.ok(!result.safe, "insertAfter should be scanned");
+    assert.ok(result.warnings.some((w) => w.includes("process.env")));
+  });
+
+  it("scans structural target.pattern", async () => {
+    const result = await checkEditSafety(
+      "src/worker.ts",
+      [{ target: { pattern: "fs.writeFile('x', y)", replacement: "logger.info('x', y)" } }],
+      { level: "prompt_on_dangerous" },
+    );
+    assert.ok(!result.safe, "structural pattern should be scanned");
+    assert.ok(result.warnings.some((w) => w.includes("writeFile")));
+  });
+
+  it("scans structural target.replacement", async () => {
+    const result = await checkEditSafety(
+      "src/worker.ts",
+      [{ target: { pattern: "foo()", replacement: "process.env.NODE_ENV" } }],
+      { level: "prompt_on_dangerous" },
+    );
+    assert.ok(!result.safe, "structural replacement should be scanned");
+    assert.ok(result.warnings.some((w) => w.includes("process.env")));
+  });
+
+  it("scans extraContent (add-file body)", async () => {
+    const result = await checkEditSafety(
+      "src/newfile.ts",
+      [],
+      { level: "prompt_on_dangerous" },
+      ["function main() { return 1; }"],
+    );
+    assert.ok(!result.safe, "extraContent should be scanned");
+    assert.ok(result.warnings.some((w) => w.includes("main() function")));
+  });
+});
+
 // ─── Approval levels ─────────────────────────────────────────────────
 
 describe("checkEditSafety — approval levels", () => {

@@ -1,10 +1,12 @@
-# Specification: Lightweight Approval Gating for SmartEdit
+# Specification: Risk Warnings for SmartEdit
 
 **Status:** Implemented (May 2026)
 **Date:** 2026-05-16
 **Author:** SmartEdit
 **Driven-by:** Codex's `AskForApproval` system — a lightweight alternative for SmartEdit's scope.
 **Extensions:** Auto-generated file detection added May 2026.
+
+> **Naming note:** This feature is advisory **risk warnings** only. It never prompts or blocks. The exported module/function/env names (`approval-gating.ts`, `checkEditSafety`, `SMART_EDIT_APPROVAL_LEVEL`) are kept for compatibility.
 
 ---
 
@@ -20,15 +22,15 @@ Codex has a comprehensive approval system backed by a 37k-line execution policy 
 
 ---
 
-## 2. Approval Levels
+## 2. Risk-Warning Levels
 
 Three levels, controlled by the environment variable `SMART_EDIT_APPROVAL_LEVEL`:
 
 | Level | Env Value | Behavior |
 |---|---|---|
-| **never_prompt** | `"never_prompt"` | No approval checks run. Edits proceed without any safety prompts. |
+| **never_prompt** | `"never_prompt"` | No risk-warning checks run. Edits proceed without any warnings. |
 | **prompt_on_dangerous** | `"prompt_on_dangerous"` | Only emits warnings when dangerous file paths, symbol patterns, or critical line ranges are detected. Safe edits produce no output. |
-| **prompt_always** | `"prompt_always"` | Emits warnings for every edit. On safe edits, a generic "approval prompt" note is added. On dangerous edits, the specific warnings are included. |
+| **prompt_always** | `"prompt_always"` | Emits warnings for every edit. On safe edits, a generic note is added. On dangerous edits, the specific warnings are included. |
 
 Default: `prompt_on_dangerous` (checks run silently; only warns on dangerous patterns).
 
@@ -57,7 +59,7 @@ Matching algorithm: simple glob-to-regex conversion supporting `**` (match acros
 
 ## 4. Dangerous Edit Patterns (Regex-based)
 
-Patterns matched against the `oldText` and `newText` content of each edit. Matching is case-sensitive and multiline:
+Patterns matched against every text-bearing edit form: `oldText`/`newText`, symbolic `target.replaceBody`/`insertBefore`/`insertAfter`, structural `target.pattern`/`target.replacement`, and add-file bodies. Matching is case-sensitive and multiline:
 
 | Pattern | RegExp | Rationale |
 |---|---|---|
@@ -99,7 +101,7 @@ If any marker is found, a warning is emitted. This catches edits to generated pr
 
 **Current stance: warnings only, never block.**
 
-All safety checks emit warnings as `matchNotes` in the edit result. The edit proceeds to completion regardless of what the checks find.
+All risk-warning checks emit warnings as advisory `checks.advisory` records (id `risk-warning`) in the edit result. The edit proceeds to completion regardless of what the checks find.
 
 Rationale:
 - SmartEdit is a developer tool in a collaborative agent session — blocking would break flow
@@ -112,7 +114,7 @@ Future consideration: add `prompt_on_dangerous_block` level that throws an error
 
 ## 7. Integration with the Execute Flow
 
-The approval gating check operates **after edits are applied to the content but before the file is written to disk**:
+The risk-warning check operates **after edits are applied to the content but before the file is written to disk**:
 
 ```
 execute() flow:
@@ -120,16 +122,15 @@ execute() flow:
   2. read file → stale check
   3. range coverage check
   4. Apply edits (hashline Phase A → symbolic Phase B → legacy Phase C)
-     └─ Conflict detection runs as pre-apply hook during Phase C
   5. No-op guard (reject if content unchanged)
-  6. APPROVAL GATING CHECK                 <── here
-  7. Save undo state (fire-and-forget)
+  6. RISK-WARNING CHECK                 <── here (also runs for topology-only add/delete/rename)
+  7. Save undo state (persisted after commit, best-effort)
   8. atomicWrite
   9. Post-edit: AST validation → LSP diagnostics → compiler fallback →
      scoped diagnostics → verification pipeline
 ```
 
-The approval gating check does NOT depend on conflict detection results — it runs independently and its warnings are merged into the same `matchNotes[]` array.
+The risk-warning check runs independently and its warnings are merged into the same `checks.advisory[]` array.
 
 ---
 
@@ -154,10 +155,12 @@ export interface SafetyCheckResult {
 }
 
 // Check edit safety for a given file path and edit items
+// extraContent: additional text to scan (e.g. add-file bodies)
 export function checkEditSafety(
   filePath: string,
   edits: EditItem[],
   config?: Partial<ApprovalConfig>,
+  extraContent?: readonly string[],
 ): Promise<SafetyCheckResult>;
 ```
 

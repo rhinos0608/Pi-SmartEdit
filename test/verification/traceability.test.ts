@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { analyzeTraceability } from "../../src/verification/traceability.js";
@@ -161,6 +161,37 @@ describe("traceability", () => {
         });
         // Only logicTarget is applicable; it's missing -> 0%
         assert.strictEqual(result.coveragePercent, 0);
+      } finally {
+        // Temp dir cleaned by OS
+      }
+    });
+
+    it("does not hang or infinite-loop on a symlink cycle under cwd", async () => {
+      // discoverTestFiles previously followed directory symlinks with no
+      // cycle guard beyond exact-path dedup, so a symlink pointing back at
+      // an ancestor produced an unbounded walk (`/a/loop/loop/loop/...`).
+      const dir = mkdtempSync(join(tmpdir(), "trace-test-cycle-"));
+      try {
+        mkdirSync(join(dir, "src"), { recursive: true });
+        symlinkSync(dir, join(dir, "src", "loop"));
+
+        const target = makeLogicTarget("orphanFunction", {
+          path: join(dir, "src", "orphan.ts"),
+        });
+
+        const result = await analyzeTraceability({
+          cwd: dir,
+          path: join(dir, "src", "orphan.ts"),
+          content: `function orphanFunction() {}`,
+          changedTargets: [target],
+          editedPaths: [],
+          lspManager: null,
+          config: defaultTraceabilityConfig(),
+        });
+
+        const entry = result.targets.find((t) => t.target.name === "orphanFunction");
+        assert.ok(entry, "Expected traceability entry for orphanFunction");
+        assert.strictEqual(entry.status, "missing");
       } finally {
         // Temp dir cleaned by OS
       }

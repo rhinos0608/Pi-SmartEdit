@@ -705,6 +705,49 @@ test("public: final advisory lanes appear only after a committed transaction", a
   assert.deepEqual((res.details as { finalization?: unknown }).finalization, { lane: "synthetic" });
 });
 
+test("public: final-lane diagnostics are also surfaced in model-visible content, not just details", async () => {
+  const { res } = await runTool({
+    workdir: realpathSync(mkdtempSync(join(tmpdir(), "cap-final-lanes-content-"))),
+    fileContent: "const x = 1;\n",
+    edits: [{ oldText: "x = 1", newText: "x = 2" }],
+    runFinalSuccessLanes: async () => ({
+      diagnostics: ["a.ts:1: type error TS2322"],
+      checks: [],
+      evidence: null,
+    }),
+  });
+  assert.equal(res.details.status.kind, "applied");
+  const text = res.content.map((c) => (c as { text?: string }).text ?? "").join("\n");
+  assert.match(text, /Post-edit diagnostics:/);
+  assert.match(text, /a\.ts:1: type error TS2322/);
+});
+
+test("public: no diagnostics block in content when the final lane reports nothing", async () => {
+  const { res } = await runTool({
+    workdir: realpathSync(mkdtempSync(join(tmpdir(), "cap-final-lanes-empty-"))),
+    fileContent: "const x = 1;\n",
+    edits: [{ oldText: "x = 1", newText: "x = 2" }],
+    runFinalSuccessLanes: async () => ({ diagnostics: [], checks: [], evidence: null }),
+  });
+  assert.equal(res.details.status.kind, "applied");
+  const text = res.content.map((c) => (c as { text?: string }).text ?? "").join("\n");
+  assert.doesNotMatch(text, /Post-edit diagnostics:/);
+});
+
+test("public: a failed edit (no match found, never committed) does not get a diagnostics block appended", async () => {
+  const { res } = await runTool({
+    workdir: realpathSync(mkdtempSync(join(tmpdir(), "cap-final-lanes-failed-"))),
+    fileContent: "alpha\nbeta\ngamma\n",
+    edits: [{ oldText: "betta", newText: "B" }],
+    runFinalSuccessLanes: async () => {
+      throw new Error("final lanes must not run for a failed/never-committed edit");
+    },
+  });
+  assert.equal(res.details.status.kind, "failed");
+  const text = res.content.map((c) => (c as { text?: string }).text ?? "").join("\n");
+  assert.doesNotMatch(text, /Post-edit diagnostics:/);
+});
+
 describe("raw formats through public execute", () => {
   test("normalizes every update syntax through the edit lifecycle", async () => {
     const rawFormats = [
@@ -766,12 +809,21 @@ describe("raw formats through public execute", () => {
     for (const { raw, path, content, removesSource } of cases) {
       const workdir = realpathSync(mkdtempSync(join(tmpdir(), "cap-raw-topology-")));
       const { res } = await runTool({ workdir, fileContent: "old\n", raw });
-      const details = res.details as { status: { kind: string; phase?: string }; diagnostics: readonly string[] };
+      const details = res.details as {
+        status: { kind: string; phase?: string };
+        diagnostics: readonly string[];
+        changedResources: ReadonlyArray<{ canonicalPath: string; newFullFileSha256?: string }>;
+      };
       assert.equal(details.status.kind, "applied", raw);
       const target = join(workdir, path);
       assert.equal(existsSync(target), content !== null, raw);
       if (content !== null) assert.equal(readFileSync(target, "utf8"), content, raw);
       if (removesSource) assert.equal(existsSync(join(workdir, "a.ts")), false, raw);
+      if (raw.includes("Rename File") || raw.includes("Move to:")) {
+        assert.equal(details.changedResources.length, 2, "rename must invalidate both paths");
+        assert.ok(details.changedResources.some((resource) => resource.canonicalPath === join(workdir, "a.ts") && resource.newFullFileSha256 === undefined));
+        assert.ok(details.changedResources.some((resource) => resource.canonicalPath === target && resource.newFullFileSha256 !== undefined));
+      }
     }
   });
 });

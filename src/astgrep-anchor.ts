@@ -174,12 +174,15 @@ function resolveMultiCapture(node: any, name: string, content: string): string {
         // captured node's end so intervening source (spaces, commas,
         // comments) is preserved — concatenating node.text() would drop it
         // (e.g. `logger(a, b)` with $$$ARGS would become "ab").
-        const ranges = nodes
+        const ranges: Array<{ start: { index: number }; end: { index: number } }> = nodes
           .map((n: any) => n?.range?.())
-          .filter((r: any) => r?.start?.index != null && r?.end?.index != null);
+          .filter(
+            (r: any): r is { start: { index: number }; end: { index: number } } =>
+              r?.start?.index != null && r?.end?.index != null,
+          );
         if (ranges.length > 0) {
-          const startByte = Math.min(...ranges.map((r: any) => r.start.index));
-          const endByte = Math.max(...ranges.map((r: any) => r.end.index));
+          const startByte = Math.min(...ranges.map((r) => r.start.index));
+          const endByte = Math.max(...ranges.map((r) => r.end.index));
           const encoded = Buffer.from(content, "utf8");
           return content.slice(
             utf8ByteOffsetToStringIndex(encoded, startByte),

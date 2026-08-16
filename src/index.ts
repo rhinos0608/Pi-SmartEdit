@@ -22,7 +22,6 @@ import {
   formatEditError,
 } from "./args.js";
 
-import { createConflictDetector, defaultConflictConfig } from "./core/conflict-detector";
 import { createAstResolver } from "./core/ast-resolver";
 
 import { recordRead, recordReadSession, getSnapshot } from "./core/read-cache";
@@ -41,6 +40,8 @@ import { runAutoValidation, formatValidationFeedback, resetRetryCounts } from ".
 import { runRepairLoop } from "./verification/repair-loop";
 import { runPostEditEvidencePipeline } from "./verification/post-edit-evidence";
 import { recordBreakage, recordCoChange } from "./smartread-bridge";
+import { claimDiagnosticsOwner, releaseDiagnosticsOwner } from "./mutation-ownership.js";
+import { appendDiagnosticsToContent } from "./post-mutation.js";
 import { createPatchTool, type PatchToolDeps, type PatchToolDetails } from "./patch.js";
 import { normalizeLegacyEditRequest } from "./edit-contract.js";
 import { normalizeRawEdit } from "./edit-intents.js";
@@ -277,13 +278,10 @@ export function combineMultiFileEditResults(results: ToolEditResult[]): ToolEdit
 
 
 
-// ─── AST resolver and conflict detector instances (per-session) ────
+// ─── AST resolver instance (per-session) ────
 
 /** AST resolver instance, created once per session. null if Tree-sitter unavailable. */
 let astResolver: ReturnType<typeof createAstResolver> | null = null;
-
-/** Conflict detector instance, created once per session. */
-let conflictDetector: ReturnType<typeof createConflictDetector> | null = null;
 
 /** LSP manager instance, created once per session. */
 let lspManager: LSPManager | null = null;
@@ -306,9 +304,31 @@ export default function smartEdit(pi: ExtensionAPI) {
   /** Per-extension, per-session authority; never shared across Pi instances. */
   let priorAuthorityStore: PriorAuthorityStore | null = null;
 
+  // ── Claim post-mutation diagnostics ownership for write/edit ──
+  // SmartRead's fallback checks isDiagnosticsClaimed() on tool_result and
+  // skips its own diagnostics collection when this extension has claimed the
+  // toolCallId, regardless of extension load order (see mutation-ownership.ts).
+  pi.on("tool_call", (event) => {
+    if (event.toolName === "write" || event.toolName === "edit") {
+      claimDiagnosticsOwner(event.toolCallId);
+    }
+    return undefined;
+  });
+
   // ── Populate read cache on every successful read ──
   pi.on("tool_result", async (event, _ctx) => {
     const toolCwd = process.cwd();
+
+    // Release the claim on a failed mutation — SmartEdit only owns
+    // diagnostics for mutations that actually succeeded; a failed write/edit
+    // must fall back to SmartRead (or nothing) rather than silently owning
+    // and then never delivering diagnostics.
+    if (
+      (event.toolName === "write" || event.toolName === "edit") &&
+      event.isError
+    ) {
+      releaseDiagnosticsOwner(event.toolCallId);
+    }
 
     // ── Ingest SmartRead workspace evidence into prior authority store ──
     // Tool-owned evidence policy B: validated `details.workspaceEvidence`
@@ -576,6 +596,11 @@ export default function smartEdit(pi: ExtensionAPI) {
     };
 
     // ── Track writes so write-then-edit flow doesn't trigger stale-file guard ──
+    // Also SmartEdit's diagnostics lane for the native `write` tool: this is
+    // awaited and returned (not fire-and-forget) so the model actually sees
+    // it — the previous `.then()` mutated `event` after this async handler
+    // had already resolved, which the runner's emitToolResult never observes
+    // (it only honors a handler's return value).
     const writePath = (event.input as { path?: string } | undefined)?.path;
     if (
       event.toolName === "write" &&
@@ -583,17 +608,18 @@ export default function smartEdit(pi: ExtensionAPI) {
       writePath
     ) {
       try {
-        validateFileAndBuildFeedback(writePath, toolCwd)
-          .then((entry) => {
-            if (!entry) return;
-            const ev = event as unknown as Record<string, unknown>;
-            ev.validationFeedback = entry.feedback;
-            ev.validationRetries = entry.retryCount;
-            ev.shouldDecompose = entry.shouldDecompose;
-          })
-          .catch(() => {
-            // Validation is advisory — silent degradation
-          });
+        const entry = await validateFileAndBuildFeedback(writePath, toolCwd);
+        if (entry) {
+          const block = `\n\nPost-write diagnostics:\n${entry.feedback}`;
+          return {
+            content: appendDiagnosticsToContent(event.content, block) as typeof event.content,
+            details: {
+              postEditDiagnostics: { schemaVersion: 1, paths: [writePath], checked: true },
+              validationRetries: entry.retryCount,
+              shouldDecompose: entry.shouldDecompose,
+            },
+          };
+        }
       } catch {
         // File might not exist yet or can't be read — skip silently
       }
@@ -628,8 +654,8 @@ export default function smartEdit(pi: ExtensionAPI) {
     // (needed so a later edit to the same file doesn't trip the stale-file
     // guard) is preserved here; see refreshReadCacheAfterEdit above.
     //
-    // The `write` tool's advisory hook below is unrelated and unchanged: it
-    // is the only diagnostic lane for `write`, so no duplication applies.
+    // The `write` tool's diagnostics lane above is unrelated: it is the only
+    // diagnostic lane for `write`, so no duplication applies.
     if (
       event.toolName === "edit" &&
       !event.isError
@@ -671,16 +697,9 @@ export default function smartEdit(pi: ExtensionAPI) {
     // Create AST resolver (returns null if Tree-sitter unavailable)
     astResolver = createAstResolver();
 
-    // Create conflict detector wired to the AST resolver
-    conflictDetector = createConflictDetector(defaultConflictConfig, () => astResolver);
-
     // Create LSP manager for semantic intelligence
     lspManager = new LSPManager(sessionCwd);
 
-    // Clear conflict history and retry counts on session start
-    if (conflictDetector) {
-      conflictDetector.clearAll();
-    }
     resetRetryCounts();
 
     // Capture the real session file path and canonical workspace root.
@@ -766,13 +785,19 @@ export default function smartEdit(pi: ExtensionAPI) {
             checks.push({ id: `diagnostics:${file.path}`, outcome: "skipped", detail: "no language diagnostic lane" });
             continue;
           }
+          // Track whether LSP actually produced a diagnosis for this file.
+          // The compiler lane is a fallback ONLY when LSP is absent
+          // (source: "none") — not merely when LSP reported no errors — so
+          // we never double-report the same file when an LSP server exists.
+          let lspSource: "lsp" | "none" = "none";
           if (lspManager) {
             const lsp = await checkPostEditDiagnostics(file.path, file.content, languageId, lspManager);
+            lspSource = lsp.source;
             const lspHasError = lsp.diagnostics.some((d) => d.severity === 1);
             checks.push({ id: `lsp:${file.path}`, outcome: lspHasError ? "fail" : "pass", detail: `${lsp.diagnostics.length} diagnostic(s), ${lsp.source}` });
             diagnostics.push(...lsp.diagnostics.map((d) => `lsp ${file.path}:${d.range.start.line + 1}: ${d.message}`));
           }
-          const compiler = getCompilerForLanguage(languageId);
+          const compiler = lspSource === "none" ? getCompilerForLanguage(languageId) : null;
           if (compiler) {
             const result = await compiler(file.path, cwd);
             const compilerHasError = result.diagnostics.some((d) => d.severity === 1);

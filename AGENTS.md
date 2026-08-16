@@ -28,12 +28,12 @@ Pi-SmartEdit is the Pi coding agent's `edit`/`write` extension. It relies on two
 
 ## Operational Contracts and Invariants
 
-### Approval gating is WARN-ONLY / ADVISORY — never blocks edits
-`src/safety/approval-gating.ts:checkEditSafety` is wired into the patch pipeline (`src/patch.ts:903-913`) and emits advisory warnings into `checks.advisory` with outcome `"pass"`. It was accidentally lost in the refactor that removed the legacy edit tool (git-confirmed regression at `a7548f6`). It was restored in the most recent review cycle.
+### Risk warnings are WARN-ONLY / ADVISORY — never blocks edits
+`src/safety/approval-gating.ts:checkEditSafety` is wired into the patch pipeline (`src/patch.ts:966` for topology-only delete, `src/patch.ts:1238` for text/topology groups) and emits advisory warnings into `checks.advisory` with outcome `"pass"` and check id `risk-warning`. It was accidentally lost in the refactor that removed the legacy edit tool (git-confirmed regression at `a7548f6`). It was restored in the most recent review cycle.
 
 **Do NOT wire `assertEditableFile`** (the blocking companion function in the same file). That would silently start blocking edits — a product-scope decision requiring explicit approval, not a routine bug fix.
 
-Default `SMART_EDIT_APPROVAL_LEVEL` is `prompt_on_dangerous` (not `never_prompt` as docs previously stated — corrected).
+Default `SMART_EDIT_APPROVAL_LEVEL` is `prompt_on_dangerous` (not `never_prompt` as docs previously stated — corrected). The env/type names are kept for compatibility; the behavior is advisory risk warnings only, never a blocking approval gate.
 
 ### atomicWrite — single source of truth
 `src/patch.ts` imports `atomicWrite` from `src/undo/atomic-write.ts` (which preserves file mode bits, handles EXDEV cross-device fallback, and uses security-restrictive 0o600 on temp files). Do not re-create a local `atomicWrite` implementation — mode-bit loss on patch writes is a real risk for scripts with execute permission.

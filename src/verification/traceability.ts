@@ -14,7 +14,8 @@
  * the LSP is unavailable or the language is not LSP-served.
  */
 
-import { readdir, readFile, stat } from "fs/promises";
+import { readdir, readFile } from "fs/promises";
+import type { Dirent } from "fs";
 import { join, relative, resolve } from "path";
 import type { ChangedTarget, TraceabilityConfig } from "./types";
 import type { TraceabilityEvidence, TraceabilityTargetEvidence } from "./types";
@@ -215,9 +216,20 @@ async function analyzeSingleTarget(
 
 // ─── Test file discovery ───────────────────────────────────────────
 
+// Hard caps on the tree walk below. Without them, a large or generic `cwd`
+// (e.g. a monorepo root, or a scratch directory like /tmp) makes this an
+// effectively-unbounded readdir/stat traversal — and a symlink cycle turns
+// it into a genuine infinite loop, since `visited` only dedupes exact
+// re-pushed directory paths, not the ever-growing distinct path strings a
+// cycle produces (`/a/loop/loop/loop/...`). Symlinks are skipped outright
+// (via dirent, no extra stat) rather than followed, which closes the cycle
+// hazard and keeps the walk inside the real project tree.
+const MAX_DIRS_VISITED = 5_000;
+const MAX_FILES_SCANNED = 50_000;
+
 /**
  * Walk the project tree to find test files matching configured globs.
- * Skips common build artifacts and dependency directories.
+ * Skips common build artifacts, dependency directories, and symlinks.
  */
 async function discoverTestFiles(
   cwd: string,
@@ -227,39 +239,39 @@ async function discoverTestFiles(
   const visited = new Set<string>();
 
   const walkStack: string[] = [cwd];
+  let filesScanned = 0;
 
   while (walkStack.length > 0) {
+    if (visited.size >= MAX_DIRS_VISITED || filesScanned >= MAX_FILES_SCANNED) break;
+
     const dir = walkStack.pop();
     if (!dir) continue;
     if (visited.has(dir)) continue;
     visited.add(dir);
 
-    let entries: string[];
+    let entries: Dirent[];
     try {
-      entries = await readdir(dir);
+      entries = await readdir(dir, { withFileTypes: true });
     } catch {
       continue; // permission denied or deleted
     }
 
     for (const entry of entries) {
-      const fullPath = join(dir, entry);
+      if (filesScanned >= MAX_FILES_SCANNED) break;
+      filesScanned++;
 
-      let entryStat;
-      try {
-        entryStat = await stat(fullPath);
-      } catch {
-        continue;
-      }
+      if (entry.isSymbolicLink()) continue;
 
-      // Skip ignored directories
-      if (entryStat.isDirectory()) {
-        if (!DEFAULT_IGNORE_DIRS.has(entry) && !entry.startsWith(".")) {
+      const fullPath = join(dir, entry.name);
+
+      if (entry.isDirectory()) {
+        if (!DEFAULT_IGNORE_DIRS.has(entry.name) && !entry.name.startsWith(".")) {
           walkStack.push(fullPath);
         }
         continue;
       }
 
-      if (entryStat.isFile() && matchesAnyGlob(fullPath, globs)) {
+      if (entry.isFile() && matchesAnyGlob(fullPath, globs)) {
         results.push(fullPath);
       }
     }

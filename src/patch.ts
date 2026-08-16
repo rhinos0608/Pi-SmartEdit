@@ -56,6 +56,7 @@ import {
     type PostEditEvidence,
     type RpcMethod,
 } from "@rhinos0608/pi-workspace-protocol";
+import { formatBoundedDiagnostics, appendDiagnosticsToContent } from "./post-mutation.js";
 import { generateDiffString } from "./core/edit-diff.js";
 import { checkEditSafety } from "./safety/approval-gating.js";
 import { EDIT_PARAMETERS, validateEditRequest, type EditOperation } from "./edit-contract.js";
@@ -960,6 +961,14 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 // add/rename flow through the full pipeline below, delete does
                 // not).
                 if (!hasTextEdits && group.topology?.kind === "delete") {
+                    // Advisory risk-warning check for topology-only delete
+                    // (path warnings). Non-blocking — delete proceeds regardless.
+                    const safetyResult = await checkEditSafety(canonicalTarget, [], undefined, []);
+                    if (safetyResult.warnings.length > 0) {
+                        for (const w of safetyResult.warnings) {
+                            checks.advisory.push(makeCheck("risk-warning", "pass", w));
+                        }
+                    }
                     try {
                         await transaction.remove(canonicalTxPath(group.absolutePath));
                     } catch (err) {
@@ -1217,28 +1226,20 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     }
                 }
 
-                // Advisory approval gating check (non-blocking, warnings only).
-                // Runs before write to catch dangerous patterns in edit content.
-                const safetyEdits: EditItem[] = group.edits.flatMap((edit) => {
-                    if (typeof edit.oldText !== "string" || typeof edit.newText !== "string") return [];
-                    return [{
-                        oldText: edit.oldText,
-                        newText: edit.newText,
-                        replaceAll: edit.replaceAll,
-                        description: edit.description,
-                        target: edit.target,
-                        lineRange: edit.lineRange,
-                        anchor: edit.anchor,
-                        hashline: edit.hashline,
-                    }];
-                });
-                if (safetyEdits.length > 0) {
-                    const safetyResult = await checkEditSafety(canonicalTarget, safetyEdits);
-                    if (safetyResult.warnings.length > 0) {
-                        // Surface warnings as advisory check records
-                        for (const w of safetyResult.warnings) {
-                            checks.advisory.push(makeCheck("approval-gating", "pass", w));
-                        }
+                // Advisory risk-warning check (non-blocking, warnings only).
+                // Runs before write to catch dangerous patterns in edit content
+                // and paths. Topology-only groups (add/delete/rename) still run
+                // path risk warnings; add-file content is scanned too.
+                const safetyEdits: readonly EditItem[] = group.edits;
+                const safetyExtraContent: string[] =
+                  group.topology?.kind === "add" && typeof group.topology.content === "string"
+                    ? [group.topology.content]
+                    : [];
+                const safetyResult = await checkEditSafety(canonicalTarget, safetyEdits, undefined, safetyExtraContent);
+                if (safetyResult.warnings.length > 0) {
+                    // Surface warnings as advisory check records
+                    for (const w of safetyResult.warnings) {
+                        checks.advisory.push(makeCheck("risk-warning", "pass", w));
                     }
                 }
 
@@ -1276,7 +1277,9 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     resourceId: resource.resourceId,
                     canonicalPath: resource.canonicalPath,
                     fullFileSha256: currentSha,
-                    newFullFileSha256: newSha,
+                    // A rename removes this source path; its destination gets a
+                    // separate post-rename invalidation below.
+                    ...(group.topology?.kind === "rename" ? {} : { newFullFileSha256: newSha }),
                     coverage: resource.coverage,
                 };
                 invalidations.push(pendingInvalidation);
@@ -1361,6 +1364,16 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         canonicalTarget = renamedAbsolute;
                     }
                     displayPath = group.topology.newPath;
+                    // SmartRead consumes changedResources as the authoritative
+                    // cache/LSP invalidation protocol. Both rename endpoints may
+                    // have prior cached state, so report destination explicitly.
+                    invalidations.push({
+                        resourceId: resource.resourceId,
+                        canonicalPath: canonicalTarget,
+                        fullFileSha256: currentSha,
+                        newFullFileSha256: postSha,
+                        coverage: resource.coverage,
+                    });
                 }
 
                 const newLines = postContent.split("\n");
@@ -1492,8 +1505,16 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             const summary = appliedSummaries.length === 1
                 ? `applied ${appliedSummaries[0]}`
                 : `applied: ${appliedSummaries.join("; ")}`;
+            // Diagnostics were already collected into `details.diagnostics` by
+            // runFinalSuccessLanes above; without this, they were only visible
+            // via `details` (not shown to the model) — surface a bounded copy
+            // in `content` too, advisory-only, without changing pass/fail.
+            const diagnosticsBlock = formatBoundedDiagnostics(diagnostics);
             return {
-                content: [{ type: "text" as const, text: summary }],
+                content: appendDiagnosticsToContent(
+                    [{ type: "text" as const, text: summary }],
+                    diagnosticsBlock,
+                ) as { type: "text"; text: string }[],
                 details,
             };
         },
@@ -1523,8 +1544,8 @@ function mapRepairSpanToPreimage(
     const mapLine = (line: number): number => {
         let shift = 0;
         for (let i = 0; i < postimage.length; i++) {
-            const post = postimage[i]!;
-            const pre = preimage[i]!;
+            const post = postimage[i];
+            const pre = preimage[i];
             if (line >= post.startLine && line <= post.endLine) return pre.startLine;
             if (line > post.endLine) shift += (pre.endLine - pre.startLine) - (post.endLine - post.startLine);
         }

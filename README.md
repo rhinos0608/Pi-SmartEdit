@@ -12,10 +12,10 @@ Smart Edit replaces Pi's built-in `edit` tool with safer matching, richer diagno
 - **Multi-format input**: JSON edits, search/replace blocks, unified diffs, OpenAI patch, Codex apply_patch, and Atomic Patch envelope format
 - **Forgiving JSON parser**: auto-repairs malformed JSON from LLM output
 - **Streaming patch parser**: progressive parse with progress callbacks for large patches
-- **Approval gating**: path/symbol/line-range safety checks, configurable via `SMART_EDIT_APPROVAL_LEVEL`
+- **Risk warnings**: advisory path/symbol/line-range checks, configurable via `SMART_EDIT_APPROVAL_LEVEL` (never blocks or prompts)
 - **Stale-file guard**: blocks edits when the file changed since read
 - **Range coverage guard**: blocks edits outside the lines you actually read
-- **Conflict detection**: warns or blocks on overlapping AST-level changes across edit calls
+- **Failure-atomic transactions**: multi-file, raw, and topology edits share one transaction with rollback for handled failures
 - **Atomic writes**: temp-file write + rename, with mode preservation (undo-safe)
 - **Edit history / undo**: captures pre-edit state to `.smart-edit-undo/` for rollback
 - **Context markers**: XML-style tags around injected semantic context for attribution/filtering
@@ -137,7 +137,7 @@ Legacy callers that append `??smartEditExtra=` metadata to `path` remain accepte
 
 ### Multi-file edit
 
-Omit top-level `path` and provide `path` on every edit. Files execute sequentially; use Atomic Patch when all-or-nothing behavior is required.
+Omit top-level `path` and provide `path` on every edit. Multi-file, raw, and topology edits share a single failure-atomic transaction: handled failures roll back the whole request. Atomic Patch is one input format for this same transaction — it is not the only atomic mode.
 
 ```json
 {
@@ -227,7 +227,7 @@ Only use this after enabling `SMART_EDIT_USE_HASHLINE_EDITING=1`.
 │   ├── core/                  # Matching, AST, hashline, read cache, and shared types
 │   ├── formats/               # JSON/search-replace/diff/OpenAI/Codex patch parsers
 │   ├── lsp/                   # LSP lifecycle, diagnostics, ESLint runner, semantic context, symbol navigation
-│   ├── safety/                # Approval gating and context-guard checks
+│   ├── safety/                # Risk-warning and context-guard checks
 │   ├── undo/                  # Atomic writes and per-edit undo capture
 │   ├── verification/          # Validation, evidence, fake-logic detection, diagnostics, repair loop
 │   ├── edit-mode.ts           # Runtime config (hashline toggle, env vars)
@@ -245,15 +245,14 @@ Only use this after enabling `SMART_EDIT_USE_HASHLINE_EDITING=1`.
 3. Repair malformed JSON if needed (forgiving parser)
 4. Resolve symbolic edits (replaceBody, insertBefore, insertAfter) via AST
 5. Resolve anchors / line ranges / hashline anchors for scoping
-6. Run approval gating checks (path/symbol/line-range safety)
+6. Run risk-warning checks (path/symbol/line-range, advisory — never blocks)
 7. Match with the 6-tier fallback pipeline
-8. Detect semantic conflicts against prior edits
-9. Capture pre-edit undo state (fire-and-forget)
-10. Apply the edit atomically (temp file + rename)
-11. Run incremental syntax validation via tree-sitter re-parse (LRU-cached)
-12. Run post-edit pipeline: LSP diagnostics → compiler fallback → scoped diagnostics → verification evidence → optional repair loop
-13. Record breakage/co-change events to SmartRead bridge
-14. Surface warnings, diagnostics, and evidence in the tool response
+8. Capture pre-edit undo state (persisted after commit, best-effort)
+9. Apply the edit atomically (temp file + rename)
+10. Run incremental syntax validation via tree-sitter re-parse (LRU-cached)
+11. Run post-edit pipeline: LSP diagnostics → compiler fallback → scoped diagnostics → verification evidence → optional repair loop
+12. Record breakage/co-change events to SmartRead bridge
+13. Surface warnings, diagnostics, and evidence in the tool response
 
 ## Testing
 
@@ -275,10 +274,10 @@ npx tsx --test test/<file>  # e.g., test/symbolic-edits.test.ts
 |---|---|---|---|
 | `SMART_EDIT_USE_HASHLINE_EDITING` | `1`/`true`/`yes`/`on` | off | Enable hashline edit mode |
 | `SMART_EDIT_HASHLINE_EXPERIMENTAL` | same | off | Alias for hashline toggle |
-| `SMART_EDIT_APPROVAL_LEVEL` | `never_prompt` / `prompt_on_dangerous` / `prompt_always` | `prompt_on_dangerous` | Safety check verbosity |
+| `SMART_EDIT_APPROVAL_LEVEL` | `never_prompt` / `prompt_on_dangerous` / `prompt_always` | `prompt_on_dangerous` | Risk-warning verbosity (advisory, never blocks) |
 | `SMART_EDIT_REPAIR_ENABLED` | `1`/`true`/`yes`/`on` | **on** | Enable edit repair loop (Aider-style retry) |
 | `SMART_EDIT_REPAIR_ENABLED=0`/`false` | disable | — | Disable the repair loop (defaults to on) |
-| `SMART_EDIT_REPAIR_MAX_RETRIES` | integer | `3` | Max retry attempts in the repair loop |
+| `SMART_EDIT_REPAIR_MAX_RETRIES` | integer | `3` | Config max retries; production caps the repair loop at **one** attempt |
 | `SMART_EDIT_FAKE_LOGIC_ENABLED` | `1`/`true`/`yes`/`on` | **on** | Detect stub bodies, constant conditions, empty catches |
 | `SMART_EDIT_LINT_ENABLED` | `1`/`true`/`yes`/`on` | **on** | Run ESLint as advisory post-edit diagnostics |
 | `SMART_EDIT_VERIFICATION_COMMANDS` | JSON array | `[]` | Concurrency/verification commands as `[{"name":"...","command":"...","args":["..."]}]` |
@@ -288,8 +287,10 @@ npx tsx --test test/<file>  # e.g., test/symbolic-edits.test.ts
 - Java LSP uses `JDT_LS_JAR` at runtime.
 - Read-range validation only trusts lines you actually read.
 - Fuzzy matches are safe: replacements are always applied to the original file text.
-- Undo data is stored in `.smart-edit-undo/` per project (fire-and-forget, never blocks).
+- Undo data is stored in `.smart-edit-undo/` per project; persistence happens **after commit** and is **best-effort** (never blocks the edit).
 - Verification pipeline is advisory: warnings are matchNotes, never hard errors by default.
+- **Workspace containment** (edits restricted to the runtime-owned workspace root) is enforced by the runtime boundary, not by this extension.
+- **Default verifier**: no production blocking verifier is configured. The extension has no safe staged-workspace command contract, so it does not run arbitrary configured commands as a blocking gate. Verification lanes are advisory only.
 - Repair loop is on by default (opt out with `SMART_EDIT_REPAIR_ENABLED=0` or `false`): repair failures produce notes but never block the pipeline.
 - Fake-logic detection uses tree-sitter AST analysis with regex fallback; never blocks the edit pipeline on error.
 - ESLint advisory diagnostics run via `npx eslint` only when an ESLint config is found in the file's ancestor tree; lint findings never affect pass/fail.

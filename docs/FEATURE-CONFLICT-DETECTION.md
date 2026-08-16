@@ -1,5 +1,11 @@
 # Feature: Semantic Conflict Detection
 
+> **Status: NOT IMPLEMENTED — historical proposal.**
+> This document is a historical design proposal. The cross-call semantic conflict detector it describes was never wired into production and was removed as dead code (see `src/index.ts`).
+>
+> **What actually exists:** intra-request byte-overlap protection within a single edit call (overlapping `oldText`/`newText` spans are rejected). There is **no** cross-call semantic conflict detection across separate edit calls.
+
+
 ## Problem Statement
 
 The current `applyEdits()` detects **byte-overlap** conflicts within a *single* edit call. But when the LLM makes **separate, sequential edit calls** to the same file, there's no detection of semantically overlapping edits — two edits that modify the same function, class method, or logical code unit in different calls.

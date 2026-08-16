@@ -300,7 +300,9 @@ export async function checkGoVetDiagnostics(
 export function getCompilerForLanguage(languageId: string) {
   switch (languageId) {
     case "typescript":
+    case "typescriptreact":
     case "javascript":
+    case "javascriptreact":
       return checkTscDiagnostics;
     case "python":
       return checkPyrightDiagnostics;
