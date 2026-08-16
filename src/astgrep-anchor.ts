@@ -17,9 +17,9 @@ export interface AstGrepMatch {
   startLine: number;
   /** 1-based end line (inclusive). */
   endLine: number;
-  /** Byte offset of match start in the source. */
+  /** UTF-16 string index of match start (field name retained for compatibility). */
   startByte: number;
-  /** Byte offset of match end in the source. */
+  /** UTF-16 string index of match end (field name retained for compatibility). */
   endByte: number;
   /** The exact text of the match. */
   matchedText: string;
@@ -181,13 +181,11 @@ function resolveMultiCapture(node: any, name: string, content: string): string {
               r?.start?.index != null && r?.end?.index != null,
           );
         if (ranges.length > 0) {
-          const startByte = Math.min(...ranges.map((r) => r.start.index));
-          const endByte = Math.max(...ranges.map((r) => r.end.index));
-          const encoded = Buffer.from(content, "utf8");
-          return content.slice(
-            utf8ByteOffsetToStringIndex(encoded, startByte),
-            utf8ByteOffsetToStringIndex(encoded, endByte),
-          );
+          // ast-grep's range().*.index is already a UTF-16 string index (not
+          // a UTF-8 byte offset, despite its name) — safe to slice directly.
+          const start = Math.min(...ranges.map((r) => r.start.index));
+          const end = Math.max(...ranges.map((r) => r.end.index));
+          return content.slice(start, end);
         }
         return nodes.map((n: any) => n?.text?.() ?? "").join("");
       }
@@ -200,11 +198,6 @@ function resolveMultiCapture(node: any, name: string, content: string): string {
   return `$$$${name}`;
 }
 /* eslint-enable @typescript-eslint/no-unsafe-call, @typescript-eslint/no-unsafe-assignment */
-
-function utf8ByteOffsetToStringIndex(encoded: Buffer, byteOffset: number): number {
-  if (byteOffset <= 0) return 0;
-  return encoded.subarray(0, byteOffset).toString("utf8").length;
-}
 
 // ─── Public Functions ────────────────────────────────────────────
 
@@ -255,7 +248,7 @@ export async function findWithPattern(
     return nodes.map((node: any) => {
       // range() returns {start: {line, column, index}, end: {line, column, index}}
       const rng = node.range();
-      // index is the byte offset within the source
+      // index is already a UTF-16 string index, not a UTF-8 byte offset
       const startByte: number = rng?.start?.index ?? 0;
       const endByte: number = rng?.end?.index ?? 0;
       // line is 0-based; convert to 1-based
@@ -334,9 +327,6 @@ export async function resolvePatternEdits(
     // Extract capture names from the pattern for substitution
     const metaVarNames = extractMetaVarNames(pattern);
 
-    // Pre-encode the content once; both start and end offsets share it.
-    const encoded = Buffer.from(content, "utf8");
-
     const edits: ResolvedPatternEdit[] = [];
     for (const node of nodes) {
       const rng = node.range();
@@ -371,8 +361,8 @@ export async function resolvePatternEdits(
       }
 
       edits.push({
-        startByte: utf8ByteOffsetToStringIndex(encoded, start),
-        endByte: utf8ByteOffsetToStringIndex(encoded, end),
+        startByte: start,
+        endByte: end,
         text: resolved,
       });
     }

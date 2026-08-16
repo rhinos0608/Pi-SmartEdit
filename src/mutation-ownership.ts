@@ -14,18 +14,14 @@
 /** Stable cross-repo key. Keep identical in Pi-SmartRead/src/mutation-ownership.ts. */
 const OWNERSHIP_KEY = Symbol.for("pi-smart-edit.postMutationDiagnostics.owner.v1");
 
-interface ClaimEntry {
-  at: number;
-}
-
 const CLAIM_TTL_MS = 60_000;
 const MAX_CLAIMS = 200;
 
-function store(): Map<string, ClaimEntry> {
+function store(): Map<string, number> {
   const g = globalThis as Record<PropertyKey, unknown>;
-  let m = g[OWNERSHIP_KEY] as Map<string, ClaimEntry> | undefined;
+  let m = g[OWNERSHIP_KEY] as Map<string, number> | undefined;
   if (!m) {
-    m = new Map<string, ClaimEntry>();
+    m = new Map<string, number>();
     Object.defineProperty(g, OWNERSHIP_KEY, {
       value: m,
       configurable: false,
@@ -38,16 +34,16 @@ function store(): Map<string, ClaimEntry> {
 
 function prune(now: number): void {
   const s = store();
-  for (const [id, entry] of s) {
-    if (now - entry.at > CLAIM_TTL_MS) s.delete(id);
+  for (const [id, at] of s) {
+    if (now - at > CLAIM_TTL_MS) s.delete(id);
   }
   // Bound the map: evict oldest claims until under the cap.
   while (s.size > MAX_CLAIMS) {
     let oldestId: string | null = null;
     let oldestAt = Infinity;
-    for (const [id, entry] of s) {
-      if (entry.at < oldestAt) {
-        oldestAt = entry.at;
+    for (const [id, at] of s) {
+      if (at < oldestAt) {
+        oldestAt = at;
         oldestId = id;
       }
     }
@@ -60,7 +56,7 @@ function prune(now: number): void {
 export function claimDiagnosticsOwner(toolCallId: string): void {
   const now = Date.now();
   prune(now);
-  store().set(toolCallId, { at: now });
+  store().set(toolCallId, now);
 }
 
 /** Release a claim (e.g. the mutation failed — SmartEdit must not own failures). */
@@ -72,9 +68,8 @@ export function releaseDiagnosticsOwner(toolCallId: string): void {
 export function isDiagnosticsClaimed(toolCallId: string): boolean {
   const now = Date.now();
   prune(now);
-  const entry = store().get(toolCallId);
-  if (!entry) return false;
-  return now - entry.at <= CLAIM_TTL_MS;
+  const at = store().get(toolCallId);
+  return at !== undefined && now - at <= CLAIM_TTL_MS;
 }
 
 /** Test hook: drop all claims. */

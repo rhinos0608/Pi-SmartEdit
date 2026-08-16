@@ -325,8 +325,9 @@ export function normalizeLegacyEditRequest(args: Record<string, unknown>): Recor
  * Agent-visible JSON schema for the registered `edit` tool. Omits
  * `evidenceRef` (tool-owned authority) and advertises mutually exclusive
  * `raw` plus rich edit fields. Nested objects are fully enumerated with
- * `additionalProperties: false`; `edits`/`raw` exclusivity is expressed with
- * `oneOf`.
+ * `additionalProperties: false`. `edits`/`raw` exclusivity is enforced by
+ * `validateEditRequest`; the schema omits a top-level `oneOf` because the
+ * Anthropic API rejects `oneOf`/`allOf`/`anyOf` at the input_schema root.
  */
 export const EDIT_PARAMETERS = {
     description:
@@ -453,8 +454,4 @@ export const EDIT_PARAMETERS = {
             description: "Raw patch text in a supported format (search/replace, unified diff, OpenAI/Codex patch, Atomic Patch). Mutually exclusive with `edits`.",
         },
     },
-    oneOf: [
-        { required: ["edits"] },
-        { required: ["raw"] },
-    ],
 } as const;

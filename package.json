@@ -1,7 +1,7 @@
 {
   "name": "smart-edit",
   "version": "0.1.0",
-  "description": "Improved edit tool for Pi Coding Agent — oldText/newText fuzzy matching by default, replaceAll, AST-anchored targeting, line-range scoping, semantic conflict detection, LSP diagnostics, optional experimental hashline edits, multi-format input (search/replace, unified diff, OpenAI patch), stale-file guard, atomic writes, and mutation queuing",
+  "description": "Improved edit tool for Pi Coding Agent — oldText/newText fuzzy matching by default, replaceAll, AST-anchored targeting, line-range scoping, LSP diagnostics, optional experimental hashline edits, multi-format input (search/replace, unified diff, OpenAI patch), stale-file guard, atomic writes, and mutation queuing",
   "private": true,
   "main": "src/index.ts",
   "license": "MIT",
@@ -26,6 +26,9 @@
     "tsx": "^4.21.0",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.59.1"
+  },
+  "optionalDependencies": {
+    "@ast-grep/napi": "^0.45.1"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",

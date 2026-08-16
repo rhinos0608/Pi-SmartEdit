@@ -543,27 +543,23 @@ export default function smartEdit(pi: ExtensionAPI) {
     > => {
       const resolvedPath = resolve(cwd, filePath);
       const content = (await fsReadFile(resolvedPath)).toString("utf-8");
+
+      recordRead(filePath, cwd, content);
+      const lines = content.split("\n");
+      recordReadSession(filePath, cwd, 1, -1, lines.length, "edit");
+
       if (!content) {
         // Empty files are recorded as reads but skip validation; this matches
         // the existing write-path behavior and makes edit-path behavior consistent.
         return undefined;
       }
 
-      recordRead(filePath, cwd, content);
-      const lines = content.split("\n");
-      recordReadSession(filePath, cwd, 1, -1, lines.length, "edit");
-
       // ── Auto-validation hook (SmallCode-inspired) ──
       // After a write/edit, run structural + compiler/linter validation.
       // Feed errors back as structured data on the event for the model to see.
       //
-      // VALIDATION IS ADVISORY: runAutoValidation runs asynchronously and may
-      // complete after this handler returns. Consumers MUST NOT rely on
-      // event.validationFeedback being present synchronously. The promise is
-      // intentionally fire-and-forget so write/edit results are not blocked by
-      // validation overhead — the model receives diagnostics as a later signal
-      // rather than a blocking response. See formatValidationFeedback for the
-      // shape of validation feedback that gets attached to the event object.
+      // This is awaited synchronously so the caller's diagnostics are resolved
+      // before this function returns.
       const validationResult = await runAutoValidation(filePath, content, {
         cwd,
         maxRetries: 3,

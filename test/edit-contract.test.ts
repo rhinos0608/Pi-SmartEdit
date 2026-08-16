@@ -136,12 +136,11 @@ test("registered edit schema advertises legacy anchor compatibility field", () =
     assert.ok(anchorProps.symbolLine, "anchor must advertise symbolLine");
 });
 
-test("registered edit schema expresses edits/raw exclusivity via oneOf", () => {
+test("registered edit schema omits top-level oneOf for Anthropic input_schema compat", () => {
     const params = registeredEditParams();
-    assert.ok(Array.isArray(params.oneOf), "schema must express edits/raw exclusivity via oneOf");
-    const requireds = (params.oneOf as Array<{ required?: string[] }>).map((o) => o.required);
-    assert.ok(requireds.some((r) => r?.includes("edits")), "oneOf must include an edits branch");
-    assert.ok(requireds.some((r) => r?.includes("raw")), "oneOf must include a raw branch");
+    assert.ok(!("oneOf" in params), "top-level oneOf is rejected by the Anthropic API");
+    assert.ok(!("anyOf" in params), "top-level anyOf is rejected by the Anthropic API");
+    assert.ok(!("allOf" in params), "top-level allOf is rejected by the Anthropic API");
 });
 
 test("registered edit tool keeps prepareArguments compatibility shim", () => {

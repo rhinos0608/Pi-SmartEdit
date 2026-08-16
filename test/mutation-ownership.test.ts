@@ -45,11 +45,9 @@ test("mutation-ownership: claims expire after the TTL", () => {
   // rather than sleeping in a test.
   const store = (globalThis as Record<PropertyKey, unknown>)[key] as Map<
     string,
-    { at: number }
+    number
   >;
-  const entry = store.get("call-ttl");
-  assert.ok(entry, "expected claim entry to exist");
-  entry!.at = Date.now() - 61_000;
+  store.set("call-ttl", Date.now() - 61_000);
 
   assert.equal(isDiagnosticsClaimed("call-ttl"), false);
 });
@@ -59,7 +57,7 @@ test("mutation-ownership: bounds total claims, evicting the oldest first", () =>
   const key = Symbol.for("pi-smart-edit.postMutationDiagnostics.owner.v1");
   const store = (globalThis as Record<PropertyKey, unknown>)[key] as Map<
     string,
-    { at: number }
+    number
   >;
 
   // Fill past MAX_CLAIMS (200) with increasing (but still TTL-fresh)
@@ -70,7 +68,7 @@ test("mutation-ownership: bounds total claims, evicting the oldest first", () =>
   const base = Date.now() - 205;
   for (let i = 0; i < 205; i++) {
     claimDiagnosticsOwner(`call-bound-${i}`);
-    store.get(`call-bound-${i}`)!.at = base + i; // deterministic ordering, all TTL-fresh
+    store.set(`call-bound-${i}`, base + i); // deterministic ordering, all TTL-fresh
   }
 
   // prune() runs before the new entry is inserted, so the store can briefly
