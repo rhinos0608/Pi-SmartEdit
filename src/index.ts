@@ -841,8 +841,8 @@ export default function smartEdit(pi: ExtensionAPI) {
       ...patchTool,
       name: "edit",
       label: "edit",
-      // Canonical schema (EDIT_PARAMETERS) already omits `evidenceRef` and
-      // carries the canonical description unchanged.
+      // Canonical schema (EDIT_PARAMETERS) already omits `evidenceRef`; the
+      // tool-level description above is the single canonical description.
       parameters: patchTool.parameters,
       renderShell: "self",
       renderCall: renderEditCall,

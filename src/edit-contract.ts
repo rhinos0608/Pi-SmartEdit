@@ -325,8 +325,6 @@ export function normalizeFlatEditRequest(args: Record<string, unknown>): Record<
  * Anthropic API rejects `oneOf`/`allOf`/`anyOf` at the input_schema root.
  */
 export const EDIT_PARAMETERS = {
-    description:
-        "Apply edits gated by workspace evidence. Provide a `path` and a list of `edits`, or a `raw` patch string in a supported format (mutually exclusive). Each edit may carry its own `path` to override the top-level default. File inspection, workspace binding, and SHA-256 freshness are handled by the edit tool.",
     type: "object",
     additionalProperties: false,
     properties: {
@@ -349,9 +347,9 @@ export const EDIT_PARAMETERS = {
                         description: "AST symbol target; scopes text search or drives symbolic operations.",
                         properties: {
                             name: { type: "string", description: "Symbol name to target (e.g., function name, class name)." },
-                            namePath: { type: "string", description: "Qualified symbol path; the final component is matched by AST name (e.g., 'MyClass.myMethod')." },
-                            kind: { type: "string", description: "AST node kind hint (e.g., 'function_declaration', 'class_declaration')." },
-                            line: { type: "integer", minimum: 1, description: "1-based line hint for disambiguation when multiple symbols share a name." },
+                            namePath: { type: "string", description: "Qualified symbol path; final component matched by AST name (e.g., 'MyClass.myMethod')." },
+                            kind: { type: "string", description: "AST node kind hint (e.g., 'function_declaration')." },
+                            line: { type: "integer", minimum: 1, description: "1-based line hint for disambiguation (e.g., 12)." },
                             replaceBody: { type: "string", description: "Replace the entire AST symbol definition with this text." },
                             insertBefore: { type: "string", description: "Insert this text immediately before the AST symbol definition." },
                             insertAfter: { type: "string", description: "Insert this text immediately after the AST symbol definition." },
@@ -410,9 +408,9 @@ export const EDIT_PARAMETERS = {
                         type: "string",
                         enum: ["copy", "move"],
                         description:
-                            "Relocate existing observed text by reference instead of reproducing it in newText. Prefer `copy`/`move` over duplicating text in newText when the text already exists and should stay substantially unchanged. `copy` leaves the source intact; `move` deletes it after transfer. `from`/`range` are pre-edit anchors from the last read of `from`; `to`/`after` is the pre-edit destination anchor to insert immediately after. If `to` does not exist, the transfer creates it with exactly the transferred content and `after` is not needed (omit it); if `to` already exists, `after` is required. An edit in the SAME call cannot target text a transfer just created — use a follow-up `edit` call to modify transferred content. Use oldText/newText/target/hashline edits instead when content must be substantially rewritten, not transfer. Examples: same-file copy {\"op\":\"copy\",\"from\":\"a.ts\",\"range\":{\"pos\":\"10ab\",\"end\":\"12cd\"},\"to\":\"a.ts\",\"after\":\"40ef\"}; cross-file copy {\"op\":\"copy\",\"from\":\"src/a.ts\",\"range\":{\"pos\":\"10ab\",\"end\":\"12cd\"},\"to\":\"src/b.ts\",\"after\":\"5gh\"}; cross-file move {\"op\":\"move\",\"from\":\"src/a.ts\",\"range\":{\"pos\":\"10ab\",\"end\":\"12cd\"},\"to\":\"src/b.ts\",\"after\":\"5gh\"}; copy into a new file {\"op\":\"copy\",\"from\":\"src/a.ts\",\"range\":{\"pos\":\"10ab\",\"end\":\"12cd\"},\"to\":\"src/new-file.ts\"}; transfer then modify: send the move, then a follow-up edit call with hashline/oldText targeting the destination's new content.",
+                            "Relocate existing observed text by reference instead of reproducing it in newText: `copy` leaves the source intact, `move` deletes it after transfer, and `after` is required when `to` exists (omitted when creating a new file). Example: {\"op\":\"copy\",\"from\":\"a.ts\",\"range\":{\"pos\":\"10ab\",\"end\":\"12cd\"},\"to\":\"a.ts\",\"after\":\"40ef\"}",
                     },
-                    from: { type: "string", description: "Source file path for a transfer op. Not used otherwise (path is used instead)." },
+                    from: { type: "string", description: "Source file path for a transfer op." },
                     range: {
                         type: "object",
                         additionalProperties: false,
@@ -424,7 +422,7 @@ export const EDIT_PARAMETERS = {
                         required: ["pos", "end"],
                     },
                     to: { type: "string", description: "Destination file path for a transfer op." },
-                    after: { type: "string", minLength: 1, description: "Destination hashline anchor (pre-edit) to insert the transferred content immediately after. Required when `to` already exists; omit when `to` should be created as a new file." },
+                    after: { type: "string", minLength: 1, description: "Destination hashline anchor to insert after. Omit when `to` is a new file." },
                 },
                 // An edit item must be actionable: a text pair (oldText+newText) or
                 // a self-actionable target (symbolic op or structural pattern+replacement)
@@ -452,7 +450,7 @@ export const EDIT_PARAMETERS = {
         },
         raw: {
             type: "string",
-            description: "Raw patch text in a supported format (search/replace, unified diff, OpenAI/Codex patch, Atomic Patch). Mutually exclusive with `edits`.",
+            description: "Raw patch text in a supported diff/patch format.",
         },
     },
 } as const;
