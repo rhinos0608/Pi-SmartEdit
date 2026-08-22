@@ -5,24 +5,20 @@
  * v3 adds:
  *   - Multi-file support: each edit may carry its own `path` (PatchEditItemV3)
  *     which overrides the top-level `path` default.
- *   - Validated batch mutation (NOT atomic across files): edits are grouped
- *     by file path and applied in order, one file at a time. Each single
- *     file's write is atomic (tmp + rename). If a later file in the batch
- *     fails, files already written earlier in the batch remain on disk as
- *     written — the caller must inspect `changedResources` in the failure
- *     result to see exactly which files were mutated before the failure.
+ *   - Validated batch mutation is failure-atomic for handled failures: edits
+ *     run in one EditTransaction with cross-file rollback before failure is
+ *     reported. Files are individually written atomically.
  *   - Per-file evidence coverage: every file targeted by an edit must have a
  *     strong-coverage resource (full-file or line-range) in the envelope
  *     covering it. Weak-coverage resources (search-match, metadata-only —
  *     produced by inspect's query/symbol modes) are explicitly rejected;
  *     the model must path-mode inspect a file before patching it.
- *   - Auto-inspect fallback: if no `evidenceRef` is provided, the patch tool
- *     reads each target file, computes SHA-256, and constructs a synthetic
- *     full-file evidence envelope so the patch is self-contained for simple
- *     cases. SHA-256 freshness is computed against the on-disk content.
+ *   - Existing files require prior strong model-visible read evidence. Missing
+ *     or weak prior evidence is rejected with actionable read guidance. New
+ *     in-root files may use explicit empty-file semantics.
  *
- * - Accepts a single EvidenceRef (`{inspectionId, resourceIds}`) or no
- *   evidenceRef at all (auto-inspect).
+ * - Accepts a single EvidenceRef (`{inspectionId, resourceIds}`); tool-owned
+ *   prior authority is preferred when available.
  * - Resolves evidence through event-RPC against the SmartRead resolver.
  * - Validates that the current on-disk full content SHA-256 matches the
  *   resource's attested `fullFileSha256` (stale-file guard).
@@ -37,7 +33,7 @@
  * - Returns a discriminated `details` with the full lifecycle.
  */
 import { readFile as fsReadFile, stat as fsStat, mkdir as fsMkdir } from "node:fs/promises";
-import { resolve as pathResolve, dirname as pathDirname } from "node:path";
+import { resolve as pathResolve, dirname as pathDirname, relative as pathRelative } from "node:path";
 import { realpathSync, existsSync } from "node:fs";
 
 import {
@@ -92,7 +88,8 @@ export interface PatchToolDeps {
     readonly getVerificationChecks?: () => ReadonlyArray<VerificationCheck>;
     /** Per-session prior-authority store (tool-owned evidence policy B). When
      *  present, a strong prior authority for a target path is selected before
-     *  auto-inspection and never falls back to full-file auto-inspection. */
+     *  RPC envelope resolution; missing prior authority for existing files is
+     *  rejected with actionable read guidance. */
     readonly getPriorAuthority?: () => PriorAuthorityStore | null;
     /** Per-session AST resolver for target/lineRange scoping. null when
      *  tree-sitter is unavailable. */
@@ -207,23 +204,10 @@ export type AuthorizationResult =
     | { ok: false; reason: string };
 
 /**
- * NOTE: not on execute()'s runtime hot path.
- *
- * `execute()` below does its own per-group authorization inline, using
- * `findResourceForCanonicalPath` plus per-group weak-coverage/line-range
- * checks — it does not call this function. That inline path is
- * canonical-path-aware (required for v3 multi-file batches, where each
- * edit group targets a different file), whereas this function checks a
- * single `targetLineRange` against all `requestedResourceIds` without any
- * path matching. The two are semantically equivalent today, but that is
- * not structurally enforced.
- *
- * This function is retained because its behavior is directly unit-tested
- * (see test/patch.test.ts) and expresses the authorization policy (reject
- * missing resources, reject weak coverage, require line-range coverage) in
- * one place for that purpose. Until the two are unified, any change to
- * authorization policy here MUST be mirrored in `execute()`'s inline
- * checks, and vice versa.
+ * Canonical authorization helper — the single source of truth for resource
+ * selection, coverage, SHA, and topology policy. `execute()` also calls
+ * `authorizeResource` for per-group authorization, keeping both paths
+ * structurally unified.
  */
 export function resolvePatchAuthorization(args: {
     envelope: WorkspaceEvidenceEnvelope;
@@ -242,21 +226,17 @@ export function resolvePatchAuthorization(args: {
     }
     if (args.requestedResourceIds.length === 0) return { ok: false, reason: "missing resourceIds" };
 
-    const resources: InspectedResource[] = [];
-    for (const rid of args.requestedResourceIds) {
-        const r = args.envelope.resources.find((x) => x.resourceId === rid);
-        if (!r) return { ok: false, reason: `missing resource: ${rid}` };
-        if (r.coverage === "search-match" || r.coverage === "metadata-only") {
-            return { ok: false, reason: `coverage: ${r.coverage} is weak evidence and cannot authorize a patch (path-mode inspect this file first)` };
-        }
-        resources.push(r);
+    const result = authorizeResource({
+        resources: args.envelope.resources,
+        canonicalWorkspaceRoot: args.canonicalWorkspaceRoot,
+        requestedResourceIds: args.requestedResourceIds,
+        targetRanges: args.targetLineRange ? [args.targetLineRange] : [],
+    });
+    if (!result.ok && result.reason === "missing resource") {
+        const missing = args.requestedResourceIds.find((id) => !args.envelope.resources.some((r) => r.resourceId === id));
+        return { ok: false, reason: `missing resource: ${missing ?? "unknown"}` };
     }
-
-    for (const r of resources) {
-        const ranges = args.targetLineRange ? [args.targetLineRange] : [];
-        if (checkResourceCoverage(r, ranges) === null) return { ok: true, resource: r };
-    }
-    return { ok: false, reason: "coverage: no requested resource covers the target line range" };
+    return result;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -267,6 +247,66 @@ function safeReadUtf8(path: string): Promise<string> {
 
 function withinRange(target: LineRange, range: LineRange): boolean {
     return target.startLine >= range.startLine && target.endLine <= range.endLine;
+}
+
+const SHA256_RE = /^[0-9a-f]{64}$/i;
+
+/** Canonicalize path without ever treating a mutation-time read as authority. */
+function canonicalizeContainedPath(root: string, absolutePath: string): { ok: true; path: string; exists: boolean } | { ok: false; error: string } {
+    const resolved = pathResolve(absolutePath);
+    let existing = resolved;
+    while (!existsSync(existing)) {
+        const parent = pathDirname(existing);
+        if (parent === existing) return { ok: false, error: `path has no canonical parent: ${absolutePath}` };
+        existing = parent;
+    }
+    let canonicalExisting: string;
+    try { canonicalExisting = realpathSync(existing); }
+    catch (err) { return { ok: false, error: `cannot canonicalize path ${absolutePath}: ${err instanceof Error ? err.message : String(err)}` }; }
+    const candidate = existsSync(resolved)
+        ? canonicalExisting
+        : pathResolve(canonicalExisting, pathRelative(existing, resolved));
+    const rel = pathRelative(root, candidate);
+    if (rel === ".." || rel.startsWith("../") || rel.startsWith("..\\")) {
+        return { ok: false, error: `path outside canonical workspace root: ${absolutePath}` };
+    }
+    // Existing symlink targets are represented by canonicalExisting above.
+    return { ok: true, path: candidate, exists: existsSync(resolved) };
+}
+
+function validateResourceAuthority(resource: InspectedResource, targetRanges: ReadonlyArray<LineRange>, requireFull: boolean): string | null {
+    if (resource.coverage !== "full-file" && resource.coverage !== "line-range") return checkResourceCoverage(resource, targetRanges);
+    if (requireFull && resource.coverage !== "full-file") return "coverage: full-file evidence required for topology mutation";
+    if (typeof resource.fullFileSha256 !== "string" || !SHA256_RE.test(resource.fullFileSha256)) {
+        return "coverage: strong evidence is missing a valid fullFileSha256 snapshot SHA-256; read the file again before editing";
+    }
+    return checkResourceCoverage(resource, targetRanges);
+}
+
+/** Canonical resource selection and authorization used by direct and execute paths. */
+function authorizeResource(args: {
+    resources: ReadonlyArray<InspectedResource>;
+    canonicalPath?: string;
+    canonicalWorkspaceRoot: string;
+    requestedResourceIds?: ReadonlyArray<string>;
+    targetRanges: ReadonlyArray<LineRange>;
+    requireFull?: boolean;
+}): AuthorizationResult {
+    const candidates = args.requestedResourceIds
+        ? args.requestedResourceIds.map((id) => args.resources.find((r) => r.resourceId === id) ?? null)
+        : [...args.resources];
+    if (candidates.some((r) => r === null)) return { ok: false, reason: "missing resource" };
+    for (const resource of candidates as InspectedResource[]) {
+        const rel = pathRelative(args.canonicalWorkspaceRoot, resource.canonicalPath);
+        if (rel === ".." || rel.startsWith("../") || rel.startsWith("..\\")) {
+            return { ok: false, reason: "workspace containment: evidence resource is outside canonical workspace root" };
+        }
+        if (args.canonicalPath !== undefined && resource.canonicalPath !== args.canonicalPath) continue;
+        const error = validateResourceAuthority(resource, args.targetRanges, args.requireFull === true);
+        if (!error) return { ok: true, resource };
+        if (args.canonicalPath !== undefined) return { ok: false, reason: error };
+    }
+    return { ok: false, reason: "coverage: no requested resource covers the target line range" };
 }
 
 /** One coverage policy shared by direct authorization tests and execute(). */
@@ -734,12 +774,34 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 if (op === "copy") copySourceOnlyPaths.add(canonicalFrom);
             }
 
+            // Every mutation and transfer endpoint must resolve inside the
+            // canonical workspace. Existing symlinks are checked by realpath;
+            // absent paths are checked through their existing parent.
+            const containmentPaths = new Set<string>();
+            for (const g of groups) containmentPaths.add(g.absolutePath);
+            for (const op of rawTopology) {
+                containmentPaths.add(pathResolve(ctx.cwd, op.kind === "rename" ? op.oldPath : op.path));
+                if (op.kind === "rename") containmentPaths.add(pathResolve(ctx.cwd, op.newPath));
+            }
+            for (const op of transferOps) {
+                containmentPaths.add(pathResolve(ctx.cwd, op.from as string));
+                containmentPaths.add(pathResolve(ctx.cwd, op.to as string));
+            }
+            for (const candidate of containmentPaths) {
+                const contained = canonicalizeContainedPath(canonicalRoot, candidate);
+                if (!contained.ok) {
+                    diagnostics.push(contained.error);
+                    return {
+                        content: [{ type: "text" as const, text: `rejected: ${contained.error}` }],
+                        details: makeRejected(toolCallId, "coverage", diagnostics, { inspectionId: "", resourceIds: [] }, checks, usedEvidence),
+                    };
+                }
+            }
+
             // ── Acquire envelope ──────────────────────────────────────
-            // Tool-owned evidence policy B: a strong prior authority for a
-            // target path is selected before auto-inspection and never falls
-            // back to full-file auto-inspection. Groups without a strong prior
-            // authority fall back to the existing envelope path (auto-inspect,
-            // or RPC for stored-call compatibility).
+            // Tool-owned evidence policy B: existing targets require strong
+            // prior authority. Mutation-time reads can check freshness only;
+            // they never mint authority.
 
             const priorStore = deps.getPriorAuthority?.() ?? null;
             const groupsNeedingEnvelope: EditGroup[] = [];
@@ -765,7 +827,17 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 // Every group has a strong prior authority; no envelope needed.
                 evidenceRefForDetails = { inspectionId: "", resourceIds: [] };
             } else if (!requestEvidenceRef) {
-                // No evidenceRef — auto-inspect only groups lacking prior authority.
+                const existingWithoutPrior = groupsNeedingEnvelope.filter((g) => existsSync(g.absolutePath));
+                if (existingWithoutPrior.length > 0) {
+                    const message = `no prior strong read authority for ${existingWithoutPrior.map((g) => g.rawPath).join(", ")}; read the file first (full file or target range), then retry`;
+                    diagnostics.push(message);
+                    return {
+                        content: [{ type: "text" as const, text: `rejected: coverage (${message})` }],
+                        details: makeRejected(toolCallId, "coverage", diagnostics, { inspectionId: "", resourceIds: [] }, checks),
+                    };
+                }
+                // Explicit empty-file semantics remain valid for genuinely new
+                // in-root files; synthesize authority only for those paths.
                 const built = await buildAutoInspectEnvelope({
                     sessionFilePath,
                     canonicalRoot,
@@ -950,7 +1022,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                             details: finalize(makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations)),
                         };
                     }
-                    const coverageError = checkResourceCoverage(sourceResource, [{ startLine: resolved.value.startLine, endLine: resolved.value.endLine }]);
+                    const coverageError = validateResourceAuthority(sourceResource, [{ startLine: resolved.value.startLine, endLine: resolved.value.endLine }], false);
                     if (coverageError) {
                         diagnostics.push(`${coverageError} for copy source ${rt.rawFrom}`);
                         return {
@@ -961,17 +1033,17 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                             }, checks, usedEvidence, invalidations)),
                         };
                     }
-                    if (usedPriorSourceAuthority && sourceResource.coverage === "line-range" && typeof sourceResource.fullFileSha256 !== "string") {
-                        diagnostics.push(`coverage: prior line-range authority for ${rt.rawFrom} is missing fullFileSha256; a fresh full-file read is required to authorize`);
+                    if (typeof sourceResource.fullFileSha256 !== "string" || !SHA256_RE.test(sourceResource.fullFileSha256)) {
+                        diagnostics.push(`coverage: missing or malformed fullFileSha256 for ${rt.rawFrom}; read the source file again before copying`);
                         return {
-                            content: [{ type: "text" as const, text: `rejected: coverage (missing sha for copy source ${rt.rawFrom})` }],
+                            content: [{ type: "text" as const, text: `rejected: coverage (missing valid snapshot SHA for copy source ${rt.rawFrom})` }],
                             details: finalize(makeRejected(toolCallId, "coverage", diagnostics, {
                                 inspectionId: evidenceRefForDetails.inspectionId,
                                 resourceIds: [sourceResource.resourceId],
                             }, checks, usedEvidence, invalidations)),
                         };
                     }
-                    if (typeof sourceResource.fullFileSha256 === "string" && sourceResource.fullFileSha256 !== sha256OfString(sourceContent)) {
+                    if (sourceResource.fullFileSha256 !== sha256OfString(sourceContent)) {
                         diagnostics.push(`stale: copy source ${rt.rawFrom} sha mismatch`);
                         return {
                             content: [{ type: "text" as const, text: `rejected: stale (copy source ${rt.rawFrom})` }],
@@ -1068,8 +1140,17 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         details: finalize(makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations)),
                     };
                 }
-                const initialCoverageError = checkResourceCoverage(resource, []);
-                if (initialCoverageError) {
+                const requiresFullEvidence = group.topology?.kind === "delete" || group.topology?.kind === "rename";
+                const authorization = authorizeResource({
+                    resources: [resource],
+                    canonicalPath: canonicalTarget,
+                    canonicalWorkspaceRoot: canonicalRoot,
+                    requestedResourceIds: [resource.resourceId],
+                    targetRanges: [],
+                    requireFull: requiresFullEvidence,
+                });
+                if (!authorization.ok) {
+                    const initialCoverageError = authorization.reason;
                     diagnostics.push(`${initialCoverageError} for ${canonicalTarget} (path-mode inspect this file first)`);
                     return {
                         content: [{ type: "text" as const, text: `rejected: coverage (weak evidence for ${group.rawPath})` }],
@@ -1112,17 +1193,17 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 // a freshness hash; missing SHA rejects rather than silently
                 // skipping freshness. A selected prior grant never falls back to
                 // full-file auto-inspection on staleness.
-                if (usedPriorAuthority && resource.coverage === "line-range" && typeof resource.fullFileSha256 !== "string") {
-                    diagnostics.push(`coverage: prior line-range authority for ${canonicalTarget} is missing fullFileSha256; a fresh full-file read is required to authorize`);
+                if (typeof resource.fullFileSha256 !== "string" || !SHA256_RE.test(resource.fullFileSha256)) {
+                    diagnostics.push(`coverage: missing or malformed fullFileSha256 for ${canonicalTarget}; read the file again before editing`);
                     return {
-                        content: [{ type: "text" as const, text: `rejected: coverage (missing sha for ${group.rawPath})` }],
+                        content: [{ type: "text" as const, text: `rejected: coverage (missing valid snapshot SHA for ${group.rawPath})` }],
                         details: finalize(makeRejected(toolCallId, "coverage", diagnostics, {
                             inspectionId: evidenceRefForDetails.inspectionId,
                             resourceIds: [resource.resourceId],
                         }, checks, usedEvidence, invalidations)),
                     };
                 }
-                if (typeof resource.fullFileSha256 === "string" && resource.fullFileSha256 !== currentSha) {
+                if (resource.fullFileSha256 !== currentSha) {
                     diagnostics.push(`stale: current sha ${currentSha} != attested ${resource.fullFileSha256} for ${canonicalTarget}`);
                     return {
                         content: [{ type: "text" as const, text: `rejected: stale (${group.rawPath})` }],

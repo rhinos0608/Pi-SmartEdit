@@ -334,7 +334,7 @@ export default function smartEdit(pi: ExtensionAPI) {
     // envelopes are recorded as they arrive; the store indexes the latest
     // strong resource per canonical path and ignores weak evidence.
     try {
-      const wsEvidence = !event.isError
+      const wsEvidence = event.toolName === "read" && !event.isError
         ? (event.details as { workspaceEvidence?: unknown } | undefined)?.workspaceEvidence
         : undefined;
       if (wsEvidence) {
@@ -810,7 +810,8 @@ export default function smartEdit(pi: ExtensionAPI) {
                 canonicalDiagPath = resolve(cwd, diagnostic.filePath);
               }
               if (canonicalDiagPath !== file.path) {
-                recordBreakage(cwd, file.path, canonicalDiagPath, diagnostic.message);
+                const bridgeError = recordBreakage(cwd, file.path, canonicalDiagPath, diagnostic.message);
+                if (bridgeError) diagnostics.push(bridgeError);
               }
             }
           }
@@ -830,7 +831,8 @@ export default function smartEdit(pi: ExtensionAPI) {
         }
         for (let i = 0; i < files.length; i++) {
           for (let j = i + 1; j < files.length; j++) {
-            recordCoChange(cwd, files[i].path, files[j].path, "committed in one SmartEdit transaction");
+            const bridgeError = recordCoChange(cwd, files[i].path, files[j].path, "committed in one SmartEdit transaction");
+            if (bridgeError) diagnostics.push(bridgeError);
           }
         }
         return { diagnostics, checks, evidence };

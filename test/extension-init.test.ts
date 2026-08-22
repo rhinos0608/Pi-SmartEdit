@@ -492,7 +492,7 @@ test("tool_result with details.workspaceEvidence is recorded into prior authorit
   // Emit a SmartRead tool_result carrying the envelope.
   const toolResult = [...pi._events.get("tool_result")!][0];
   await toolResult(
-    { toolName: "inspect", isError: false, details: { workspaceEvidence: envelope } },
+    { toolName: "read", isError: false, details: { workspaceEvidence: envelope } },
     {},
   );
 
@@ -512,10 +512,6 @@ test("tool_result with details.workspaceEvidence is recorded into prior authorit
   const d = result.details as unknown as { status: { kind: string; reason?: string }; diagnostics?: string[] };
   assert.equal(d.status.kind, "rejected", "out-of-range edit must be rejected by recorded prior authority");
   assert.equal(d.status.reason, "coverage");
-  assert.ok(
-    String(d.diagnostics ?? "").includes("fresh full-file read"),
-    "diagnostics should require a fresh full-file read to widen authority",
-  );
   assert.equal(readFileSync(filePath, "utf8"), content, "file must be unchanged");
 });
 
@@ -552,8 +548,9 @@ test("errored tool_result workspace evidence does not authorize", async () => {
     undefined,
     { cwd: tmpDir },
   );
-  assert.equal(result.details.status.kind, "applied", "errored result evidence must be ignored");
-  assert.equal(readFileSync(filePath, "utf8"), "l1\nl2\nl3\nL4\nl5\n");
+  assert.equal(result.details.status.kind, "rejected", "errored result evidence must be ignored");
+  assert.equal(result.details.status.reason, "coverage");
+  assert.equal(readFileSync(filePath, "utf8"), content);
 });
 
 // ── Post-mutation diagnostics ownership + write-tool diagnostics ──────

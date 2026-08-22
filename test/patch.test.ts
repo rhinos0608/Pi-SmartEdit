@@ -494,13 +494,13 @@ test("end-to-end: multi-file patch with per-edit paths (v3)", async () => {
         makeCtx(workdir),
     );
     const d = res.details as any;
-    // v3: multi-file is allowed. Second edit targets non-existent file with no evidence → fails.
-    assert.equal(d.status.kind, "failed");
+    // Outside-workspace target is rejected before transaction.
+    assert.equal(d.status.kind, "rejected");
 });
 
 // ── Review-fix regression tests (B1-B4) ──────────────────────────────
 
-test("end-to-end: auto-inspect fallback is reachable when evidenceRef is omitted entirely (not just empty)", async () => {
+test("end-to-end: omitted evidence rejects existing-file edit", async () => {
     const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-")));
     mkdirSync(workdir, { recursive: true });
     const file = join(workdir, "a.ts");
@@ -517,7 +517,7 @@ test("end-to-end: auto-inspect fallback is reachable when evidenceRef is omitted
         getCanonicalWorkspaceRoot: () => workdir,
     };
     const tool = createPatchTool(deps);
-    // No evidenceRef field at all in params — schema-conforming auto-inspect call.
+    // No evidenceRef field: existing-file edits require prior authority.
     const res = await tool.execute(
         "tc1",
         {
@@ -529,9 +529,8 @@ test("end-to-end: auto-inspect fallback is reachable when evidenceRef is omitted
         makeCtx(workdir),
     );
     const d = res.details as any;
-    assert.equal(d.status.kind, "applied");
-    const final = readFileSync(realpathSync(file), "utf8");
-    assert.equal(final, "alpha\nBETA\n");
+    assert.equal(d.status.kind, "rejected");
+    assert.equal(readFileSync(realpathSync(file), "utf8"), "alpha\nbeta\n");
 });
 
 test("end-to-end: toolCallId is not required in the wire payload (Pi supplies it as the execute() argument)", async () => {
@@ -540,8 +539,10 @@ test("end-to-end: toolCallId is not required in the wire payload (Pi supplies it
     const file = join(workdir, "a.ts");
     writeFileSync(file, "alpha\nbeta\n", "utf8");
     const sessionFilePath = "/sessions/a.jsonl";
+    const resource = makeResource({ canonicalPath: realpathSync(file), full: true, content: "alpha\nbeta\n" });
+    const envelope = makeEnvelope({ sessionFilePath, canonicalRoot: workdir, resources: [resource] });
     const deps: PatchToolDeps = {
-        getRpcClient: () => ({ request: async () => { throw new Error("unused"); }, dispose: () => {} }),
+        getRpcClient: () => ({ request: async () => ({ kind: "reply" as const, schemaVersion: PROTOCOL_SCHEMA_VERSION, requestId: "r1", ok: true, payload: envelope }), dispose: () => {} }),
         getSessionFilePath: () => sessionFilePath,
         getCanonicalWorkspaceRoot: () => workdir,
     };
@@ -549,7 +550,7 @@ test("end-to-end: toolCallId is not required in the wire payload (Pi supplies it
     // Schema-conforming params per PATCH_PARAMS_DOC: no toolCallId field.
     const res = await tool.execute(
         "tc-from-harness",
-        { path: "a.ts", edits: [{ oldText: "beta", newText: "BETA" }] },
+        { path: "a.ts", edits: [{ oldText: "beta", newText: "BETA" }], evidenceRef: { inspectionId: envelope.inspectionId, resourceIds: [resource.resourceId] } },
         undefined,
         undefined,
         makeCtx(workdir),
@@ -566,9 +567,15 @@ test("end-to-end: successful multi-file patch returns renderable diffs for every
     writeFileSync(file1, "alpha\nbeta\n", "utf8");
     writeFileSync(file2, "gamma\ndelta\n", "utf8");
 
+    const sessionFilePath = "/sessions/a.jsonl";
+    const resources = [
+        makeResource({ canonicalPath: realpathSync(file1), full: true, content: "alpha\nbeta\n" }),
+        makeResource({ canonicalPath: realpathSync(file2), full: true, content: "gamma\ndelta\n" }),
+    ];
+    const envelope = makeEnvelope({ sessionFilePath, canonicalRoot: workdir, resources });
     const deps: PatchToolDeps = {
-        getRpcClient: () => { throw new Error("auto-inspect must not use RPC"); },
-        getSessionFilePath: () => "/sessions/a.jsonl",
+        getRpcClient: () => ({ request: async () => ({ kind: "reply" as const, schemaVersion: PROTOCOL_SCHEMA_VERSION, requestId: "r1", ok: true, payload: envelope }), dispose: () => {} }),
+        getSessionFilePath: () => sessionFilePath,
         getCanonicalWorkspaceRoot: () => workdir,
     };
     const res = await createPatchTool(deps).execute(
@@ -576,7 +583,7 @@ test("end-to-end: successful multi-file patch returns renderable diffs for every
         { edits: [
             { path: "a.ts", oldText: "alpha", newText: "ALPHA" },
             { path: "b.ts", oldText: "gamma", newText: "GAMMA" },
-        ] },
+        ], evidenceRef: { inspectionId: envelope.inspectionId, resourceIds: resources.map((r) => r.resourceId) } },
         undefined,
         undefined,
         makeCtx(workdir),
@@ -1305,13 +1312,13 @@ test("prior authority: missing fullFileSha256 on prior line-range rejects", asyn
     assert.equal(d.status.kind, "rejected");
     assert.equal(d.status.reason, "coverage");
     assert.ok(
-        String(d.diagnostics ?? "").includes("missing fullFileSha256"),
+        String(d.diagnostics ?? "").includes("missing a valid fullFileSha256 snapshot SHA-256"),
         "diagnostics should mention missing fullFileSha256",
     );
     assert.equal(readFileSync(canonicalFile, "utf8"), content, "file must be unchanged");
 });
 
-test("prior authority: no strong prior grant falls back to auto-inspection", async () => {
+test("prior authority: no strong prior grant rejects", async () => {
     const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-prior-none-")));
     mkdirSync(workdir, { recursive: true });
     const content = "alpha\nbeta\n";
@@ -1322,11 +1329,11 @@ test("prior authority: no strong prior grant falls back to auto-inspection", asy
         edits: [{ oldText: "beta", newText: "BETA" }],
     });
     const d = res.details as any;
-    assert.equal(d.status.kind, "applied");
-    assert.equal(readFileSync(canonicalFile, "utf8"), "alpha\nBETA\n");
+    assert.equal(d.status.kind, "rejected");
+    assert.equal(readFileSync(canonicalFile, "utf8"), content);
 });
 
-test("prior authority: weak evidence does not authorize but counts as no strong grant (auto-inspects)", async () => {
+test("prior authority: weak evidence rejects", async () => {
     const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-prior-weak-")));
     mkdirSync(workdir, { recursive: true });
     const content = "alpha\nbeta\n";
@@ -1344,8 +1351,8 @@ test("prior authority: weak evidence does not authorize but counts as no strong 
         edits: [{ oldText: "beta", newText: "BETA" }],
     });
     const d = res.details as any;
-    assert.equal(d.status.kind, "applied", "weak evidence must not block auto-inspection fallback");
-    assert.equal(readFileSync(canonicalFile, "utf8"), "alpha\nBETA\n");
+    assert.equal(d.status.kind, "rejected");
+    assert.equal(readFileSync(canonicalFile, "utf8"), content);
 });
 
 test("prior authority: later full-file read widens authority again", async () => {
@@ -1366,7 +1373,7 @@ test("prior authority: later full-file read widens authority again", async () =>
     assert.equal(readFileSync(canonicalFile, "utf8"), "l1\nl2\nl3\nL4\nl5\n");
 });
 
-test("prior authority: outside-workspace target remains allowed (auto-inspect)", async () => {
+test("prior authority: outside-workspace target rejects", async () => {
     const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-prior-outside-")));
     mkdirSync(workdir, { recursive: true });
     const outsideDir = realpathSync(mkdtempSync(join(tmpdir(), "patch-prior-outside-target-")));
@@ -1388,8 +1395,8 @@ test("prior authority: outside-workspace target remains allowed (auto-inspect)",
         makeCtx(workdir),
     );
     const d = res.details as any;
-    assert.equal(d.status.kind, "applied", "outside-workspace target must remain allowed");
-    assert.equal(readFileSync(outsideFile, "utf8"), "alpha\nBETA\n");
+    assert.equal(d.status.kind, "rejected");
+    assert.equal(readFileSync(outsideFile, "utf8"), "alpha\nbeta\n");
 });
 
 test("prior authority: caller evidenceRef does not override a selected prior grant", async () => {
@@ -1466,14 +1473,17 @@ test("risk-warning: topology-only delete runs path risk warnings", async () => {
     mkdirSync(workdir, { recursive: true });
     writeFileSync(join(workdir, "main.ts"), "x\n", "utf8");
     const sessionFilePath = "/sessions/topo-del-warn.jsonl";
+    const canonicalFile = realpathSync(join(workdir, "main.ts"));
+    const resource = makeResource({ canonicalPath: canonicalFile, full: true, content: "x\n" });
+    const envelope = makeEnvelope({ sessionFilePath, canonicalRoot: workdir, resources: [resource] });
     const deps: PatchToolDeps = {
-        getRpcClient: () => ({ request: async () => { throw new Error("unused"); }, dispose: () => {} }),
+        getRpcClient: () => ({ request: async () => ({ kind: "reply" as const, schemaVersion: PROTOCOL_SCHEMA_VERSION, requestId: "r1", ok: true, payload: envelope }), dispose: () => {} }),
         getSessionFilePath: () => sessionFilePath,
         getCanonicalWorkspaceRoot: () => workdir,
     };
     const res = await createPatchTool(deps).execute(
         "tc-topo-del-warn",
-        { raw: "*** Begin Atomic Patch\n*** Delete File: main.ts\n*** End Atomic Patch\n", toolCallId: "tc-topo-del-warn" } as any,
+        { raw: "*** Begin Atomic Patch\n*** Delete File: main.ts\n*** End Atomic Patch\n", evidenceRef: { inspectionId: envelope.inspectionId, resourceIds: [resource.resourceId] }, toolCallId: "tc-topo-del-warn" } as any,
         undefined,
         undefined,
         makeCtx(workdir),
@@ -1600,13 +1610,29 @@ async function execAutoInspect(
     checks?: VerificationCheck[],
 ) {
     const sessionFilePath = "/sessions/transfer.jsonl";
+    const paths = new Set<string>();
+    if (body.path) paths.add(body.path);
+    for (const edit of body.edits) {
+        if (!edit || typeof edit !== "object") continue;
+        const value = edit as Record<string, unknown>;
+        for (const key of ["path", "from", "to"]) if (typeof value[key] === "string") paths.add(value[key] as string);
+    }
+    const resources = [...paths].flatMap((path) => {
+        const absolute = join(workdir, path);
+        if (!existsSync(absolute)) return [];
+        const canonical = realpathSync(absolute);
+        return [makeResource({ canonicalPath: canonical, full: true, content: readFileSync(canonical, "utf8") })];
+    });
+    const store = createPriorAuthorityStore({ sessionFilePath, canonicalWorkspaceRoot: workdir });
+    if (resources.length) store.record(makeEnvelope({ sessionFilePath, canonicalRoot: workdir, resources }));
     const deps: PatchToolDeps = {
         getRpcClient: () => ({
-            request: async () => { throw new Error("auto-inspect must not use RPC"); },
+            request: async () => { throw new Error("prior authority must not use RPC"); },
             dispose: () => {},
         }),
         getSessionFilePath: () => sessionFilePath,
         getCanonicalWorkspaceRoot: () => workdir,
+        getPriorAuthority: () => store,
         ...(checks ? { getVerificationChecks: () => checks } : {}),
     };
     const tool = createPatchTool(deps);
@@ -1946,7 +1972,7 @@ test("transfer: rejects a copy whose source is a prior line-range authority miss
     assert.equal(d.status.kind, "rejected", `expected rejected, got ${JSON.stringify(d.status)}`);
     assert.equal(d.status.reason, "coverage");
     assert.ok(
-        String(d.diagnostics ?? "").match(/missing fullFileSha256|missing sha/i),
+        String(d.diagnostics ?? "").match(/fullFileSha256|missing sha/i),
         `diagnostics should mention the missing sha (got: ${JSON.stringify(d.diagnostics)})`,
     );
     assert.equal(readFileSync(srcFile, "utf8"), srcContent, "source must be unmodified");

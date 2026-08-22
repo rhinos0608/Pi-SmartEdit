@@ -9,6 +9,7 @@
  * Smart-Edit writes here after:
  *   1. Post-edit diagnostics detect breakage in files outside the edit target
  *   2. Git history analysis finds files that co-change together
+ *   3. Same-transaction co-change (source: "same_transaction")
  *
  * Pi-SmartRead reads from here during:
  *   1. ContextGraph.buildContextGraph() — replays events into mutation edges
@@ -57,24 +58,24 @@ export function recordBreakage(
   to: string,
   context?: string,
   confidence?: number,
-): void {
+): string | null {
   const event: MutationEvent = {
     type: "breakage",
     data: { from, to, context, confidence: confidence ?? 1.0, source: "diagnostics" },
     timestamp: Date.now(),
   };
-  appendEvent(root, event);
+  return appendEvent(root, event);
 }
 
 /**
- * Record a co-change edge — `from` and `to` consistently change in the same
- * git commits. Call this after git history analysis identifies coupled files.
+ * Record a same-transaction edge — `from` and `to` changed in one committed
+ * SmartEdit transaction.
  *
  * @param root    Project root directory.
  * @param from    Relative or absolute path to the edited file.
  * @param to      Relative or absolute path to the co-changing file.
  * @param context Optional description (e.g., commit hash).
- * @param confidence Confidence score 0-1 (default 0.7 for git history).
+ * @param confidence Confidence score 0-1 (default 1.0 for observed transaction).
  */
 export function recordCoChange(
   root: string,
@@ -82,13 +83,13 @@ export function recordCoChange(
   to: string,
   context?: string,
   confidence?: number,
-): void {
+): string | null {
   const event: MutationEvent = {
     type: "co_change",
-    data: { from, to, context, confidence: confidence ?? 0.7, source: "git_history" },
+    data: { from, to, context, confidence: confidence ?? 1.0, source: "same_transaction" },
     timestamp: Date.now(),
   };
-  appendEvent(root, event);
+  return appendEvent(root, event);
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────
@@ -97,20 +98,24 @@ export function recordCoChange(
 // execution (JavaScript is single-threaded). For multi-process scenarios (e.g.,
 // multiple Pi instances editing the same project), consider using a file lock or
 // switching to an async queue with proper synchronization.
-function appendEvent(root: string, event: MutationEvent): void {
+function appendEvent(root: string, event: MutationEvent): string | null {
   const logPath = resolve(root, EDGE_LOG_RELPATH);
   const dir = dirname(logPath);
 
   try {
     mkdirSync(dir, { recursive: true });
-  } catch {
-    // Directory may already exist
+  } catch (err) {
+    return `SmartRead bridge directory creation failed: ${err instanceof Error ? err.message : String(err)}`;
   }
 
+  if (!event.data.from || !event.data.to || !Number.isFinite(event.timestamp)) {
+    return "SmartRead bridge rejected malformed mutation event";
+  }
   const line = JSON.stringify(event) + "\n";
   try {
     appendFileSync(logPath, line, "utf-8");
-  } catch {
-    // Silently ignore write failures — edge recording is advisory
+    return null;
+  } catch (err) {
+    return `SmartRead bridge persistence failed: ${err instanceof Error ? err.message : String(err)}`;
   }
 }

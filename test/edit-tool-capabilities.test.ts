@@ -106,6 +106,19 @@ function makeEnvelope(args: {
   };
 }
 
+function fullFileResource(canonicalFile: string, content: string): InspectedResource {
+  return {
+    resourceId: resourceIdFor({ canonicalPath: canonicalFile, kind: "full" }),
+    canonicalPath: canonicalFile,
+    kind: "full",
+    coverage: "full-file",
+    allowedRanges: [{ startLine: 1, endLine: content.split("\n").length }],
+    fullFileSha256: sha256(content),
+    fresh: true,
+    lineCount: content.split("\n").length,
+  };
+}
+
 function lineRangeResource(canonicalFile: string, range: { startLine: number; endLine: number }, content: string): InspectedResource {
   return {
     resourceId: resourceIdFor({ canonicalPath: canonicalFile, kind: "range", range }),
@@ -143,10 +156,12 @@ async function runTool(opts: {
   const canonicalFile = realpathSync(file);
   const sessionFilePath = "/sessions/cap.jsonl";
   const store = createPriorAuthorityStore({ sessionFilePath, canonicalWorkspaceRoot: opts.workdir });
-  if (opts.prior) {
-    const resources = opts.prior(canonicalFile);
-    if (resources.length) store.record(makeEnvelope({ sessionFilePath, canonicalRoot: opts.workdir, resources }));
-  }
+  const priorResources = opts.prior
+    ? opts.prior(canonicalFile)
+    : [fullFileResource(canonicalFile, opts.fileContent), ...Object.entries(opts.additionalFiles ?? {}).map(([relativePath, content]) =>
+      fullFileResource(realpathSync(join(opts.workdir, relativePath)), content),
+    )];
+  if (priorResources.length) store.record(makeEnvelope({ sessionFilePath, canonicalRoot: opts.workdir, resources: priorResources }));
   const deps: PatchToolDeps = {
     getRpcClient: () => ({ request: async () => { throw new Error("unused"); }, dispose: () => {} }),
     getSessionFilePath: () => sessionFilePath,
