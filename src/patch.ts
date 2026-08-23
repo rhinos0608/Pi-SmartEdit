@@ -551,7 +551,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
         name: "patch",
         label: "patch",
         description:
-            "Apply edits to files gated by workspace evidence. Provide a `path` and a list of `edits`, or a `raw` patch string (mutually exclusive); each edit may carry its own `path`. File inspection, workspace binding, and SHA-256 freshness are handled automatically; returns a discriminated lifecycle result (applied | rejected | failed).",
+            "Apply edits to files gated by workspace evidence. Existing files require prior strong read authority; new files may use empty-file semantics. Provide a `path` and a list of `edits`, or a `raw` patch string (mutually exclusive); each edit may carry its own `path`. Freshness and coverage are validated automatically; returns a discriminated lifecycle result (applied | rejected | failed).",
         parameters: EDIT_PARAMETERS as unknown as Record<string, unknown>,
 
         async execute(toolCallId, params, signal, onUpdate, ctx) {

@@ -90,13 +90,12 @@ interface EditItem {
   /** Line-range hint to narrow the search scope for oldText matching.
    *
    * When provided, oldText is only searched within the specified line range.
-   * If oldText is not found within this range, the tool falls back to
-   * whole-file search (with a matchNote about the fallback).
+   * If oldText is not found within this range, the tool reports a scoped
+   * match failure — there is no whole-file fallback.
    *
    * Line numbers are 1-based and refer to the file content AS LAST READ
-   * by the agent. After edits, line numbers shift — this is why lineRange
-   * is a HINT, not a guarantee. The tool validates that the range still
-   * makes sense and adjusts if needed.
+   * by the agent. After edits, line numbers shift — re-read the file
+   * if you are unsure about current line numbers.
    */
   lineRange?: LineRange;
 }
@@ -128,55 +127,22 @@ When `lineRange` is provided:
 1. Extract lines [startLine, endLine] from file content
 2. Search for oldText within the extracted slice
 3. If found: apply edit (success, no fallback needed)
-4. If NOT found in slice:
-   a. Expand range by ±5 lines and retry (line shift tolerance)
-   b. If still not found: fall back to whole-file search
-   c. If found in whole file: apply edit with matchNote about range shift
-   d. If not found at all: throw not-found error as usual
+4. If NOT found in slice: report a scoped match failure (no range expansion or whole-file fallback)
 ```
 
-### Range Expansion
+### Stale Ranges
 
-Line numbers shift after edits — the LLM's view of line numbers may be stale. To compensate:
-
-```typescript
-function expandRange(
-  content: string,
-  range: LineRange,
-  oldText: string,
-  expansionLines: number = 5,
-): { startIndex: number; endIndex: number } | null {
-  const lines = content.split('\n');
-
-  // Try exact range first
-  const slice = lines.slice(range.startLine - 1, range.endLine).join('\n');
-  const exactIndex = slice.indexOf(oldText);
-  if (exactIndex !== -1) {
-    return offsetToContentRange(range.startLine, exactIndex, oldText.length);
-  }
-
-  // Try expanded range: ±expansionLines around the specified range
-  const expandedStart = Math.max(0, range.startLine - 1 - expansionLines);
-  const expandedEnd = Math.min(lines.length, (range.endLine ?? range.startLine) + expansionLines);
-  const expandedSlice = lines.slice(expandedStart, expandedEnd).join('\n');
-  const expandedIndex = expandedSlice.indexOf(oldText);
-  if (expandedIndex !== -1) {
-    return offsetToContentRange(expandedStart + 1, expandedIndex, oldText.length);
-  }
-
-  return null; // Fall back to whole-file search
-}
-```
+Line numbers shift after edits. Re-read the file before retrying a scoped edit when the requested range may be stale.
 
 ### Integration with AST Anchoring
 
-`lineRange` and `anchor` can be combined:
+`lineRange` and `target` can be combined:
 
 ```json
 {
   "oldText": "return obj.value",
   "newText": "return obj.computedValue",
-  "anchor": { "symbolName": "calculateTotal" },
+  "target": { "name": "calculateTotal" },
   "lineRange": { "startLine": 85, "endLine": 95 }
 }
 ```
@@ -229,12 +195,11 @@ Successfully replaced 1 block(s) in src/handlers.ts.
 Note: Edit targeted lines 85-120 (function "handleRequest").
 ```
 
-### Range Hint Missed, Found Via Whole-File Search
+### Range Hint Missed (Scoped Match Failure)
 
 ```
-Successfully replaced 1 block(s) in src/handlers.ts.
-Note: lineRange [85, 120] did not contain oldText; found at line 203 instead.
-The line range may be stale — consider re-reading the file.
+Error: edits[0].lineRange [85, 120] did not contain oldText.
+The specified scope did not match — re-read the file to confirm current line numbers.
 ```
 
 ### Range Out of Bounds

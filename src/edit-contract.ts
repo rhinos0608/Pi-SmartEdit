@@ -27,11 +27,15 @@ export interface EditOperation {
     description?: string;
     /** Replace every non-overlapping occurrence. */
     replaceAll?: boolean;
-    /** AST symbol target; scopes text search or drives symbolic operations. */
+    /** AST target: scopes text search or drives symbolic and structural operations.
+     *  Symbol operations use replaceBody / insertBefore / insertAfter on the
+     *  matched AST node. Structural operations use ast-grep `pattern`/`replacement`
+     *  for template-based transforms. */
     target?: EditTarget;
     /** 1-based line-range scope for this edit. */
     lineRange?: LineRange;
-    /** Freshness-checked hashline edit metadata. */
+    /** Experimental hashline edit metadata. Enable with
+     *  `SMART_EDIT_USE_HASHLINE_EDITING` or its experimental alias. */
     hashline?: HashlineEditMetadata;
     /** Transfer (copy/move) operation: relocate an existing observed range by
      *  reference. Mutually exclusive with every other edit field. */
@@ -344,7 +348,7 @@ export const EDIT_PARAMETERS = {
                     target: {
                         type: "object",
                         additionalProperties: false,
-                        description: "AST symbol target; scopes text search or drives symbolic operations.",
+                        description: "AST target: scopes text search or drives symbolic and structural operations. Symbol operations (replaceBody/insertBefore/insertAfter) act on the matched AST node; structural operations (pattern/replacement) use ast-grep transforms.",
                         properties: {
                             name: { type: "string", description: "Symbol name to target (e.g., function name, class name)." },
                             namePath: { type: "string", description: "Qualified symbol path; final component matched by AST name (e.g., 'MyClass.myMethod')." },
@@ -371,7 +375,7 @@ export const EDIT_PARAMETERS = {
                     hashline: {
                         type: "object",
                         additionalProperties: false,
-                        description: "Freshness-checked hashline edit metadata.",
+                        description: "Experimental hashline edit metadata. Enable SMART_EDIT_USE_HASHLINE_EDITING or its experimental alias.",
                         properties: {
                             range: {
                                 type: "object",

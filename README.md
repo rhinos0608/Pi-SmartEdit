@@ -6,7 +6,7 @@ Smart Edit replaces Pi's built-in `edit` tool with safer matching, richer diagno
 
 - **6-tier matching**: exact → indentation → Unicode → similarity → dotdotdots ellipsis → relative indent
 - **Symbolic edits**: replaceBody, insertBefore, insertAfter via AST symbol targeting
-- **AST-scoped edits**: target a symbol with `anchor` for disambiguation
+- **AST-scoped edits**: target a symbol with `target` for disambiguation
 - **Line-range scoping**: constrain matching with `lineRange`
 - **Hashline edits**: freshness-checked anchored edits for zero-text workflows (opt-in via `SMART_EDIT_USE_HASHLINE_EDITING=1`)
 - **Multi-format input**: JSON edits, search/replace blocks, unified diffs, OpenAI patch, Codex apply_patch, and Atomic Patch envelope format
@@ -23,7 +23,7 @@ Smart Edit replaces Pi's built-in `edit` tool with safer matching, richer diagno
 - **Fake-logic detection**: AST-based detection of stub bodies, constant conditions, and empty catch blocks (configurable via `SMART_EDIT_FAKE_LOGIC_ENABLED`)
 - **ESLint advisory diagnostics**: post-edit linting for TypeScript/JavaScript, never blocks the edit (configurable via `SMART_EDIT_LINT_ENABLED`)
 - **Incremental syntax validation**: tree-sitter incremental re-parse with LRU parse cache for fast post-edit checks
-- **Edit repair loop**: auto-retries failed edits with validation feedback (Aider-style, opt-in via config)
+- **Edit repair loop**: auto-retries failed edits with validation feedback (Aider-style, enabled by default via `SMART_EDIT_REPAIR_ENABLED`)
 - **Closest-match diagnostics**: shows the best near-match when an edit fails
 - **Post-edit diagnostics**: LSP + compiler fallback, scoped to changed targets
 - **Verification pipeline**: concurrency detection, traceability analysis, git history context, repair loop
@@ -39,7 +39,7 @@ Smart Edit uses a multi-tier diagnostics pipeline:
 4. **Language-specific output parsing** to turn CLI results into editor diagnostics
 5. **Scoped diagnostics**: filters diagnostics to only the symbols/lines actually changed
 6. **Post-edit evidence pipeline**: concurrency verification, test traceability, git history context
-7. **Repair loop** (opt-in): auto-retries failed edits with validation feedback on each attempt
+7. **Repair loop** (enabled by default): auto-retries failed edits with validation feedback on each attempt
 
 ## Supported LSP servers
 
@@ -164,8 +164,8 @@ Omit top-level `path` and provide `path` on every edit. Multi-file, raw, and top
     {
       "oldText": "return result;",
       "newText": "return processedResult;",
-      "anchor": {
-        "symbolName": "processRequest"
+      "target": {
+        "name": "processRequest"
       },
       "lineRange": {
         "startLine": 44,
@@ -176,7 +176,7 @@ Omit top-level `path` and provide `path` on every edit. Multi-file, raw, and top
 }
 ```
 
-The `anchor` and `lineRange` helpers still work on the default text path.
+The `target` and `lineRange` helpers still work on the default text path.
 
 ### Experimental hashline edit
 
