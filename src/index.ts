@@ -14,7 +14,7 @@ import { truncateToWidth, visibleWidth, type Component } from "@mariozechner/pi-
 
 import { realpathSync, statSync } from "fs";
 import { readFile as fsReadFile } from "fs/promises";
-import { resolve } from "path";
+import { relative, resolve, sep } from "path";
 import { sortHashlineEditsForApplication, formatHashlineBatchSummary } from "./hashline-batching.js";
 import {
   prepareArguments,
@@ -46,7 +46,17 @@ import { createPatchTool, type PatchToolDeps, type PatchToolDetails } from "./pa
 import { normalizeFlatEditRequest } from "./edit-contract.js";
 import { normalizeRawEdit } from "./edit-intents.js";
 import { createPriorAuthorityStore, type PriorAuthorityStore } from "./evidence-authority.js";
-import { createRpcClient, RPC_CHANNELS } from "@rhinos0608/pi-workspace-protocol";
+import {
+  createRpcClient,
+  RPC_CHANNELS,
+  PROTOCOL_SCHEMA_VERSION,
+  hashSessionFilePath,
+  inspectionIdFor,
+  resourceIdFor,
+  sha256OfString,
+  type WorkspaceEvidenceEnvelope,
+  type LineRange,
+} from "@rhinos0608/pi-workspace-protocol";
 
 import type {
   EditResult,
@@ -302,6 +312,139 @@ export { sortHashlineEditsForApplication, formatHashlineBatchSummary };
 export default function smartEdit(pi: ExtensionAPI) {
   /** Per-extension, per-session authority; never shared across Pi instances. */
   let priorAuthorityStore: PriorAuthorityStore | null = null;
+  let currentSessionFilePath: string | null = null;
+  let currentCanonicalWorkspaceRoot: string | null = null;
+  let currentCwd: string | null = null;
+
+  const buildMutationEvidence = async (paths: string[]): Promise<WorkspaceEvidenceEnvelope | undefined> => {
+    if (!currentSessionFilePath || !currentCanonicalWorkspaceRoot) return undefined;
+    const resources: Array<WorkspaceEvidenceEnvelope["resources"][number]> = [];
+    for (const path of [...new Set(paths)]) {
+      try {
+        const resolvedPath = resolve(currentCwd ?? process.cwd(), path);
+        const canonicalPath = realpathSync(resolvedPath);
+        const relativePath = relative(currentCanonicalWorkspaceRoot, canonicalPath);
+        if (!relativePath || relativePath === ".." || relativePath.startsWith(`..${sep}`)) continue;
+        if (!statSync(canonicalPath).isFile()) continue;
+        const content = (await fsReadFile(canonicalPath)).toString("utf8");
+        const lineCount = content.split("\n").length;
+        resources.push({
+          resourceId: resourceIdFor({ canonicalPath, kind: "full" }),
+          canonicalPath,
+          kind: "full",
+          coverage: "full-file",
+          allowedRanges: [{ startLine: 1, endLine: lineCount }],
+          fullFileSha256: sha256OfString(content),
+          fresh: true,
+          byteLength: Buffer.byteLength(content, "utf8"),
+          lineCount,
+        });
+      } catch {
+        // Evidence is advisory; unreadable or deleted paths are omitted.
+      }
+    }
+    if (resources.length === 0) return undefined;
+    const sessionId = hashSessionFilePath(currentSessionFilePath);
+    return {
+      schemaVersion: PROTOCOL_SCHEMA_VERSION,
+      inspectionId: inspectionIdFor({
+        sessionId,
+        workspaceRoot: currentCanonicalWorkspaceRoot,
+        resources: resources.map((resource) => ({ canonicalPath: resource.canonicalPath })),
+      }),
+      sessionId,
+      workspaceRoot: currentCanonicalWorkspaceRoot,
+      canonicalWorkspaceRoot: currentCanonicalWorkspaceRoot,
+      createdAt: new Date().toISOString(),
+      resources,
+      mode: "path",
+    };
+  };
+
+  const buildRetryEvidence = async (
+    event: { input?: unknown; details?: unknown; content?: unknown; isError?: boolean; toolName?: string },
+    cwd: string,
+  ): Promise<{ envelope: WorkspaceEvidenceEnvelope; text: string } | undefined> => {
+    if (event.toolName !== "edit" || event.isError || !currentSessionFilePath || !currentCanonicalWorkspaceRoot) return undefined;
+    const details = event.details as { status?: { kind?: string; phase?: string }; matchFailure?: string } | undefined;
+    if (details?.status?.kind !== "failed" || details.status.phase !== "stage") return undefined;
+    if (details.matchFailure !== "NOT_FOUND" && details.matchFailure !== "AMBIGUOUS") return undefined;
+    const input = event.input as { path?: unknown; edits?: unknown; raw?: unknown } | undefined;
+    if (!input || input.raw !== undefined || !Array.isArray(input.edits) || input.edits.length !== 1) return undefined;
+    const edit = input.edits[0] as { path?: unknown; oldText?: unknown; target?: unknown; lineRange?: unknown; hashline?: unknown };
+    if (typeof edit?.oldText !== "string" || edit.target !== undefined || edit.hashline !== undefined) return undefined;
+    if (input.path !== undefined && typeof input.path !== "string") return undefined;
+    if (edit.path !== undefined && typeof edit.path !== "string") return undefined;
+    if (input.path !== undefined && edit.path !== undefined && resolve(cwd, input.path) !== resolve(cwd, edit.path)) return undefined;
+    const targetPath = typeof input.path === "string" ? input.path : edit.path;
+    if (typeof targetPath !== "string" || targetPath.length === 0) return undefined;
+    const lineRange = edit.lineRange as { startLine?: unknown; endLine?: unknown } | undefined;
+    const explicitRange = lineRange && Number.isInteger(lineRange.startLine) && Number.isInteger(lineRange.endLine)
+      ? { startLine: lineRange.startLine as number, endLine: lineRange.endLine as number } : undefined;
+    const resolvedPath = resolve(cwd, targetPath);
+    let canonicalPath: string;
+    try { canonicalPath = realpathSync(resolvedPath); } catch { return undefined; }
+    const resource = priorAuthorityStore?.select(canonicalPath);
+    if (!resource || (resource.coverage !== "full-file" && resource.coverage !== "line-range") || typeof resource.fullFileSha256 !== "string") return undefined;
+    const readFresh = async () => (await fsReadFile(canonicalPath)).toString("utf8");
+    let content: string;
+    try { content = await readFresh(); } catch { return undefined; }
+    const sha = sha256OfString(content);
+    if (sha !== resource.fullFileSha256) return undefined;
+    const lines = content.split("\n");
+    const ranges: LineRange[] = [];
+    const addWindow = (line: number) => {
+      if (!Number.isInteger(line) || line < 1 || line > lines.length) return;
+      ranges.push({ startLine: Math.max(1, line - 2), endLine: Math.min(lines.length, line + 2) });
+    };
+    if (explicitRange) addWindow(explicitRange.startLine);
+    if (details.matchFailure === "AMBIGUOUS" && !explicitRange && edit.oldText.length > 0) {
+      let from = 0;
+      while (ranges.length < 3) {
+        const at = content.indexOf(edit.oldText, from);
+        if (at < 0) break;
+        addWindow(content.slice(0, at).split("\n").length);
+        from = at + Math.max(1, edit.oldText.length);
+      }
+    }
+    if (ranges.length === 0) return undefined;
+    const authorized = resource.coverage === "full-file" ? ranges : ranges.flatMap((candidate) => resource.allowedRanges.flatMap((allowed) => {
+      const startLine = Math.max(candidate.startLine, allowed.startLine);
+      const endLine = Math.min(candidate.endLine, allowed.endLine);
+      return startLine <= endLine ? [{ startLine, endLine }] : [];
+    }));
+    const unique = [...new Map(authorized.map((range) => [`${range.startLine}:${range.endLine}`, range])).values()].slice(0, 3);
+    const selected: LineRange[] = [];
+    let bytes = 0;
+    for (const range of unique) {
+      const source = lines.slice(range.startLine - 1, range.endLine).join("\n");
+      const size = Buffer.byteLength(source, "utf8");
+      if (selected.length >= 3 || selected.reduce((n, r) => n + r.endLine - r.startLine + 1, 0) + range.endLine - range.startLine + 1 > 24 || bytes + size > 8192) break;
+      selected.push(range); bytes += size;
+    }
+    if (selected.length === 0) return undefined;
+    // Re-read after range selection: a concurrent write must never mint retry authority.
+    let confirm: string;
+    try { confirm = await readFresh(); } catch { return undefined; }
+    if (sha256OfString(confirm) !== sha) return undefined;
+    const resources = selected.map((range) => ({
+      resourceId: resourceIdFor({ canonicalPath, kind: "range", range }), canonicalPath, kind: "range" as const,
+      coverage: "line-range" as const, allowedRanges: [range], fullFileSha256: sha,
+      fresh: true, byteLength: Buffer.byteLength(confirm, "utf8"), lineCount: confirm.split("\n").length,
+    }));
+    const sessionFilePath = currentSessionFilePath;
+    const workspaceRoot = currentCanonicalWorkspaceRoot;
+    if (!sessionFilePath || !workspaceRoot) return undefined;
+    const sessionId = hashSessionFilePath(sessionFilePath);
+    const envelope: WorkspaceEvidenceEnvelope = {
+      schemaVersion: PROTOCOL_SCHEMA_VERSION,
+      inspectionId: inspectionIdFor({ sessionId, workspaceRoot, resources: resources.map((r) => ({ canonicalPath: r.canonicalPath, allowedRanges: r.allowedRanges })) }),
+      sessionId, workspaceRoot, canonicalWorkspaceRoot: workspaceRoot,
+      createdAt: new Date().toISOString(), resources, mode: "path",
+    };
+    const text = selected.map((range) => `lineRange ${range.startLine}-${range.endLine}:\n${confirm.split("\n").slice(range.startLine - 1, range.endLine).join("\n")}`).join("\n");
+    return { envelope, text };
+  };
 
   // ── Claim post-mutation diagnostics ownership for write/edit ──
   // SmartRead's fallback checks isDiagnosticsClaimed() on tool_result and
@@ -604,19 +747,43 @@ export default function smartEdit(pi: ExtensionAPI) {
     ) {
       try {
         const entry = await validateFileAndBuildFeedback(writePath, toolCwd);
-        if (entry) {
-          const block = `\n\nPost-write diagnostics:\n${entry.feedback}`;
+        const workspaceEvidence = await buildMutationEvidence([writePath]);
+        if (workspaceEvidence) priorAuthorityStore?.record(workspaceEvidence);
+        if (entry || workspaceEvidence) {
+          const block = entry ? `\n\nPost-write diagnostics:\n${entry.feedback}` : "";
           return {
-            content: appendDiagnosticsToContent(event.content, block) as typeof event.content,
+            content: block ? appendDiagnosticsToContent(event.content, block) as typeof event.content : event.content,
             details: {
-              postEditDiagnostics: { schemaVersion: 1, paths: [writePath], checked: true },
-              validationRetries: entry.retryCount,
-              shouldDecompose: entry.shouldDecompose,
+              ...((event.details as Record<string, unknown> | undefined) ?? {}),
+              ...(entry ? {
+                postEditDiagnostics: { schemaVersion: 1, paths: [writePath], checked: true },
+                validationRetries: entry.retryCount,
+                shouldDecompose: entry.shouldDecompose,
+              } : {}),
+              ...(workspaceEvidence ? { workspaceEvidence } : {}),
             },
           };
         }
       } catch {
         // File might not exist yet or can't be read — skip silently
+      }
+    }
+
+    // Failed classic-text matches may return narrowly authorized retry context.
+    // This path never ingests caller-supplied evidence; it mints only from the
+    // tool-owned prior authority after a fresh, double-checked filesystem read.
+    if (event.toolName === "edit" && !event.isError) {
+      try {
+        const retry = await buildRetryEvidence(event, toolCwd);
+        if (retry) {
+          priorAuthorityStore?.record(retry.envelope);
+          return {
+            content: appendDiagnosticsToContent(event.content, `\n\n${retry.text}\nRe-edit using exact text and lineRange above; no separate read needed.`) as typeof event.content,
+            details: { ...(event.details ?? {}), workspaceEvidence: retry.envelope },
+          };
+        }
+      } catch {
+        // Retry context is advisory; failed reads and races produce no evidence.
       }
     }
 
@@ -671,8 +838,16 @@ export default function smartEdit(pi: ExtensionAPI) {
           ];
           for (const p of uniquePaths) {
             await refreshReadCacheAfterEdit(p, toolCwd).catch(() => {
-              // File might not exist or can't be read — skip silently
+              // File might not exist yet or can't be read — skip silently
             });
+          }
+          const workspaceEvidence = await buildMutationEvidence(uniquePaths);
+          if (workspaceEvidence) {
+            priorAuthorityStore?.record(workspaceEvidence);
+            return {
+              content: event.content,
+              details: { ...(event.details ?? {}), workspaceEvidence },
+            };
           }
         }
       } catch {
@@ -682,9 +857,6 @@ export default function smartEdit(pi: ExtensionAPI) {
   });
 
   // ── Initialize per-session state ──
-  let currentSessionFilePath: string | null = null;
-  let currentCanonicalWorkspaceRoot: string | null = null;
-  let currentCwd: string | null = null;
 
   pi.on("session_start", async (_event, ctx) => {
     const sessionCwd = process.cwd();
@@ -850,20 +1022,34 @@ export default function smartEdit(pi: ExtensionAPI) {
       renderCall: renderEditCall,
       renderResult: renderEditResult,
 
-      execute(
+      async execute(
         toolCallId: string,
         params: Record<string, unknown>,
         signal: AbortSignal | undefined,
         onUpdate: ((u: { content: Array<{ type: "text"; text: string }> }) => void) | undefined,
         ctx: { cwd: string; hasUI?: boolean; ui?: unknown; [k: string]: unknown },
       ) {
-        return patchTool.execute(
+        const result = await patchTool.execute(
           toolCallId,
           omitAgentEvidenceRef(params),
           signal,
           onUpdate,
           ctx,
         );
+        const reason = result.details?.status?.kind === "rejected" ? result.details.status.reason : undefined;
+        const hasLineRangeFailure = reason === "coverage" && result.details.diagnostics.some(
+          (diagnostic) => diagnostic.includes("outside allowedRanges"),
+        );
+        const note = reason === "stale"
+          ? "\n\nNot applied: file changed since last read. Read the file again, then retry."
+          : hasLineRangeFailure
+            ? "\n\nNot applied: exact target lines were not detected as read. Read those lines, then retry."
+            : reason === "coverage"
+              ? "\n\nNot applied: required file coverage was unavailable. Read the file (full file or target lines), then retry."
+              : "";
+        return note
+          ? { ...result, content: appendDiagnosticsToContent(result.content, note) as typeof result.content }
+          : result;
       },
 
       // Compatibility shim for resumed sessions with stored `edit` calls

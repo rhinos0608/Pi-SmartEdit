@@ -525,6 +525,8 @@ export interface PatchDisplayDiff {
 }
 
 export type PatchToolDetails = PatchDetails & {
+    /** Exact classic-text match failure; used only for bounded retry guidance. */
+    readonly matchFailure?: "NOT_FOUND" | "AMBIGUOUS";
     readonly diff?: string;
     readonly diffs?: ReadonlyArray<PatchDisplayDiff>;
     /** Advisory repair results for staged candidates, keyed by canonical path. */
@@ -1361,10 +1363,13 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                                 : `failed: edit (${group.rawPath})`;
                         return {
                             content: [{ type: "text" as const, text: message }],
-                            details: finalize(makeFailed(toolCallId, "stage", `edit planning failed: ${group.rawPath}`, {
+                            details: finalize({
+                                ...makeFailed(toolCallId, "stage", `edit planning failed: ${group.rawPath}`, {
                                 inspectionId: evidenceRefForDetails.inspectionId,
                                 resourceIds: [resource.resourceId],
-                            }, checks, diagnostics, usedEvidence, invalidations)),
+                            }, checks, diagnostics, usedEvidence, invalidations),
+                                ...(matchCode === "NOT_FOUND" || matchCode === "AMBIGUOUS" ? { matchFailure: matchCode } : {}),
+                            }),
                         };
                     }
                 }

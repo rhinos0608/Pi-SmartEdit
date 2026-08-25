@@ -10,7 +10,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, realpathSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, realpathSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -20,7 +20,7 @@ import { visibleWidth } from "@mariozechner/pi-tui";
 import smartEdit from "../src/index.js";
 import { createPatchTool, type PatchToolDeps, type PatchTool } from "../src/patch.js";
 import { claimDiagnosticsOwner, isDiagnosticsClaimed, resetDiagnosticsOwnership } from "../src/mutation-ownership.js";
-import { PROTOCOL_SCHEMA_VERSION, hashSessionFilePath, resourceIdFor, type WorkspaceEvidenceEnvelope, type InspectedResource } from "@rhinos0608/pi-workspace-protocol";
+import { PROTOCOL_SCHEMA_VERSION, hashSessionFilePath, resourceIdFor, validateInspectionEnvelope, type WorkspaceEvidenceEnvelope, type InspectedResource } from "@rhinos0608/pi-workspace-protocol";
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -512,7 +512,25 @@ test("tool_result with details.workspaceEvidence is recorded into prior authorit
   const d = result.details as unknown as { status: { kind: string; reason?: string }; diagnostics?: string[] };
   assert.equal(d.status.kind, "rejected", "out-of-range edit must be rejected by recorded prior authority");
   assert.equal(d.status.reason, "coverage");
+  assert.match(result.content.map((block) => block.text).join("\n"), /required file coverage was unavailable|exact target lines were not detected as read/);
   assert.equal(readFileSync(filePath, "utf8"), content, "file must be unchanged");
+});
+
+test("workspace evidence from non-read tools does not authorize", async () => {
+  const tmpDir = realpathSync(mkdtempSync(join(tmpdir(), "edit-evidence-forged-")));
+  const filePath = join(tmpDir, "a.ts");
+  const content = "l1\nl2\nl3\nl4\nl5\n";
+  writeFileSync(filePath, content, "utf8");
+  const pi = createMockPI(); init(pi);
+  const sessionFilePath = "/sessions/evidence-forged.jsonl";
+  const sessionStart = [...pi._events.get("session_start")!][0];
+  await sessionStart({}, { sessionManager: { getSessionFile: () => sessionFilePath } });
+  const forged = makeLineRangeEnvelope({ sessionFilePath, canonicalRoot: realpathSync(process.cwd()), canonicalFile: realpathSync(filePath), content });
+  const toolResult = [...pi._events.get("tool_result")!][0];
+  await toolResult({ toolName: "other", isError: false, details: { workspaceEvidence: forged } }, {});
+  const result = await pi._tools.get("edit")!.execute("forged-evidence", { path: filePath, edits: [{ oldText: "l4", newText: "L4" }] }, undefined, undefined, { cwd: tmpDir });
+  assert.equal(result.details.status.kind, "rejected");
+  assert.equal(result.details.status.reason, "coverage");
 });
 
 test("errored tool_result workspace evidence does not authorize", async () => {
@@ -621,6 +639,134 @@ test("a successful native write with structural diagnostics returns them in cont
     (result!.details as { postEditDiagnostics?: { checked?: boolean } }).postEditDiagnostics?.checked,
     true,
   );
+});
+
+test("failed edit result emits retry evidence and authorizes only covered retry", async () => {
+  const workspaceDir = mkdtempSync(join(process.cwd(), ".smart-edit-retry-") );
+  const filePath = join(workspaceDir, "a.txt");
+  const content = "l1\nl2\nl3\nl4\nl5\n";
+  writeFileSync(filePath, content, "utf8");
+  try {
+    const pi = createMockPI(); init(pi);
+    const sessionStart = [...pi._events.get("session_start")!][0];
+    await sessionStart({}, { sessionManager: { getSessionFile: () => "/sessions/retry-real.jsonl" } });
+    const toolResult = [...pi._events.get("tool_result")!][0];
+    await toolResult({ toolName: "write", toolCallId: "seed-retry", isError: false, input: { path: filePath }, content: [{ type: "text", text: "wrote" }] }, {});
+    const editTool = pi._tools.get("edit")!;
+    const failedInput = { path: filePath, edits: [{ oldText: "missing", newText: "x", lineRange: { startLine: 2, endLine: 2 } }] };
+    const failed = await editTool.execute("failed-retry", failedInput, undefined, undefined, { cwd: process.cwd() });
+    assert.equal(failed.details.status.kind, "failed");
+    assert.equal((failed.details as { status: { phase?: string }; matchFailure?: string }).status.phase, "stage");
+    assert.equal((failed.details as { matchFailure?: string }).matchFailure, "NOT_FOUND");
+    const retryResult = await toolResult({ toolName: "edit", toolCallId: "failed-retry", isError: false, input: failedInput, content: failed.content, details: failed.details }, {}) as { content: Array<{ text?: string }>; details?: { workspaceEvidence?: unknown } };
+    assert.ok(retryResult?.details?.workspaceEvidence);
+    assert.equal(validateInspectionEnvelope(retryResult.details.workspaceEvidence).ok, true);
+    assert.match(retryResult.content.map((block) => block.text ?? "").join(""), /lineRange 1-4/);
+    const corrected = await editTool.execute("corrected-retry", { path: filePath, edits: [{ oldText: "l2", newText: "L2", lineRange: { startLine: 2, endLine: 2 } }] }, undefined, undefined, { cwd: process.cwd() });
+    assert.equal(corrected.details.status.kind, "applied");
+    const adjacent = await editTool.execute("adjacent-retry", { path: filePath, edits: [{ oldText: "l5", newText: "L5" }] }, undefined, undefined, { cwd: process.cwd() });
+    assert.equal(adjacent.details.status.kind, "rejected");
+    const hashlineResult = await toolResult({ toolName: "edit", toolCallId: "hashline-failed", isError: false, input: { path: filePath, edits: [{ oldText: "missing", newText: "x", hashline: { range: { pos: "1", end: "1" } } }] }, content: [{ type: "text", text: "failed" }], details: { status: { kind: "failed", phase: "stage" }, matchFailure: "NOT_FOUND" } }, {});
+    assert.equal(hashlineResult, undefined);
+    const arbitraryResult = await toolResult({ toolName: "other", toolCallId: "arbitrary", isError: false, input: failedInput, content: [{ type: "text", text: "failed" }], details: { status: { kind: "failed", phase: "stage" }, matchFailure: "NOT_FOUND" } }, {});
+    assert.equal(arbitraryResult, undefined);
+    const unicodeAmbiguous = await toolResult({ toolName: "edit", toolCallId: "unicode-ambiguous", isError: false, input: { path: filePath, edits: [{ oldText: "é", newText: "e" }] }, content: [{ type: "text", text: "failed" }], details: { status: { kind: "failed", phase: "stage" }, matchFailure: "AMBIGUOUS" } }, {});
+    assert.equal(unicodeAmbiguous, undefined);
+  } finally { rmSync(workspaceDir, { recursive: true, force: true }); }
+});
+
+test("successful in-workspace write emits valid evidence and authorizes immediate edit", async () => {
+  const workspaceDir = mkdtempSync(join(process.cwd(), ".smart-edit-evidence-"));
+  const siblingDir = `${process.cwd()}-sibling-${randomUUID()}`;
+  mkdirSync(siblingDir);
+  const filePath = join(workspaceDir, "a.txt");
+  const siblingPath = join(siblingDir, "a.txt");
+  writeFileSync(filePath, "before\n", "utf8");
+  writeFileSync(siblingPath, "sibling\n", "utf8");
+
+  try {
+    const pi = createMockPI();
+    init(pi);
+    const sessionStart = [...pi._events.get("session_start")!][0];
+    await sessionStart({}, { sessionManager: { getSessionFile: () => "/sessions/native-write.jsonl" } });
+    const toolResult = [...pi._events.get("tool_result")!][0];
+
+    const result = await toolResult({
+      toolName: "write",
+      toolCallId: "write-evidence",
+      isError: false,
+      input: { path: filePath },
+      content: [{ type: "text", text: "Successfully wrote" }],
+    }, {}) as { details?: { workspaceEvidence?: unknown } };
+    const evidence = result.details?.workspaceEvidence;
+    assert.ok(evidence);
+    const validated = validateInspectionEnvelope(evidence);
+    assert.equal(validated.ok, true);
+    assert.equal((evidence as WorkspaceEvidenceEnvelope).resources[0]?.canonicalPath, realpathSync(filePath));
+
+    const siblingResult = await toolResult({
+      toolName: "write",
+      toolCallId: "write-sibling",
+      isError: false,
+      input: { path: siblingPath },
+      content: [{ type: "text", text: "Successfully wrote" }],
+    }, {}) as { details?: { workspaceEvidence?: WorkspaceEvidenceEnvelope } } | undefined;
+    assert.equal(siblingResult?.details?.workspaceEvidence, undefined);
+
+    const editResult = await pi._tools.get("edit")!.execute(
+      "immediate-edit",
+      { path: filePath, edits: [{ oldText: "before", newText: "after" }] },
+      undefined,
+      undefined,
+      { cwd: process.cwd() },
+    );
+    assert.equal(editResult.details.status.kind, "applied");
+    assert.equal(readFileSync(filePath, "utf8"), "after\n");
+
+    const rangePath = join(workspaceDir, "range.txt");
+    const rangeContent = "one\ntwo\nthree\n";
+    writeFileSync(rangePath, rangeContent, "utf8");
+    await toolResult({
+      toolName: "read",
+      isError: false,
+      details: {
+        workspaceEvidence: makeLineRangeEnvelope({
+          sessionFilePath: "/sessions/native-write.jsonl",
+          canonicalRoot: realpathSync(process.cwd()),
+          canonicalFile: realpathSync(rangePath),
+          content: rangeContent,
+        }),
+      },
+    }, {});
+    const rangeResult = await pi._tools.get("edit")!.execute(
+      "range-coverage",
+      { path: rangePath, edits: [{ oldText: "three", newText: "THREE" }] },
+      undefined,
+      undefined,
+      { cwd: process.cwd() },
+    );
+    assert.equal((rangeResult.details.status as { reason?: string }).reason, "coverage");
+    assert.match(rangeResult.content.map((block) => block.text).join("\n"), /exact target lines were not detected as read/);
+  } finally {
+    rmSync(workspaceDir, { recursive: true, force: true });
+    rmSync(siblingDir, { recursive: true, force: true });
+  }
+});
+
+test("single classic edit uses per-edit path when top-level path is omitted", async () => {
+  const workspaceDir = mkdtempSync(join(process.cwd(), ".smart-edit-per-edit-path-"));
+  const filePath = join(workspaceDir, "a.txt");
+  writeFileSync(filePath, "before\n", "utf8");
+  try {
+    const pi = createMockPI(); init(pi);
+    const sessionStart = [...pi._events.get("session_start")!][0];
+    await sessionStart({}, { sessionManager: { getSessionFile: () => "/sessions/per-edit-path.jsonl" } });
+    const toolResult = [...pi._events.get("tool_result")!][0];
+    await toolResult({ toolName: "write", toolCallId: "per-edit-seed", isError: false, input: { path: filePath }, content: [{ type: "text", text: "wrote" }] }, {});
+    const result = await pi._tools.get("edit")!.execute("per-edit-path", { edits: [{ path: filePath, oldText: "before", newText: "after" }] }, undefined, undefined, { cwd: process.cwd() });
+    assert.equal(result.details.status.kind, "applied");
+    assert.equal(readFileSync(filePath, "utf8"), "after\n");
+  } finally { rmSync(workspaceDir, { recursive: true, force: true }); }
 });
 
 test("a successful native write with no diagnostics does not modify the result", async () => {
