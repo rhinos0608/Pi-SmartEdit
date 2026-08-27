@@ -456,13 +456,24 @@ test("end-to-end: multi-file patch with per-edit paths (v3)", async () => {
     const file = join(workdir, "a.ts");
     writeFileSync(file, "alpha\nbeta\n", "utf8");
     const canonicalFile = realpathSync(file);
+
+    // Create a file OUTSIDE the workspace to prove cross-folder edits work.
+    const outsideDir = realpathSync(mkdtempSync(join(tmpdir(), "patch-outside-")));
+    const outsideFile = join(outsideDir, "c.ts");
+    writeFileSync(outsideFile, "gamma\ndelta\n", "utf8");
+    const canonicalOutside = realpathSync(outsideFile);
+
     const sessionFilePath = "/sessions/a.jsonl";
     const envelope = makeEnvelope({
         sessionFilePath,
         canonicalRoot: workdir,
-        resources: [makeResource({ canonicalPath: canonicalFile, full: true, content: "alpha\nbeta\n" })],
+        resources: [
+            makeResource({ canonicalPath: canonicalFile, full: true, content: "alpha\nbeta\n" }),
+            makeResource({ canonicalPath: canonicalOutside, full: true, content: "gamma\ndelta\n" }),
+        ],
     });
-    const resource = envelope.resources[0]!;
+    const resA = envelope.resources[0]!;
+    const resC = envelope.resources[1]!;
     const deps: PatchToolDeps = {
         getRpcClient: () => ({
             request: async () => ({
@@ -484,9 +495,9 @@ test("end-to-end: multi-file patch with per-edit paths (v3)", async () => {
             path: "a.ts",
             edits: [
                 { oldText: "alpha", newText: "ALPHA" },
-                { oldText: "BETA", newText: "beta", path: "/some/other/file.ts" },
+                { oldText: "gamma", newText: "GAMMA", path: canonicalOutside },
             ],
-            evidenceRef: { inspectionId: envelope.inspectionId, resourceIds: [resource.resourceId] },
+            evidenceRef: { inspectionId: envelope.inspectionId, resourceIds: [resA.resourceId, resC.resourceId] },
             toolCallId: "tc1",
         },
         undefined,
@@ -494,8 +505,10 @@ test("end-to-end: multi-file patch with per-edit paths (v3)", async () => {
         makeCtx(workdir),
     );
     const d = res.details as any;
-    // Outside-workspace target is rejected before transaction.
-    assert.equal(d.status.kind, "rejected");
+    // Both edits apply: cross-folder editing is allowed.
+    assert.equal(d.status.kind, "applied");
+    assert.match(readFileSync(canonicalOutside, "utf8"), /^GAMMA\n/);
+    assert.match(readFileSync(file, "utf8"), /^ALPHA\n/);
 });
 
 // ── Review-fix regression tests (B1-B4) ──────────────────────────────
@@ -1373,7 +1386,7 @@ test("prior authority: later full-file read widens authority again", async () =>
     assert.equal(readFileSync(canonicalFile, "utf8"), "l1\nl2\nl3\nL4\nl5\n");
 });
 
-test("prior authority: outside-workspace target rejects", async () => {
+test("prior authority: outside-workspace target still requires authority", async () => {
     const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-prior-outside-")));
     mkdirSync(workdir, { recursive: true });
     const outsideDir = realpathSync(mkdtempSync(join(tmpdir(), "patch-prior-outside-target-")));
@@ -1395,8 +1408,68 @@ test("prior authority: outside-workspace target rejects", async () => {
         makeCtx(workdir),
     );
     const d = res.details as any;
+    // No authority for the outside file → rejected for coverage, not containment.
     assert.equal(d.status.kind, "rejected");
     assert.equal(readFileSync(outsideFile, "utf8"), "alpha\nbeta\n");
+});
+
+test("regression: cross-folder edits apply when evidence exists", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-crossfolder-")));
+    mkdirSync(workdir, { recursive: true });
+    const file = join(workdir, "a.ts");
+    writeFileSync(file, "alpha\nbeta\n", "utf8");
+    const canonicalFile = realpathSync(file);
+
+    // File outside workspace
+    const outsideDir = realpathSync(mkdtempSync(join(tmpdir(), "patch-crossfolder-ext-")));
+    const outsideFile = join(outsideDir, "z.ts");
+    writeFileSync(outsideFile, "omega\nzeta\n", "utf8");
+    const canonicalOutside = realpathSync(outsideFile);
+
+    const sessionFilePath = "/sessions/cross.jsonl";
+    const envelope = makeEnvelope({
+        sessionFilePath,
+        canonicalRoot: workdir,
+        resources: [
+            makeResource({ canonicalPath: canonicalFile, full: true, content: "alpha\nbeta\n" }),
+            makeResource({ canonicalPath: canonicalOutside, full: true, content: "omega\nzeta\n" }),
+        ],
+    });
+    const deps: PatchToolDeps = {
+        getRpcClient: () => ({
+            request: async () => ({
+                kind: "reply" as const,
+                schemaVersion: PROTOCOL_SCHEMA_VERSION,
+                requestId: "r1",
+                ok: true,
+                payload: envelope,
+            }),
+            dispose: () => {},
+        }),
+        getSessionFilePath: () => sessionFilePath,
+        getCanonicalWorkspaceRoot: () => workdir,
+    };
+    const tool = createPatchTool(deps);
+    // Edit both files in one call — the outside file uses an absolute path.
+    const res = await tool.execute(
+        "tc-cross",
+        {
+            path: "a.ts",
+            edits: [
+                { oldText: "alpha", newText: "ALPHA" },
+                { oldText: "omega", newText: "OMEGA", path: canonicalOutside },
+            ],
+            evidenceRef: { inspectionId: envelope.inspectionId, resourceIds: envelope.resources.map(r => r.resourceId) },
+            toolCallId: "tc-cross",
+        },
+        undefined,
+        undefined,
+        makeCtx(workdir),
+    );
+    const d = res.details as any;
+    assert.equal(d.status.kind, "applied", `expected applied, got ${d.status.kind}: ${d.status.reason ?? ""}`);
+    assert.match(readFileSync(file, "utf8"), /ALPHA/);
+    assert.match(readFileSync(outsideFile, "utf8"), /OMEGA/);
 });
 
 test("prior authority: caller evidenceRef does not override a selected prior grant", async () => {

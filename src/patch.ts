@@ -33,7 +33,7 @@
  * - Returns a discriminated `details` with the full lifecycle.
  */
 import { readFile as fsReadFile, stat as fsStat, mkdir as fsMkdir } from "node:fs/promises";
-import { resolve as pathResolve, dirname as pathDirname, relative as pathRelative } from "node:path";
+import { resolve as pathResolve, dirname as pathDirname } from "node:path";
 import { realpathSync, existsSync } from "node:fs";
 
 import {
@@ -251,29 +251,6 @@ function withinRange(target: LineRange, range: LineRange): boolean {
 
 const SHA256_RE = /^[0-9a-f]{64}$/i;
 
-/** Canonicalize path without ever treating a mutation-time read as authority. */
-function canonicalizeContainedPath(root: string, absolutePath: string): { ok: true; path: string; exists: boolean } | { ok: false; error: string } {
-    const resolved = pathResolve(absolutePath);
-    let existing = resolved;
-    while (!existsSync(existing)) {
-        const parent = pathDirname(existing);
-        if (parent === existing) return { ok: false, error: `path has no canonical parent: ${absolutePath}` };
-        existing = parent;
-    }
-    let canonicalExisting: string;
-    try { canonicalExisting = realpathSync(existing); }
-    catch (err) { return { ok: false, error: `cannot canonicalize path ${absolutePath}: ${err instanceof Error ? err.message : String(err)}` }; }
-    const candidate = existsSync(resolved)
-        ? canonicalExisting
-        : pathResolve(canonicalExisting, pathRelative(existing, resolved));
-    const rel = pathRelative(root, candidate);
-    if (rel === ".." || rel.startsWith("../") || rel.startsWith("..\\")) {
-        return { ok: false, error: `path outside canonical workspace root: ${absolutePath}` };
-    }
-    // Existing symlink targets are represented by canonicalExisting above.
-    return { ok: true, path: candidate, exists: existsSync(resolved) };
-}
-
 function validateResourceAuthority(resource: InspectedResource, targetRanges: ReadonlyArray<LineRange>, requireFull: boolean): string | null {
     if (resource.coverage !== "full-file" && resource.coverage !== "line-range") return checkResourceCoverage(resource, targetRanges);
     if (requireFull && resource.coverage !== "full-file") return "coverage: full-file evidence required for topology mutation";
@@ -297,10 +274,6 @@ function authorizeResource(args: {
         : [...args.resources];
     if (candidates.some((r) => r === null)) return { ok: false, reason: "missing resource" };
     for (const resource of candidates as InspectedResource[]) {
-        const rel = pathRelative(args.canonicalWorkspaceRoot, resource.canonicalPath);
-        if (rel === ".." || rel.startsWith("../") || rel.startsWith("..\\")) {
-            return { ok: false, reason: "workspace containment: evidence resource is outside canonical workspace root" };
-        }
         if (args.canonicalPath !== undefined && resource.canonicalPath !== args.canonicalPath) continue;
         const error = validateResourceAuthority(resource, args.targetRanges, args.requireFull === true);
         if (!error) return { ok: true, resource };
@@ -776,29 +749,6 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 if (op === "copy") copySourceOnlyPaths.add(canonicalFrom);
             }
 
-            // Every mutation and transfer endpoint must resolve inside the
-            // canonical workspace. Existing symlinks are checked by realpath;
-            // absent paths are checked through their existing parent.
-            const containmentPaths = new Set<string>();
-            for (const g of groups) containmentPaths.add(g.absolutePath);
-            for (const op of rawTopology) {
-                containmentPaths.add(pathResolve(ctx.cwd, op.kind === "rename" ? op.oldPath : op.path));
-                if (op.kind === "rename") containmentPaths.add(pathResolve(ctx.cwd, op.newPath));
-            }
-            for (const op of transferOps) {
-                containmentPaths.add(pathResolve(ctx.cwd, op.from as string));
-                containmentPaths.add(pathResolve(ctx.cwd, op.to as string));
-            }
-            for (const candidate of containmentPaths) {
-                const contained = canonicalizeContainedPath(canonicalRoot, candidate);
-                if (!contained.ok) {
-                    diagnostics.push(contained.error);
-                    return {
-                        content: [{ type: "text" as const, text: `rejected: ${contained.error}` }],
-                        details: makeRejected(toolCallId, "coverage", diagnostics, { inspectionId: "", resourceIds: [] }, checks, usedEvidence),
-                    };
-                }
-            }
 
             // ── Acquire envelope ──────────────────────────────────────
             // Tool-owned evidence policy B: existing targets require strong

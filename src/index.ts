@@ -14,7 +14,7 @@ import { truncateToWidth, visibleWidth, type Component } from "@mariozechner/pi-
 
 import { realpathSync, statSync } from "fs";
 import { readFile as fsReadFile } from "fs/promises";
-import { relative, resolve, sep } from "path";
+import { resolve } from "path";
 import { sortHashlineEditsForApplication, formatHashlineBatchSummary } from "./hashline-batching.js";
 import {
   prepareArguments,
@@ -323,8 +323,6 @@ export default function smartEdit(pi: ExtensionAPI) {
       try {
         const resolvedPath = resolve(currentCwd ?? process.cwd(), path);
         const canonicalPath = realpathSync(resolvedPath);
-        const relativePath = relative(currentCanonicalWorkspaceRoot, canonicalPath);
-        if (!relativePath || relativePath === ".." || relativePath.startsWith(`..${sep}`)) continue;
         if (!statSync(canonicalPath).isFile()) continue;
         const content = (await fsReadFile(canonicalPath)).toString("utf8");
         const lineCount = content.split("\n").length;
