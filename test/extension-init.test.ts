@@ -753,6 +753,33 @@ test("successful in-workspace write emits valid evidence and authorizes immediat
   }
 });
 
+test("workspace root '/' mints evidence for files under root", async () => {
+  const originalCwd = process.cwd();
+  const tmpFile = "/tmp/smartedit-root-containment.txt";
+  writeFileSync(tmpFile, "root content\n", "utf8");
+  try {
+    process.chdir("/");
+    const pi = createMockPI();
+    init(pi);
+    const sessionStart = [...pi._events.get("session_start")!][0];
+    await sessionStart({}, { sessionManager: { getSessionFile: () => "/sessions/root-test.jsonl" } });
+    const toolResult = [...pi._events.get("tool_result")!][0];
+
+    const result = await toolResult({
+      toolName: "write",
+      toolCallId: "write-root",
+      isError: false,
+      input: { path: tmpFile },
+      content: [{ type: "text", text: "Successfully wrote" }],
+    }, {}) as { details?: { workspaceEvidence?: WorkspaceEvidenceEnvelope } };
+    // With workspace root "/", /tmp/... IS inside the workspace — evidence must be minted.
+    assert.ok(result?.details?.workspaceEvidence, "evidence should be minted for file under root '/'");
+  } finally {
+    process.chdir(originalCwd);
+    try { rmSync(tmpFile, { force: true }); } catch {}
+  }
+});
+
 test("single classic edit uses per-edit path when top-level path is omitted", async () => {
   const workspaceDir = mkdtempSync(join(process.cwd(), ".smart-edit-per-edit-path-"));
   const filePath = join(workspaceDir, "a.txt");

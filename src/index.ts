@@ -14,7 +14,7 @@ import { truncateToWidth, visibleWidth, type Component } from "@mariozechner/pi-
 
 import { realpathSync, statSync } from "fs";
 import { readFile as fsReadFile } from "fs/promises";
-import { resolve } from "path";
+import { resolve, relative } from "path";
 import { sortHashlineEditsForApplication, formatHashlineBatchSummary } from "./hashline-batching.js";
 import {
   prepareArguments,
@@ -323,6 +323,12 @@ export default function smartEdit(pi: ExtensionAPI) {
       try {
         const resolvedPath = resolve(currentCwd ?? process.cwd(), path);
         const canonicalPath = realpathSync(resolvedPath);
+        // Evidence-provenance containment: only mint evidence for paths inside the canonical workspace root.
+        // Mutations to outside paths still succeed — they simply get no workspaceEvidence.
+        // Use path.relative for containment: root "/" must still match /tmp/x.ts, and
+        // /workspace-evil must NOT match root /workspace. relative() returns "" for
+        // identity, a bare name for children, or "../.." for outside — only reject the last.
+        if (relative(currentCanonicalWorkspaceRoot, canonicalPath).startsWith("..")) continue;
         if (!statSync(canonicalPath).isFile()) continue;
         const content = (await fsReadFile(canonicalPath)).toString("utf8");
         const lineCount = content.split("\n").length;
