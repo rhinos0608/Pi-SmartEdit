@@ -1,3 +1,5 @@
+> **⚠ HISTORICAL / ARCHIVED** — This document is superseded. It describes the pre-Task-7 implementation state and is kept for historical reference only.
+
 # Task 7 Recon: Failure-Atomic Multi-File Transaction
 
 > Read-only recon for `docs/plans/2026-08-14-unified-edit-transaction.md` Task 7.

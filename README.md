@@ -16,6 +16,7 @@ Smart Edit replaces Pi's built-in `edit` tool with safer matching, richer diagno
 - **Stale-file guard**: blocks edits when the file changed since read
 - **Range coverage guard**: blocks edits outside the lines you actually read
 - **Failure-atomic transactions**: multi-file, raw, and topology edits share one transaction with rollback for handled failures
+- **Outside-workspace targets**: SmartEdit canonicalizes target paths but does not enforce workspace containment for mutations — only evidence minting is containment-gated
 - **Atomic writes**: temp-file write + rename, with mode preservation (undo-safe)
 - **Edit history / undo**: captures pre-edit state to `.smart-edit-undo/` for rollback
 - **Context markers**: XML-style tags around injected semantic context for attribution/filtering
@@ -341,7 +342,9 @@ npx tsx --test test/<file>  # e.g., test/symbolic-edits.test.ts
 - Fuzzy matches are safe: replacements are always applied to the original file text.
 - Undo data is stored in `.smart-edit-undo/` per project; persistence happens **after commit** and is **best-effort** (never blocks the edit).
 - Verification pipeline is advisory: warnings are matchNotes, never hard errors by default.
-- **Workspace containment** (edits restricted to the runtime-owned workspace root) is enforced by the runtime boundary, not by this extension.
+- **Outside-workspace policy**: SmartEdit canonicalizes targets but does not enforce workspace containment for mutations. Only evidence minting is containment-gated; filesystem confinement is the container/runtime's responsibility.
+- **Failure-atomicity guarantee**: Multi-file, raw, and topology edits share one failure-atomic transaction. Handled write/verify failures roll back all prior changes in the transaction and report exact rollback outcome. This does **not** cover power-loss, OS crash, or instantaneous cross-file filesystem atomicity — only handled process failures with explicit rollback.
+- **Evidence Policy B**: The agent-visible schema omits `evidenceRef`. The latest strong prior authority for a canonical path is reused; prior line-range authority is never widened by omission. Full-file auto-inspection occurs only when no strong prior authority exists.
 - **Default verifier**: no production blocking verifier is configured. The extension has no safe staged-workspace command contract, so it does not run arbitrary configured commands as a blocking gate. Verification lanes are advisory only.
 - Repair loop is on by default (opt out with `SMART_EDIT_REPAIR_ENABLED=0` or `false`): repair failures produce notes but never block the pipeline.
 - Fake-logic detection uses tree-sitter AST analysis with regex fallback; never blocks the edit pipeline on error.

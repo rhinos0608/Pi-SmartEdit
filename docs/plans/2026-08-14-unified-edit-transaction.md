@@ -69,11 +69,11 @@
 - Red signal: `npx tsx --test test/edit-contract.test.ts test/extension-init.test.ts` fails because registered schema lacks `raw`, `target`, `lineRange`, and `hashline`.
 - Green signal: same command passes; schema and validator reject `raw`+`edits`, accept current edit arrays, and hide/ignore agent-supplied `evidenceRef` without breaking stored calls.
 
-- [ ] Write one registration-level test capturing `pi.registerTool` parameters and validating current text call plus one rich field.
-- [ ] Implement minimal canonical contract and switch registration/runtime validation to it.
-- [ ] Add raw/edit exclusivity and remaining compatibility cases incrementally.
-- [ ] Remove dead `editItemSchema` only after registration tests prove parity.
-- [ ] Run focused checks and `npx tsc --noEmit`.
+- [x] Write one registration-level test capturing `pi.registerTool` parameters and validating current text call plus one rich field.
+- [x] Implement minimal canonical contract and switch registration/runtime validation to it.
+- [x] Add raw/edit exclusivity and remaining compatibility cases incrementally.
+- [x] Remove dead `editItemSchema` only after registration tests prove parity.
+- [x] Run focused checks and `npx tsc --noEmit`.
 
 ### Task 2: Tool-owned prior authority
 
@@ -92,13 +92,13 @@
 - Green signal: out-of-range edit rejects unchanged file; in-range edit applies; stale prior authority rejects without auto-inspection; no prior strong authority auto-inspects; outside-workspace target remains allowed.
 
 - [ ] Add an extension integration probe that emits a representative SmartRead `tool_result` with `details.workspaceEvidence`, then proves `src/index.ts` records it. If real runtime shape differs, pivot behind `PriorAuthorityStore`; do not weaken policy.
-- [ ] Add authority-store unit tests: latest strong wins, newer line-range supersedes older full-file, weak evidence does not authorize, session/root mismatch ignored.
-- [ ] Ingest validated SmartRead envelopes from tool-result details in `src/index.ts`.
-- [ ] Select prior authority before building synthetic evidence; never use agent-supplied authority.
+- [x] Add authority-store unit tests: latest strong wins, newer line-range supersedes older full-file, weak evidence does not authorize, session/root mismatch ignored.
+- [x] Ingest validated SmartRead envelopes from tool-result details in `src/index.ts`.
+- [x] Select prior authority before building synthetic evidence; never use agent-supplied authority.
 - [ ] When newer line-range authority supersedes older full-file authority, return an actionable diagnostic requiring a fresh full-file read to widen authority again.
-- [ ] Consolidate duplicated authorization into one path-aware helper used by tests and execute flow.
-- [ ] Require freshness hash for any selected prior line-range authority; reject missing hash rather than silently skipping freshness.
-- [ ] Run authority and patch tests.
+- [x] Consolidate duplicated authorization into one path-aware helper used by tests and execute flow.
+- [x] Require freshness hash for any selected prior line-range authority; reject missing hash rather than silently skipping freshness.
+- [x] Run authority and patch tests.
 
 ### Task 3: Fuzzy text, AST scope, line range, and closest diagnostics
 
@@ -117,13 +117,13 @@
 - Red signal: registration-level similarity match and scoped duplicate match fail through current exact `indexOf` path.
 - Green signal: public execute call reaches fuzzy match, closest diagnostic, AST target, line range, combined scope, replaceAll, and literal `$` replacement behavior.
 
-- [ ] Add one fuzzy tracer test through public tool execute; route plain text through `applyEdits`.
-- [ ] Add line-range and AST-target tests; implement scope intersection without whole-file fallback when authority is narrower.
-- [ ] Add closest-match and ambiguity diagnostics tests.
-- [ ] Add overlap/conflict tests against immutable snapshot.
-- [ ] Preserve actual resolved spans for later authorization and verification.
-- [ ] Route writes through existing `src/patch.ts` commit path during this capability slice; failure-atomicity arrives in Task 7. Do not create a temporary transaction engine.
-- [ ] Run planner, patch, legacy edit-diff, context-guard, and conflict tests.
+- [x] Add one fuzzy tracer test through public tool execute; route plain text through `applyEdits`.
+- [x] Add line-range and AST-target tests; implement scope intersection without whole-file fallback when authority is narrower.
+- [x] Add closest-match and ambiguity diagnostics tests.
+- [x] Add overlap/conflict tests against immutable snapshot.
+- [x] Preserve actual resolved spans for later authorization and verification.
+- [x] Route writes through existing `src/patch.ts` commit path during this capability slice; failure-atomicity arrives in Task 7. Do not create a temporary transaction engine.
+- [x] Run planner, patch, legacy edit-diff, context-guard, and conflict tests.
 
 ### Task 4: Symbolic and structural operations
 
@@ -141,12 +141,12 @@
 - Red signal: registered tool rejects or strips symbol/ast-grep fields.
 - Green signal: public calls modify intended symbol/pattern; unresolved/ambiguous targets fail before writes; mixed operations reject overlaps; same-position inserts preserve request order.
 
-- [ ] Add symbolic replace tracer, then before/after insert cases.
-- [ ] Adapt symbolic engine output to resolved mutations rather than independent filesystem lifecycle.
-- [ ] Add structural operation tracer and unavailable-engine diagnostic.
-- [ ] Add mixed-operation ordering and overlap tests.
-- [ ] Route writes through existing `src/patch.ts` commit path during this capability slice; failure-atomicity arrives in Task 7.
-- [ ] Run symbolic, AST, capability, planner, and patch tests.
+- [x] Add symbolic replace tracer, then before/after insert cases.
+- [x] Adapt symbolic engine output to resolved mutations rather than independent filesystem lifecycle.
+- [x] Add structural operation tracer and unavailable-engine diagnostic.
+- [x] Add mixed-operation ordering and overlap tests.
+- [x] Route writes through existing `src/patch.ts` commit path during this capability slice; failure-atomicity arrives in Task 7.
+- [x] Run symbolic, AST, capability, planner, and patch tests.
 
 ### Task 5: Hashline operations
 
@@ -163,12 +163,12 @@
 - Red signal: registered tool rejects hashline-only operation.
 - Green signal: fast path, rebase, scoped fallback, full fuzzy fallback, and mismatch rejection are reachable through public execute; final changed ranges remain inside selected authority.
 
-- [ ] Add public hashline fast-path tracer.
-- [ ] Adapt existing hashline results into staged mutation contract without reimplementing anchor logic.
-- [ ] Add fallback/mismatch public-path tests.
-- [ ] Add repair/coverage regression proving fallback cannot escape prior line-range authority.
-- [ ] Route writes through existing `src/patch.ts` commit path during this capability slice; failure-atomicity arrives in Task 7.
-- [ ] Run hashline suites, capability tests, and patch tests.
+- [x] Add public hashline fast-path tracer.
+- [x] Adapt existing hashline results into staged mutation contract without reimplementing anchor logic.
+- [x] Add fallback/mismatch public-path tests.
+- [x] Add repair/coverage regression proving fallback cannot escape prior line-range authority.
+- [x] Route writes through existing `src/patch.ts` commit path during this capability slice; failure-atomicity arrives in Task 7.
+- [x] Run hashline suites, capability tests, and patch tests.
 
 ### Task 6: Raw format normalization
 
@@ -186,12 +186,12 @@
 - Red signal: public raw call fails schema validation.
 - Green signal: one public test per advertised format reaches staging; malformed input reports parser diagnostics; Atomic Patch add/delete/update/rename produces intents and performs no parser-side write.
 
-- [ ] Add one search/replace raw tracer; wire format detection and conversion.
-- [ ] Add formats incrementally, one red/green case each.
-- [ ] Split Atomic Patch parsing from its legacy executor; retain executor only as compatibility wrapper delegating to coordinator until callers are migrated.
-- [ ] Verify streaming updates do not affect final semantics.
-- [ ] Route writes through existing `src/patch.ts` commit path during this capability slice; failure-atomicity arrives in Task 7.
-- [ ] Run format, atomic-patch, streaming, contract, and capability tests.
+- [x] Add one search/replace raw tracer; wire format detection and conversion.
+- [x] Add formats incrementally, one red/green case each.
+- [x] Split Atomic Patch parsing from its legacy executor; retain executor only as compatibility wrapper delegating to coordinator until callers are migrated.
+- [x] Verify streaming updates do not affect final semantics.
+- [x] Route writes through existing `src/patch.ts` commit path during this capability slice; failure-atomicity arrives in Task 7.
+- [x] Run format, atomic-patch, streaming, contract, and capability tests.
 
 ### Task 7: Failure-atomic multi-file transaction
 
@@ -209,14 +209,14 @@
 - Red signal: existing mid-batch failure leaves earlier file modified; raced creator can be overwritten.
 - Green signal: injected failure at each commit/verify position restores content, modes, existence, and rename topology; create race returns conflict without overwrite; two overlapping calls never lose a write.
 
-- [ ] Add update-only two-file rollback tracer before changing commit path.
-- [ ] Add sorted multi-path locking that holds until worker truly finishes; do not reuse timeout behavior that releases while work continues.
-- [ ] Capture every snapshot and finish every stage/check before first write.
-- [ ] Extend atomic-write module with no-clobber create primitive using same-directory temporary data.
-- [ ] Add delete/rename backup and reverse rollback for raw file operations.
-- [ ] Recheck fingerprints immediately before commit and before destructive rollback.
-- [ ] Keep cancellation deferred until commit/rollback completes.
-- [ ] Run transaction, atomic-write, mutation, patch, and capability tests.
+- [x] Add update-only two-file rollback tracer before changing commit path.
+- [x] Add sorted multi-path locking that holds until worker truly finishes; do not reuse timeout behavior that releases while work continues.
+- [x] Capture every snapshot and finish every stage/check before first write.
+- [x] Extend atomic-write module with no-clobber create primitive using same-directory temporary data.
+- [x] Add delete/rename backup and reverse rollback for raw file operations.
+- [x] Recheck fingerprints immediately before commit and before destructive rollback.
+- [x] Keep cancellation deferred until commit/rollback completes.
+- [x] Run transaction, atomic-write, mutation, patch, and capability tests.
 
 ### Task 8: Undo with content and mode integrity
 
@@ -233,11 +233,11 @@
 - Red signal: current restore compares edited content to pre-edit hash and rejects normal undo.
 - Green signal: update undo restores bytes+mode; changed-after-edit refuses overwrite; create undo deletes only matching file; delete/rename restore topology; failed/rolled-back transaction creates no successful undo record.
 
-- [ ] Add normal update-undo red test.
-- [ ] Version stored format with `beforeSha`, `afterSha`, mode, existence, operation, transaction ID.
-- [ ] Keep legacy entries readable where safe; never guess missing `afterSha` for destructive restore.
-- [ ] Persist only after final transaction success.
-- [ ] Run undo and transaction tests.
+- [x] Add normal update-undo red test.
+- [x] Version stored format with `beforeSha`, `afterSha`, mode, existence, operation, transaction ID.
+- [x] Keep legacy entries readable where safe; never guess missing `afterSha` for destructive restore.
+- [x] Persist only after final transaction success.
+- [x] Run undo and transaction tests.
 
 ### Task 9: Verification, repair, diagnostics, and SmartRead bridge
 
@@ -256,13 +256,13 @@
 - Red signal: public edit result lacks advertised pipeline evidence and repair cannot return usable repaired content.
 - Green signal: capability test observes each configured lane; blocking verifier rolls back all files; advisory failure does not; repair outside authority is skipped/rejected; bridge events publish only for final success.
 
-- [ ] Add one public pipeline tracer with injected checks.
-- [ ] Replace the approval-gating `as any` call with a typed operation adapter and remove the residual deleted-atomicWrite comment; this milestone must clear the known lint error.
-- [ ] Return repaired candidate content from repair loop and re-plan/re-authorize its diff.
-- [ ] Wire LSP/compiler fallback and scoped diagnostics per path.
-- [ ] Run post-edit evidence once per successful transaction with all edited paths.
-- [ ] Publish invalidations/co-change/breakage only after final state is known.
-- [ ] Run verification, LSP, diagnostics, bridge, transaction, and capability tests.
+- [x] Add one public pipeline tracer with injected checks.
+- [x] Replace the approval-gating `as any` call with a typed operation adapter and remove the residual deleted-atomicWrite comment; this milestone must clear the known lint error.
+- [x] Return repaired candidate content from repair loop and re-plan/re-authorize its diff.
+- [x] Wire LSP/compiler fallback and scoped diagnostics per path.
+- [x] Run post-edit evidence once per successful transaction with all edited paths.
+- [x] Publish invalidations/co-change/breakage only after final state is known.
+- [x] Run verification, LSP, diagnostics, bridge, transaction, and capability tests.
 
 ### Task 10: Result contract, parity gate, and documentation
 
@@ -279,21 +279,21 @@
 - Red signal: multi-file result exposes only last file post-edit evidence and README capability claims lack public-path tests.
 - Green signal: result arrays cover every path; rollback result matches disk; every README capability maps to named end-to-end test.
 
-- [ ] Add per-path result tests for success, prewrite rejection, rollback success, and rollback failure.
-- [ ] Remove no-op/inconsistent `finalize` path or make one finalizer own all result assembly.
-- [ ] Update README flow, evidence policy B, outside-workspace policy, and failure-atomic limitation.
-- [ ] Correct package author/repository metadata only from verified project values; leave unknown values unchanged.
-- [ ] Run focused result/docs checks.
+- [x] Add per-path result tests for success, prewrite rejection, rollback success, and rollback failure.
+- [x] Remove no-op/inconsistent `finalize` path or make one finalizer own all result assembly.
+- [x] Update README flow, evidence policy B, outside-workspace policy, and failure-atomic limitation.
+- [x] Correct package author/repository metadata only from verified project values; leave unknown values unchanged.
+- [x] Run focused result/docs checks.
 
 ## Final verification and review
 
-- [ ] Run `npx tsx --test test/edit-contract.test.ts test/evidence-authority.test.ts test/edit-planner.test.ts test/edit-transaction.test.ts test/edit-tool-capabilities.test.ts`.
-- [ ] Run `npx tsx --test test/patch.test.ts test/extension-init.test.ts test/atomic-write.test.ts test/edit-history.test.ts test/symbolic-edits.test.ts test/hashline-edit.test.ts test/hashline-scoping.test.ts test/formats.test.ts test/atomic-patch.test.ts`.
-- [ ] Run `npm run test:v`.
-- [ ] Run `npx tsc --noEmit`.
-- [ ] Run `npm run lint`.
-- [ ] Run `npm test`.
-- [ ] Run `git diff --check`.
+- [x] Run `npx tsx --test test/edit-contract.test.ts test/evidence-authority.test.ts test/edit-planner.test.ts test/edit-transaction.test.ts test/edit-tool-capabilities.test.ts`.
+- [x] Run `npx tsx --test test/patch.test.ts test/extension-init.test.ts test/atomic-write.test.ts test/edit-history.test.ts test/symbolic-edits.test.ts test/hashline-edit.test.ts test/hashline-scoping.test.ts test/formats.test.ts test/atomic-patch.test.ts`.
+- [x] Run `npm run test:v`.
+- [x] Run `npx tsc --noEmit`.
+- [x] Run `npm run lint`.
+- [x] Run `npm test`.
+- [x] Run `git diff --check`.
 - [ ] Review full diff against every locked decision and current user-owned baseline.
 - [ ] Launch fresh read-only reviewers for correctness/rollback, capability parity, evidence policy, and simplicity. Verify every accepted finding with focused test before fixing.
 - [ ] Report any check that could not run as unverified; do not claim crash atomicity, workspace confinement, or protocol migration.

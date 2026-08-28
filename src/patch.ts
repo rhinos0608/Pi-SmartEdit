@@ -862,14 +862,14 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     diagnostics.push("envelope session identity mismatch");
                     return {
                         content: [{ type: "text" as const, text: "rejected: session identity mismatch" }],
-                        details: finalize(makeRejected(toolCallId, "session", diagnostics, evidenceRefForDetails, checks, usedEvidence)),
+                        details: makeRejected(toolCallId, "session", diagnostics, evidenceRefForDetails, checks, usedEvidence),
                     };
                 }
                 if (envelope.canonicalWorkspaceRoot !== canonicalRoot) {
                     diagnostics.push("envelope workspace root mismatch");
                     return {
                         content: [{ type: "text" as const, text: "rejected: workspace mismatch" }],
-                        details: finalize(makeRejected(toolCallId, "session", diagnostics, evidenceRefForDetails, checks, usedEvidence)),
+                        details: makeRejected(toolCallId, "session", diagnostics, evidenceRefForDetails, checks, usedEvidence),
                     };
                 }
             }
@@ -915,10 +915,10 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 diagnostics.push(`failed to begin transaction: ${msg}`);
                 return {
                     content: [{ type: "text" as const, text: `failed: begin transaction (${msg})` }],
-                    details: finalize(makeFailed(toolCallId, "stage", `failed to begin transaction: ${msg}`, {
+                    details: makeFailed(toolCallId, "stage", `failed to begin transaction: ${msg}`, {
                         inspectionId: evidenceRefForDetails.inspectionId,
                         resourceIds: [],
-                    }, checks, diagnostics, usedEvidence, invalidations)),
+                    }, checks, diagnostics, usedEvidence, invalidations),
                 };
             }
             let committed = false;
@@ -937,7 +937,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     diagnostics.push(`transfer source does not exist: ${rt.rawFrom}`);
                     return {
                         content: [{ type: "text" as const, text: `failed: transfer source does not exist: ${rt.rawFrom}` }],
-                        details: finalize(makeFailed(toolCallId, "stage", `transfer source does not exist: ${rt.rawFrom}`, evidenceRefForDetails, checks, diagnostics, usedEvidence, invalidations)),
+                        details: makeFailed(toolCallId, "stage", `transfer source does not exist: ${rt.rawFrom}`, evidenceRefForDetails, checks, diagnostics, usedEvidence, invalidations),
                     };
                 }
                 const rawSourceContent = snapshot.content ? snapshot.content.toString("utf8") : "";
@@ -949,7 +949,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     diagnostics.push(`transfer: ${resolved.error} (${rt.rawFrom})`);
                     return {
                         content: [{ type: "text" as const, text: `failed: transfer range resolution (${rt.rawFrom})` }],
-                        details: finalize(makeFailed(toolCallId, "stage", `${resolved.error} (${rt.rawFrom})`, evidenceRefForDetails, checks, diagnostics, usedEvidence, invalidations)),
+                        details: makeFailed(toolCallId, "stage", `${resolved.error} (${rt.rawFrom})`, evidenceRefForDetails, checks, diagnostics, usedEvidence, invalidations),
                     };
                 }
 
@@ -971,7 +971,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         diagnostics.push(`coverage: no authority for copy source ${rt.rawFrom}`);
                         return {
                             content: [{ type: "text" as const, text: `rejected: coverage (copy source ${rt.rawFrom})` }],
-                            details: finalize(makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations)),
+                            details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
                         };
                     }
                     const coverageError = validateResourceAuthority(sourceResource, [{ startLine: resolved.value.startLine, endLine: resolved.value.endLine }], false);
@@ -979,30 +979,30 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         diagnostics.push(`${coverageError} for copy source ${rt.rawFrom}`);
                         return {
                             content: [{ type: "text" as const, text: `rejected: coverage (copy source ${rt.rawFrom})` }],
-                            details: finalize(makeRejected(toolCallId, "coverage", diagnostics, {
+                            details: makeRejected(toolCallId, "coverage", diagnostics, {
                                 inspectionId: evidenceRefForDetails.inspectionId,
                                 resourceIds: [sourceResource.resourceId],
-                            }, checks, usedEvidence, invalidations)),
+                            }, checks, usedEvidence, invalidations),
                         };
                     }
                     if (typeof sourceResource.fullFileSha256 !== "string" || !SHA256_RE.test(sourceResource.fullFileSha256)) {
                         diagnostics.push(`coverage: missing or malformed fullFileSha256 for ${rt.rawFrom}; read the source file again before copying`);
                         return {
                             content: [{ type: "text" as const, text: `rejected: coverage (missing valid snapshot SHA for copy source ${rt.rawFrom})` }],
-                            details: finalize(makeRejected(toolCallId, "coverage", diagnostics, {
+                            details: makeRejected(toolCallId, "coverage", diagnostics, {
                                 inspectionId: evidenceRefForDetails.inspectionId,
                                 resourceIds: [sourceResource.resourceId],
-                            }, checks, usedEvidence, invalidations)),
+                            }, checks, usedEvidence, invalidations),
                         };
                     }
                     if (sourceResource.fullFileSha256 !== sha256OfString(sourceContent)) {
                         diagnostics.push(`stale: copy source ${rt.rawFrom} sha mismatch`);
                         return {
                             content: [{ type: "text" as const, text: `rejected: stale (copy source ${rt.rawFrom})` }],
-                            details: finalize(makeRejected(toolCallId, "stale", diagnostics, {
+                            details: makeRejected(toolCallId, "stale", diagnostics, {
                                 inspectionId: evidenceRefForDetails.inspectionId,
                                 resourceIds: [sourceResource.resourceId],
-                            }, checks, usedEvidence, invalidations)),
+                            }, checks, usedEvidence, invalidations),
                         };
                     }
                 }
@@ -1012,7 +1012,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     diagnostics.push(message);
                     return {
                         content: [{ type: "text" as const, text: `rejected: ${message}` }],
-                        details: finalize(makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations)),
+                        details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
                     };
                 }
 
@@ -1053,10 +1053,10 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         diagnostics.push(`file not found: ${group.absolutePath}`);
                         return {
                             content: [{ type: "text" as const, text: `failed: file not found: ${group.rawPath}` }],
-                            details: finalize(makeFailed(toolCallId, "stage", `file not found: ${group.rawPath}`, {
+                            details: makeFailed(toolCallId, "stage", `file not found: ${group.rawPath}`, {
                                 ...evidenceRefForDetails,
                                 resourceIds: [""],
-                            }, checks, diagnostics, usedEvidence, invalidations)),
+                            }, checks, diagnostics, usedEvidence, invalidations),
                         };
                     }
                 }
@@ -1076,7 +1076,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         diagnostics.push(`coverage: no prior authority and no envelope for ${canonicalTarget}`);
                         return {
                             content: [{ type: "text" as const, text: `rejected: coverage (no authority for ${group.rawPath})` }],
-                            details: finalize(makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations)),
+                            details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
                         };
                     }
                     resource = findResourceForCanonicalPath(
@@ -1089,7 +1089,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     diagnostics.push(`coverage: no resource in envelope for ${canonicalTarget}`);
                     return {
                         content: [{ type: "text" as const, text: `rejected: coverage (no resource for ${group.rawPath})` }],
-                        details: finalize(makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations)),
+                        details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
                     };
                 }
                 const requiresFullEvidence = group.topology?.kind === "delete" || group.topology?.kind === "rename";
@@ -1106,10 +1106,10 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     diagnostics.push(`${initialCoverageError} for ${canonicalTarget} (path-mode inspect this file first)`);
                     return {
                         content: [{ type: "text" as const, text: `rejected: coverage (weak evidence for ${group.rawPath})` }],
-                        details: finalize(makeRejected(toolCallId, "coverage", diagnostics, {
+                        details: makeRejected(toolCallId, "coverage", diagnostics, {
                             inspectionId: evidenceRefForDetails.inspectionId,
                             resourceIds: [resource.resourceId],
-                        }, checks, usedEvidence, invalidations)),
+                        }, checks, usedEvidence, invalidations),
                     };
                 }
                 usedEvidence.push(resource.resourceId);
@@ -1133,10 +1133,10 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         diagnostics.push(`read failed: ${err instanceof Error ? err.message : String(err)}`);
                         return {
                             content: [{ type: "text" as const, text: `failed: read ${group.rawPath}` }],
-                            details: finalize(makeFailed(toolCallId, "stage", `read failed: ${group.rawPath}`, {
+                            details: makeFailed(toolCallId, "stage", `read failed: ${group.rawPath}`, {
                                 inspectionId: evidenceRefForDetails.inspectionId,
                                 resourceIds: [resource.resourceId],
-                            }, checks, diagnostics, usedEvidence, invalidations)),
+                            }, checks, diagnostics, usedEvidence, invalidations),
                         };
                     }
                 }
@@ -1149,20 +1149,20 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     diagnostics.push(`coverage: missing or malformed fullFileSha256 for ${canonicalTarget}; read the file again before editing`);
                     return {
                         content: [{ type: "text" as const, text: `rejected: coverage (missing valid snapshot SHA for ${group.rawPath})` }],
-                        details: finalize(makeRejected(toolCallId, "coverage", diagnostics, {
+                        details: makeRejected(toolCallId, "coverage", diagnostics, {
                             inspectionId: evidenceRefForDetails.inspectionId,
                             resourceIds: [resource.resourceId],
-                        }, checks, usedEvidence, invalidations)),
+                        }, checks, usedEvidence, invalidations),
                     };
                 }
                 if (resource.fullFileSha256 !== currentSha) {
                     diagnostics.push(`stale: current sha ${currentSha} != attested ${resource.fullFileSha256} for ${canonicalTarget}`);
                     return {
                         content: [{ type: "text" as const, text: `rejected: stale (${group.rawPath})` }],
-                        details: finalize(makeRejected(toolCallId, "stale", diagnostics, {
+                        details: makeRejected(toolCallId, "stale", diagnostics, {
                             inspectionId: evidenceRefForDetails.inspectionId,
                             resourceIds: [resource.resourceId],
-                        }, checks, usedEvidence, invalidations)),
+                        }, checks, usedEvidence, invalidations),
                     };
                 }
 
@@ -1173,10 +1173,10 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     diagnostics.push(`text edits combined with delete topology for ${group.rawPath}: cannot edit and delete the same file in one group`);
                     return {
                         content: [{ type: "text" as const, text: `rejected: conflicting operations (${group.rawPath})` }],
-                        details: finalize(makeRejected(toolCallId, "conflict", diagnostics, {
+                        details: makeRejected(toolCallId, "conflict", diagnostics, {
                             inspectionId: evidenceRefForDetails.inspectionId,
                             resourceIds: [resource.resourceId],
-                        }, checks, usedEvidence, invalidations)),
+                        }, checks, usedEvidence, invalidations),
                     };
                 }
 
@@ -1204,10 +1204,10 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         diagnostics.push(`topology delete failed: ${err instanceof Error ? err.message : String(err)}`);
                         return {
                             content: [{ type: "text" as const, text: `failed: delete ${group.rawPath}` }],
-                            details: finalize(makeFailed(toolCallId, "write", `delete failed: ${group.rawPath}`, {
+                            details: makeFailed(toolCallId, "write", `delete failed: ${group.rawPath}`, {
                                 inspectionId: evidenceRefForDetails.inspectionId,
                                 resourceIds: [resource.resourceId],
-                            }, checks, diagnostics, usedEvidence, invalidations)),
+                            }, checks, diagnostics, usedEvidence, invalidations),
                         };
                     }
                     invalidations.push({
@@ -1260,20 +1260,20 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                             diagnostics.push(`edit missing oldText/newText in ${group.rawPath}`);
                             return {
                                 content: [{ type: "text" as const, text: `failed: edit (missing fields) in ${group.rawPath}` }],
-                                details: finalize(makeFailed(toolCallId, "stage", `edit missing oldText/newText: ${group.rawPath}`, {
+                                details: makeFailed(toolCallId, "stage", `edit missing oldText/newText: ${group.rawPath}`, {
                                     inspectionId: evidenceRefForDetails.inspectionId,
                                     resourceIds: [resource.resourceId],
-                                }, checks, diagnostics, usedEvidence, invalidations)),
+                                }, checks, diagnostics, usedEvidence, invalidations),
                             };
                         }
                         if (!newContent.includes(edit.oldText)) {
                             diagnostics.push(`oldText not found in composed buffer for ${group.rawPath}`);
                             return {
                                 content: [{ type: "text" as const, text: `failed: edit (oldText not found) in ${group.rawPath}` }],
-                                details: finalize(makeFailed(toolCallId, "stage", `oldText not found: ${group.rawPath}`, {
+                                details: makeFailed(toolCallId, "stage", `oldText not found: ${group.rawPath}`, {
                                     inspectionId: evidenceRefForDetails.inspectionId,
                                     resourceIds: [resource.resourceId],
-                                }, checks, diagnostics, usedEvidence, invalidations)),
+                                }, checks, diagnostics, usedEvidence, invalidations),
                             };
                         }
                         if (edit.replaceAll) {
@@ -1313,13 +1313,13 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                                 : `failed: edit (${group.rawPath})`;
                         return {
                             content: [{ type: "text" as const, text: message }],
-                            details: finalize({
+                            details: {
                                 ...makeFailed(toolCallId, "stage", `edit planning failed: ${group.rawPath}`, {
                                 inspectionId: evidenceRefForDetails.inspectionId,
                                 resourceIds: [resource.resourceId],
                             }, checks, diagnostics, usedEvidence, invalidations),
                                 ...(matchCode === "NOT_FOUND" || matchCode === "AMBIGUOUS" ? { matchFailure: matchCode } : {}),
-                            }),
+                            },
                         };
                     }
                 }
@@ -1336,10 +1336,10 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     }
                     return {
                         content: [{ type: "text" as const, text: `rejected: coverage (${group.rawPath})` }],
-                        details: finalize(makeRejected(toolCallId, "coverage", diagnostics, {
+                        details: makeRejected(toolCallId, "coverage", diagnostics, {
                             inspectionId: evidenceRefForDetails.inspectionId,
                             resourceIds: [resource.resourceId],
-                        }, checks, usedEvidence, invalidations)),
+                        }, checks, usedEvidence, invalidations),
                     };
                 }
 
@@ -1422,10 +1422,10 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     diagnostics.push(`blocking check failed: ${failedBlocking.id}${failedBlocking.detail ? ` (${failedBlocking.detail})` : ""}`);
                     return {
                         content: [{ type: "text" as const, text: `rejected: blocking check failed (${group.rawPath})` }],
-                        details: finalize(makeRejected(toolCallId, "approval", diagnostics, {
+                        details: makeRejected(toolCallId, "approval", diagnostics, {
                             inspectionId: evidenceRefForDetails.inspectionId,
                             resourceIds: [resource.resourceId],
-                        }, checks, usedEvidence, invalidations)),
+                        }, checks, usedEvidence, invalidations),
                     };
                 }
 
@@ -1442,20 +1442,20 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         diagnostics.push(`re-read failed: ${err instanceof Error ? err.message : String(err)}`);
                         return {
                             content: [{ type: "text" as const, text: `rejected: stale (${group.rawPath})` }],
-                            details: finalize(makeRejected(toolCallId, "stale", diagnostics, {
+                            details: makeRejected(toolCallId, "stale", diagnostics, {
                                 inspectionId: evidenceRefForDetails.inspectionId,
                                 resourceIds: [resource.resourceId],
-                            }, checks, usedEvidence, invalidations)),
+                            }, checks, usedEvidence, invalidations),
                         };
                     }
                     if (sha256OfString(preWriteContent) !== currentSha) {
                         diagnostics.push(`stale re-read for ${canonicalTarget} (sha changed during apply)`);
                         return {
                             content: [{ type: "text" as const, text: `rejected: stale (${group.rawPath})` }],
-                            details: finalize(makeRejected(toolCallId, "stale", diagnostics, {
+                            details: makeRejected(toolCallId, "stale", diagnostics, {
                                 inspectionId: evidenceRefForDetails.inspectionId,
                                 resourceIds: [resource.resourceId],
-                            }, checks, usedEvidence, invalidations)),
+                            }, checks, usedEvidence, invalidations),
                         };
                     }
                 }
@@ -1495,10 +1495,10 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     committed = true;
                     return {
                         content: [{ type: "text" as const, text: `failed: write ${group.rawPath}` }],
-                        details: finalize(makeFailed(toolCallId, "write", `write failed: ${group.rawPath}`, {
+                        details: makeFailed(toolCallId, "write", `write failed: ${group.rawPath}`, {
                             inspectionId: evidenceRefForDetails.inspectionId,
                             resourceIds: [resource.resourceId],
-                        }, checks, diagnostics, usedEvidence, invalidations, rollbackInfo)),
+                        }, checks, diagnostics, usedEvidence, invalidations, rollbackInfo),
                     };
                 }
 
@@ -1528,10 +1528,10 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     diagnostics.push(`verify read failed: ${err instanceof Error ? err.message : String(err)}`);
                     return {
                         content: [{ type: "text" as const, text: `failed: verify ${group.rawPath}` }],
-                        details: finalize(makeFailed(toolCallId, "verify", `post-write read failed: ${group.rawPath}`, {
+                        details: makeFailed(toolCallId, "verify", `post-write read failed: ${group.rawPath}`, {
                             inspectionId: evidenceRefForDetails.inspectionId,
                             resourceIds: [resource.resourceId],
-                        }, checks, diagnostics, usedEvidence, invalidations)),
+                        }, checks, diagnostics, usedEvidence, invalidations),
                     };
                 }
                 const postSha = sha256OfString(postContent);
@@ -1540,10 +1540,10 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     diagnostics.push(`verify mismatch: in-memory ${postVerifySha} != on-disk ${postSha} for ${canonicalTarget}`);
                     return {
                         content: [{ type: "text" as const, text: `failed: verify ${group.rawPath}` }],
-                        details: finalize(makeFailed(toolCallId, "verify", `post-write hash mismatch: ${group.rawPath}`, {
+                        details: makeFailed(toolCallId, "verify", `post-write hash mismatch: ${group.rawPath}`, {
                             inspectionId: evidenceRefForDetails.inspectionId,
                             resourceIds: [resource.resourceId],
-                        }, checks, diagnostics, usedEvidence, invalidations)),
+                        }, checks, diagnostics, usedEvidence, invalidations),
                     };
                 }
 
@@ -1562,10 +1562,10 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         diagnostics.push(`blocking post-write check failed: ${check.id}`);
                         return {
                             content: [{ type: "text" as const, text: `failed: post-write check (${group.rawPath})` }],
-                            details: finalize(makeFailed(toolCallId, "verify", `blocking post-write check failed: ${group.rawPath}`, {
+                            details: makeFailed(toolCallId, "verify", `blocking post-write check failed: ${group.rawPath}`, {
                                 inspectionId: evidenceRefForDetails.inspectionId,
                                 resourceIds: [resource.resourceId],
-                            }, checks, diagnostics, usedEvidence, invalidations)),
+                            }, checks, diagnostics, usedEvidence, invalidations),
                         };
                     }
                 }
@@ -1580,10 +1580,10 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         diagnostics.push(`rename failed: ${err instanceof Error ? err.message : String(err)}`);
                         return {
                             content: [{ type: "text" as const, text: `failed: rename ${group.rawPath}` }],
-                            details: finalize(makeFailed(toolCallId, "write", `rename failed: ${group.rawPath}`, {
+                            details: makeFailed(toolCallId, "write", `rename failed: ${group.rawPath}`, {
                                 inspectionId: evidenceRefForDetails.inspectionId,
                                 resourceIds: [resource.resourceId],
-                            }, checks, diagnostics, usedEvidence, invalidations)),
+                            }, checks, diagnostics, usedEvidence, invalidations),
                         };
                     }
                     // The old path no longer exists on disk. Every downstream
@@ -1861,10 +1861,6 @@ function makeFailed(
         error: message,
         ...(rollback ? { rollback } : {}),
     };
-}
-
-function finalize(d: PatchDetails): PatchDetails {
-    return d;
 }
 
 function classifyRpcError(msg: string | undefined): "stale" | "coverage" | "conflict" | "approval" | "session" {
