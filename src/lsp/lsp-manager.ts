@@ -126,6 +126,36 @@ export class LSPManager {
       args: ["--stdio"],
       languageIds: ["markdown"],
     },
+    {
+      command: "clangd",
+      args: [],
+      languageIds: ["c", "cpp"],
+    },
+    {
+      command: "omnisharp",
+      args: ["--languageserver"],
+      languageIds: ["csharp"],
+    },
+    {
+      command: "csharp-ls",
+      args: [],
+      languageIds: ["csharp"],
+    },
+    {
+      command: "bash-language-server",
+      args: ["start"],
+      languageIds: ["bash", "shellscript"],
+    },
+    {
+      command: "intelephense",
+      args: ["--stdio"],
+      languageIds: ["php"],
+    },
+    {
+      command: "phpactor",
+      args: ["language-server"],
+      languageIds: ["php"],
+    },
   ];
 
   constructor(cwd: string, options: LSPManagerOptions = {}) {

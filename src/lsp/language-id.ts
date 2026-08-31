@@ -17,5 +17,19 @@ export function detectLanguageFromExtension(filePath: string): string | null {
   if (ext.endsWith(".go")) return "go";
   if (ext.endsWith(".rs")) return "rust";
   if (ext.endsWith(".java")) return "java";
+  if (ext.endsWith(".c")) return "c";
+  if (
+    ext.endsWith(".cpp") ||
+    ext.endsWith(".h") ||
+    ext.endsWith(".hpp") ||
+    ext.endsWith(".cc") ||
+    ext.endsWith(".cxx") ||
+    ext.endsWith(".hh") ||
+    ext.endsWith(".hxx")
+  )
+    return "cpp";
+  if (ext.endsWith(".cs")) return "csharp";
+  if (ext.endsWith(".sh") || ext.endsWith(".bash")) return "bash";
+  if (ext.endsWith(".php")) return "php";
   return null;
 }

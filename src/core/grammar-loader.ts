@@ -31,6 +31,10 @@ const EXT_TO_WASM: Record<string, string | null> = {
   ".tsx": "tree-sitter-tsx.wasm",
   ".js": "tree-sitter-javascript.wasm",
   ".jsx": "tree-sitter-javascript.wasm",
+  ".mjs": "tree-sitter-javascript.wasm",
+  ".cjs": "tree-sitter-javascript.wasm",
+  ".mts": "tree-sitter-typescript.wasm",
+  ".cts": "tree-sitter-typescript.wasm",
   ".py": "tree-sitter-python.wasm",
   ".rs": "tree-sitter-rust.wasm",
   ".go": "tree-sitter-go.wasm",
@@ -39,8 +43,16 @@ const EXT_TO_WASM: Record<string, string | null> = {
   ".cpp": "tree-sitter-cpp.wasm",
   ".h": "tree-sitter-cpp.wasm",       // C header → CPP parser
   ".hpp": "tree-sitter-cpp.wasm",
+  ".cc": "tree-sitter-cpp.wasm",
+  ".cxx": "tree-sitter-cpp.wasm",
+  ".hh": "tree-sitter-cpp.wasm",
+  ".hxx": "tree-sitter-cpp.wasm",
   ".rb": "tree-sitter-ruby.wasm",
   ".css": "tree-sitter-css.wasm",
+  ".sh": "tree-sitter-bash.wasm",
+  ".bash": "tree-sitter-bash.wasm",
+  ".cs": "tree-sitter-c-sharp.wasm",
+  ".php": "tree-sitter-php.wasm",
   // The following extensions gracefully degrade if grammar not available
   ".json": null,  // not in @vscode/tree-sitter-wasm
   ".yaml": null,  // not in @vscode/tree-sitter-wasm

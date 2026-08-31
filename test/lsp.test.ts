@@ -17,6 +17,7 @@ import { LSPConnection } from "../src/lsp/lsp-connection";
 import { LSPManager } from "../src/lsp/lsp-manager";
 import { checkPostEditDiagnostics } from "../src/lsp/diagnostics";
 import { goToDefinition, findReferences, getHoverInfo } from "../src/lsp/semantic-nav";
+import { detectLanguageFromExtension } from "../src/lsp/language-id";
 
 // ─── Helpers ──────────────────────────────────────────────────────
 
@@ -236,6 +237,73 @@ describe("Diagnostic Status", () => {
 // ════════════════════════════════════════════════════════════════════
 //  semantic-nav tests
 // ════════════════════════════════════════════════════════════════════
+
+describe("LSP server catalog (new language families)", () => {
+  const configs: Array<{ command: string; args: string[]; languageIds: string[] }> = (LSPManager as unknown as { SERVER_CONFIGS: Array<{ command: string; args: string[]; languageIds: string[] }> }).SERVER_CONFIGS;
+
+  function findConfig(cmd: string) {
+    return configs.find((c) => c.command === cmd);
+  }
+
+  it("clangd present with languageIds c,cpp and empty args", () => {
+    const c = findConfig("clangd");
+    assert.ok(c, "clangd not in SERVER_CONFIGS");
+    assert.deepEqual(c.languageIds, ["c", "cpp"]);
+    assert.deepEqual(c.args, []);
+  });
+
+  it("omnisharp and csharp-ls present as csharp fallbacks", () => {
+    const o = findConfig("omnisharp");
+    const f = findConfig("csharp-ls");
+    assert.ok(o, "omnisharp missing");
+    assert.ok(f, "csharp-ls missing");
+    assert.deepEqual(o.languageIds, ["csharp"]);
+    assert.deepEqual(f.languageIds, ["csharp"]);
+    assert.deepEqual(o.args, ["--languageserver"]);
+    assert.deepEqual(f.args, []);
+  });
+
+  it("bash-language-server present with args start and languageIds bash/shellscript", () => {
+    const c = findConfig("bash-language-server");
+    assert.ok(c, "bash-language-server missing");
+    assert.deepEqual(c.args, ["start"]);
+    assert.deepEqual(c.languageIds, ["bash", "shellscript"]);
+  });
+
+  it("intelephense and phpactor present as php fallbacks", () => {
+    const i = findConfig("intelephense");
+    const p = findConfig("phpactor");
+    assert.ok(i, "intelephense missing");
+    assert.ok(p, "phpactor missing");
+    assert.deepEqual(i.languageIds, ["php"]);
+    assert.deepEqual(p.languageIds, ["php"]);
+    assert.deepEqual(i.args, ["--stdio"]);
+    assert.deepEqual(p.args, ["language-server"]);
+  });
+});
+
+describe("Extension to languageId routing", () => {
+  it("C/C++ extensions map to c/cpp", () => {
+    assert.equal(detectLanguageFromExtension("foo.c"), "c");
+    assert.equal(detectLanguageFromExtension("foo.cpp"), "cpp");
+    assert.equal(detectLanguageFromExtension("foo.h"), "cpp");
+    assert.equal(detectLanguageFromExtension("foo.hpp"), "cpp");
+    assert.equal(detectLanguageFromExtension("foo.cc"), "cpp");
+    assert.equal(detectLanguageFromExtension("foo.cxx"), "cpp");
+    assert.equal(detectLanguageFromExtension("foo.hh"), "cpp");
+    assert.equal(detectLanguageFromExtension("foo.hxx"), "cpp");
+    assert.equal(detectLanguageFromExtension("FOO.CPP"), "cpp");
+    assert.equal(detectLanguageFromExtension("nested/dir/bar.H"), "cpp");
+  });
+
+  it(".cs maps to csharp, .php to php, .sh/.bash to bash", () => {
+    assert.equal(detectLanguageFromExtension("foo.cs"), "csharp");
+    assert.equal(detectLanguageFromExtension("foo.php"), "php");
+    assert.equal(detectLanguageFromExtension("foo.sh"), "bash");
+    assert.equal(detectLanguageFromExtension("foo.bash"), "bash");
+    assert.equal(detectLanguageFromExtension("FOO.SH"), "bash");
+  });
+});
 
 describe("Semantic Navigation", () => {
   it("no LSP returns null for goToDefinition", async () => {

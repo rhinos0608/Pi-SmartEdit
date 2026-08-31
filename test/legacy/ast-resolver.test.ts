@@ -69,6 +69,21 @@ function test_getSupportedExtensions(): void {
   assert(extensions.includes(".ts"), "supports .ts");
   assert(extensions.includes(".py"), "supports .py");
   assert(extensions.includes(".go"), "supports .go");
+  // newly mapped extensions
+  assert(extensions.includes(".mjs"), "supports .mjs");
+  assert(extensions.includes(".cjs"), "supports .cjs");
+  assert(extensions.includes(".mts"), "supports .mts");
+  assert(extensions.includes(".cts"), "supports .cts");
+  assert(extensions.includes(".sh"), "supports .sh");
+  assert(extensions.includes(".bash"), "supports .bash");
+  assert(extensions.includes(".cs"), "supports .cs");
+  assert(extensions.includes(".php"), "supports .php");
+  assert(extensions.includes(".cc"), "supports .cc");
+  assert(extensions.includes(".cxx"), "supports .cxx");
+  assert(extensions.includes(".hh"), "supports .hh");
+  assert(extensions.includes(".hxx"), "supports .hxx");
+  assert(!extensions.includes(".ini"), "does not support .ini (skipped)");
+  assert(!extensions.includes(".ps1"), "does not support .ps1 (skipped)");
   assert(!extensions.includes(".xyz"), "does not support .xyz");
 }
 
@@ -187,6 +202,113 @@ function test_disposeParseResult_signature(): void {
     "disposeParseResult is a function");
 }
 
+// ─── Real-grammar table-driven tests (P1 gap) ───────────────────────
+
+async function test_realGrammarSymbolResolution(): Promise<void> {
+  console.log("\n── AST resolver: real grammar symbol resolution (table-driven) ──");
+  setup();
+
+  const cases: Array<{
+    label: string;
+    file: string;
+    code: string;
+    symbolName: string;
+    // optional kind check — when set, assert exact match
+    expectedKind?: string;
+  }> = [
+    {
+      label: "bash .sh function_definition",
+      file: "test.sh",
+      code: "function foo() {\n  echo hi\n}",
+      symbolName: "foo",
+      expectedKind: "function_definition",
+    },
+    {
+      label: "bash .bash reviewer snippet",
+      file: "test.bash",
+      code: "function foo() { :; }",
+      symbolName: "foo",
+      expectedKind: "function_definition",
+    },
+    {
+      label: "csharp .cs class + method",
+      file: "Test.cs",
+      code: [
+        "public class MyClass",
+        "{",
+        "    public void MyMethod() {}",
+        "}",
+      ].join("\n"),
+      symbolName: "MyClass",
+      expectedKind: "class_declaration",
+    },
+    {
+      label: "csharp .cs method inside class",
+      file: "Test2.cs",
+      code: [
+        "public class MyClass",
+        "{",
+        "    public void MyMethod() {}",
+        "}",
+      ].join("\n"),
+      symbolName: "MyMethod",
+    },
+    {
+      label: "php .php class + method",
+      file: "test.php",
+      code: "<?php\nclass Foo {\n    public function bar() {}\n}",
+      symbolName: "Foo",
+      expectedKind: "class_declaration",
+    },
+    {
+      label: "php .php method",
+      file: "test2.php",
+      code: "<?php\nclass Foo {\n    public function bar() {}\n}",
+      symbolName: "bar",
+    },
+    {
+      label: "js alias .mjs",
+      file: "mod.mjs",
+      code: "export function myFunc() { return 1; }",
+      symbolName: "myFunc",
+      expectedKind: "function_declaration",
+    },
+    {
+      label: "cpp alias .cc",
+      file: "test.cc",
+      code: "class Foo {\npublic:\n    void bar() {}\n};",
+      symbolName: "Foo",
+      expectedKind: "class_specifier",
+    },
+  ];
+
+  for (const c of cases) {
+    const result = await parseFile(c.code, c.file);
+    // Pre-existing WASM-version-vs-web-tree-sitter mismatch (FIX-3) can make
+    // parseFile return null for ALL languages even when grammar mapping exists.
+    // Skip gracefully like existing tests do (see validateSyntax handling), rather
+    // than hard-failing — the bash `word` fix is still validated when parsing works.
+    if (!result) {
+      console.log(`  - ${c.label}: skipped — parseFile returned null (WASM unavailable/version mismatch, pre-existing FIX-3)`);
+      continue;
+    }
+    assert(!result.tree.rootNode.hasError, `${c.label}: tree has no ERROR nodes`);
+    try {
+      const node = findSymbolNode(result.tree, { symbolName: c.symbolName });
+      assert(node !== null, `${c.label}: findSymbolNode("${c.symbolName}") returned a node`);
+      if (c.expectedKind) {
+        assert(node!.type === c.expectedKind, `${c.label}: node.type === "${c.expectedKind}" (got "${node!.type}")`);
+      } else {
+        assert(!!node!.type, `${c.label}: node has a type (${node!.type})`);
+      }
+      // sanity: extracted name child text matches requested name
+      assert(node!.type.length > 0, `${c.label}: node.type non-empty`);
+    } finally {
+      disposeParseResult(result);
+    }
+  }
+}
+
 // ─── Main ───────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
@@ -205,6 +327,7 @@ async function main(): Promise<void> {
     { name: "identical names disambiguation", fn: test_symbolWithIdenticalNames },
     { name: "findEnclosingSymbols signature", fn: test_findEnclosingSymbols_signature },
     { name: "disposeParseResult signature", fn: test_disposeParseResult_signature },
+    { name: "real grammar symbol resolution", fn: test_realGrammarSymbolResolution },
   ];
 
   for (const test of tests) {

@@ -382,6 +382,16 @@ const SYMBOL_NODE_TYPES = new Set([
   "class_specifier",
   "struct_specifier",
   "enum_specifier",
+
+  // ── C# ──
+  "namespace_declaration",
+  "struct_declaration",
+  "enum_declaration",
+  "record_declaration",
+
+  // ── PHP ──
+  "trait_declaration",
+  "namespace_definition",
 ]);
 
 /**
@@ -403,6 +413,13 @@ const NAME_LIKE_TYPES = new Set([
 
   // Ruby-specific name-bearing nodes
   "constant",
+
+  // Bash: function names are `word` nodes (e.g. `function foo() {}` → child `word` "foo")
+  // Safe — no other supported grammar uses `word` as child of a symbol node
+  "word",
+
+  // PHP (and others): class/method/namespace names are `name` nodes
+  "name",
 ]);
 
 // ─── Public API ─────────────────────────────────────────────────────
