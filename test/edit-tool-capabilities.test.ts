@@ -498,6 +498,67 @@ test("public: prior line-range blocks a resolved symbol span outside authority",
   assert.equal(readFileSync(canonicalFile, "utf8"), content, "file must be unchanged");
 });
 
+test("public: structural unavailable engine reports explicit failure not silent success", async () => {
+  const workdir = realpathSync(mkdtempSync(join(tmpdir(), "cap-struct-unavailable-")));
+  const content = "console.log(1);\n";
+  const { res, canonicalFile } = await runTool({
+    workdir,
+    fileContent: content,
+    edits: [{ target: { pattern: "console.log($ARG)", replacement: "logger.info($ARG)" } }],
+    structuralResolver: {
+      async resolve() {
+        return { ok: false, error: "ast-grep engine is unavailable in this session; install @ast-grep/napi or use text/symbolic edits" };
+      },
+    },
+  });
+  const d = res.details as any;
+  assert.equal(d.status.kind, "failed");
+  assert.equal(d.status.phase, "stage");
+  assert.match(`${d.diagnostics ?? ""}`.toLowerCase() + (res.content[0]?.text ?? "").toLowerCase(), /ast-grep.*unavailable/);
+  assert.equal(readFileSync(canonicalFile, "utf8"), content, "file must be unchanged on unavailable backend");
+});
+
+test("public: structural zero matches reports explicit failure not silent success", async () => {
+  const workdir = realpathSync(mkdtempSync(join(tmpdir(), "cap-struct-zero-")));
+  const content = "console.log(1);\n";
+  const { res, canonicalFile } = await runTool({
+    workdir,
+    fileContent: content,
+    edits: [{ target: { pattern: "foo($$$ARGS)", replacement: "bar($$$ARGS)" } }],
+    structuralResolver: {
+      async resolve() {
+        return { ok: true, edits: [] };
+      },
+    },
+  });
+  const d = res.details as any;
+  assert.equal(d.status.kind, "failed");
+  assert.equal(d.status.phase, "stage");
+  assert.match(`${d.diagnostics ?? ""}`.toLowerCase() + (res.content[0]?.text ?? "").toLowerCase(), /matched nothing/);
+  assert.equal(readFileSync(canonicalFile, "utf8"), content, "file must be unchanged when pattern matches nothing");
+});
+
+test("public: structural freshness mismatch rejects before any write, same as plain text", async () => {
+  const workdir = realpathSync(mkdtempSync(join(tmpdir(), "cap-struct-stale-")));
+  const content = "console.log(1);\n";
+  const { res, canonicalFile } = await runTool({
+    workdir,
+    fileContent: content,
+    edits: [{ target: { pattern: "console.log($ARG)", replacement: "logger.info($ARG)" } }],
+    structuralResolver: {
+      async resolve() {
+        return { ok: true, edits: [{ startByte: 0, endByte: 15, text: "logger.info(1);" }] };
+      },
+    },
+    // prior line-range authority covers the file but carries a stale SHA (different content)
+    prior: (cf) => [lineRangeResource(cf, { startLine: 1, endLine: 3 }, "STALE CONTENT\n")],
+  });
+  const d = res.details as any;
+  assert.equal(d.status.kind, "rejected");
+  assert.equal(d.status.reason, "stale");
+  assert.equal(readFileSync(canonicalFile, "utf8"), content, "file must be unchanged on stale structural edit");
+});
+
 test("public: prior line-range blocks a resolved structural span outside authority", async () => {
   const workdir = realpathSync(mkdtempSync(join(tmpdir(), "cap-struct-out-")));
   const content = "function alpha() { return 1; }\nfunction beta() { return 2; }\n";

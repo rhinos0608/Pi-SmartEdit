@@ -445,6 +445,28 @@ test("validateEditRequest rejects malformed transfer range", () => {
     }
 });
 
+test("registered edit schema advertises target.pattern/replacement together (both-or-neither) via anyOf", () => {
+    const params = registeredEditParams();
+    const props = params.properties as Record<string, unknown>;
+    const editsItem = props.edits as { items?: { properties?: Record<string, unknown>; anyOf?: Array<{ required?: string[]; properties?: Record<string, unknown> }> } };
+    const target = editsItem.items?.properties?.target as { properties?: Record<string, unknown> };
+    assert.ok(target, "target must be advertised");
+    const editsAnyOf = editsItem.items?.anyOf ?? [];
+    const structuralBranch = editsAnyOf.find((b) => {
+        const t = (b.properties as Record<string, unknown> | undefined)?.target as { anyOf?: Array<{ required?: string[] }> } | undefined;
+        return !!t?.anyOf?.some((inner) => inner.required?.includes("pattern") && inner.required?.includes("replacement"));
+    });
+    assert.ok(structuralBranch, "schema anyOf must include a target branch requiring both pattern and replacement together");
+    const onlyPattern = validateEditRequest({ path: "a.ts", edits: [{ target: { pattern: "console.log($ARG)" } }] });
+    assert.ok(!onlyPattern.ok, "pattern without replacement must be rejected");
+    assert.match(onlyPattern.error, /pattern and replacement must be provided together/);
+    const onlyReplacement = validateEditRequest({ path: "a.ts", edits: [{ target: { replacement: "logger.info($ARG)" } }] });
+    assert.ok(!onlyReplacement.ok, "replacement without pattern must be rejected");
+    assert.match(onlyReplacement.error, /pattern and replacement must be provided together/);
+    const both = validateEditRequest({ path: "a.ts", edits: [{ target: { pattern: "console.log($ARG)", replacement: "logger.info($ARG)" } }] });
+    assert.ok(both.ok, `paired pattern+replacement must be accepted`);
+});
+
 test("registered edit schema advertises op/from/range/to/after and a copy/move enum", () => {
     const params = registeredEditParams();
     const properties = params.properties as Record<string, unknown>;

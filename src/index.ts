@@ -960,15 +960,22 @@ export default function smartEdit(pi: ExtensionAPI) {
           // The compiler lane is a fallback ONLY when LSP is absent
           // (source: "none") — not merely when LSP reported no errors — so
           // we never double-report the same file when an LSP server exists.
-          let lspSource: "lsp" | "none" = "none";
+          // LSP diagnostic honesty: only "confirmed" (publishDiagnostics match including empty or successful pull including empty) is authoritative.
+          // Extension seam: future mutating autofix/format and external security-scanner triage would plug in here — keep status handling additive (check === "confirmed", not exhaustive switch).
+          let lspConfirmed = false;
           if (lspManager) {
             const lsp = await checkPostEditDiagnostics(file.path, file.content, languageId, lspManager);
-            lspSource = lsp.source;
-            const lspHasError = lsp.diagnostics.some((d) => d.severity === 1);
-            checks.push({ id: `lsp:${file.path}`, outcome: lspHasError ? "fail" : "pass", detail: `${lsp.diagnostics.length} diagnostic(s), ${lsp.source}` });
-            diagnostics.push(...lsp.diagnostics.map((d) => `lsp ${file.path}:${d.range.start.line + 1}: ${d.message}`));
+            // Additive-friendly: only "confirmed" is definitive; future statuses (e.g. "needs-triage") fall through to skipped.
+            if (lsp.status === "confirmed") {
+              lspConfirmed = true;
+              const lspHasError = lsp.diagnostics.some((d) => d.severity === 1);
+              checks.push({ id: `lsp:${file.path}`, outcome: lspHasError ? "fail" : "pass", detail: `${lsp.diagnostics.length} diagnostic(s), ${lsp.source}, ${lsp.status}` });
+              diagnostics.push(...lsp.diagnostics.map((d) => `lsp ${file.path}:${d.range.start.line + 1}: ${d.message}`));
+            } else {
+              checks.push({ id: `lsp:${file.path}`, outcome: "skipped", detail: `${lsp.diagnostics.length} diagnostic(s), ${lsp.source}, ${lsp.status}` });
+            }
           }
-          const compiler = lspSource === "none" ? getCompilerForLanguage(languageId) : null;
+          const compiler = !lspConfirmed ? getCompilerForLanguage(languageId) : null;
           if (compiler) {
             const result = await compiler(file.path, cwd);
             const compilerHasError = result.diagnostics.some((d) => d.severity === 1);

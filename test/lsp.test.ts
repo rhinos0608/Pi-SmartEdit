@@ -6,11 +6,12 @@
  * - lsp-manager: server not found returns null, shutdown
  * - diagnostics: no LSP server returns source='none'
  * - semantic-nav: no LSP server returns null/[]
- *
- * Run: npx tsx test/lsp.test.ts
+ * - diagnostic status: confirmed vs unconfirmed/failed/unavailable
  */
 
 import { resolve } from "path";
+import { describe, it } from "node:test";
+import assert from "node:assert/strict";
 
 import { LSPConnection } from "../src/lsp/lsp-connection";
 import { LSPManager } from "../src/lsp/lsp-manager";
@@ -19,210 +20,239 @@ import { goToDefinition, findReferences, getHoverInfo } from "../src/lsp/semanti
 
 // ─── Helpers ──────────────────────────────────────────────────────
 
-function assert(condition: boolean, message: string): void {
-  if (!condition) throw new Error(`FAIL: ${message}`);
-  console.log(`  ✓ ${message}`);
-}
-
-function assertEqual<T>(actual: T, expected: T, message: string): void {
-  if (actual !== expected) {
-    throw new Error(`FAIL: ${message}\n    expected: ${JSON.stringify(expected)}\n    actual:   ${JSON.stringify(actual)}`);
-  }
-  console.log(`  ✓ ${message}`);
-}
-
-function assertContains(haystack: string, needle: string, message: string): void {
-  if (!haystack.includes(needle)) {
-    throw new Error(`FAIL: ${message}\n    expected to contain: ${JSON.stringify(needle)}\n    actual: ${haystack}`);
-  }
-  console.log(`  ✓ ${message}`);
+function makeMockManager(opts: {
+  publishDiagnostics?: unknown[] | null,
+  publishDelayMs?: number,
+  pullItems?: unknown[] | null,
+  pullShouldFail?: boolean,
+  openShouldFail?: boolean,
+} = {}): any {
+  let handler: ((params: unknown) => void) | null = null;
+  let lastUri: string | null = null;
+  const server: any = {
+    async notify(method: string, params: unknown) {
+      if (opts.openShouldFail && method === "textDocument/didOpen") throw new Error("open failed");
+      if (method === "textDocument/didOpen") {
+        const p = params as any;
+        lastUri = p?.textDocument?.uri ?? null;
+        if (opts.publishDiagnostics !== undefined) {
+          const delay = opts.publishDelayMs ?? 15;
+          setTimeout(() => {
+            if (handler && lastUri) {
+              handler({ uri: lastUri, diagnostics: opts.publishDiagnostics });
+            }
+          }, delay);
+        }
+      }
+    },
+    async request(method: string, _params: unknown) {
+      if (method === "workspace/symbol") return null;
+      if (method === "textDocument/diagnostic") {
+        if (opts.pullShouldFail) throw new Error("pull not supported");
+        if (opts.pullItems !== undefined) {
+          if (opts.pullItems === null) return null;
+          return { items: opts.pullItems };
+        }
+        throw new Error("pull not supported");
+      }
+      throw new Error("unexpected request " + method);
+    },
+    onNotification(method: string, h: (params: unknown) => void) {
+      if (method === "textDocument/publishDiagnostics") {
+        handler = h;
+        if (lastUri && opts.publishDiagnostics !== undefined) {
+          const delay = opts.publishDelayMs ?? 15;
+          setTimeout(() => {
+            if (handler && lastUri) handler({ uri: lastUri, diagnostics: opts.publishDiagnostics });
+          }, delay);
+        }
+      }
+      return () => { if (handler === h) handler = null; };
+    },
+    isRunning() { return true; },
+  };
+  return {
+    async getServer(_languageId: string) { return server; },
+  };
 }
 
 // ════════════════════════════════════════════════════════════════════
 //  lsp-connection tests
 // ════════════════════════════════════════════════════════════════════
 
-console.log("\n=== LSPConnection ===\n");
-
-async function testInitSequence() {
-  const conn = new LSPConnection(process.execPath, [resolve(__dirname, "lsp", "mock-server.js")]);
-  await conn.initialize("file:///test-project");
-  assert(true, "Initialization completes without error");
-  await conn.shutdown();
-  console.log();
-}
-
-async function testRequestResponse() {
-  const conn = new LSPConnection(process.execPath, [resolve(__dirname, "lsp", "mock-server.js")]);
-  await conn.initialize("file:///test-project");
-
-  // Send a request (shutdown returns null from mock)
-  await conn.request("textDocument/definition", {
-    textDocument: { uri: "file:///test.ts" },
-    position: { line: 0, character: 5 },
+describe("LSPConnection", () => {
+  it("initialization completes without error", async () => {
+    const conn = new LSPConnection(process.execPath, [resolve(__dirname, "lsp", "mock-server.js")]);
+    await conn.initialize("file:///test-project");
+    await conn.shutdown();
   });
 
-  assert(true, "Request/response works");
-  await conn.shutdown();
-  console.log();
-}
-
-async function testNotificationAndDiagnostics() {
-  const conn = new LSPConnection(process.execPath, [resolve(__dirname, "lsp", "mock-server.js")]);
-  await conn.initialize("file:///test-project");
-
-  // Register notification handler for diagnostics
-  const receivedDiagnostics: unknown[] = [];
-  conn.onNotification("textDocument/publishDiagnostics", (params) => {
-    receivedDiagnostics.push(params);
+  it("request/response works", async () => {
+    const conn = new LSPConnection(process.execPath, [resolve(__dirname, "lsp", "mock-server.js")]);
+    await conn.initialize("file:///test-project");
+    await conn.request("textDocument/definition", {
+      textDocument: { uri: "file:///test.ts" },
+      position: { line: 0, character: 5 },
+    });
+    await conn.shutdown();
   });
 
-  // Send didOpen (mock server replies with diagnostics)
-  await conn.notify("textDocument/didOpen", {
-    textDocument: {
-      uri: "file:///test.ts",
-      languageId: "typescript",
-      version: 1,
-      text: "const x = ERROR;\nconst y = WARNING;\n",
-    },
+  it("diagnostics notification received", async () => {
+    const conn = new LSPConnection(process.execPath, [resolve(__dirname, "lsp", "mock-server.js")]);
+    await conn.initialize("file:///test-project");
+    const receivedDiagnostics: unknown[] = [];
+    conn.onNotification("textDocument/publishDiagnostics", (params) => {
+      receivedDiagnostics.push(params);
+    });
+    await conn.notify("textDocument/didOpen", {
+      textDocument: {
+        uri: "file:///test.ts",
+        languageId: "typescript",
+        version: 1,
+        text: "const x = ERROR;\nconst y = WARNING;\n",
+      },
+    });
+    await new Promise((r) => setTimeout(r, 100));
+    assert.ok(receivedDiagnostics.length > 0, "Diagnostics notification received");
+    await conn.shutdown();
   });
 
-  // Wait for notification to be processed
-  await new Promise((r) => setTimeout(r, 100));
-
-  assert(receivedDiagnostics.length > 0, "Diagnostics notification received");
-  await conn.shutdown();
-  console.log();
-}
-
-async function testShutdown() {
-  const conn = new LSPConnection(process.execPath, [resolve(__dirname, "lsp", "mock-server.js")]);
-  await conn.initialize("file:///test-project");
-  await conn.shutdown();
-  assert(true, "Shutdown completes without error");
-  console.log();
-}
+  it("shutdown completes without error", async () => {
+    const conn = new LSPConnection(process.execPath, [resolve(__dirname, "lsp", "mock-server.js")]);
+    await conn.initialize("file:///test-project");
+    await conn.shutdown();
+  });
+});
 
 // ════════════════════════════════════════════════════════════════════
 //  lsp-manager tests
 // ════════════════════════════════════════════════════════════════════
 
-console.log("\n=== LSPManager ===\n");
+describe("LSPManager", () => {
+  it("unknown language returns null (no crash)", async () => {
+    const manager = new LSPManager("/tmp");
+    const server = await manager.getServer("nonexistent-lang");
+    assert.equal(server, null);
+  });
 
-async function testServerNotFound() {
-  const manager = new LSPManager("/tmp");
-  const server = await manager.getServer("nonexistent-lang");
-  assertEqual(server, null, "Unknown language returns null (no crash)");
-  console.log();
-}
-
-async function testShutdownEmptyManager() {
-  const manager = new LSPManager("/tmp");
-  await manager.shutdown();
-  assert(true, "Shutdown empty manager completes without error");
-  console.log();
-}
-
-async function testManagerWithRealServer() {
-  // Only test if typescript-language-server is in PATH
-  const manager = new LSPManager("/tmp");
-  const server = await manager.getServer("typescript");
-
-  if (server) {
-    assert(true, "TypeScript server started successfully");
+  it("shutdown empty manager completes without error", async () => {
+    const manager = new LSPManager("/tmp");
     await manager.shutdown();
-    assert(true, "Manager shutdown successful");
-    console.log("  - typescript-language-server found in PATH");
-  } else {
-    // This is expected if typescript-language-server isn't installed
-    assert(true, "Typescript server not in PATH — graceful fallback");
-    console.log("  - typescript-language-server not in PATH (expected on non-TS machines)");
-  }
-  console.log();
-}
+  });
+
+  it("manager with real server — graceful fallback", async () => {
+    const manager = new LSPManager("/tmp");
+    const server = await manager.getServer("typescript");
+    if (server) {
+      await manager.shutdown();
+    } else {
+      assert.equal(server, null);
+    }
+  });
+});
 
 // ════════════════════════════════════════════════════════════════════
 //  diagnostics tests
 // ════════════════════════════════════════════════════════════════════
 
-console.log("\n=== Diagnostics ===\n");
+describe("Diagnostics", () => {
+  it("no LSP returns source none or lsp", async () => {
+    const manager = new LSPManager("/tmp");
+    const result = await checkPostEditDiagnostics("/tmp/test.ts", "const x = 1;", "typescript", manager);
+    assert.ok(result.source === "none" || result.source === "lsp");
+    if (result.source === "none") {
+      assert.equal(result.diagnostics.length, 0);
+    }
+  });
 
-async function testNoLSPReturnsNone() {
-  const manager = new LSPManager("/tmp");
+  it("unsupported language returns source='none'", async () => {
+    const manager = new LSPManager("/tmp");
+    const result = await checkPostEditDiagnostics("/tmp/test.xyz", "some content", "nonexistent-lang", manager);
+    assert.equal(result.source, "none");
+  });
+});
 
-  const result = await checkPostEditDiagnostics("/tmp/test.ts", "const x = 1;", "typescript", manager);
+// ════════════════════════════════════════════════════════════════════
+//  diagnostic status tests (WP-SE1 honesty fix)
+// ════════════════════════════════════════════════════════════════════
 
-  // With typescript-language-server installed, this may return real diagnostics.
-  // Accept both modes: no LSP available (source='none') or LSP active (source='lsp').
-  if (result.source === 'none') {
-    assertEqual(result.diagnostics.length, 0, "No diagnostics when no LSP");
-  } else {
-    assertEqual(result.source, 'lsp', "LSP active when server is available");
-  }
-  console.log();
-}
+describe("Diagnostic Status", () => {
+  it("unavailable — no server -> status unavailable", async () => {
+    const manager = new LSPManager("/tmp");
+    const result = await checkPostEditDiagnostics("/tmp/status-test.ts", "const x=1;", "nonexistent-lang", manager);
+    assert.equal(result.source, "none");
+    assert.equal((result as any).status, "unavailable");
+  });
 
-async function testUnsupportedLanguage() {
-  const manager = new LSPManager("/tmp");
+  it("failed — lifecycle failure -> status failed", async () => {
+    const manager = makeMockManager({ openShouldFail: true }) as any;
+    const result = await checkPostEditDiagnostics("/tmp/status-test.ts", "const x=1;", "typescript", manager);
+    assert.equal(result.source, "none");
+    assert.equal((result as any).status, "failed");
+  });
 
-  const result = await checkPostEditDiagnostics("/tmp/test.xyz", "some content", "nonexistent-lang", manager);
+  it("confirmed empty via publishDiagnostics []", async () => {
+    const manager = makeMockManager({ publishDiagnostics: [], pullShouldFail: true }) as any;
+    const result = await checkPostEditDiagnostics("/tmp/status-test.ts", "const x=1;", "typescript", manager);
+    assert.equal((result as any).status, "confirmed");
+    assert.equal(result.source, "lsp");
+    assert.equal(result.diagnostics.length, 0);
+  });
 
-  assertEqual(result.source, "none", "Unsupported language returns source='none'");
-  console.log();
-}
+  it("confirmed empty via pull items []", async () => {
+    const manager = makeMockManager({ publishDiagnostics: undefined, pullItems: [] }) as any;
+    const result = await checkPostEditDiagnostics("/tmp/status-test.ts", "const x=1;", "typescript", manager);
+    assert.equal((result as any).status, "confirmed");
+    assert.equal(result.source, "lsp");
+    assert.equal(result.diagnostics.length, 0);
+  });
+
+  it("confirmed with diagnostics", async () => {
+    const diags = [{ message: "err", severity: 1 as const, range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } }, source: "test" }];
+    const manager = makeMockManager({ publishDiagnostics: diags }) as any;
+    const result = await checkPostEditDiagnostics("/tmp/status-test.ts", "const x=ERROR;", "typescript", manager);
+    assert.equal((result as any).status, "confirmed");
+    assert.equal(result.diagnostics.length, 1);
+  });
+
+  it("unconfirmed empty — timeout + no pull support", async () => {
+    const manager = makeMockManager({ publishDiagnostics: undefined, pullShouldFail: true }) as any;
+    const result = await checkPostEditDiagnostics("/tmp/status-test.ts", "const x=1;", "typescript", manager);
+    assert.equal((result as any).status, "unconfirmed");
+    assert.equal(result.source, "lsp");
+    assert.equal(result.diagnostics.length, 0);
+  });
+
+  it("confirmed-empty vs unconfirmed-empty distinguishable by status", async () => {
+    const unconfirmedMgr = makeMockManager({ publishDiagnostics: undefined, pullShouldFail: true }) as any;
+    const unconfirmed = await checkPostEditDiagnostics("/tmp/status-test.ts", "const x=1;", "typescript", unconfirmedMgr);
+    const confirmedMgr = makeMockManager({ publishDiagnostics: [], pullShouldFail: true }) as any;
+    const confirmed = await checkPostEditDiagnostics("/tmp/status-test.ts", "const x=1;", "typescript", confirmedMgr);
+    assert.equal(confirmed.diagnostics.length, unconfirmed.diagnostics.length);
+    assert.notEqual((confirmed as any).status, (unconfirmed as any).status);
+  });
+});
 
 // ════════════════════════════════════════════════════════════════════
 //  semantic-nav tests
 // ════════════════════════════════════════════════════════════════════
 
-console.log("\n=== Semantic Navigation ===\n");
+describe("Semantic Navigation", () => {
+  it("no LSP returns null for goToDefinition", async () => {
+    const manager = new LSPManager("/tmp");
+    const result = await goToDefinition("/tmp/test.ts", 0, 5, "typescript", manager);
+    assert.equal(result, null);
+  });
 
-async function testGoToDefinitionNoLSP() {
-  const manager = new LSPManager("/tmp");
-  const result = await goToDefinition("/tmp/test.ts", 0, 5, "typescript", manager);
-  assertEqual(result, null, "No LSP returns null for goToDefinition");
-  console.log();
-}
+  it("no LSP returns empty array for findReferences", async () => {
+    const manager = new LSPManager("/tmp");
+    const result = await findReferences("/tmp/test.ts", 0, 5, "typescript", manager);
+    assert.ok(Array.isArray(result) && result.length === 0);
+  });
 
-async function testFindReferencesNoLSP() {
-  const manager = new LSPManager("/tmp");
-  const result = await findReferences("/tmp/test.ts", 0, 5, "typescript", manager);
-  assert(Array.isArray(result) && result.length === 0, "No LSP returns empty array for findReferences");
-  console.log();
-}
-
-async function testGetHoverInfoNoLSP() {
-  const manager = new LSPManager("/tmp");
-  const result = await getHoverInfo("/tmp/test.ts", 0, 5, "typescript", manager);
-  assertEqual(result, null, "No LSP returns null for getHoverInfo");
-  console.log();
-}
-
-// ════════════════════════════════════════════════════════════════════
-//  Runner
-// ════════════════════════════════════════════════════════════════════
-
-async function main() {
-  console.log("=== LSP Integration Tests ===\n");
-
-  await testInitSequence();
-  await testRequestResponse();
-  await testNotificationAndDiagnostics();
-  await testShutdown();
-
-  await testServerNotFound();
-  await testShutdownEmptyManager();
-  await testManagerWithRealServer();
-
-  await testNoLSPReturnsNone();
-  await testUnsupportedLanguage();
-
-  await testGoToDefinitionNoLSP();
-  await testFindReferencesNoLSP();
-  await testGetHoverInfoNoLSP();
-
-  console.log("\n=== All LSP tests completed ===\n");
-  process.exit(0);
-}
-
-void main();
+  it("no LSP returns null for getHoverInfo", async () => {
+    const manager = new LSPManager("/tmp");
+    const result = await getHoverInfo("/tmp/test.ts", 0, 5, "typescript", manager);
+    assert.equal(result, null);
+  });
+});

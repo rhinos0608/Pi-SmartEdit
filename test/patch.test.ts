@@ -1649,6 +1649,47 @@ test("Bug 4a regression: a blocking verifier that times out blocks the write (ti
     assert.ok(timedOutRecord, "the timeout must also remain visible in checks.timedOut for observability");
 });
 
+test("structural: freshness mismatch rejects structural edit before any write, same as plain text", async () => {
+  const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-structural-stale-")));
+  const before = "console.log(1);\nconsole.log(2);\n";
+  const file = join(workdir, "a.ts");
+  writeFileSync(file, before, "utf8");
+  const canonicalFile = realpathSync(file);
+  const sessionFilePath = "/sessions/struct-stale.jsonl";
+  const envelope = makeEnvelope({
+    sessionFilePath,
+    canonicalRoot: workdir,
+    resources: [makeResource({ canonicalPath: canonicalFile, full: true, content: before })],
+  });
+  // Mutate file after envelope was minted so SHA is stale.
+  writeFileSync(canonicalFile, "console.log(1);\nconsole.log(999);\n", "utf8");
+  const deps: PatchToolDeps = {
+    getRpcClient: () => ({
+      request: async () => ({
+        kind: "reply" as const,
+        schemaVersion: PROTOCOL_SCHEMA_VERSION,
+        requestId: "r1",
+        ok: true,
+        payload: envelope,
+      }),
+      dispose: () => {},
+    }),
+    getSessionFilePath: () => sessionFilePath,
+    getCanonicalWorkspaceRoot: () => workdir,
+    getStructuralResolver: () => ({
+      async resolve() {
+        return { ok: true, edits: [{ startByte: 0, endByte: 15, text: "logger.info(1);" }] };
+      },
+    }),
+  };
+  const tool = createPatchTool(deps);
+  const res = await tool.execute("tc-struct-stale", { path: "a.ts", edits: [{ target: { pattern: "console.log($ARG)", replacement: "logger.info($ARG)" } }], evidenceRef: { inspectionId: envelope.inspectionId, resourceIds: [envelope.resources[0]!.resourceId] }, toolCallId: "tc-struct-stale" }, undefined, undefined, makeCtx(workdir));
+  const d = res.details as any;
+  assert.equal(d.status.kind, "rejected");
+  assert.equal(d.status.reason, "stale");
+  assert.equal(readFileSync(canonicalFile, "utf8"), "console.log(1);\nconsole.log(999);\n", "file must be unchanged on stale structural edit");
+});
+
 test("Bug 4b regression: a hung post-write verifier times out and is treated as a failure instead of hanging forever", async () => {
     const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-postwrite-timeout-")));
     mkdirSync(workdir, { recursive: true });

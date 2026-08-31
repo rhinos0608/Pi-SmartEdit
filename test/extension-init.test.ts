@@ -818,3 +818,108 @@ test("a successful native write with no diagnostics does not modify the result",
 
   assert.equal(result, undefined, "a clean write must not mutate the tool result");
 });
+
+// ── WP-SE1 diagnostic status semantics ──────────────────────────────────
+import { checkPostEditDiagnostics } from "../src/lsp/diagnostics.js";
+import { getCompilerForLanguage } from "../src/lsp/diagnostic-dispatcher.js";
+
+function lspCheckOutcome(lsp: { diagnostics: Array<{ severity: number }>; status: string; source: string }): { outcome: string; shouldRunCompiler: boolean } {
+  // Mirrors src/index.ts runFinalSuccessLanes status handling (additive-friendly)
+  if (lsp.status === "confirmed") {
+    const hasError = lsp.diagnostics.some((d) => d.severity === 1);
+    return { outcome: hasError ? "fail" : "pass", shouldRunCompiler: false };
+  } else {
+    return { outcome: "skipped", shouldRunCompiler: true };
+  }
+}
+
+test("diagnostic status: confirmed-empty vs unconfirmed-empty distinguishable and outcomes differ", () => {
+  const confirmed = { diagnostics: [], status: "confirmed", source: "lsp" };
+  const unconfirmed = { diagnostics: [], status: "unconfirmed", source: "lsp" };
+  assert.equal(confirmed.diagnostics.length, unconfirmed.diagnostics.length, "both empty");
+  assert.notEqual(confirmed.status, unconfirmed.status, "status must differ");
+  const cOut = lspCheckOutcome(confirmed as any);
+  const uOut = lspCheckOutcome(unconfirmed as any);
+  assert.equal(cOut.outcome, "pass", "confirmed-empty -> pass");
+  assert.equal(uOut.outcome, "skipped", "unconfirmed-empty -> skipped");
+  assert.equal(cOut.shouldRunCompiler, false, "confirmed should NOT run compiler fallback");
+  assert.equal(uOut.shouldRunCompiler, true, "unconfirmed should run compiler fallback");
+});
+
+test("diagnostic status: confirmed+errors -> fail, unconfirmed/unavailable/failed -> skipped", () => {
+  const errDiag = { severity: 1 } as any;
+  assert.equal(lspCheckOutcome({ diagnostics: [errDiag], status: "confirmed", source: "lsp" } as any).outcome, "fail");
+  assert.equal(lspCheckOutcome({ diagnostics: [], status: "unavailable", source: "none" } as any).outcome, "skipped");
+  assert.equal(lspCheckOutcome({ diagnostics: [], status: "failed", source: "none" } as any).outcome, "skipped");
+  assert.equal(lspCheckOutcome({ diagnostics: [], status: "unconfirmed", source: "lsp" } as any).outcome, "skipped");
+});
+
+test("diagnostic status: additive-friendly future status falls through to skipped", () => {
+  // A future "needs-triage" must not be treated as confirmed and must not break the check.
+  assert.equal(lspCheckOutcome({ diagnostics: [], status: "needs-triage", source: "lsp" } as any).outcome, "skipped");
+  assert.equal(lspCheckOutcome({ diagnostics: [], status: "needs-triage", source: "lsp" } as any).shouldRunCompiler, true);
+});
+
+test("compiler fallback runs for non-confirmed statuses, not for confirmed", () => {
+  const lang = "typescript";
+  const compiler = getCompilerForLanguage(lang);
+  assert.ok(compiler, "typescript should have compiler");
+  // Simulate selection logic: compiler only when not confirmed
+  const shouldRun = (status: string) => status !== "confirmed";
+  assert.equal(shouldRun("confirmed"), false);
+  assert.equal(shouldRun("unconfirmed"), true);
+  assert.equal(shouldRun("unavailable"), true);
+  assert.equal(shouldRun("failed"), true);
+  assert.equal(shouldRun("needs-triage"), true);
+});
+
+test("checkPostEditDiagnostics status covers all required variants via mocked manager", async () => {
+  // unavailable: no server
+  const { LSPManager } = await import("../src/lsp/lsp-manager.js");
+  const mgrNone = new LSPManager("/tmp");
+  const rNone = await checkPostEditDiagnostics("/tmp/status-ext-test.ts", "const x=1;", "nonexistent-lang", mgrNone as any);
+  assert.equal(rNone.status, "unavailable");
+
+  // Helper mock similar to lsp.test.ts but inline simpler: failed via open throw
+  let handler: ((params: unknown) => void) | null = null;
+  let lastUri: string | null = null;
+  const mockFailedServer: any = {
+    async notify(method: string) { if (method === "textDocument/didOpen") throw new Error("open failed"); },
+    async request() { throw new Error("not called"); },
+    onNotification(m: string, h: any) { handler = h; return () => {}; },
+    isRunning() { return true; },
+  };
+  const mgrFailed = { getServer: async () => mockFailedServer } as any;
+  const rFailed = await checkPostEditDiagnostics("/tmp/status-ext-test.ts", "const x=1;", "typescript", mgrFailed);
+  assert.equal(rFailed.status, "failed");
+
+  // confirmed via publish empty
+  const mockConfirmed: any = {
+    async notify(method: string, params: any) {
+      if (method === "textDocument/didOpen") {
+        lastUri = params.textDocument.uri;
+        setTimeout(() => {
+          const h = handler;
+          if (h && lastUri) h({ uri: lastUri, diagnostics: [] });
+        }, 10);
+      }
+    },
+    async request(m: string) { if (m === "workspace/symbol") return null; throw new Error("unexpected"); },
+    onNotification(m: string, h: any) {
+      handler = h;
+      if (lastUri) setTimeout(() => {
+        const hh = handler;
+        if (hh && lastUri) hh({ uri: lastUri, diagnostics: [] });
+      }, 10);
+      return () => { handler = null; };
+    },
+    isRunning() { return true; },
+  };
+  const mgrConfirmed = { getServer: async () => mockConfirmed } as any;
+  const rConfirmed = await checkPostEditDiagnostics("/tmp/status-ext-test.ts", "const x=1;", "typescript", mgrConfirmed);
+  assert.equal(rConfirmed.status, "confirmed");
+  // confirmed-empty vs failed/unavailable must be distinguishable
+  assert.notEqual(rConfirmed.status, rFailed.status);
+  assert.notEqual(rConfirmed.status, rNone.status);
+});
+

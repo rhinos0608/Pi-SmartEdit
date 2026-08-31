@@ -28,9 +28,14 @@ export interface Diagnostic {
   source?: string;
 }
 
+export type DiagnosticStatus = "confirmed" | "unconfirmed" | "unavailable" | "failed";
+// Additive-friendly: future statuses (e.g. "needs-triage") can be added without breaking
+// callers that check `status === "confirmed"` \u2014 avoid exhaustive switches that would throw on unknown values.
+
 export interface DiagnosticResult {
   diagnostics: Diagnostic[];
   source: "lsp" | "none";
+  status: DiagnosticStatus;
 }
 
 /**
@@ -54,10 +59,11 @@ function waitForDiagnostics(
   conn: ManagedLSPConnection,
   uri: string,
   timeoutMs: number,
-): Promise<Diagnostic[]> {
+): Promise<{ diagnostics: Diagnostic[]; received: boolean }> {
   return new Promise((resolve) => {
     const allDiagnostics: Diagnostic[] = [];
     let didResolve = false;
+    let received = false;
 
     const timer = setTimeout(() => {
       done(allDiagnostics);
@@ -75,12 +81,16 @@ function waitForDiagnostics(
         // project-wide batched notifications, not just for the opened file.
         if (typedParams.uri !== uri) return;
 
-        if (typedParams.diagnostics) {
-          allDiagnostics.push(...typedParams.diagnostics);
+        if (typedParams.diagnostics !== undefined) {
+          received = true;
+          if (typedParams.diagnostics) {
+            allDiagnostics.push(...typedParams.diagnostics);
+          }
 
           // Resolve early once we've seen at least one batch for our URI.
           // The diagnostics at this point are authoritative — the LSP
           // computed them in response to didOpen with the post-edit content.
+          // An empty array is also authoritative when received via notification.
           done(allDiagnostics);
         }
       },
@@ -91,7 +101,7 @@ function waitForDiagnostics(
       didResolve = true;
       clearTimeout(timer);
       unsubscribe();
-      resolve(diagnostics);
+      resolve({ diagnostics, received });
     }
   });
 }
@@ -120,13 +130,13 @@ export async function checkPostEditDiagnostics(
   lspManager: LSPManager,
 ): Promise<DiagnosticResult> {
   const server = await lspManager.getServer(languageId);
-  if (!server) return { diagnostics: [], source: "none" };
+  if (!server) return { diagnostics: [], source: "none", status: "unavailable" };
 
   const uri = `file://${resolve(filePath)}`;
 
   try {
     // Open document with current (post-edit) content using withOpenDocument
-    const diagnostics = await withOpenDocument(server, {
+    const result = await withOpenDocument(server, {
       uri,
       languageId,
       content,
@@ -135,32 +145,36 @@ export async function checkPostEditDiagnostics(
       // Phase 1: Wait for push-based diagnostics notification (up to 3s).
       // TypeScript language servers typically push diagnostics within 1-2s
       // for files that are part of a tsconfig.json project.
-      let diags = await waitForDiagnostics(server, uri, 3000);
+      const waitResult = await waitForDiagnostics(server, uri, 3000);
+      let diags = waitResult.diagnostics;
+      let confirmed = waitResult.received;
 
       // Phase 2: If no diagnostics received via notification, try the
       // pull-based `textDocument/diagnostic` request (LSP 3.17).
       // This is needed for standalone files or servers that don't auto-push.
-      if (diags.length === 0) {
+      if (!confirmed) {
         try {
           const pullResult = await server.request("textDocument/diagnostic", {
             textDocument: { uri },
           }) as { items?: Diagnostic[]; kind?: string } | null;
 
-          if (pullResult?.items) {
+          if (pullResult && Array.isArray(pullResult.items)) {
             diags = pullResult.items;
+            confirmed = true;
           }
         } catch {
           // textDocument/diagnostic not supported (pre-LSP 3.17 servers)
-          // or request failed — diagnostics remains empty, which is fine.
+          // or request failed — remains unconfirmed.
         }
       }
 
-      return diags;
+      return { diags, confirmed };
     });
 
-    return { diagnostics, source: "lsp" };
+    const status: DiagnosticStatus = result.confirmed ? "confirmed" : "unconfirmed";
+    return { diagnostics: result.diags, source: "lsp", status };
   } catch {
-    // Diagnostics check failed — silently degrade
-    return { diagnostics: [], source: "none" };
+    // Diagnostics check failed — request/lifecycle failure
+    return { diagnostics: [], source: "none", status: "failed" };
   }
 }
