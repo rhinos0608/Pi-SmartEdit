@@ -48,12 +48,18 @@ export interface EditOperation {
 
 /** Canonical edit request accepted by the registered `edit` tool. */
 export interface RefactorRequest {
-    kind: "rename-preview" | "apply-refactor-preview";
+    kind: "rename-preview" | "apply-refactor-preview" | "organize-imports-preview" | "formatting-preview" | "code-action-preview";
     path?: string;
     line?: number;
     character?: number;
     newName?: string;
     previewId?: string;
+    tabSize?: number;
+    insertSpaces?: boolean;
+    endLine?: number;
+    endCharacter?: number;
+    diagnostics?: unknown;
+    only?: unknown;
 }
 
 export interface EditRequest {
@@ -288,14 +294,27 @@ export function validateEditRequest(
     if (hasRefactor) {
         if (!isPlainObject(refactor)) return fail("edit.refactor must be an object");
         const r = refactor as Record<string, unknown>;
-        const rk = firstUnknownKey(r, new Set(["kind", "path", "line", "character", "newName", "previewId"]));
+        const rk = firstUnknownKey(r, new Set(["kind", "path", "line", "character", "newName", "previewId", "tabSize", "insertSpaces", "endLine", "endCharacter", "diagnostics", "only"]));
         if (rk) return fail(`edit.refactor.${rk} is not supported`);
-        if (r.kind !== "rename-preview" && r.kind !== "apply-refactor-preview") return fail("edit.refactor.kind must be \"rename-preview\" or \"apply-refactor-preview\"");
+        const allowedKinds = new Set(["rename-preview", "apply-refactor-preview", "organize-imports-preview", "formatting-preview", "code-action-preview"]);
+        if (typeof r.kind !== "string" || !allowedKinds.has(r.kind as string)) return fail("edit.refactor.kind must be \"rename-preview\", \"apply-refactor-preview\", \"organize-imports-preview\", \"formatting-preview\" or \"code-action-preview\"");
         if (r.kind === "rename-preview") {
             if (typeof r.path !== "string" || r.path.length === 0) return fail("edit.refactor.path required for rename-preview");
             if (typeof r.newName !== "string" || r.newName.length === 0) return fail("edit.refactor.newName required for rename-preview");
             if (typeof r.line !== "number" || !Number.isInteger(r.line) || r.line < 0) return fail("edit.refactor.line must be a non-negative integer");
             if (typeof r.character !== "number" || !Number.isInteger(r.character) || r.character < 0) return fail("edit.refactor.character must be a non-negative integer");
+        } else if (r.kind === "organize-imports-preview") {
+            if (typeof r.path !== "string" || r.path.length === 0) return fail("edit.refactor.path required for organize-imports-preview");
+        } else if (r.kind === "formatting-preview") {
+            if (typeof r.path !== "string" || r.path.length === 0) return fail("edit.refactor.path required for formatting-preview");
+            if (r.tabSize !== undefined && (typeof r.tabSize !== "number" || !Number.isInteger(r.tabSize) || r.tabSize <= 0)) return fail("edit.refactor.tabSize must be a positive integer if present");
+            if (r.insertSpaces !== undefined && typeof r.insertSpaces !== "boolean") return fail("edit.refactor.insertSpaces must be a boolean if present");
+        } else if (r.kind === "code-action-preview") {
+            if (typeof r.path !== "string" || r.path.length === 0) return fail("edit.refactor.path required for code-action-preview");
+            if (typeof r.line !== "number" || !Number.isInteger(r.line) || r.line < 0) return fail("edit.refactor.line must be a non-negative integer");
+            if (typeof r.character !== "number" || !Number.isInteger(r.character) || r.character < 0) return fail("edit.refactor.character must be a non-negative integer");
+            if (r.endLine !== undefined && (typeof r.endLine !== "number" || !Number.isInteger(r.endLine) || r.endLine < 0)) return fail("edit.refactor.endLine must be a non-negative integer if present");
+            if (r.endCharacter !== undefined && (typeof r.endCharacter !== "number" || !Number.isInteger(r.endCharacter) || r.endCharacter < 0)) return fail("edit.refactor.endCharacter must be a non-negative integer if present");
         } else {
             if (typeof r.previewId !== "string" || r.previewId.length === 0) return fail("edit.refactor.previewId required for apply-refactor-preview");
         }
@@ -489,12 +508,18 @@ export const EDIT_PARAMETERS = {
             additionalProperties: false,
             description: "Refactor preview/apply variant. Mutually exclusive with edits/raw.",
             properties: {
-                kind: { type: "string", enum: ["rename-preview", "apply-refactor-preview"] },
+                kind: { type: "string", enum: ["rename-preview", "apply-refactor-preview", "organize-imports-preview", "formatting-preview", "code-action-preview"] },
                 path: { type: "string" },
                 line: { type: "integer", minimum: 0 },
                 character: { type: "integer", minimum: 0 },
                 newName: { type: "string" },
                 previewId: { type: "string" },
+                tabSize: { type: "integer", minimum: 1 },
+                insertSpaces: { type: "boolean" },
+                endLine: { type: "integer", minimum: 0 },
+                endCharacter: { type: "integer", minimum: 0 },
+                diagnostics: { type: "array", items: { type: "object" } },
+                only: { type: "array", items: { type: "string" } },
             },
             required: ["kind"],
         },
