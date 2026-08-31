@@ -1483,7 +1483,7 @@ test("prior authority: caller evidenceRef does not override a selected prior gra
         edits: [{ oldText: "l4", newText: "L4" }],
         // A full-file evidenceRef would authorize line 4, but the prior line-range
         // grant must win and RPC must not be consulted.
-        evidenceRef: { inspectionId: "full-file-inspection", resourceIds: ["full-file-resource"] },
+        evidenceRef: { inspectionId: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", resourceIds: ["full-file-resource"] },
         rpcShouldThrow: true,
     });
     const d = res.details as any;

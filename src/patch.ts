@@ -57,6 +57,9 @@ import { generateDiffString, stripBom, normalizeToLF } from "./core/edit-diff.js
 import { resolveSourceRange, buildTransferInsertEdit, buildTransferDeleteEdit } from "./transfer-edit.js";
 import { checkEditSafety } from "./safety/approval-gating.js";
 import { EDIT_PARAMETERS, validateEditRequest, type EditOperation } from "./edit-contract.js";
+import { planPositionalEdits } from "./positional-planner.js";
+import { globalRenamePreviewCache } from "./rename-preview-cache.js";
+import { requestRenamePreview } from "./lsp-smartread-client.js";
 import { normalizeRawEdit } from "./edit-intents.js";
 import type { PriorAuthorityStore } from "./evidence-authority.js";
 import { planTextEdits, type StructuralResolver } from "./edit-planner.js";
@@ -82,6 +85,7 @@ export interface RpcClientLike {
 }
 
 export interface PatchToolDeps {
+    readonly getBus?: () => { emit: (c: string, d: unknown) => void; on: (c: string, h: (d: unknown) => void) => () => void };
     readonly getRpcClient: () => RpcClientLike;
     readonly getSessionFilePath: () => string | null;
     readonly getCanonicalWorkspaceRoot: () => string;
@@ -537,6 +541,90 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             // Inject it before validating so the schema-conforming request
             // the model actually sends can pass validation.
             const v = validateEditRequest({ ...params, toolCallId });
+            // Refactor variants handle before generic session checks (but still validate shape via above)
+            if ((v as { ok: boolean; value?: { refactor?: { kind: string } } }).ok && (v as unknown as { value: { refactor?: { kind: string } } }).value?.refactor) {
+                const refactor = (v as unknown as { value: { refactor: { kind: string; path?: string; line?: number; character?: number; newName?: string; previewId?: string } } }).value.refactor;
+                if (refactor.kind === "rename-preview") {
+                    const bus = deps.getBus?.() ?? null;
+                    if (!bus) {
+                        return { content: [{ type: "text" as const, text: "failed: rename-preview requires bus" }], details: makeFailed(toolCallId, "stage", "bus unavailable", { inspectionId: "", resourceIds: [] }, freshChecks(), ["bus unavailable"]) };
+                    }
+                    try {
+                        const resp = await requestRenamePreview(bus, { filePath: refactor.path!, line: refactor.line!, character: refactor.character!, newName: refactor.newName! });
+                        if (!resp.ok || !resp.workspaceEdit) {
+                            return { content: [{ type: "text" as const, text: `failed: rename-preview: ${resp.error ?? "no edit"}` }], details: makeFailed(toolCallId, "stage", resp.error ?? "no workspaceEdit", { inspectionId: "", resourceIds: [] }, freshChecks(), [resp.error ?? "no workspaceEdit"]) };
+                        }
+                        const planned = await planPositionalEdits(resp.workspaceEdit, async (p) => (await fsReadFile(p)).toString("utf8"));
+                        const previewId = globalRenamePreviewCache.store(resp.workspaceEdit, planned, { filePath: refactor.path!, line: refactor.line!, character: refactor.character!, newName: refactor.newName!, serverDescriptorId: resp.serverDescriptorId });
+                        return { content: [{ type: "text" as const, text: `preview ${previewId}: ${planned.stagedFiles.length} file(s)\n${planned.diffString.slice(0, 4000)}` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: planned.diffString, diffs: planned.stagedFiles.map((sf) => ({ path: sf.filePath, diff: sf.newContent })), previewId, stagedFiles: planned.stagedFiles.length } as unknown as PatchToolDetails };
+                    } catch (err) {
+                        const msg = err instanceof Error ? err.message : String(err);
+                        return { content: [{ type: "text" as const, text: `failed: rename-preview ${msg}` }], details: makeFailed(toolCallId, "stage", msg, { inspectionId: "", resourceIds: [] }, freshChecks(), [msg]) };
+                    }
+                } else {
+                    const cached = globalRenamePreviewCache.get(refactor.previewId!);
+                    if (!cached) {
+                        return { content: [{ type: "text" as const, text: "rejected: preview not found or expired" }], details: makeRejected(toolCallId, "coverage", ["preview not found or expired"], { inspectionId: "", resourceIds: [] }, freshChecks()) };
+                    }
+                    // Apply via transaction: write each staged file atomically
+                    const files = cached.plannedRename.stagedFiles;
+                    try {
+                        const { EditTransaction: ET } = await import("./edit-transaction.js");
+                        const tx = await ET.begin(files.map((f) => f.filePath));
+                        try {
+                            // Finding 4: freshness check inside transaction before writes
+                            const staleFiles: string[] = [];
+                            for (const sf of files) {
+                                try {
+                                    const current = (await fsReadFile(sf.filePath)).toString("utf8");
+                                    if (current !== sf.originalContent) {
+                                        staleFiles.push(sf.filePath);
+                                    }
+                                } catch {
+                                    staleFiles.push(sf.filePath);
+                                }
+                            }
+                            if (staleFiles.length > 0) {
+                                await tx.rollback();
+                                return { content: [{ type: "text", text: `rejected: files changed since preview: ${staleFiles.join(", ")}` }], details: makeRejected(toolCallId, "stale", [`files changed since preview: ${staleFiles.join(", ")}`], { inspectionId: "", resourceIds: [] }, freshChecks()) };
+                            }
+                            // Finding 5: authorization check per staged file via prior authority
+                            const priorStore = deps.getPriorAuthority?.() ?? null;
+                            const unauthorized: string[] = [];
+                            for (const sf of files) {
+                                let canonical: string;
+                                try { canonical = realpathSync(sf.filePath); } catch { canonical = sf.filePath; }
+                                const res = priorStore ? priorStore.select(canonical) : null;
+                                if (!res) {
+                                    // fallback: also try unresolved path
+                                    const res2 = priorStore ? priorStore.select(sf.filePath) : null;
+                                    if (!res2) unauthorized.push(sf.filePath);
+                                }
+                            }
+                            if (unauthorized.length > 0) {
+                                await tx.rollback();
+                                return { content: [{ type: "text", text: `rejected: missing read authority for: ${unauthorized.join(", ")} — read the file first, then retry` }], details: makeRejected(toolCallId, "coverage", [`missing read authority for: ${unauthorized.join(", ")}`], { inspectionId: "", resourceIds: [] }, freshChecks()) };
+                            }
+                            for (const sf of files) {
+                                await tx.write(sf.filePath, sf.newContent);
+                            }
+                            await tx.commit();
+                        } catch (e) {
+                            try { await tx.rollback(); } catch {}
+                            throw e;
+                        }
+                        globalRenamePreviewCache.delete(refactor.previewId!);
+                        return { content: [{ type: "text" as const, text: `applied refactor ${refactor.previewId}: ${files.length} file(s)` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: cached.plannedRename.diffString } as unknown as PatchToolDetails };
+                    } catch (err) {
+                        const msg = err instanceof Error ? err.message : String(err);
+                        // If already formatted as rejected (contains "rejected:"), preserve it
+                        if (msg.includes("rejected:")) {
+                            return { content: [{ type: "text" as const, text: msg }], details: makeRejected(toolCallId, "coverage", [msg], { inspectionId: "", resourceIds: [] }, freshChecks()) };
+                        }
+                        return { content: [{ type: "text" as const, text: `failed: apply refactor ${msg}` }], details: makeFailed(toolCallId, "write", msg, { inspectionId: "", resourceIds: [] }, freshChecks(), [msg]) };
+                    }
+                }
+            }
             if (!v.ok) {
                 return {
                     content: [{ type: "text" as const, text: `invalid patch request: ${v.error}` }],

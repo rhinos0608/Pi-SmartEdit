@@ -30,6 +30,7 @@ import { buildHashlineAnchors } from "./core/hashline";
 
 import { LSPManager } from "./lsp/lsp-manager";
 import { checkPostEditDiagnostics } from "./lsp/diagnostics";
+import { createSmartReadDiagnosticsClient } from "./lsp/smartread-diagnostics-client.js";
 import { getCompilerForLanguage } from "./lsp/diagnostic-dispatcher";
 import { detectLanguageFromExtension } from "./lsp/language-id";
 
@@ -294,6 +295,8 @@ let astResolver: ReturnType<typeof createAstResolver> | null = null;
 
 /** LSP manager instance, created once per session. */
 let lspManager: LSPManager | null = null;
+/** SmartRead diagnostics client (sticky remote/standalone mode). */
+let smartReadDiagnosticsClient: ReturnType<typeof createSmartReadDiagnosticsClient> | null = null;
 
 /**
  * Compute the containing line range for a set of edits from their oldText.
@@ -870,6 +873,11 @@ export default function smartEdit(pi: ExtensionAPI) {
 
     // Create LSP manager for semantic intelligence
     lspManager = new LSPManager(sessionCwd);
+    // Create SmartRead diagnostics client (lazy probe, sticky mode)
+    if (pi.events && typeof (pi.events as { on?: unknown }).on === "function") {
+      const b = pi.events as { emit: (c: string, d: unknown) => void; on: (c: string, h: (d: unknown) => void) => () => void };
+      smartReadDiagnosticsClient = createSmartReadDiagnosticsClient(b);
+    }
 
     resetRetryCounts();
 
@@ -902,6 +910,8 @@ export default function smartEdit(pi: ExtensionAPI) {
 
   // ── Shutdown on session end ──
   pi.on("session_shutdown", async () => {
+    smartReadDiagnosticsClient?.dispose();
+    smartReadDiagnosticsClient = null;
     await lspManager?.shutdown();
     lspManager = null;
     priorAuthorityStore?.clear();
@@ -918,6 +928,7 @@ export default function smartEdit(pi: ExtensionAPI) {
       on: (c: string, h: (d: unknown) => void) => () => void;
     };
     const patchDeps: PatchToolDeps = {
+      getBus: () => bus,
       getRpcClient: () => createRpcClient({ bus, channel: RPC_CHANNELS.inspectPatch, timeoutMs: 2000 }),
       getSessionFilePath: () => currentSessionFilePath,
       getCanonicalWorkspaceRoot: () => currentCanonicalWorkspaceRoot ?? "",
@@ -964,7 +975,9 @@ export default function smartEdit(pi: ExtensionAPI) {
           // Extension seam: future mutating autofix/format and external security-scanner triage would plug in here — keep status handling additive (check === "confirmed", not exhaustive switch).
           let lspConfirmed = false;
           if (lspManager) {
-            const lsp = await checkPostEditDiagnostics(file.path, file.content, languageId, lspManager);
+            const lsp = smartReadDiagnosticsClient
+              ? await smartReadDiagnosticsClient.checkPostEditDiagnostics(file.path, file.content, languageId, cwd, lspManager)
+              : await checkPostEditDiagnostics(file.path, file.content, languageId, lspManager);
             // Additive-friendly: only "confirmed" is definitive; future statuses (e.g. "needs-triage") fall through to skipped.
             if (lsp.status === "confirmed") {
               lspConfirmed = true;

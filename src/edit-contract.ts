@@ -47,6 +47,15 @@ export interface EditOperation {
 }
 
 /** Canonical edit request accepted by the registered `edit` tool. */
+export interface RefactorRequest {
+    kind: "rename-preview" | "apply-refactor-preview";
+    path?: string;
+    line?: number;
+    character?: number;
+    newName?: string;
+    previewId?: string;
+}
+
 export interface EditRequest {
     /** Default target file path. May be omitted when every edit provides its own. */
     path?: string;
@@ -54,6 +63,7 @@ export interface EditRequest {
     edits?: EditOperation[];
     /** Raw patch text in a supported format. Mutually exclusive with `edits`. */
     raw?: string;
+    refactor?: RefactorRequest;
     /** Injected by the runtime; not part of the agent-visible schema. */
     toolCallId?: string;
     /** Optional evidence reference for stored-call compatibility. Validated when
@@ -257,10 +267,10 @@ export function validateEditRequest(
     if (!isPlainObject(input)) return fail("edit request must be an object");
     const normalized = normalizeFlatEditRequest(input);
     const unknown = firstUnknownKey(normalized, new Set([
-        "path", "edits", "raw", "toolCallId", "evidenceRef",
+        "path", "edits", "raw", "toolCallId", "evidenceRef", "refactor",
     ]));
     if (unknown) return fail(`edit.${unknown} is not supported`);
-    const { path, edits, raw, toolCallId, evidenceRef } = normalized;
+    const { path, edits, raw, toolCallId, evidenceRef, refactor } = normalized;
 
     if (path !== undefined && (typeof path !== "string" || path.length === 0))
         return fail("edit.path, if present, must be a non-empty string");
@@ -269,10 +279,28 @@ export function validateEditRequest(
 
     const hasEdits = edits !== undefined;
     const hasRaw = raw !== undefined;
-    if (hasEdits && hasRaw)
-        return fail("edit.raw and edit.edits are mutually exclusive; provide exactly one");
-    if (!hasEdits && !hasRaw)
-        return fail("edit requires either edits (array) or raw (string)");
+    const hasRefactor = refactor !== undefined;
+    const variantCount = (hasEdits ? 1 : 0) + (hasRaw ? 1 : 0) + (hasRefactor ? 1 : 0);
+    if (variantCount > 1)
+        return fail("edit.edits, edit.raw, and edit.refactor are mutually exclusive; provide exactly one");
+    if (variantCount === 0)
+        return fail("edit requires either edits (array), raw (string), or refactor");
+    if (hasRefactor) {
+        if (!isPlainObject(refactor)) return fail("edit.refactor must be an object");
+        const r = refactor as Record<string, unknown>;
+        const rk = firstUnknownKey(r, new Set(["kind", "path", "line", "character", "newName", "previewId"]));
+        if (rk) return fail(`edit.refactor.${rk} is not supported`);
+        if (r.kind !== "rename-preview" && r.kind !== "apply-refactor-preview") return fail("edit.refactor.kind must be \"rename-preview\" or \"apply-refactor-preview\"");
+        if (r.kind === "rename-preview") {
+            if (typeof r.path !== "string" || r.path.length === 0) return fail("edit.refactor.path required for rename-preview");
+            if (typeof r.newName !== "string" || r.newName.length === 0) return fail("edit.refactor.newName required for rename-preview");
+            if (typeof r.line !== "number" || !Number.isInteger(r.line) || r.line < 0) return fail("edit.refactor.line must be a non-negative integer");
+            if (typeof r.character !== "number" || !Number.isInteger(r.character) || r.character < 0) return fail("edit.refactor.character must be a non-negative integer");
+        } else {
+            if (typeof r.previewId !== "string" || r.previewId.length === 0) return fail("edit.refactor.previewId required for apply-refactor-preview");
+        }
+        return ok(normalized as EditRequest);
+    }
     if (hasRaw && (typeof raw !== "string" || raw.length === 0))
         return fail("edit.raw must be a non-empty string");
 
@@ -455,6 +483,20 @@ export const EDIT_PARAMETERS = {
         raw: {
             type: "string",
             description: "Raw patch text in a supported diff/patch format.",
+        },
+        refactor: {
+            type: "object",
+            additionalProperties: false,
+            description: "Refactor preview/apply variant. Mutually exclusive with edits/raw.",
+            properties: {
+                kind: { type: "string", enum: ["rename-preview", "apply-refactor-preview"] },
+                path: { type: "string" },
+                line: { type: "integer", minimum: 0 },
+                character: { type: "integer", minimum: 0 },
+                newName: { type: "string" },
+                previewId: { type: "string" },
+            },
+            required: ["kind"],
         },
     },
 } as const;
