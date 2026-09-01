@@ -28,7 +28,101 @@ Smart Edit replaces Pi's built-in `edit` tool with safer matching, richer diagno
 - **Closest-match diagnostics**: shows the best near-match when an edit fails
 - **Post-edit diagnostics**: LSP + compiler fallback, scoped to changed targets
 - **Verification pipeline**: concurrency detection, traceability analysis, git history context, repair loop
-- **SmartRead bridge**: records breakage and co-change events to Pi-SmartRead
+- **Refactor preview**: LSP-powered rename, organize imports, formatting, and code actions with unified diff preview and evidence-gated atomic apply
+- **SmartRead bridge**: RPC consumer for rename/format/code-action/organize-imports via Pi-SmartRead; lazy 250 ms capability probe, sticky remote-vs-standalone mode per session, 15 s client / 10 s provider timeout alignment; also records breakage and co-change events
+
+## Refactor Preview
+
+LSP-powered refactoring with preview-then-apply. The `refactor` field on the edit tool input is mutually exclusive with `edits` and `raw`. Preview generates a unified diff without touching disk; apply verifies freshness and evidence authorization, then commits via a failure-atomic transaction.
+
+### Rename preview
+
+```json
+{
+  "refactor": {
+    "kind": "rename-preview",
+    "path": "src/auth.ts",
+    "line": 42,
+    "character": 5,
+    "newName": "authenticate"
+  }
+}
+```
+
+Positions are 1-based. Returns `previewId`, staged file count, and unified diff. Rename routes through SmartRead's language intelligence RPC to the LSP `textDocument/rename` flow.
+
+### Organize imports preview
+
+```json
+{
+  "refactor": {
+    "kind": "organize-imports-preview",
+    "path": "src/auth.ts"
+  }
+}
+```
+
+### Formatting preview
+
+```json
+{
+  "refactor": {
+    "kind": "formatting-preview",
+    "path": "src/auth.ts",
+    "tabSize": 2,
+    "insertSpaces": true
+  }
+}
+```
+
+### Code action preview
+
+```json
+{
+  "refactor": {
+    "kind": "code-action-preview",
+    "path": "src/auth.ts",
+    "line": 42,
+    "character": 5,
+    "only": ["quickfix"]
+  }
+}
+```
+
+Automatically selects the preferred action or the first action with an edit. Optional `endLine`/`endCharacter` and `diagnostics` narrow the range/context.
+
+### Apply preview
+
+```json
+{
+  "refactor": {
+    "kind": "apply-refactor-preview",
+    "previewId": "uuid-from-preview"
+  }
+}
+```
+
+Previews expire after 5 minutes, max 16 cached (oldest evicted first). Apply verifies:
+
+- **Session identity binding** — preview bound to originating session; cross-session use rejected
+- **File freshness** — content unchanged since preview (re-read and compared)
+- **SHA-256 matching** — each touched file requires prior strong read authority with matching hash
+- **Range coverage validation** — touched ranges must fall within previously read coverage
+- **Atomic multi-file write** — all staged files written via `EditTransaction` with rollback on failure
+
+### Security model
+
+All LSP output is treated as untrusted. Every `WorkspaceEdit` is validated: file URIs must resolve to canonical realpaths inside allowed roots, UTF-16 ranges must be in-bounds and non-overlapping, and counts are bounded. Each touched file requires prior strong read authority with matching SHA-256 — no evidence, no write. Apply uses a failure-atomic `EditTransaction` so partial writes roll back.
+
+## SmartRead Integration
+
+SmartEdit delegates language intelligence to Pi-SmartRead over the `languageIntelligence` RPC channel (`@rhinos0608/pi-workspace-protocol`).
+
+- **Operations**: `renamePreview`, `organizeImports`, `formatting`, `codeAction` — each with a dedicated `request*` function in `src/lsp-smartread-client.ts`.
+- **Lazy capability probe**: first refactor call probes SmartRead with a 250 ms timeout to detect availability; result is cached per session.
+- **Sticky mode selection**: the probe outcome pins the session to `remote` (RPC) or `standalone` mode; no flapping between calls.
+- **Timeout alignment**: client budget 15 s vs provider budget 10 s, so provider timeouts surface as structured errors before the client races.
+- **Evidence bridge**: post-edit breakage and co-change events are still recorded to SmartRead via `src/smartread-bridge.ts`.
 
 ## Diagnostics
 
@@ -284,6 +378,10 @@ Transfer text comes from retained observed content, never model regeneration; th
 │   ├── undo/                  # Atomic writes and per-edit undo capture
 │   ├── verification/          # Validation, evidence, fake-logic detection, diagnostics, repair loop
 │   ├── edit-mode.ts           # Runtime config (hashline toggle, env vars)
+│   ├── edit-contract.ts       # Edit request validation including refactor variants
+│   ├── positional-planner.ts  # WorkspaceEdit → staged content via exact UTF-16 range edits
+│   ├── rename-preview-cache.ts # Session-scoped UUID-keyed preview storage with TTL
+│   ├── lsp-smartread-client.ts # RPC consumer for SmartRead language intelligence
 │   ├── symbolic-edits.ts      # Symbolic edit engine (replaceBody, insertBefore, insertAfter)
 │   └── smartread-bridge.ts    # Breakage/co-change recording to Pi-SmartRead
 ├── test/                      # 45+ automated test suites plus manual scripts
@@ -306,6 +404,7 @@ Transfer text comes from retained observed content, never model regeneration; th
 11. Run post-edit pipeline: LSP diagnostics → compiler fallback → scoped diagnostics → verification evidence → optional repair loop
 12. Record breakage/co-change events to SmartRead bridge
 13. Surface warnings, diagnostics, and evidence in the tool response
+14. Refactor operations route through RPC to SmartRead → positional planner → preview cache → evidence-gated apply
 
 ## Testing
 
