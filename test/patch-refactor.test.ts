@@ -4,7 +4,7 @@ import { validateEditRequest } from "../src/edit-contract.js";
 
 describe("patch-refactor contract", () => {
   it("mutually exclusive edits/raw/refactor", () => {
-    const v = validateEditRequest({ edits: [{ oldText: "a", newText: "b" }], refactor: { kind: "rename-preview", path: "/a.ts", line: 0, character: 0, newName: "b" }, toolCallId: "t" } as unknown as Record<string, unknown>);
+    const v = validateEditRequest({ edits: [{ oldText: "a", newText: "b" }], refactor: { kind: "rename-preview", path: "/a.ts", line: 1, character: 1, newName: "b" }, toolCallId: "t" } as unknown as Record<string, unknown>);
     assert.equal(v.ok, false);
   });
   it("rename-preview requires path/newName", () => {
@@ -12,7 +12,7 @@ describe("patch-refactor contract", () => {
     assert.equal(v.ok, false);
   });
   it("valid rename-preview passes", () => {
-    const v = validateEditRequest({ refactor: { kind: "rename-preview", path: "/a.ts", line: 0, character: 0, newName: "b" }, toolCallId: "t" } as unknown as Record<string, unknown>);
+    const v = validateEditRequest({ refactor: { kind: "rename-preview", path: "/a.ts", line: 1, character: 1, newName: "b" }, toolCallId: "t" } as unknown as Record<string, unknown>);
     assert.equal(v.ok, true);
   });
   it("apply-refactor-preview requires previewId", () => {
@@ -52,18 +52,24 @@ describe("patch-refactor contract", () => {
     assert.equal(v.ok, false);
     const v2 = validateEditRequest({ refactor: { kind: "code-action-preview", path: "/a.ts" }, toolCallId: "t" } as unknown as Record<string, unknown>);
     assert.equal(v2.ok, false);
-    const v3 = validateEditRequest({ refactor: { kind: "code-action-preview", path: "/a.ts", line: 0 }, toolCallId: "t" } as unknown as Record<string, unknown>);
+    const v3 = validateEditRequest({ refactor: { kind: "code-action-preview", path: "/a.ts", line: 1 }, toolCallId: "t" } as unknown as Record<string, unknown>);
     assert.equal(v3.ok, false);
   });
   it("valid code-action-preview passes with optional endLine/endCharacter", () => {
-    const v = validateEditRequest({ refactor: { kind: "code-action-preview", path: "/a.ts", line: 0, character: 0 }, toolCallId: "t" } as unknown as Record<string, unknown>);
+    const v = validateEditRequest({ refactor: { kind: "code-action-preview", path: "/a.ts", line: 1, character: 1 }, toolCallId: "t" } as unknown as Record<string, unknown>);
     assert.equal(v.ok, true);
     const v2 = validateEditRequest({ refactor: { kind: "code-action-preview", path: "/a.ts", line: 1, character: 2, endLine: 1, endCharacter: 5, diagnostics: [], only: ["quickfix"] }, toolCallId: "t" } as unknown as Record<string, unknown>);
     assert.equal(v2.ok, true);
   });
+  it("rejects line 0 (1-based)", () => {
+    const v = validateEditRequest({ refactor: { kind: "rename-preview", path: "/a.ts", line: 0, character: 1, newName: "b" }, toolCallId: "t" } as unknown as Record<string, unknown>);
+    assert.equal(v.ok, false);
+    const v2 = validateEditRequest({ refactor: { kind: "rename-preview", path: "/a.ts", line: 1, character: 0, newName: "b" }, toolCallId: "t" } as unknown as Record<string, unknown>);
+    assert.equal(v2.ok, false);
+  });
   it("new kinds are mutually exclusive with edits/raw", () => {
     for (const kind of ["organize-imports-preview", "formatting-preview", "code-action-preview"] as const) {
-      const base: Record<string, unknown> = kind === "code-action-preview" ? { kind, path: "/a.ts", line: 0, character: 0 } : { kind, path: "/a.ts" };
+      const base: Record<string, unknown> = kind === "code-action-preview" ? { kind, path: "/a.ts", line: 1, character: 1 } : { kind, path: "/a.ts" };
       const v = validateEditRequest({ edits: [{ oldText: "a", newText: "b" }], refactor: base, toolCallId: "t" } as unknown as Record<string, unknown>);
       assert.equal(v.ok, false, `${kind} should be mutually exclusive with edits`);
       const v2 = validateEditRequest({ raw: "diff", refactor: base, toolCallId: "t" } as unknown as Record<string, unknown>);

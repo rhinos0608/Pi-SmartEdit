@@ -12,6 +12,8 @@ export interface CachedPreview {
   character: number;
   newName: string;
   serverDescriptorId?: string;
+  sessionId: string;
+  sessionRoot: string;
 }
 
 export class RenamePreviewCache {
@@ -27,7 +29,7 @@ export class RenamePreviewCache {
   store(
     workspaceEdit: LspWorkspaceEdit,
     plannedRename: PlannedRename,
-    meta: { filePath: string; line: number; character: number; newName: string; serverDescriptorId?: string },
+    meta: { filePath: string; line: number; character: number; newName: string; serverDescriptorId?: string; sessionId: string; sessionRoot: string },
   ): string {
     const previewId = crypto.randomUUID();
     const createdAt = Date.now();
@@ -42,6 +44,8 @@ export class RenamePreviewCache {
       character: meta.character,
       newName: meta.newName,
       ...(meta.serverDescriptorId ? { serverDescriptorId: meta.serverDescriptorId } : {}),
+      sessionId: meta.sessionId,
+      sessionRoot: meta.sessionRoot,
     };
     // Evict oldest if at capacity
     if (this.map.size >= this.maxEntries) {
@@ -59,13 +63,15 @@ export class RenamePreviewCache {
     return previewId;
   }
 
-  get(previewId: string): CachedPreview | null {
+  get(previewId: string, opts?: { sessionId?: string; sessionRoot?: string }): CachedPreview | null {
     const entry = this.map.get(previewId);
     if (!entry) return null;
     if (Date.now() > entry.expiresAt) {
       this.map.delete(previewId);
       return null;
     }
+    if (opts?.sessionId !== undefined && entry.sessionId !== opts.sessionId) return null;
+    if (opts?.sessionRoot !== undefined && entry.sessionRoot !== opts.sessionRoot) return null;
     return entry;
   }
 
@@ -73,10 +79,19 @@ export class RenamePreviewCache {
     this.map.delete(previewId);
   }
 
-  size(): number {
+  size(opts?: { sessionId?: string; sessionRoot?: string }): number {
     // purge expired before counting
     for (const [k, v] of [...this.map.entries()]) {
       if (Date.now() > v.expiresAt) this.map.delete(k);
+    }
+    if (opts?.sessionId !== undefined || opts?.sessionRoot !== undefined) {
+      let n = 0;
+      for (const v of this.map.values()) {
+        if (opts.sessionId !== undefined && v.sessionId !== opts.sessionId) continue;
+        if (opts.sessionRoot !== undefined && v.sessionRoot !== opts.sessionRoot) continue;
+        n++;
+      }
+      return n;
     }
     return this.map.size;
   }

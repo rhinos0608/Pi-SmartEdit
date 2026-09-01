@@ -555,8 +555,16 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                             return { content: [{ type: "text" as const, text: `failed: rename-preview: ${resp.error ?? "no edit"}` }], details: makeFailed(toolCallId, "stage", resp.error ?? "no workspaceEdit", { inspectionId: "", resourceIds: [] }, freshChecks(), [resp.error ?? "no workspaceEdit"]) };
                         }
                         const planned = await planPositionalEdits(resp.workspaceEdit, async (p) => (await fsReadFile(p)).toString("utf8"));
-                        const previewId = globalRenamePreviewCache.store(resp.workspaceEdit, planned, { filePath: refactor.path!, line: refactor.line!, character: refactor.character!, newName: refactor.newName!, serverDescriptorId: resp.serverDescriptorId });
-                        return { content: [{ type: "text" as const, text: `preview ${previewId}: ${planned.stagedFiles.length} file(s)\n${planned.diffString.slice(0, 4000)}` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: planned.diffString, diffs: planned.stagedFiles.map((sf) => ({ path: sf.filePath, diff: sf.newContent })), previewId, stagedFiles: planned.stagedFiles.length } as unknown as PatchToolDetails };
+                        {
+                            const _sfp = deps.getSessionFilePath();
+                            if (!_sfp) {
+                                return { content: [{ type: "text" as const, text: "failed: refactor preview requires an active session (no session file path available)" }], details: makeFailed(toolCallId, "stage", "no session file path", { inspectionId: "", resourceIds: [] }, freshChecks(), ["no session file path"]) };
+                            }
+                            const _root = deps.getCanonicalWorkspaceRoot();
+                            const _sid = hashSessionFilePath(_sfp);
+                            const previewId = globalRenamePreviewCache.store(resp.workspaceEdit, planned, { filePath: refactor.path!, line: refactor.line!, character: refactor.character!, newName: refactor.newName!, serverDescriptorId: resp.serverDescriptorId, sessionId: _sid, sessionRoot: _root });
+                            return { content: [{ type: "text" as const, text: `preview ${previewId}: ${planned.stagedFiles.length} file(s)\n${planned.diffString.slice(0, 4000)}` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: planned.diffString, diffs: planned.stagedFiles.map((sf) => ({ path: sf.filePath, diff: sf.newContent })), previewId, stagedFiles: planned.stagedFiles.length } as unknown as PatchToolDetails };
+                        }
                     } catch (err) {
                         const msg = err instanceof Error ? err.message : String(err);
                         return { content: [{ type: "text" as const, text: `failed: rename-preview ${msg}` }], details: makeFailed(toolCallId, "stage", msg, { inspectionId: "", resourceIds: [] }, freshChecks(), [msg]) };
@@ -572,8 +580,16 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                             return { content: [{ type: "text" as const, text: `failed: organize-imports-preview: ${resp.error ?? "no edit"}` }], details: makeFailed(toolCallId, "stage", resp.error ?? "no workspaceEdit", { inspectionId: "", resourceIds: [] }, freshChecks(), [resp.error ?? "no workspaceEdit"]) };
                         }
                         const planned = await planPositionalEdits(resp.workspaceEdit, async (p) => (await fsReadFile(p)).toString("utf8"));
-                        const previewId = globalRenamePreviewCache.store(resp.workspaceEdit, planned, { filePath: refactor.path!, line: 0, character: 0, newName: "", serverDescriptorId: resp.serverDescriptorId });
-                        return { content: [{ type: "text" as const, text: `preview ${previewId}: ${planned.stagedFiles.length} file(s)\n${planned.diffString.slice(0, 4000)}` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: planned.diffString, diffs: planned.stagedFiles.map((sf) => ({ path: sf.filePath, diff: sf.newContent })), previewId, stagedFiles: planned.stagedFiles.length } as unknown as PatchToolDetails };
+                        {
+                            const _sfp2 = deps.getSessionFilePath();
+                            if (!_sfp2) {
+                                return { content: [{ type: "text" as const, text: "failed: refactor preview requires an active session (no session file path available)" }], details: makeFailed(toolCallId, "stage", "no session file path", { inspectionId: "", resourceIds: [] }, freshChecks(), ["no session file path"]) };
+                            }
+                            const _root2 = deps.getCanonicalWorkspaceRoot();
+                            const _sid2 = hashSessionFilePath(_sfp2);
+                            const previewId = globalRenamePreviewCache.store(resp.workspaceEdit, planned, { filePath: refactor.path!, line: 0, character: 0, newName: "", serverDescriptorId: resp.serverDescriptorId, sessionId: _sid2, sessionRoot: _root2 });
+                            return { content: [{ type: "text" as const, text: `preview ${previewId}: ${planned.stagedFiles.length} file(s)\n${planned.diffString.slice(0, 4000)}` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: planned.diffString, diffs: planned.stagedFiles.map((sf) => ({ path: sf.filePath, diff: sf.newContent })), previewId, stagedFiles: planned.stagedFiles.length } as unknown as PatchToolDetails };
+                        }
                     } catch (err) {
                         const msg = err instanceof Error ? err.message : String(err);
                         return { content: [{ type: "text" as const, text: `failed: organize-imports-preview ${msg}` }], details: makeFailed(toolCallId, "stage", msg, { inspectionId: "", resourceIds: [] }, freshChecks(), [msg]) };
@@ -589,8 +605,16 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                             return { content: [{ type: "text" as const, text: `failed: formatting-preview: ${resp.error ?? "no edit"}` }], details: makeFailed(toolCallId, "stage", resp.error ?? "no workspaceEdit", { inspectionId: "", resourceIds: [] }, freshChecks(), [resp.error ?? "no workspaceEdit"]) };
                         }
                         const planned = await planPositionalEdits(resp.workspaceEdit, async (p) => (await fsReadFile(p)).toString("utf8"));
-                        const previewId = globalRenamePreviewCache.store(resp.workspaceEdit, planned, { filePath: refactor.path!, line: 0, character: 0, newName: "", serverDescriptorId: resp.serverDescriptorId });
-                        return { content: [{ type: "text" as const, text: `preview ${previewId}: ${planned.stagedFiles.length} file(s)\n${planned.diffString.slice(0, 4000)}` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: planned.diffString, diffs: planned.stagedFiles.map((sf) => ({ path: sf.filePath, diff: sf.newContent })), previewId, stagedFiles: planned.stagedFiles.length } as unknown as PatchToolDetails };
+                        {
+                            const _sfp3 = deps.getSessionFilePath();
+                            if (!_sfp3) {
+                                return { content: [{ type: "text" as const, text: "failed: refactor preview requires an active session (no session file path available)" }], details: makeFailed(toolCallId, "stage", "no session file path", { inspectionId: "", resourceIds: [] }, freshChecks(), ["no session file path"]) };
+                            }
+                            const _root3 = deps.getCanonicalWorkspaceRoot();
+                            const _sid3 = hashSessionFilePath(_sfp3);
+                            const previewId = globalRenamePreviewCache.store(resp.workspaceEdit, planned, { filePath: refactor.path!, line: 0, character: 0, newName: "", serverDescriptorId: resp.serverDescriptorId, sessionId: _sid3, sessionRoot: _root3 });
+                            return { content: [{ type: "text" as const, text: `preview ${previewId}: ${planned.stagedFiles.length} file(s)\n${planned.diffString.slice(0, 4000)}` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: planned.diffString, diffs: planned.stagedFiles.map((sf) => ({ path: sf.filePath, diff: sf.newContent })), previewId, stagedFiles: planned.stagedFiles.length } as unknown as PatchToolDetails };
+                        }
                     } catch (err) {
                         const msg = err instanceof Error ? err.message : String(err);
                         return { content: [{ type: "text" as const, text: `failed: formatting-preview ${msg}` }], details: makeFailed(toolCallId, "stage", msg, { inspectionId: "", resourceIds: [] }, freshChecks(), [msg]) };
@@ -621,14 +645,26 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         }
                         const workspaceEdit = selected!.workspaceEdit!;
                         const planned = await planPositionalEdits(workspaceEdit, async (p) => (await fsReadFile(p)).toString("utf8"));
-                        const previewId = globalRenamePreviewCache.store(workspaceEdit, planned, { filePath: refactor.path!, line: refactor.line!, character: refactor.character!, newName: "", serverDescriptorId: resp.serverDescriptorId });
+                        const _sfp4 = deps.getSessionFilePath();
+                        if (!_sfp4) {
+                            return { content: [{ type: "text" as const, text: "failed: refactor preview requires an active session (no session file path available)" }], details: makeFailed(toolCallId, "stage", "no session file path", { inspectionId: "", resourceIds: [] }, freshChecks(), ["no session file path"]) };
+                        }
+                        const _root4 = deps.getCanonicalWorkspaceRoot();
+                        const _sid4 = hashSessionFilePath(_sfp4);
+                        const previewId = globalRenamePreviewCache.store(workspaceEdit, planned, { filePath: refactor.path!, line: refactor.line!, character: refactor.character!, newName: "", serverDescriptorId: resp.serverDescriptorId, sessionId: _sid4, sessionRoot: _root4 });
                         return { content: [{ type: "text" as const, text: `preview ${previewId}: ${planned.stagedFiles.length} file(s)\n${planned.diffString.slice(0, 4000)}` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: planned.diffString, diffs: planned.stagedFiles.map((sf) => ({ path: sf.filePath, diff: sf.newContent })), previewId, stagedFiles: planned.stagedFiles.length } as unknown as PatchToolDetails };
                     } catch (err) {
                         const msg = err instanceof Error ? err.message : String(err);
                         return { content: [{ type: "text" as const, text: `failed: code-action-preview ${msg}` }], details: makeFailed(toolCallId, "stage", msg, { inspectionId: "", resourceIds: [] }, freshChecks(), [msg]) };
                     }
                 } else {
-                    const cached = globalRenamePreviewCache.get(refactor.previewId!);
+                    const _sfpGet = deps.getSessionFilePath();
+                    if (!_sfpGet) {
+                        return { content: [{ type: "text" as const, text: "failed: refactor preview requires an active session (no session file path available)" }], details: makeFailed(toolCallId, "stage", "no session file path", { inspectionId: "", resourceIds: [] }, freshChecks(), ["no session file path"]) };
+                    }
+                    const _rootGet = deps.getCanonicalWorkspaceRoot();
+                    const _sidGet = hashSessionFilePath(_sfpGet);
+                    const cached = globalRenamePreviewCache.get(refactor.previewId!, { sessionId: _sidGet, sessionRoot: _rootGet });
                     if (!cached) {
                         return { content: [{ type: "text" as const, text: "rejected: preview not found or expired" }], details: makeRejected(toolCallId, "coverage", ["preview not found or expired"], { inspectionId: "", resourceIds: [] }, freshChecks()) };
                     }
@@ -654,17 +690,21 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                                 await tx.rollback();
                                 return { content: [{ type: "text", text: `rejected: files changed since preview: ${staleFiles.join(", ")}` }], details: makeRejected(toolCallId, "stale", [`files changed since preview: ${staleFiles.join(", ")}`], { inspectionId: "", resourceIds: [] }, freshChecks()) };
                             }
-                            // Finding 5: authorization check per staged file via prior authority
+                            // F1: canonical evidence authorization — SHA + range coverage per staged file
                             const priorStore = deps.getPriorAuthority?.() ?? null;
                             const unauthorized: string[] = [];
                             for (const sf of files) {
                                 let canonical: string;
                                 try { canonical = realpathSync(sf.filePath); } catch { canonical = sf.filePath; }
-                                const res = priorStore ? priorStore.select(canonical) : null;
-                                if (!res) {
-                                    // fallback: also try unresolved path
-                                    const res2 = priorStore ? priorStore.select(sf.filePath) : null;
-                                    if (!res2) unauthorized.push(sf.filePath);
+                                let res = priorStore ? priorStore.select(canonical) : null;
+                                if (!res) res = priorStore ? priorStore.select(sf.filePath) : null;
+                                if (!res) { unauthorized.push(`${sf.filePath} (no prior read authority)`); continue; }
+                                const preimageSha = sha256OfString(sf.originalContent);
+                                if (res.fullFileSha256 !== preimageSha) { unauthorized.push(`${sf.filePath} (SHA mismatch: authority ${String(res.fullFileSha256).slice(0, 8)} != preimage ${preimageSha.slice(0, 8)})`); continue; }
+                                const touched: Array<{ startLine: number; endLine: number }> = sf.edits.length === 0 ? [] : sf.edits.map((e) => ({ startLine: e.range.start.line + 1, endLine: e.range.end.line + 1 }));
+                                if (touched.length > 0) {
+                                    const covErr = checkResourceCoverage(res, touched);
+                                    if (covErr) unauthorized.push(`${sf.filePath} (${covErr})`);
                                 }
                             }
                             if (unauthorized.length > 0) {

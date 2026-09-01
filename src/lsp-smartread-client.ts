@@ -22,7 +22,7 @@ export async function requestRenamePreview(
   request: RenamePreviewRequest,
   opts?: { timeoutMs?: number },
 ): Promise<RenamePreviewResponse> {
-  const client = createRpcClient({ bus, channel: RPC_CHANNELS.languageIntelligence, timeoutMs: opts?.timeoutMs ?? 5000 });
+  const client = createRpcClient({ bus, channel: RPC_CHANNELS.languageIntelligence, timeoutMs: opts?.timeoutMs ?? 15000 });
   try {
     const reply = await client.request(LANGUAGE_INTELLIGENCE_RPC_METHODS.renamePreview, request);
     if (!reply.ok) throw new Error(reply.error ?? "rename_preview rpc failed");
@@ -37,7 +37,7 @@ export async function requestOrganizeImports(
   request: OrganizeImportsRequest,
   opts?: { timeoutMs?: number },
 ): Promise<OrganizeImportsResponse> {
-  const client = createRpcClient({ bus, channel: RPC_CHANNELS.languageIntelligence, timeoutMs: opts?.timeoutMs ?? 5000 });
+  const client = createRpcClient({ bus, channel: RPC_CHANNELS.languageIntelligence, timeoutMs: opts?.timeoutMs ?? 15000 });
   try {
     const reply = await client.request(LANGUAGE_INTELLIGENCE_RPC_METHODS.organizeImports, request);
     if (!reply.ok) throw new Error(reply.error ?? "organize_imports rpc failed");
@@ -52,7 +52,7 @@ export async function requestFormatting(
   request: FormattingRequest,
   opts?: { timeoutMs?: number },
 ): Promise<FormattingResponse> {
-  const client = createRpcClient({ bus, channel: RPC_CHANNELS.languageIntelligence, timeoutMs: opts?.timeoutMs ?? 5000 });
+  const client = createRpcClient({ bus, channel: RPC_CHANNELS.languageIntelligence, timeoutMs: opts?.timeoutMs ?? 15000 });
   try {
     const reply = await client.request(LANGUAGE_INTELLIGENCE_RPC_METHODS.formatting, request);
     if (!reply.ok) throw new Error(reply.error ?? "formatting rpc failed");
@@ -67,7 +67,7 @@ export async function requestCodeAction(
   request: CodeActionRequest,
   opts?: { timeoutMs?: number },
 ): Promise<CodeActionResponse> {
-  const client = createRpcClient({ bus, channel: RPC_CHANNELS.languageIntelligence, timeoutMs: opts?.timeoutMs ?? 5000 });
+  const client = createRpcClient({ bus, channel: RPC_CHANNELS.languageIntelligence, timeoutMs: opts?.timeoutMs ?? 15000 });
   try {
     const reply = await client.request(LANGUAGE_INTELLIGENCE_RPC_METHODS.codeAction, request);
     if (!reply.ok) throw new Error(reply.error ?? "code_action rpc failed");
