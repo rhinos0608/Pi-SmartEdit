@@ -23,6 +23,7 @@ import { constants } from "fs";
 import { saveUndoState, restoreUndoState } from "../undo/edit-history";
 import { atomicWrite } from "../undo/atomic-write";
 import { SmartEditError } from "../core/errors";
+import { normalizePatchText, PatchCursor } from "./patch-parser-core";
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -124,90 +125,18 @@ export function parseAtomicPatchEnvelope(input: string): AtomicPatchParseResult 
 
 // ─── Internal Parser ────────────────────────────────────────────────
 
-class AtomicPatchParser {
-  private input: string;
-  private pos: number;
-  private line: number;
-  private column: number;
+class AtomicPatchParser extends PatchCursor {
   private warnings: AtomicPatchWarning[];
 
   constructor(input: string) {
-    // Normalize line endings and strip BOM
-    this.input = input.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/^\uFEFF/, '');
-    this.pos = 0;
-    this.line = 1;
-    this.column = 1;
+    // Atomic strips BOM (preserved historical behavior).
+    super(normalizePatchText(input, { stripBOM: true }));
     this.warnings = [];
   }
 
   parse(): AtomicPatchParseResult {
     const envelope = this.parseEnvelope();
     return { envelope, warnings: this.warnings };
-  }
-
-  // ── Cursor management ──────────────────────────────────────────
-
-  private done(): boolean {
-    return this.pos >= this.input.length;
-  }
-
-  private peek(): string {
-    return this.input[this.pos] ?? '';
-  }
-
-  private advance(): string {
-    const ch = this.input[this.pos] ?? '';
-    this.pos++;
-    if (ch === '\n') {
-      this.line++;
-      this.column = 1;
-    } else {
-      this.column++;
-    }
-    return ch;
-  }
-
-  private consumeLine(): string {
-    const start = this.pos;
-    while (!this.done() && this.peek() !== '\n') {
-      this.pos++;
-    }
-    const line = this.input.slice(start, this.pos);
-    this.column += this.pos - start;
-    if (!this.done() && this.peek() === '\n') {
-      this.advance();
-    }
-    return line;
-  }
-
-  private peekLine(): string {
-    const start = this.pos;
-    let end = start;
-    while (end < this.input.length && this.input[end] !== '\n') {
-      end++;
-    }
-    return this.input.slice(start, end);
-  }
-
-  private skipBlankLines(): void {
-    while (!this.done()) {
-      const saved = { pos: this.pos, line: this.line, column: this.column };
-      this.skipHorizontalWs();
-      if (this.peek() === '\n' || this.done()) {
-        if (this.peek() === '\n') this.advance();
-        continue;
-      }
-      this.pos = saved.pos;
-      this.line = saved.line;
-      this.column = saved.column;
-      return;
-    }
-  }
-
-  private skipHorizontalWs(): void {
-    while (this.peek() === ' ' || this.peek() === '\t') {
-      this.advance();
-    }
   }
 
   // ── Grammar: envelope ───────────────────────────────────────────

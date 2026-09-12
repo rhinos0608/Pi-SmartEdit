@@ -14,6 +14,7 @@
  */
 
 import { parseCodexPatch, codexHunkToEditItem } from './codex-patch';
+import { normalizePatchText } from './patch-parser-core';
 
 export interface OpenAIPatch {
   path: string;
@@ -41,7 +42,8 @@ export interface OpenAIPatch {
  * NewText = contextAnchor + "\n" + addedLines.join("\n")
  */
 export function parseOpenAIPatch(input: string): OpenAIPatch[] {
-  const normalized = input.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/^\uFEFF/, '');
+  // OpenAI strips BOM (preserved historical behavior).
+  const normalized = normalizePatchText(input, { stripBOM: true });
 
   // Check for complex Codex operations that need the grammar parser
   const hasComplexOps =

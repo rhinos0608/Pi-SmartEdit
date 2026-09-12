@@ -17,6 +17,7 @@
  */
 
 import { SmartEditError } from "../core/errors";
+import { normalizePatchText, PatchCursor } from "./patch-parser-core";
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -230,20 +231,13 @@ export function codexHunkToEditItem(
 
 // ─── Internal Parser ────────────────────────────────────────────────
 
-class CodexPatchParser {
-  private input: string;
-  private pos: number;
-  private line: number;
-  private column: number;
+class CodexPatchParser extends PatchCursor {
   private mode: ParseMode;
   private warnings: PatchWarning[];
 
   constructor(input: string, mode: ParseMode) {
-    // Normalize CRLF to LF, then CR to LF
-    this.input = input.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-    this.pos = 0;
-    this.line = 1;
-    this.column = 1;
+    // Codex does not strip BOM (preserved historical behavior).
+    super(normalizePatchText(input));
     this.mode = mode;
     this.warnings = [];
   }
@@ -251,78 +245,6 @@ class CodexPatchParser {
   parse(): CodexPatchResult {
     const hunks = this.parsePatch();
     return { hunks, warnings: this.warnings };
-  }
-
-  // ── Cursor management ──────────────────────────────────────────
-
-  private done(): boolean {
-    return this.pos >= this.input.length;
-  }
-
-  private peek(): string {
-    return this.input[this.pos] ?? '';
-  }
-
-  private advance(): string {
-    const ch = this.input[this.pos] ?? '';
-    this.pos++;
-    if (ch === '\n') {
-      this.line++;
-      this.column = 1;
-    } else {
-      this.column++;
-    }
-    return ch;
-  }
-
-  /** Consume until newline, return consumed text (not including newline). */
-  private consumeLine(): string {
-    const start = this.pos;
-    while (!this.done() && this.peek() !== '\n') {
-      this.pos++;
-    }
-    const line = this.input.slice(start, this.pos);
-    this.column += this.pos - start;
-    // Consume the newline
-    if (!this.done() && this.peek() === '\n') {
-      this.advance();
-    }
-    return line;
-  }
-
-  /** Read the rest of the current line without consuming it. */
-  private peekLine(): string {
-    const start = this.pos;
-    let end = start;
-    while (end < this.input.length && this.input[end] !== '\n') {
-      end++;
-    }
-    return this.input.slice(start, end);
-  }
-
-  /** Skip whitespace (spaces and tabs) at current position. */
-  private skipHorizontalWs(): void {
-    while (this.peek() === ' ' || this.peek() === '\t') {
-      this.advance();
-    }
-  }
-
-  /** Skip any blank lines at current position. */
-  private skipBlankLines(): void {
-    while (!this.done()) {
-      const saved = { pos: this.pos, line: this.line, column: this.column };
-      this.skipHorizontalWs();
-      if (this.peek() === '\n' || this.done()) {
-        // Blank line — consume the newline if present
-        if (this.peek() === '\n') this.advance();
-        continue;
-      }
-      // Not blank — restore full cursor state so caller's position is unchanged
-      this.pos = saved.pos;
-      this.line = saved.line;
-      this.column = saved.column;
-      return;
-    }
   }
 
   // ── Grammar: patch ─────────────────────────────────────────────
