@@ -203,125 +203,33 @@ async function runVerifierCheck(
     }
 }
 
-// ── Authorization ───────────────────────────────────────────────────
-
-export type AuthorizationResult =
-    | { ok: true; resource: InspectedResource }
-    | { ok: false; reason: string };
-
-/**
- * Canonical authorization helper — the single source of truth for resource
- * selection, coverage, SHA, and topology policy. `execute()` also calls
- * `authorizeResource` for per-group authorization, keeping both paths
- * structurally unified.
- */
-export function resolvePatchAuthorization(args: {
-    envelope: WorkspaceEvidenceEnvelope;
-    sessionFilePath: string;
-    canonicalWorkspaceRoot: string;
-    requestedResourceIds: ReadonlyArray<string>;
-    targetLineRange?: LineRange;
-}): AuthorizationResult {
-    if (!args.envelope) return { ok: false, reason: "missing envelope" };
-    const expectedSessionId = hashSessionFilePath(args.sessionFilePath);
-    if (args.envelope.sessionId !== expectedSessionId) {
-        return { ok: false, reason: "session identity mismatch" };
-    }
-    if (args.envelope.canonicalWorkspaceRoot !== args.canonicalWorkspaceRoot) {
-        return { ok: false, reason: "workspace mismatch" };
-    }
-    if (args.requestedResourceIds.length === 0) return { ok: false, reason: "missing resourceIds" };
-
-    const result = authorizeResource({
-        resources: args.envelope.resources,
-        canonicalWorkspaceRoot: args.canonicalWorkspaceRoot,
-        requestedResourceIds: args.requestedResourceIds,
-        targetRanges: args.targetLineRange ? [args.targetLineRange] : [],
-    });
-    if (!result.ok && result.reason === "missing resource") {
-        const missing = args.requestedResourceIds.find((id) => !args.envelope.resources.some((r) => r.resourceId === id));
-        return { ok: false, reason: `missing resource: ${missing ?? "unknown"}` };
-    }
-    return result;
-}
+// ── Authorization (see ./patch-authorization.ts) ────────────────────
+// Evidence authorization (types, resource selection, coverage validation,
+// SHA-shape validation, requested-resource lookup) lives in
+// patch-authorization.ts. patch.ts keeps evidence RPC, grouping, mutation,
+// and rollback. Re-exported here so existing importers keep working.
+export {
+    resolvePatchAuthorization,
+    authorizeResource,
+    checkResourceCoverage,
+    validateResourceAuthority,
+    findResourceForCanonicalPath,
+    isValidFullFileSha256,
+    SHA256_RE,
+    type AuthorizationResult,
+} from "./patch-authorization.js";
+import {
+    authorizeResource,
+    checkResourceCoverage,
+    validateResourceAuthority,
+    findResourceForCanonicalPath,
+    isValidFullFileSha256,
+} from "./patch-authorization.js";
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
 function safeReadUtf8(path: string): Promise<string> {
     return fsReadFile(path).then((b) => b.toString("utf8"));
-}
-
-function withinRange(target: LineRange, range: LineRange): boolean {
-    return target.startLine >= range.startLine && target.endLine <= range.endLine;
-}
-
-const SHA256_RE = /^[0-9a-f]{64}$/i;
-
-function validateResourceAuthority(resource: InspectedResource, targetRanges: ReadonlyArray<LineRange>, requireFull: boolean): string | null {
-    if (resource.coverage !== "full-file" && resource.coverage !== "line-range") return checkResourceCoverage(resource, targetRanges);
-    if (requireFull && resource.coverage !== "full-file") return "coverage: full-file evidence required for topology mutation";
-    if (typeof resource.fullFileSha256 !== "string" || !SHA256_RE.test(resource.fullFileSha256)) {
-        return "coverage: strong evidence is missing a valid fullFileSha256 snapshot SHA-256; read the file again before editing";
-    }
-    return checkResourceCoverage(resource, targetRanges);
-}
-
-/** Canonical resource selection and authorization used by direct and execute paths. */
-function authorizeResource(args: {
-    resources: ReadonlyArray<InspectedResource>;
-    canonicalPath?: string;
-    canonicalWorkspaceRoot: string;
-    requestedResourceIds?: ReadonlyArray<string>;
-    targetRanges: ReadonlyArray<LineRange>;
-    requireFull?: boolean;
-}): AuthorizationResult {
-    const candidates = args.requestedResourceIds
-        ? args.requestedResourceIds.map((id) => args.resources.find((r) => r.resourceId === id) ?? null)
-        : [...args.resources];
-    if (candidates.some((r) => r === null)) return { ok: false, reason: "missing resource" };
-    for (const resource of candidates as InspectedResource[]) {
-        if (args.canonicalPath !== undefined && resource.canonicalPath !== args.canonicalPath) continue;
-        const error = validateResourceAuthority(resource, args.targetRanges, args.requireFull === true);
-        if (!error) return { ok: true, resource };
-        if (args.canonicalPath !== undefined) return { ok: false, reason: error };
-    }
-    return { ok: false, reason: "coverage: no requested resource covers the target line range" };
-}
-
-/** One coverage policy shared by direct authorization tests and execute(). */
-export function checkResourceCoverage(
-    resource: InspectedResource,
-    targetRanges: ReadonlyArray<LineRange>,
-): string | null {
-    if (resource.coverage === "search-match" || resource.coverage === "metadata-only") {
-        return `coverage: ${resource.coverage} is weak evidence and cannot authorize a patch`;
-    }
-    if (resource.coverage !== "line-range") return null;
-    const uncovered = targetRanges.filter(
-        (target) => !resource.allowedRanges.some((allowed) => withinRange(target, allowed)),
-    );
-    if (uncovered.length === 0) return null;
-    const first = uncovered[0];
-    return first
-        ? `coverage: ${uncovered.length} occurrence(s) outside allowedRanges (e.g. [${first.startLine},${first.endLine}])`
-        : `coverage: ${uncovered.length} occurrence(s) outside allowedRanges`;
-}
-
-function findResourceForCanonicalPath(
-    envelope: WorkspaceEvidenceEnvelope,
-    canonicalPath: string,
-    requestedIds: ReadonlyArray<string>,
-): InspectedResource | null {
-    // Restrict strictly to requested resources — evidenceRef.resourceIds is
-    // the explicit authorization list. A resource not listed there must
-    // never authorize a patch, even if it happens to share a canonical path
-    // with a listed resource.
-    for (const rid of requestedIds) {
-        const r = envelope.resources.find((x) => x.resourceId === rid);
-        if (!r) continue;
-        if (r.canonicalPath === canonicalPath) return r;
-    }
-    return null;
 }
 
 // ── Per-edit grouping ───────────────────────────────────────────────
@@ -1245,7 +1153,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                             }, checks, usedEvidence, invalidations),
                         };
                     }
-                    if (typeof sourceResource.fullFileSha256 !== "string" || !SHA256_RE.test(sourceResource.fullFileSha256)) {
+                    if (!isValidFullFileSha256(sourceResource.fullFileSha256)) {
                         diagnostics.push(`coverage: missing or malformed fullFileSha256 for ${rt.rawFrom}; read the source file again before copying`);
                         return {
                             content: [{ type: "text" as const, text: `rejected: coverage (missing valid snapshot SHA for copy source ${rt.rawFrom})` }],
@@ -1490,7 +1398,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 // a freshness hash; missing SHA rejects rather than silently
                 // skipping freshness. A selected prior grant never falls back to
                 // full-file auto-inspection on staleness.
-                if (typeof resource.fullFileSha256 !== "string" || !SHA256_RE.test(resource.fullFileSha256)) {
+                if (!isValidFullFileSha256(resource.fullFileSha256)) {
                     diagnostics.push(`coverage: missing or malformed fullFileSha256 for ${canonicalTarget}; read the file again before editing`);
                     return {
                         content: [{ type: "text" as const, text: `rejected: coverage (missing valid snapshot SHA for ${group.rawPath})` }],
