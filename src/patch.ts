@@ -54,7 +54,9 @@ import {
 } from "@rhinos0608/pi-workspace-protocol";
 import { formatBoundedDiagnostics, appendDiagnosticsToContent } from "./post-mutation.js";
 import { generateDiffString, stripBom, normalizeToLF } from "./core/edit-diff.js";
-import { resolveSourceRange, buildTransferInsertEdit, buildTransferDeleteEdit } from "./transfer-edit.js";
+import { adaptTransferOps } from "./transfer/adapter.js";
+import { resolveSourceRange, resolveDestination } from "./transfer/resolve.js";
+import { planTransfer, bindResolvedTransfer, planTransferMutations, buildTransferDescription, buildTransferInsertEdit, buildTransferDeleteEdit, type TransferPlan } from "./transfer/plan.js";
 import { checkEditSafety } from "./safety/approval-gating.js";
 import { EDIT_PARAMETERS, validateEditRequest, type EditOperation } from "./edit-contract.js";
 import { planPositionalEdits } from "./positional-planner.js";
@@ -550,7 +552,14 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         return { content: [{ type: "text" as const, text: "failed: rename-preview requires bus" }], details: makeFailed(toolCallId, "stage", "bus unavailable", { inspectionId: "", resourceIds: [] }, freshChecks(), ["bus unavailable"]) };
                     }
                     try {
-                        const resp = await requestRenamePreview(bus, { filePath: refactor.path!, line: refactor.line!, character: refactor.character!, newName: refactor.newName! });
+                        const renamePath = refactor.path;
+                        const renameLine = refactor.line;
+                        const renameCharacter = refactor.character;
+                        const renameNewName = refactor.newName;
+                        if (renamePath === undefined || renameLine === undefined || renameCharacter === undefined || renameNewName === undefined) {
+                            return { content: [{ type: "text" as const, text: "failed: rename-preview requires path, line, character, newName" }], details: makeFailed(toolCallId, "stage", "missing rename-preview fields", { inspectionId: "", resourceIds: [] }, freshChecks(), ["missing rename-preview fields"]) };
+                        }
+                        const resp = await requestRenamePreview(bus, { filePath: renamePath, line: renameLine, character: renameCharacter, newName: renameNewName });
                         if (!resp.ok || !resp.workspaceEdit) {
                             return { content: [{ type: "text" as const, text: `failed: rename-preview: ${resp.error ?? "no edit"}` }], details: makeFailed(toolCallId, "stage", resp.error ?? "no workspaceEdit", { inspectionId: "", resourceIds: [] }, freshChecks(), [resp.error ?? "no workspaceEdit"]) };
                         }
@@ -562,7 +571,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                             }
                             const _root = deps.getCanonicalWorkspaceRoot();
                             const _sid = hashSessionFilePath(_sfp);
-                            const previewId = globalRenamePreviewCache.store(resp.workspaceEdit, planned, { filePath: refactor.path!, line: refactor.line!, character: refactor.character!, newName: refactor.newName!, serverDescriptorId: resp.serverDescriptorId, sessionId: _sid, sessionRoot: _root });
+                            const previewId = globalRenamePreviewCache.store(resp.workspaceEdit, planned, { filePath: renamePath, line: renameLine, character: renameCharacter, newName: renameNewName, serverDescriptorId: resp.serverDescriptorId, sessionId: _sid, sessionRoot: _root });
                             return { content: [{ type: "text" as const, text: `preview ${previewId}: ${planned.stagedFiles.length} file(s)\n${planned.diffString.slice(0, 4000)}` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: planned.diffString, diffs: planned.stagedFiles.map((sf) => ({ path: sf.filePath, diff: sf.newContent })), previewId, stagedFiles: planned.stagedFiles.length } as unknown as PatchToolDetails };
                         }
                     } catch (err) {
@@ -575,7 +584,11 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         return { content: [{ type: "text" as const, text: "failed: organize-imports-preview requires bus" }], details: makeFailed(toolCallId, "stage", "bus unavailable", { inspectionId: "", resourceIds: [] }, freshChecks(), ["bus unavailable"]) };
                     }
                     try {
-                        const resp = await requestOrganizeImports(bus, { filePath: refactor.path! });
+                        const organizePath = refactor.path;
+                        if (organizePath === undefined) {
+                            return { content: [{ type: "text" as const, text: "failed: organize-imports-preview requires path" }], details: makeFailed(toolCallId, "stage", "missing organize-imports-preview path", { inspectionId: "", resourceIds: [] }, freshChecks(), ["missing organize-imports-preview path"]) };
+                        }
+                        const resp = await requestOrganizeImports(bus, { filePath: organizePath });
                         if (!resp.ok || !resp.workspaceEdit) {
                             return { content: [{ type: "text" as const, text: `failed: organize-imports-preview: ${resp.error ?? "no edit"}` }], details: makeFailed(toolCallId, "stage", resp.error ?? "no workspaceEdit", { inspectionId: "", resourceIds: [] }, freshChecks(), [resp.error ?? "no workspaceEdit"]) };
                         }
@@ -587,7 +600,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                             }
                             const _root2 = deps.getCanonicalWorkspaceRoot();
                             const _sid2 = hashSessionFilePath(_sfp2);
-                            const previewId = globalRenamePreviewCache.store(resp.workspaceEdit, planned, { filePath: refactor.path!, line: 0, character: 0, newName: "", serverDescriptorId: resp.serverDescriptorId, sessionId: _sid2, sessionRoot: _root2 });
+                            const previewId = globalRenamePreviewCache.store(resp.workspaceEdit, planned, { filePath: organizePath, line: 0, character: 0, newName: "", serverDescriptorId: resp.serverDescriptorId, sessionId: _sid2, sessionRoot: _root2 });
                             return { content: [{ type: "text" as const, text: `preview ${previewId}: ${planned.stagedFiles.length} file(s)\n${planned.diffString.slice(0, 4000)}` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: planned.diffString, diffs: planned.stagedFiles.map((sf) => ({ path: sf.filePath, diff: sf.newContent })), previewId, stagedFiles: planned.stagedFiles.length } as unknown as PatchToolDetails };
                         }
                     } catch (err) {
@@ -600,7 +613,11 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         return { content: [{ type: "text" as const, text: "failed: formatting-preview requires bus" }], details: makeFailed(toolCallId, "stage", "bus unavailable", { inspectionId: "", resourceIds: [] }, freshChecks(), ["bus unavailable"]) };
                     }
                     try {
-                        const resp = await requestFormatting(bus, { filePath: refactor.path!, tabSize: refactor.tabSize, insertSpaces: refactor.insertSpaces });
+                        const formattingPath = refactor.path;
+                        if (formattingPath === undefined) {
+                            return { content: [{ type: "text" as const, text: "failed: formatting-preview requires path" }], details: makeFailed(toolCallId, "stage", "missing formatting-preview path", { inspectionId: "", resourceIds: [] }, freshChecks(), ["missing formatting-preview path"]) };
+                        }
+                        const resp = await requestFormatting(bus, { filePath: formattingPath, tabSize: refactor.tabSize, insertSpaces: refactor.insertSpaces });
                         if (!resp.ok || !resp.workspaceEdit) {
                             return { content: [{ type: "text" as const, text: `failed: formatting-preview: ${resp.error ?? "no edit"}` }], details: makeFailed(toolCallId, "stage", resp.error ?? "no workspaceEdit", { inspectionId: "", resourceIds: [] }, freshChecks(), [resp.error ?? "no workspaceEdit"]) };
                         }
@@ -612,7 +629,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                             }
                             const _root3 = deps.getCanonicalWorkspaceRoot();
                             const _sid3 = hashSessionFilePath(_sfp3);
-                            const previewId = globalRenamePreviewCache.store(resp.workspaceEdit, planned, { filePath: refactor.path!, line: 0, character: 0, newName: "", serverDescriptorId: resp.serverDescriptorId, sessionId: _sid3, sessionRoot: _root3 });
+                            const previewId = globalRenamePreviewCache.store(resp.workspaceEdit, planned, { filePath: formattingPath, line: 0, character: 0, newName: "", serverDescriptorId: resp.serverDescriptorId, sessionId: _sid3, sessionRoot: _root3 });
                             return { content: [{ type: "text" as const, text: `preview ${previewId}: ${planned.stagedFiles.length} file(s)\n${planned.diffString.slice(0, 4000)}` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: planned.diffString, diffs: planned.stagedFiles.map((sf) => ({ path: sf.filePath, diff: sf.newContent })), previewId, stagedFiles: planned.stagedFiles.length } as unknown as PatchToolDetails };
                         }
                     } catch (err) {
@@ -625,7 +642,13 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         return { content: [{ type: "text" as const, text: "failed: code-action-preview requires bus" }], details: makeFailed(toolCallId, "stage", "bus unavailable", { inspectionId: "", resourceIds: [] }, freshChecks(), ["bus unavailable"]) };
                     }
                     try {
-                        const resp = await requestCodeAction(bus, { filePath: refactor.path!, line: refactor.line!, character: refactor.character!, endLine: refactor.endLine as number | undefined, endCharacter: refactor.endCharacter as number | undefined, diagnostics: refactor.diagnostics as never, only: refactor.only as never });
+                        const codeActionPath = refactor.path;
+                        const codeActionLine = refactor.line;
+                        const codeActionCharacter = refactor.character;
+                        if (codeActionPath === undefined || codeActionLine === undefined || codeActionCharacter === undefined) {
+                            return { content: [{ type: "text" as const, text: "failed: code-action-preview requires path, line, character" }], details: makeFailed(toolCallId, "stage", "missing code-action-preview fields", { inspectionId: "", resourceIds: [] }, freshChecks(), ["missing code-action-preview fields"]) };
+                        }
+                        const resp = await requestCodeAction(bus, { filePath: codeActionPath, line: codeActionLine, character: codeActionCharacter, endLine: refactor.endLine, endCharacter: refactor.endCharacter, diagnostics: refactor.diagnostics as never, only: refactor.only as never });
                         if (!resp.ok) {
                             return { content: [{ type: "text" as const, text: `failed: code-action-preview: ${resp.error ?? "no actions"}` }], details: makeFailed(toolCallId, "stage", resp.error ?? "code action failed", { inspectionId: "", resourceIds: [] }, freshChecks(), [resp.error ?? "code action failed"]) };
                         }
@@ -643,7 +666,10 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         } else {
                             selected = withEdit.find((a) => a.isPreferred) ?? withEdit[0];
                         }
-                        const workspaceEdit = selected!.workspaceEdit!;
+                        if (!selected?.workspaceEdit) {
+                            return { content: [{ type: "text" as const, text: "failed: no applicable code action" }], details: makeFailed(toolCallId, "stage", "no applicable code action", { inspectionId: "", resourceIds: [] }, freshChecks(), ["no applicable code action"]) };
+                        }
+                        const workspaceEdit = selected.workspaceEdit;
                         const planned = await planPositionalEdits(workspaceEdit, async (p) => (await fsReadFile(p)).toString("utf8"));
                         const _sfp4 = deps.getSessionFilePath();
                         if (!_sfp4) {
@@ -651,7 +677,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                         }
                         const _root4 = deps.getCanonicalWorkspaceRoot();
                         const _sid4 = hashSessionFilePath(_sfp4);
-                        const previewId = globalRenamePreviewCache.store(workspaceEdit, planned, { filePath: refactor.path!, line: refactor.line!, character: refactor.character!, newName: "", serverDescriptorId: resp.serverDescriptorId, sessionId: _sid4, sessionRoot: _root4 });
+                        const previewId = globalRenamePreviewCache.store(workspaceEdit, planned, { filePath: codeActionPath, line: codeActionLine, character: codeActionCharacter, newName: "", serverDescriptorId: resp.serverDescriptorId, sessionId: _sid4, sessionRoot: _root4 });
                         return { content: [{ type: "text" as const, text: `preview ${previewId}: ${planned.stagedFiles.length} file(s)\n${planned.diffString.slice(0, 4000)}` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: planned.diffString, diffs: planned.stagedFiles.map((sf) => ({ path: sf.filePath, diff: sf.newContent })), previewId, stagedFiles: planned.stagedFiles.length } as unknown as PatchToolDetails };
                     } catch (err) {
                         const msg = err instanceof Error ? err.message : String(err);
@@ -664,7 +690,11 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     }
                     const _rootGet = deps.getCanonicalWorkspaceRoot();
                     const _sidGet = hashSessionFilePath(_sfpGet);
-                    const cached = globalRenamePreviewCache.get(refactor.previewId!, { sessionId: _sidGet, sessionRoot: _rootGet });
+                    const applyPreviewId = refactor.previewId;
+                    if (applyPreviewId === undefined) {
+                        return { content: [{ type: "text" as const, text: "failed: apply-refactor-preview requires previewId" }], details: makeFailed(toolCallId, "stage", "missing previewId", { inspectionId: "", resourceIds: [] }, freshChecks(), ["missing previewId"]) };
+                    }
+                    const cached = globalRenamePreviewCache.get(applyPreviewId, { sessionId: _sidGet, sessionRoot: _rootGet });
                     if (!cached) {
                         return { content: [{ type: "text" as const, text: "rejected: preview not found or expired" }], details: makeRejected(toolCallId, "coverage", ["preview not found or expired"], { inspectionId: "", resourceIds: [] }, freshChecks()) };
                     }
@@ -719,8 +749,8 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                             try { await tx.rollback(); } catch {}
                             throw e;
                         }
-                        globalRenamePreviewCache.delete(refactor.previewId!);
-                        return { content: [{ type: "text" as const, text: `applied refactor ${refactor.previewId}: ${files.length} file(s)` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: cached.plannedRename.diffString } as unknown as PatchToolDetails };
+                        globalRenamePreviewCache.delete(applyPreviewId);
+                        return { content: [{ type: "text" as const, text: `applied refactor ${applyPreviewId}: ${files.length} file(s)` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: cached.plannedRename.diffString } as unknown as PatchToolDetails };
                     } catch (err) {
                         const msg = err instanceof Error ? err.message : String(err);
                         // If already formatted as rejected (contains "rejected:"), preserve it
@@ -797,6 +827,22 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             // produce `op`, so this is a no-op split when v.value.raw was used.
             const transferOps = requestEdits.filter((e) => e.op !== undefined);
             const textOps = requestEdits.filter((e) => e.op === undefined);
+            // Strict transfer adapter: only op/from/range/to/after/description
+            // may be present (path/replaceAll/oldText/newText/target/lineRange/
+            // hashline reject, mirroring the validator). Defense-in-depth — the
+            // request validator normally rejects these before patch runs.
+            // Transfer addressing is pathless (from/to carry the paths); the
+            // top-level path is accepted-but-ignored here.
+            const adaptedTransfers = adaptTransferOps(transferOps, v.value.path);
+            if (!adaptedTransfers.ok) {
+                return {
+                    content: [{ type: "text" as const, text: `rejected: ${adaptedTransfers.error}` }],
+                    details: makeRejected(toolCallId, "session", [adaptedTransfers.error], {
+                        inspectionId: requestEvidenceRef?.inspectionId ?? "",
+                        resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [],
+                    }, freshChecks()),
+                };
+            }
 
             // Group edits by file path (per-edit path overrides top-level).
             // v.value.path may be undefined when every edit supplies its own
@@ -880,6 +926,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 rawFrom: string;
                 rawTo: string;
                 toIsNewFile: boolean;
+                description: string | undefined;
             }> = [];
             // Transfer destinations that don't exist yet: allowed to be created
             // by the transfer (the append_file / EOF branch), authorized the
@@ -889,12 +936,12 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             // mutation happens there), but its content must still be snapshotted
             // by the transaction for resolveSourceRange/staleness to read it.
             const copySourceOnlyPaths = new Set<string>();
-            for (const transferOp of transferOps) {
-                const op = transferOp.op as "copy" | "move";
-                const rawFrom = transferOp.from as string;
-                const rawTo = transferOp.to as string;
-                const range = transferOp.range as { pos: string; end: string };
-                const after = transferOp.after as string | undefined;
+            for (const transferReq of adaptedTransfers.value) {
+                const op = transferReq.op;
+                const rawFrom = transferReq.from;
+                const rawTo = transferReq.to;
+                const range = transferReq.range;
+                const after = transferReq.after;
 
                 let canonicalFrom: string;
                 try {
@@ -930,7 +977,8 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 }
                 if (toIsNewFile) transferNewFileCanonicals.add(canonicalTo);
 
-                resolvedTransfers.push({ op, canonicalFrom, canonicalTo, range, after, rawFrom, rawTo, toIsNewFile });
+                const description = transferReq.description;
+                resolvedTransfers.push({ op, canonicalFrom, canonicalTo, range, after, rawFrom, rawTo, toIsNewFile, description });
 
                 const buckets: Array<[string, string]> = op === "move"
                     ? [[canonicalTo, rawTo], [canonicalFrom, rawFrom]]
@@ -1125,6 +1173,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             // loop (which then treats these exactly like any other hashline
             // group) and inside this try so an early rejection here still
             // triggers the finally-block rollback below.
+            const moveSourceSpans: Array<{ canonicalFrom: string; startLine: number; endLine: number }> = [];
             for (const rt of resolvedTransfers) {
                 const snapshot = transaction.getSnapshot(rt.canonicalFrom);
                 if (!snapshot || !snapshot.exists) {
@@ -1135,10 +1184,27 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     };
                 }
                 const rawSourceContent = snapshot.content ? snapshot.content.toString("utf8") : "";
-                const { text: strippedSource } = stripBom(rawSourceContent);
-                const sourceContent = normalizeToLF(strippedSource);
+                // Anchors address logical lines (BOM-stripped, LF-normalized);
+                // freshness below hashes the raw snapshot preimage instead.
+                const sourceLogicalLines = normalizeToLF(stripBom(rawSourceContent).text).split("\n");
 
-                const resolved = resolveSourceRange(sourceContent, rt.range.pos, rt.range.end);
+                // Plan the destination first: a supplied `after` on a new-file
+                // destination (or a non-public sentinel/suffix) is a pure
+                // planning error — reject pre-write with a transfer conflict
+                // before any source authority is consulted.
+                let transferPlan: TransferPlan;
+                try {
+                    transferPlan = planTransfer({ op: rt.op, from: rt.rawFrom, range: rt.range, to: rt.rawTo, after: rt.after, toIsNewFile: rt.toIsNewFile });
+                } catch (err) {
+                    const message = err instanceof Error ? err.message : String(err);
+                    diagnostics.push(message);
+                    return {
+                        content: [{ type: "text" as const, text: `rejected: ${message}` }],
+                        details: makeRejected(toolCallId, "conflict", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
+                    };
+                }
+
+                const resolved = resolveSourceRange(rawSourceContent, rt.range.pos, rt.range.end);
                 if (!resolved.ok) {
                     diagnostics.push(`transfer: ${resolved.error} (${rt.rawFrom})`);
                     return {
@@ -1189,7 +1255,10 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                             }, checks, usedEvidence, invalidations),
                         };
                     }
-                    if (sourceResource.fullFileSha256 !== sha256OfString(sourceContent)) {
+                    // Freshness hashes the raw snapshot preimage (BOM/CRLF
+                    // included): normalized content would hash differently from
+                    // the attested fullFileSha256 on such files.
+                    if (sourceResource.fullFileSha256 !== sha256OfString(rawSourceContent)) {
                         diagnostics.push(`stale: copy source ${rt.rawFrom} sha mismatch`);
                         return {
                             content: [{ type: "text" as const, text: `rejected: stale (copy source ${rt.rawFrom})` }],
@@ -1210,13 +1279,95 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     };
                 }
 
-                const description = `${rt.op} from ${rt.rawFrom}:${rt.range.pos}-${rt.range.end}`;
-                const toIdx = groups.findIndex((g) => g.absolutePath === rt.canonicalTo);
-                groups[toIdx] = { ...groups[toIdx], edits: [...groups[toIdx].edits, buildTransferInsertEdit(rt.toIsNewFile ? undefined : rt.after, resolved.value.lines, description)] };
-
+                // Overlapping move deletions resolve against the same original
+                // pre-transaction snapshot, so overlapping spans are a planning
+                // conflict — reject transfer-specifically rather than letting
+                // the unified overlap check report a generic failure.
                 if (rt.op === "move") {
+                    for (const seen of moveSourceSpans) {
+                        if (seen.canonicalFrom === rt.canonicalFrom
+                            && resolved.value.startLine <= seen.endLine && seen.startLine <= resolved.value.endLine) {
+                            const message = `transfer source spans overlap in ${rt.rawFrom} ([${seen.startLine},${seen.endLine}] vs [${resolved.value.startLine},${resolved.value.endLine}]): refusing conflicting move deletions`;
+                            diagnostics.push(message);
+                            return {
+                                content: [{ type: "text" as const, text: `rejected: ${message}` }],
+                                details: makeRejected(toolCallId, "conflict", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
+                            };
+                        }
+                    }
+                    moveSourceSpans.push({ canonicalFrom: rt.canonicalFrom, startLine: resolved.value.startLine, endLine: resolved.value.endLine });
+                }
+                // Same-file destination landing inside or touching the source
+                // span (insert point between lines [startLine-1, endLine]) has
+                // no well-defined pre/post-delete meaning — reject with a
+                // transfer-specific conflict. Sentinel `start`/`end` dests are
+                // absolute file edges and never participate in this check.
+                if (rt.op === "move" && rt.canonicalFrom === rt.canonicalTo && rt.after !== undefined && rt.after !== "start") {
+                    const rebasedAfter = resolveDestination(rt.after, sourceLogicalLines);
+                    const afterLine = typeof rebasedAfter === "number" ? rebasedAfter : null;
+                    if (afterLine !== null && afterLine >= resolved.value.startLine - 1 && afterLine <= resolved.value.endLine) {
+                        const message = `transfer destination after anchor ${rt.after} lands inside or touching the source span [${resolved.value.startLine},${resolved.value.endLine}] in ${rt.rawFrom}: refusing conflicting same-file transfer`;
+                        diagnostics.push(message);
+                        return {
+                            content: [{ type: "text" as const, text: `rejected: ${message}` }],
+                            details: makeRejected(toolCallId, "conflict", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
+                        };
+                    }
+                }
+
+                // Hashline inserts are idempotent: an insert whose lines already
+                // follow the destination anchor is a silent no-op downstream
+                // (edit-planner skips no-change spans; hashline append_at no-ops
+                // on identical following lines). Reject pre-write with a
+                // transfer-specific conflict instead of silently dropping the
+                // insert — covers same-file and cross-file. Generic hashline
+                // idempotence itself is unchanged.
+                const sourceLines = resolved.value.lines;
+                if (sourceLines.length > 0 && !rt.toIsNewFile) {
+                    let destLines: string[] | null = null;
+                    if (rt.canonicalFrom === rt.canonicalTo) {
+                        destLines = sourceLogicalLines;
+                    } else {
+                        const destSnapshot = transaction.getSnapshot(rt.canonicalTo);
+                        const rawDest = destSnapshot?.content ? destSnapshot.content.toString("utf8") : null;
+                        if (rawDest !== null) destLines = normalizeToLF(stripBom(rawDest).text).split("\n");
+                    }
+                    if (destLines !== null) {
+                        const linesEqual = (a: string[], b: string[]): boolean =>
+                            a.length === b.length && a.every((line, i) => line === b[i]);
+                        let existingAtDest: string[] | null = null;
+                        if (rt.after === "start") {
+                            existingAtDest = destLines.slice(0, sourceLines.length);
+                        } else if (rt.after !== undefined) {
+                            const destAfterLine = resolveDestination(rt.after, destLines);
+                            if (typeof destAfterLine === "number") existingAtDest = destLines.slice(destAfterLine, destAfterLine + sourceLines.length);
+                        }
+                        if (existingAtDest !== null && linesEqual(existingAtDest, sourceLines)) {
+                            const message = `transfer destination already contains the source lines after ${rt.after ?? "start"} in ${rt.rawTo}: refusing duplicate transfer that the insert layer would silently drop`;
+                            diagnostics.push(message);
+                            return {
+                                content: [{ type: "text" as const, text: `rejected: ${message}` }],
+                                details: makeRejected(toolCallId, "conflict", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
+                            };
+                        }
+                    }
+                }
+                // Literal mutation plan: destination insert + (for move) source
+                // delete as plain data, converted to hashline EditItems below.
+                // Transaction/evidence/verifier/rollback/undo/finalization stay
+                // shared in this pipeline — plan.ts owns no lifecycle engine.
+                const mutations = planTransferMutations(
+                    bindResolvedTransfer(transferPlan, { startLine: resolved.value.startLine, endLine: resolved.value.endLine, sourceLines }),
+                    buildTransferDescription({ op: rt.op, from: rt.rawFrom, range: rt.range, description: rt.description }),
+                );
+                const description = mutations.description;
+                const destAfter = mutations.insert.afterAnchor;
+                const toIdx = groups.findIndex((g) => g.absolutePath === rt.canonicalTo);
+                groups[toIdx] = { ...groups[toIdx], edits: [...groups[toIdx].edits, buildTransferInsertEdit(destAfter, mutations.insert.lines, description)] };
+
+                if (mutations.erase !== null) {
                     const fromIdx = groups.findIndex((g) => g.absolutePath === rt.canonicalFrom);
-                    groups[fromIdx] = { ...groups[fromIdx], edits: [...groups[fromIdx].edits, buildTransferDeleteEdit(rt.range, description)] };
+                    groups[fromIdx] = { ...groups[fromIdx], edits: [...groups[fromIdx].edits, buildTransferDeleteEdit(mutations.erase, description)] };
                 }
             }
 
