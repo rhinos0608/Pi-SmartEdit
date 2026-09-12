@@ -110,6 +110,15 @@ test("transfer-regression: literal duplicate move preserves multiplicity at dest
         { op: "append_at", pos: { line: 1, hash: "|" }, lines: ["dup"] },
     ]);
     assert.notEqual(generic.noopEdits, undefined);
+    // Complete move: the generated source deletion removes the source line.
+    const source = "alpha\nbeta";
+    const resolved = resolveSourceRange(source, pos, end);
+    assert.equal(resolved.ok, true);
+    if (resolved.ok) {
+        const applyTransferDeleteLiteral = transferEntry("applyTransferDeleteLiteral");
+        const afterDelete = applyTransferDeleteLiteral(source, resolved.value.startLine, resolved.value.endLine) as { lines: string };
+        assert.equal(afterDelete.lines, "beta");
+    }
     // Destination multiplicity belongs to the transfer literal applier.
     const applyTransferLiteral = transferEntry("applyTransferLiteral");
     const result = applyTransferLiteral("head\ndup", ["dup"]) as { lines: string; noopEdits?: unknown };
@@ -208,9 +217,12 @@ test("transfer-regression: multiple transfers to the same new destination both l
         { op: "append_file", lines: ["shared"] },
     ]);
     assert.notEqual(generic.noopEdits, undefined);
-    // Ordered multi-transfer landing belongs to the transfer literal applier.
+    // Ordered multi-transfer landing belongs to the transfer literal applier:
+    // each transfer applies to the destination state left by the previous one.
     const applyTransferLiteral = transferEntry("applyTransferLiteral");
-    const result = applyTransferLiteral("", ["shared", "shared"]) as { lines: string; noopEdits?: unknown };
-    assert.equal(result.noopEdits, undefined);
-    assert.equal(result.lines, "shared\nshared");
+    const firstLanding = applyTransferLiteral("", ["shared"]) as { lines: string; noopEdits?: unknown };
+    assert.equal(firstLanding.noopEdits, undefined);
+    const secondLanding = applyTransferLiteral(firstLanding.lines, ["shared"]) as { lines: string; noopEdits?: unknown };
+    assert.equal(secondLanding.noopEdits, undefined);
+    assert.equal(secondLanding.lines, "shared\nshared");
 });

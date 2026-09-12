@@ -603,6 +603,17 @@ describe("format-equivalence", () => {
     }
   });
 
+  test("detectFormatter finds cwd config for a nested file", () => {
+    mkdirSync(resolve(tmpDir, "nested"), { recursive: true });
+    const cfg = resolve(tmpDir, "biome.json");
+    writeFileSync(cfg, "{}");
+    try {
+      assert.strictEqual(detectFormatter(tmpDir, "nested/plain.ts"), "bunx biome format");
+    } finally {
+      unlinkSync(cfg);
+    }
+  });
+
   test("runFormatEquivalenceCheck is fail-open without formatter", async () => {
     mkdirSync(tmpDir, { recursive: true });
     const result = await runFormatEquivalenceCheck(

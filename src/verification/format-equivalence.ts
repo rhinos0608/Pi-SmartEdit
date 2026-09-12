@@ -27,15 +27,11 @@ export interface FormatEquivalenceResult {
  * Returns the formatter command string or null if none found.
  */
 export function detectFormatter(cwd: string, filePath: string): string | null {
-  // Get the directory containing the file
-  const dir = dirname(resolve(cwd, filePath));
+  // Walk ancestor directories from the file directory up through cwd,
+  // so a config in cwd applies to nested files.
+  const root = resolve(cwd);
+  let dir = dirname(resolve(cwd, filePath));
 
-  // Check for Biome config
-  if (existsSync(resolve(dir, 'biome.json'))) {
-    return 'bunx biome format';
-  }
-
-  // Check for Prettier config files
   const prettierConfigs = [
     '.prettierrc',
     '.prettierrc.json',
@@ -47,10 +43,19 @@ export function detectFormatter(cwd: string, filePath: string): string | null {
     'prettier.config.cjs',
   ];
 
-  for (const config of prettierConfigs) {
-    if (existsSync(resolve(dir, config))) {
-      return 'npx prettier --write';
+  for (;;) {
+    if (existsSync(resolve(dir, 'biome.json'))) {
+      return 'bunx biome format';
     }
+    for (const config of prettierConfigs) {
+      if (existsSync(resolve(dir, config))) {
+        return 'npx prettier --write';
+      }
+    }
+    if (dir === root || !dir.startsWith(root)) break;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
   }
 
   return null;

@@ -84,7 +84,10 @@ test("rollback restores the original mode", async () => {
   await tx.write(file, "after");
   await chmod(file, 0o644);
   await tx.rollback();
-  assert.equal((await stat(file)).mode & 0o777, 0o755);
+  // Windows only honors the read-only bit; exact mode bits are POSIX-only.
+  if (process.platform !== "win32") {
+    assert.equal((await stat(file)).mode & 0o777, 0o755);
+  }
   assert.equal(await readFile(file, "utf8"), "before");
 });
 

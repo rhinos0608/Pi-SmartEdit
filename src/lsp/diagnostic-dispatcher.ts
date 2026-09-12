@@ -179,7 +179,9 @@ export async function checkTscDiagnostics(
     : ["--noEmit", "--pretty", "false", filePath];
 
   const localTscPath = resolveLocalTscPath();
-  const command = localTscPath ? process.execPath : "npx";
+  // Spawned without a shell: extensionless `npx` never resolves on Windows
+  // (and `npx.cmd` needs the safeSpawnAsync cmd.exe gate), so name the shim.
+  const command = localTscPath ? process.execPath : process.platform === "win32" ? "npx.cmd" : "npx";
   const args = localTscPath ? [localTscPath, ...tscArgs] : ["--no-install", "tsc", ...tscArgs];
 
   const result = await safeSpawnAsync(command, args, {

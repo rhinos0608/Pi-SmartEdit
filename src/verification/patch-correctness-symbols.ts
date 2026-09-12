@@ -116,7 +116,6 @@ export function checkImportConsistency(
   languageId: string,
   config: LangConfig,
 ): PatchCheck {
-  void config;
   // Only meaningful for languages with explicit import systems
   const lang = languageId.toLowerCase();
   if (!["typescript", "tsx", "javascript", "jsx", "python", "go", "rust", "java", "kotlin", "dart"].includes(lang)) {
@@ -142,6 +141,7 @@ export function checkImportConsistency(
   const knownGlobals = lang === "typescript" || lang === "tsx" || lang === "javascript" || lang === "jsx"
     ? KNOWN_GLOBALS_TS
     : new Set<string>();
+  const declared = countDeclarations(newContent, config);
 
   const missing: string[] = [];
   for (const call of addedCalls) {
@@ -149,6 +149,7 @@ export function checkImportConsistency(
     if (/^[A-Z][A-Z_0-9]+$/.test(call)) continue; // skip constants
     if (call === call.toLowerCase() && call.length <= 2) continue; // skip very short lowercase names (i, j, k, x, y)
     if (knownGlobals.has(call)) continue;
+    if (declared.has(call)) continue; // defined locally — not a missing import
 
     // Check if this call might be a member expression (e.g., foo.bar())
     // where `call` is `bar` and the base identifier `foo` is imported.

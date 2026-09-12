@@ -2,6 +2,12 @@ import { describe, it, afterEach } from "node:test";
 import assert from "node:assert";
 import { BackgroundRunRegistry } from "../../src/verification/background-runner.js";
 
+// process.execPath is the only executable guaranteed on every platform
+// (no echo/sleep on Windows), so all child commands are node -e scripts.
+const NODE = process.execPath;
+const ECHO_DONE: [string, ...string[]] = [NODE, "-e", "console.log('done')"];
+const SLEEP: [string, ...string[]] = [NODE, "-e", "setTimeout(() => {}, 30000)"];
+
 describe("background-runner", () => {
   describe("BackgroundRunRegistry", () => {
     // Clean up any active runs after each test to prevent hanging
@@ -23,7 +29,7 @@ describe("background-runner", () => {
     }
     it("schedules a run and returns runId", async () => {
       const registry = createRegistry({ maxConcurrent: 3 });
-      const { runId, promise } = registry.schedule(["echo", "hello"]);
+      const { runId, promise } = registry.schedule([NODE, "-e", "console.log('hello')"]);
       assert.ok(typeof runId === "string" && runId.length > 0);
       const status = await promise;
       assert.strictEqual(status.runId, runId);
@@ -31,15 +37,15 @@ describe("background-runner", () => {
 
     it("rejects when max concurrent runs reached", async () => {
       const registry = createRegistry({ maxConcurrent: 1 });
-      registry.schedule(["sleep", "10"]); // occupies the slot
+      registry.schedule(SLEEP); // occupies the slot
       assert.throws(() => {
-        registry.schedule(["echo", "world"]);
+        registry.schedule(ECHO_DONE);
       }, /Max concurrent verification runs/);
     });
 
     it("getStatus returns running status for active runs", async () => {
       const registry = createRegistry({ maxConcurrent: 3 });
-      const { runId } = registry.schedule(["sleep", "30"]);
+      const { runId } = registry.schedule(SLEEP);
       const status = registry.getStatus(runId);
       assert.ok(status, "Expected status for active run");
       assert.strictEqual(status.status, "running");
@@ -47,7 +53,7 @@ describe("background-runner", () => {
 
     it("getStatus returns completed status after finalize", async () => {
       const registry = createRegistry({ maxConcurrent: 3 });
-      const { runId, promise } = registry.schedule(["echo", "done"]);
+      const { runId, promise } = registry.schedule(ECHO_DONE);
 
       // Wait for completion
       await promise;
@@ -68,7 +74,7 @@ describe("background-runner", () => {
 
     it("listRuns returns active runs", async () => {
       const registry = createRegistry({ maxConcurrent: 3 });
-      const { runId } = registry.schedule(["sleep", "30"]);
+      const { runId } = registry.schedule(SLEEP);
       const runs = registry.listRuns(false);
       assert.ok(runs.length >= 1);
       assert.ok(runs.every((r) => r.status === "running"));
@@ -77,7 +83,7 @@ describe("background-runner", () => {
 
     it("listRuns with includeCompleted returns completed runs too", async () => {
       const registry = createRegistry({ maxConcurrent: 3 });
-      const { runId, promise } = registry.schedule(["echo", "done"]);
+      const { runId, promise } = registry.schedule(ECHO_DONE);
       await promise; // wait for completion
       const runs = registry.listRuns(true);
       const completed = runs.find((r) => r.runId === runId);
@@ -87,7 +93,7 @@ describe("background-runner", () => {
 
     it("cancel stops a running verification", async () => {
       const registry = createRegistry({ maxConcurrent: 3 });
-      const { runId } = registry.schedule(["sleep", "30"]);
+      const { runId } = registry.schedule(SLEEP);
       const cancelled = registry.cancel(runId);
       assert.ok(cancelled, "Expected cancel to return true");
 
@@ -111,7 +117,7 @@ describe("background-runner", () => {
         evictAfterMs: 5000,
       });
 
-      const { runId, promise } = registry.schedule(["sleep", "30"]);
+      const { runId, promise } = registry.schedule(SLEEP);
       const status = await promise;
       assert.strictEqual(status.status, "timeout");
       const msgs = status.diagnostics.map((d) => d.message);

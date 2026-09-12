@@ -346,8 +346,12 @@ export function preserveQuoteStyle(
   // because the editor normalizes them away. The only files where they
   // appear are markdown, documentation, and copy-pasted prose.
   if (filePath) {
-    const ext = filePath.toLowerCase().slice(filePath.lastIndexOf("."));
-    if (CODE_EXTENSIONS.has(ext)) return newText;
+    const base = filePath.split("/").pop() ?? filePath;
+    const dot = base.lastIndexOf(".");
+    if (dot > 0) {
+      const ext = base.toLowerCase().slice(dot);
+      if (CODE_EXTENSIONS.has(ext)) return newText;
+    }
   }
 
   const region = originalContent.slice(matchStart, matchStart + matchLength);
@@ -930,14 +934,9 @@ function tryUnicodeMatch(
   const originalEndIndex = windowEndIndex + baseOffset;
   const matchLength = originalEndIndex - originalIndex;
 
-  // Guard: zero-length matches indicate normalization drift — refuse
-  if (matchLength <= 0) {
-    throw new Error(
-      `Normalization produced a zero-length match in edits. ` +
-      `This usually means the oldText contains characters that cannot be ` +
-      `reliably matched after Unicode normalization. Try using exact text from the file.`
-    );
-  }
+  // Guard: zero-length matches indicate normalization drift — no usable
+  // match, so let the caller fall through to the remaining tiers.
+  if (matchLength <= 0) return null;
 
   // searchContent slices from 0, so originalIndex is already relative to originalContent
   const matchedText = originalContent.slice(originalIndex, originalIndex + matchLength);
@@ -1293,14 +1292,25 @@ export function findAllMatches(
     // Accept matches at or above (at least as strict as) the minimum tier
     if (tierPriority(match.tier) < tierPriority(minTier)) {
       // Lower priority than min — advance past the rejected match span
-      searchStart = match.index + match.matchLength;
+      if (match.matchLength <= 0) {
+        if (match.index >= rangeEnd - 1) break;
+        searchStart = match.index + 1;
+      } else {
+        searchStart = match.index + match.matchLength;
+      }
       continue;
     }
 
     results.push(match);
 
-    // Move past this match to avoid overlapping
-    searchStart = match.index + match.matchLength;
+    // Move past this match to avoid overlapping; a zero-length match
+    // (empty oldText) makes no progress, so advance one code unit.
+    if (match.matchLength <= 0) {
+      if (match.index >= rangeEnd - 1) break;
+      searchStart = match.index + 1;
+    } else {
+      searchStart = match.index + match.matchLength;
+    }
   }
 
   return results;
@@ -1362,11 +1372,24 @@ export function countSimilarityOccurrences(
   let count = 0;
   let bestScore = 0;
   let secondBestScore = 0;
+  const startTime = Date.now();
+  const TIMEOUT_MS = 100;
 
   for (let windowSize = minWindowSize; windowSize <= maxWindowSize; windowSize++) {
+    if (Date.now() - startTime > TIMEOUT_MS) break;
     for (let startLine = 0; startLine <= contentLines.length - windowSize; startLine++) {
+      if (Date.now() - startTime > TIMEOUT_MS) break;
       const windowLines = contentLines.slice(startLine, startLine + windowSize);
       const score = computeSimilarityScore(oldLines, windowLines);
+      // Track best/second-best scores for dominant-fuzzy auto-accept
+      // Must run for ALL scores (including ≥threshold) so early-exit returns
+      // valid bestScore/secondBestScore, not stale sub-threshold values.
+      if (score > bestScore) {
+        secondBestScore = bestScore;
+        bestScore = score;
+      } else if (score > secondBestScore) {
+        secondBestScore = score;
+      }
       if (score >= threshold) {
         const endLine = startLine + windowSize;
         const overlaps = countedRanges.some(
@@ -1377,16 +1400,6 @@ export function countSimilarityOccurrences(
           count++;
           if (count >= 2) return { count, bestScore, secondBestScore };
         }
-      }
-
-      // Track best/second-best scores for dominant-fuzzy auto-accept
-      // Must run for ALL scores (including ≥threshold) so early-exit returns
-      // valid bestScore/secondBestScore, not stale sub-threshold values.
-      if (score > bestScore) {
-        secondBestScore = bestScore;
-        bestScore = score;
-      } else if (score > secondBestScore) {
-        secondBestScore = score;
       }
     }
   }

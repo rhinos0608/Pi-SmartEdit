@@ -153,8 +153,10 @@ describe("edit-match bulk + ambiguity counters", () => {
   it("countSimilarityOccurrences flags duplicated near-match windows", () => {
     const block = ["const alpha = 1;", "const beta = 2;", "return alpha;"].join("\n");
     const content = [block, block].join("\n");
-    const { count } = countSimilarityOccurrences(content, block);
+    const { count, bestScore, secondBestScore } = countSimilarityOccurrences(content, block);
     assert.ok(count >= 2);
+    assert.ok(bestScore >= 0.85);
+    assert.ok(secondBestScore >= 0.85);
   });
 
   it("isDominantFuzzyMatch needs 97% best and 8% delta", () => {

@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
 import { execSync, spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { retrieveHistory } from "../../src/verification/history-context.js";
@@ -103,7 +103,7 @@ describe("history-context", () => {
         const subjects = entry.commits.map((c) => c.subject);
         assert.ok(subjects.some((s) => s.includes("initial")), `Expected "initial" in subjects: [${subjects}]`);
       } finally {
-        execSync(`rm -rf "${repoDir}"`, { stdio: "pipe" });
+        rmSync(repoDir, { recursive: true, force: true });
       }
     });
 
@@ -137,7 +137,7 @@ describe("history-context", () => {
         const riskyCount = entry.commits.filter((c) => c.reason === "risky").length;
         assert.ok(riskyCount > 0, `Expected at least 1 risky commit, got ${riskyCount}`);
       } finally {
-        execSync(`rm -rf "${repoDir}"`, { stdio: "pipe" });
+        rmSync(repoDir, { recursive: true, force: true });
       }
     });
 
@@ -168,7 +168,7 @@ function criticalFn() { return 1; }`,
         assert.ok(entry, "Expected history entry for criticalFn");
         assert.ok(entry.nearbyComments.length > 0, "Expected nearby comments to be extracted");
       } finally {
-        execSync(`rm -rf "${repoDir}"`, { stdio: "pipe" });
+        rmSync(repoDir, { recursive: true, force: true });
       }
     });
 

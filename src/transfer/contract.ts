@@ -65,6 +65,10 @@ export function validateTransferRequest(
   input: unknown,
 ): { ok: true; value: TransferRequest } | { ok: false; error: string } {
   if (!isPlainObject(input)) return { ok: false, error: "transfer request must be an object" };
+  for (const key of Object.keys(input)) {
+    if (key !== "op" && key !== "from" && key !== "range" && key !== "to" && key !== "after" && key !== "description")
+      return { ok: false, error: `transfer.${key} is not supported` };
+  }
   const { op, from, range, to, after, description } = input;
   if (op !== "copy" && op !== "move") return { ok: false, error: `transfer op must be "copy" or "move"` };
   if (typeof from !== "string" || from.length === 0) return { ok: false, error: "transfer.from must be a non-empty string" };

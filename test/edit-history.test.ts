@@ -393,8 +393,11 @@ describe("edit-history", () => {
     await fsMkdir(undoDir, { recursive: true });
     await fsWriteFile(join(undoDir, `${hash("moved").slice(0, 8)}-rename.json`), JSON.stringify(entry), "utf8");
     assert.equal(await restoreUndoState(cwd, newPath), true);
-    const mode = (await fsStat(oldPath)).mode & 0o7777;
-    assert.equal(mode, 0o600, "old path should be restored with beforeMode");
+    // Windows only honors the read-only bit; exact mode bits are POSIX-only.
+    if (process.platform !== "win32") {
+      const mode = (await fsStat(oldPath)).mode & 0o7777;
+      assert.equal(mode, 0o600, "old path should be restored with beforeMode");
+    }
   });
 
   it("restoreTransactionUndoState rejects an incomplete persisted transaction (recordCount mismatch)", async () => {

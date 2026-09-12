@@ -138,11 +138,11 @@ export function findUnclosedStrings(content: string): string[] {
 
   while (i < content.length) {
     const ch = content[i];
-    const prev = i > 0 ? content[i - 1] : "";
 
-    // Skip escaped characters
-    if (prev === "\\" && (ch === "'" || ch === '"' || ch === "\\")) {
-      i++;
+    // Inside a literal, a backslash escapes the next character: consume
+    // both together so an escaped backslash cannot suppress the quote.
+    if ((inSingle || inDouble) && ch === "\\") {
+      i += 2;
       continue;
     }
 
@@ -190,10 +190,13 @@ export function findMissingSemicolons(content: string): number {
     if (OPEN_BLOCK_RE.test(trimmed)) continue;
     if (trimmed.endsWith(",") || trimmed.endsWith(":")) continue;
 
+    // Skip continued statements: lines ending with an operator or an open
+    // paren are part of a multiline expression, not missing a semicolon.
+    if (/[+\-*/%&|^?:<>=.]$/.test(trimmed) || trimmed.endsWith("(")) continue;
     // If the line has a statement-looking pattern (assignment, return, call, expression)
     // and doesn't end with a semicolon, it might be missing one.
     const STATEMENT_RE = /\b(?:return|throw|break|continue|yield)\b/;
-    const ASSIGNMENT_RE = /\w\s*=/;
+    const ASSIGNMENT_RE = /\w\s*=(?![=>])/;
     const EXPRESSION_CALL_RE = /\w+\s*\(/;
 
     if (

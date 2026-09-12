@@ -13,6 +13,99 @@ export interface SpawnResult {
   status: number | null;
 }
 
+// ── Windows cmd escaping (pattern + regexes ported from cross-spawn, MIT) ──
+// Since Node's CVE-2024-27980 mitigation, spawning a `.cmd`/`.bat` without a
+// shell throws EINVAL on Windows. Route those through `cmd.exe /d /s /c`.
+// Two traps shape this, both confirmed against cross-spawn's lib/parse.js:
+//  1. Node's libuv quoting targets the C runtime, not cmd — pre-quoted argv
+//     elements get backslash-mangled (`"` is literal to cmd). So the whole
+//     line is built here as ONE pre-escaped string, wrapped in a single outer
+//     quote pair (defeats /s quote-stripping), spawned with
+//     windowsVerbatimArguments so Node passes it through untouched.
+//  2. cmd parses the /c line itself, so every element gets `^`-escaping for
+//     cmd metachars — otherwise a filename like `x&whoami.ts` would chain.
+//     Args here undergo exactly one cmd parse before reaching node (npx),
+//     so single-level escaping is correct. A bare `.cmd` invoked directly
+//     (double parse via a forwarding shim) would need double escaping — no
+//     caller does that; the test fake's fixtures are static strings.
+const CMD_META_CHARS = /([()\][%!^"`<>&|;, *?])/g;
+
+function escapeCmdCommand(command: string): string {
+  return command.replace(CMD_META_CHARS, "^$1");
+}
+
+function escapeCmdArgument(arg: string): string {
+  let escaped = arg;
+  // Backslashes before a quote, and trailing backslashes, are doubled so the
+  // C runtime of the downstream program does not eat the closing quote.
+  escaped = escaped.replace(/(\\*)"/g, "$1$1\\\"");
+  escaped = escaped.replace(/(\\*)$/, "$1$1");
+  escaped = '"' + escaped + '"';
+  return escaped.replace(CMD_META_CHARS, "^$1");
+}
+
+export interface SpawnTarget {
+  command: string;
+  args: string[];
+  windowsVerbatimArguments?: boolean;
+}
+
+/**
+ * Map a spawn target through the Windows batch-file gate.
+ *
+ * Everything except win32 `.cmd`/`.bat` passes through unchanged
+ * (notably extensionless names like `npx`, which fail closed with ENOENT
+ * rather than crashing the caller).
+ *
+ * Pure over (`command`, `args`, `platform`) so it is unit-testable on any OS.
+ */
+export function buildSpawnTarget(
+  command: string,
+  args: string[],
+  platform: string = process.platform,
+): SpawnTarget {
+  if (platform === "win32" && /\.(cmd|bat)$/i.test(command)) {
+    const shellCommand = [escapeCmdCommand(command), ...args.map((a) => escapeCmdArgument(a))].join(" ");
+    return {
+      command: "cmd.exe",
+      args: ["/d", "/s", "/c", `"${shellCommand}"`],
+      windowsVerbatimArguments: true,
+    };
+  }
+  return { command, args };
+}
+
+/**
+ * Ordered spawn attempts for a command.
+ *
+ * On Windows, CreateProcess resolves a bare name to `.exe` only, so npm
+ * (`.cmd`) and RubyGems (`.bat`) shims need explicit suffix attempts after
+ * the as-is try. Only names already carrying a Windows executable suffix
+ * (`.cmd`/`.bat`/`.exe`/`.com`) yield a single attempt — a version-like
+ * basename such as `tool-1.2` is extensionless for this purpose. POSIX
+ * always yields exactly the primary target: zero behavior change.
+ *
+ * Pure over (`command`, `args`, `platform`) so it is unit-testable on any OS.
+ */
+export function buildSpawnTargets(
+  command: string,
+  args: string[],
+  platform: string = process.platform,
+): SpawnTarget[] {
+  const primary = buildSpawnTarget(command, args, platform);
+  if (platform === "win32" && !/\.(cmd|bat|exe|com)$/i.test(command)) {
+    // Windows ignores trailing dots/spaces in names: `tool.` resolves as
+    // `tool`, so suffix the trimmed form (`tool.cmd`, not `tool..cmd`).
+    const base = command.replace(/[. ]+$/, "");
+    return [
+      primary,
+      buildSpawnTarget(`${base}.cmd`, args, platform),
+      buildSpawnTarget(`${base}.bat`, args, platform),
+    ];
+  }
+  return [primary];
+}
+
 /**
  * Spawn a command asynchronously with timeout support.
  *
@@ -28,49 +121,95 @@ export function safeSpawnAsync(
   return new Promise((resolve) => {
     let stdout = "";
     let stderr = "";
-    const child = spawn(command, args, {
-      cwd: options.cwd,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-
     let timedOut = false;
+    let settled = false;
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
+    let activeChild: ReturnType<typeof spawn> | undefined;
+    // Guards late events from an attempt superseded by a fallback retry.
+    let attemptId = 0;
+
+    const targets = buildSpawnTargets(command, args);
+    let index = 0;
 
     if (options.timeout) {
       timeoutId = setTimeout(() => {
         timedOut = true;
-        child.kill("SIGKILL");
+        try {
+          activeChild?.kill("SIGKILL");
+        } catch {
+          // A throwing kill delivers no terminal event; settle here to honor
+          // the documented timeout contract instead of hanging the promise.
+          finish(-1);
+        }
       }, options.timeout);
     }
 
-    if (child.stdout) {
-      child.stdout.on("data", (data: Buffer) => {
+    const finish = (status: number | null): void => {
+      if (settled) return;
+      settled = true;
+      if (timeoutId) clearTimeout(timeoutId);
+      resolve({ stdout, stderr, status: timedOut ? -1 : status });
+    };
+
+    const attempt = (): void => {
+      const id = ++attemptId;
+      const target = targets[index];
+      const child = spawn(target.command, target.args, {
+        cwd: options.cwd,
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsVerbatimArguments: target.windowsVerbatimArguments,
+      });
+      activeChild = child;
+
+      child.stdout?.on("data", (data: Buffer) => {
         stdout = appendBounded(stdout, data.toString(), maxOutputChars);
       });
-    }
-    if (child.stderr) {
-      child.stderr.on("data", (data: Buffer) => {
+      child.stderr?.on("data", (data: Buffer) => {
         stderr = appendBounded(stderr, data.toString(), maxOutputChars);
       });
-    }
 
-    child.on("close", (code: number | null) => {
-      if (timeoutId) clearTimeout(timeoutId);
-      resolve({
-        stdout,
-        stderr,
-        status: timedOut ? -1 : code,
+      child.on("close", (code: number | null) => {
+        if (settled || id !== attemptId) return;
+        // cmd.exe reports an unresolvable command as exit 9009 via `close`,
+        // not `error` — without this the `.bat` fallback would be dead when
+        // only a later suffix exists. 9009 is cmd-specific (POSIX exit codes
+        // are 8-bit); message-matching would break on non-English Windows.
+        // A tool that ran and diagnosed something wrote stdout, so an empty
+        // stdout separates lookup failure from a genuine 9009 exit — without
+        // this, a real 9009 (none of our callers produce one) with kept
+        // diagnostics could be discarded by the fallback. Never start new
+        // work after the deadline either. A terminal lookup failure (all
+        // suffixes exhausted) normalizes to -1, the missing-command status
+        // on every OS — callers treat it as "tool absent", not as a
+        // diagnostic exit code.
+        const lookupFailure = code === 9009 && stdout === "";
+        if (!timedOut && lookupFailure && index + 1 < targets.length) {
+          index++;
+          attempt();
+          return;
+        }
+        finish(lookupFailure ? -1 : code);
       });
-    });
 
-    child.on("error", () => {
-      if (timeoutId) clearTimeout(timeoutId);
-      resolve({
-        stdout,
-        stderr,
-        status: -1,
+      child.on("error", () => {
+        if (settled || id !== attemptId) return;
+        // A spawn failure racing a fired timeout must not start new work.
+        if (timedOut) {
+          finish(-1);
+          return;
+        }
+        // Spawn failure (ENOENT/EINVAL): fall through to the next suffixed
+        // attempt. Any other outcome resolves here.
+        if (index + 1 < targets.length) {
+          index++;
+          attempt();
+          return;
+        }
+        finish(-1);
       });
-    });
+    };
+
+    attempt();
   });
 }
 

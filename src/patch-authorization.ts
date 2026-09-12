@@ -86,12 +86,14 @@ export function authorizeResource(args: {
         ? args.requestedResourceIds.map((id) => args.resources.find((r) => r.resourceId === id) ?? null)
         : [...args.resources];
     if (candidates.some((r) => r === null)) return { ok: false, reason: "missing resource" };
+    let firstError: string | null = null;
     for (const resource of candidates as InspectedResource[]) {
         if (args.canonicalPath !== undefined && resource.canonicalPath !== args.canonicalPath) continue;
         const error = validateResourceAuthority(resource, args.targetRanges, args.requireFull === true);
         if (!error) return { ok: true, resource };
-        if (args.canonicalPath !== undefined) return { ok: false, reason: error };
+        if (firstError === null) firstError = error;
     }
+    if (firstError !== null) return { ok: false, reason: firstError };
     return { ok: false, reason: "coverage: no requested resource covers the target line range" };
 }
 

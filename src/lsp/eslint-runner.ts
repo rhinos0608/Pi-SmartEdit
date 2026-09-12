@@ -136,8 +136,11 @@ export async function checkEslintDiagnostics(
   }
 
   try {
+    // Spawned without a shell, so on Windows the .cmd shim name is required
+    // (CreateProcess does not apply PATHEXT to extensionless names).
+    const npx = process.platform === "win32" ? "npx.cmd" : "npx";
     const result = await safeSpawnAsync(
-      "npx",
+      npx,
       ["--no-install", "eslint", "--format", "json", "--no-warn-ignored", filePath],
       {
         cwd: configDir,

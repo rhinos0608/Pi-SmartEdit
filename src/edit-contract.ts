@@ -347,17 +347,16 @@ export function validateEditRequest(
         if (!Array.isArray(edits) || edits.length === 0)
             return fail("edit.edits must be a non-empty array");
         const editList = edits as unknown[];
-        let everyEditHasPath = true;
-        let everyEditTransfer = true;
+        let needsTopLevelPath = false;
         for (let i = 0; i < editList.length; i++) {
             const e = editList[i];
             if (!isPlainObject(e)) return fail(`edit.edits[${i}] must be an object`);
             const err = validateEditOperation(e, i);
             if (err) return fail(err);
-            if (e.path === undefined) everyEditHasPath = false;
-            if ((e.op as string | undefined) !== "copy" && (e.op as string | undefined) !== "move") everyEditTransfer = false;
+            const isTransfer = (e.op as string | undefined) === "copy" || (e.op as string | undefined) === "move";
+            if (!isTransfer && e.path === undefined) needsTopLevelPath = true;
         }
-        if (path === undefined && !everyEditHasPath && !everyEditTransfer)
+        if (path === undefined && needsTopLevelPath)
             return fail("edit.path is required unless every edit provides its own path");
     }
 

@@ -25,11 +25,35 @@ function installFakeEslint(
 ): void {
   const binDir = join(dir, "node_modules", ".bin");
   mkdirSync(binDir, { recursive: true });
+  if (process.platform === "win32") {
+    // Windows CreateProcess resolves executables by extension (PATHEXT), so
+    // the fake must be eslint.cmd; an extensionless file is not executable.
+    // Batch `echo <json>` would mangle cmd metachars (`&|<>()^%`), cap lines
+    // at 8191 chars, and print `ECHO is off.` for empty output — so the shim
+    // delegates to node with a fixture file: exact bytes, no cmd parsing.
+    writeFileSync(
+      join(binDir, "eslint-fixture.json"),
+      JSON.stringify({ output: stdout, exitCode }),
+      "utf-8",
+    );
+    writeFileSync(
+      join(binDir, "eslint-fake.js"),
+      "const fs = require('fs');\n" +
+        "const path = require('path');\n" +
+        "const fixture = JSON.parse(fs.readFileSync(path.join(__dirname, 'eslint-fixture.json'), 'utf8'));\n" +
+        "process.stdout.write(fixture.output);\n" +
+        "process.exit(fixture.exitCode);\n",
+      "utf-8",
+    );
+    writeFileSync(
+      join(binDir, "eslint.cmd"),
+      '@echo off\r\nnode "%~dp0eslint-fake.js" %*\r\nexit /b %errorlevel%\r\n',
+      "utf-8",
+    );
+    return;
+  }
   const script = join(binDir, "eslint");
-  const shell =
-    process.platform === "win32"
-      ? `@echo off\n${stdout}\nexit /b ${exitCode}\n`
-      : `#!/bin/sh\nprintf '%s' ${shellEscape(stdout)}\nexit ${exitCode}\n`;
+  const shell = `#!/bin/sh\nprintf '%s' ${shellEscape(stdout)}\nexit ${exitCode}\n`;
   writeFileSync(script, shell, "utf-8");
   chmodSync(script, 0o755);
 }

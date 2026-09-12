@@ -173,7 +173,9 @@ describe("traceability", () => {
       const dir = mkdtempSync(join(tmpdir(), "trace-test-cycle-"));
       try {
         mkdirSync(join(dir, "src"), { recursive: true });
-        symlinkSync(dir, join(dir, "src", "loop"));
+        // "junction" works for directory links on Windows without elevation;
+        // "dir" is the POSIX equivalent.
+        symlinkSync(dir, join(dir, "src", "loop"), process.platform === "win32" ? "junction" : "dir");
 
         const target = makeLogicTarget("orphanFunction", {
           path: join(dir, "src", "orphan.ts"),

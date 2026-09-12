@@ -12,7 +12,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, realpathSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, parse } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -753,12 +753,14 @@ test("successful in-workspace write emits valid evidence and authorizes immediat
   }
 });
 
-test("workspace root '/' mints evidence for files under root", async () => {
+test("workspace filesystem root mints evidence for files under root", async () => {
   const originalCwd = process.cwd();
-  const tmpFile = "/tmp/smartedit-root-containment.txt";
+  // os.tmpdir() — /tmp does not exist on Windows.
+  const dir = mkdtempSync(join(tmpdir(), "smartedit-root-containment-"));
+  const tmpFile = join(dir, "smartedit-root-containment.txt");
   writeFileSync(tmpFile, "root content\n", "utf8");
   try {
-    process.chdir("/");
+    process.chdir(parse(dir).root);
     const pi = createMockPI();
     init(pi);
     const sessionStart = [...pi._events.get("session_start")!][0];
@@ -772,11 +774,11 @@ test("workspace root '/' mints evidence for files under root", async () => {
       input: { path: tmpFile },
       content: [{ type: "text", text: "Successfully wrote" }],
     }, {}) as { details?: { workspaceEvidence?: WorkspaceEvidenceEnvelope } };
-    // With workspace root "/", /tmp/... IS inside the workspace — evidence must be minted.
-    assert.ok(result?.details?.workspaceEvidence, "evidence should be minted for file under root '/'");
+    // With workspace root at the filesystem root, tmpFile IS inside the workspace — evidence must be minted.
+    assert.ok(result?.details?.workspaceEvidence, "evidence should be minted for file under filesystem root");
   } finally {
     process.chdir(originalCwd);
-    try { rmSync(tmpFile, { force: true }); } catch {}
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

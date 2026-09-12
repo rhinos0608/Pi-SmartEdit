@@ -89,7 +89,7 @@ export function getLangConfig(languageId: string): LangConfig {
           // Arrow function const|let foo = (...) => ...
           /\b(?:const|let|var)\s+(\w+)\s*[:=]/.source,
           // method shorthand in class/object: foo(...) { ... }
-          /^\s*(\w+)\s*\([^)]*\)\s*[{:]/.source,
+          /^\s*(?!(?:if|for|while|switch|catch|else|do|try|finally|with)\b)(\w+)\s*\([^)]*\)\s*[{:]/.source,
         ],
         requiresSemicolons: false,
         semicolonsOptional: true,
@@ -102,7 +102,7 @@ export function getLangConfig(languageId: string): LangConfig {
           /\b(?:function|const|let|var|class)\s+(\w+)\b/.source,
           /\bexport\s+(?:default\s+)?(?:class|function|const|let|var)\s+(\w+)\b/.source,
           /\b(?:const|let|var)\s+(\w+)\s*[:=]/.source,
-          /^\s*(\w+)\s*\([^)]*\)\s*[{:]/.source,
+          /^\s*(?!(?:if|for|while|switch|catch|else|do|try|finally|with)\b)(\w+)\s*\([^)]*\)\s*[{:]/.source,
         ],
         requiresSemicolons: false,
         semicolonsOptional: true,
@@ -140,7 +140,7 @@ export function getLangConfig(languageId: string): LangConfig {
           /\btrait\s+(\w+)\b/.source,
           /\btype\s+(\w+)\b/.source,
           /\bconst\s+(\w+)\b/.source,
-          /\bu?impl\s/.source,
+          /\bimpl\s+(\w+)/.source,
         ],
         requiresSemicolons: false,
         semicolonsOptional: true,
@@ -168,14 +168,15 @@ export function getLangConfig(languageId: string): LangConfig {
         keywordPairs: PASCAL_KEYWORD_PAIRS,
       };
     default:
-      // C-family fallback: C, C++, C#, Java, Kotlin, Dart, Swift, etc.
+      // Fallback for unknown or non-code language IDs: keep C-family
+      // declaration patterns but disable semicolon enforcement.
       return {
         declarationPatterns: [
           /\b(?:function|class|struct|enum|interface|trait)\s+(\w+)\b/.source,
           // Type-like: int foo, String foo, Foo foo,
-          /\b(?:\w+\s+)+(\w+)\s*\([^)]*\)\s*[{:]/.source,
+          /\b(?:\w+\s+)+(?!(?:if|for|while|switch|catch|else|do|try|finally|with)\b)(\w+)\s*\([^)]*\)\s*[{:]/.source,
         ],
-        requiresSemicolons: true,
+        requiresSemicolons: false,
         semicolonsOptional: false,
         keywordPairs: [],
       };

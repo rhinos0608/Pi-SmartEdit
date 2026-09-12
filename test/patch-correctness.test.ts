@@ -106,8 +106,17 @@ describe("patch-correctness golden: warning order + assembly", () => {
       "zeroValuePlaceholders",
     ];
     const filtered = names.filter((n) => expected.includes(n));
-    assert.deepStrictEqual(filtered, [...filtered].sort((a, b) => expected.indexOf(a) - expected.indexOf(b)));
-    assert.strictEqual(r.passed, r.warnings.length === 0);
+    assert.deepStrictEqual(filtered, ["unbalancedDelimiters", "zeroValuePlaceholders"]);
+    assert.strictEqual(r.passed, false);
+  });
+
+  it("returns safePass when a check throws", () => {
+    const r = checkPatchCorrectness(null as unknown as string, "function f() {\n  return 1;\n}\n", "typescript");
+    assert.strictEqual(r.passed, true);
+    for (const check of Object.values(r.checks)) {
+      assert.strictEqual(check.passed, true);
+      assert.match(check.details, /Check skipped due to error/);
+    }
   });
 
   it("constrains duplicate candidates via changedSymbols", () => {

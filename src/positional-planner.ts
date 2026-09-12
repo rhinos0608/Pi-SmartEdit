@@ -28,6 +28,7 @@ interface MutableTextEdit {
   filePath: string;
   range: { start: MutablePosition; end: MutablePosition };
   newText: string;
+  ordinal: number;
 }
 
 interface MutableFileEdit {
@@ -49,12 +50,14 @@ export async function planPositionalEdits(
   }
 
   const byPath = new Map<string, MutableFileEdit>();
+  let ordinal = 0;
   for (const fe of workspaceEdit.fileEdits) {
     const existing = byPath.get(fe.filePath);
     const copies: MutableTextEdit[] = fe.edits.map((e) => ({
       filePath: e.filePath,
       range: { start: { line: e.range.start.line, character: e.range.start.character }, end: { line: e.range.end.line, character: e.range.end.character } },
       newText: e.newText,
+      ordinal: ordinal++,
     }));
     if (existing) {
       existing.edits.push(...copies);
@@ -78,7 +81,8 @@ export async function planPositionalEdits(
 
     const sorted = [...fileEdit.edits].sort((a, b) => {
       if (a.range.start.line !== b.range.start.line) return b.range.start.line - a.range.start.line;
-      return b.range.start.character - a.range.start.character;
+      if (a.range.start.character !== b.range.start.character) return b.range.start.character - a.range.start.character;
+      return b.ordinal - a.ordinal;
     });
 
     for (let i = 0; i < sorted.length; i++) {

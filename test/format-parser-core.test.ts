@@ -72,15 +72,14 @@ describe('patch-parser-core: PatchCursor', () => {
 describe('parser integration: shared core preserves behavior', () => {
   it('codex parses CRLF input with correct error line/col', () => {
     const bad = '*** Begin Patch\r\n*** Update File: a.txt\r\n@@\r\n??? bad line\r\n';
-    // lenient: skips unknown hunk line, warns empty hunk; strict would throw — check strict error line
-    let threwLine = -1;
+    // strict: the bad hunk line surfaces as a parse error at line 4, column 1
     try {
-      parseCodexPatch('*** Begin Patch\n*** Update File: a.txt\n@@\n', 'strict');
+      parseCodexPatch(bad, 'strict');
+      assert.fail('expected strict parse of bad CRLF input to throw');
     } catch (e: any) {
-      threwLine = e.line ?? -1;
+      assert.equal(e.line, 4);
+      assert.equal(e.column, 1);
     }
-    void bad;
-    void threwLine;
     const res = parseCodexPatch(
       '*** Begin Patch\r\n*** Add File: n.txt\r\nhello\r\n*** End Patch\r\n',
       'lenient',
