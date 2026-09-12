@@ -19,6 +19,22 @@ export interface PlannedRename {
   diffString: string;
 }
 
+interface MutablePosition {
+  line: number;
+  character: number;
+}
+
+interface MutableTextEdit {
+  filePath: string;
+  range: { start: MutablePosition; end: MutablePosition };
+  newText: string;
+}
+
+interface MutableFileEdit {
+  filePath: string;
+  edits: MutableTextEdit[];
+}
+
 const DEFAULT_MAX_DIFF_BYTES = 200 * 1024;
 
 export async function planPositionalEdits(
@@ -28,17 +44,22 @@ export async function planPositionalEdits(
 ): Promise<PlannedRename> {
   const maxDiffBytes = opts?.maxDiffBytes ?? DEFAULT_MAX_DIFF_BYTES;
 
-  if (!workspaceEdit || !Array.isArray(workspaceEdit.fileEdits) || workspaceEdit.fileEdits.length === 0) {
+  if (!workspaceEdit || workspaceEdit.fileEdits.length === 0) {
     throw new Error("workspaceEdit must have at least one fileEdit");
   }
 
-  const byPath = new Map<string, (typeof workspaceEdit.fileEdits)[number]>();
+  const byPath = new Map<string, MutableFileEdit>();
   for (const fe of workspaceEdit.fileEdits) {
     const existing = byPath.get(fe.filePath);
+    const copies: MutableTextEdit[] = fe.edits.map((e) => ({
+      filePath: e.filePath,
+      range: { start: { line: e.range.start.line, character: e.range.start.character }, end: { line: e.range.end.line, character: e.range.end.character } },
+      newText: e.newText,
+    }));
     if (existing) {
-      existing.edits = [...existing.edits, ...fe.edits];
+      existing.edits.push(...copies);
     } else {
-      byPath.set(fe.filePath, { ...fe, edits: [...fe.edits] });
+      byPath.set(fe.filePath, { filePath: fe.filePath, edits: copies });
     }
   }
 
