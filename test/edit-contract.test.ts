@@ -429,6 +429,44 @@ test("validateEditRequest rejects transfer op combined with oldText/newText/targ
     }
 });
 
+test("validateEditRequest rejects transfer op combined with replaceAll (even false)", () => {
+    const base = { op: "copy" as const, from: "a.ts", range: { pos: "5aa", end: "6bb" }, to: "b.ts", after: "18cd" };
+    for (const replaceAll of [true, false]) {
+        const v = validateEditRequest({ path: "unused.ts", edits: [{ ...base, replaceAll }], toolCallId: "t" });
+        assert.ok(!v.ok, `transfer op combined with replaceAll:${replaceAll} must be rejected`);
+        assert.match(v.error, /transfer|replaceAll|mutually exclusive/i);
+    }
+});
+
+test("validateEditRequest rejects transfer-only fields without op", () => {
+    const v = validateEditRequest({
+        path: "unused.ts",
+        edits: [{ from: "a.ts", range: { pos: "5aa", end: "6bb" }, to: "b.ts", after: "18cd" }],
+        toolCallId: "t",
+    });
+    assert.ok(!v.ok, "transfer fields without op must be rejected");
+    assert.match(v.error, /transfer.*op|require op/i);
+});
+
+test("validateEditRequest accepts pathless transfer (top-level path accepted-but-ignored)", () => {
+    const edits = [{ op: "copy" as const, from: "a.ts", range: { pos: "5aa", end: "6bb" }, to: "new.ts" }];
+    const pathless = validateEditRequest({ edits, toolCallId: "t" });
+    assert.ok(pathless.ok, `pathless transfer must validate (got: ${pathless.ok ? "" : pathless.error})`);
+    const withPath = validateEditRequest({ path: "unused.ts", edits, toolCallId: "t" });
+    assert.ok(withPath.ok, "top-level path alongside transfers must validate");
+});
+
+test("validateEditRequest accepts after=start but rejects EOF/end/before/suffix tricks", () => {
+    const base = { op: "copy" as const, from: "a.ts", range: { pos: "5aa", end: "6bb" }, to: "b.ts" };
+    const start = validateEditRequest({ path: "unused.ts", edits: [{ ...base, after: "start" }], toolCallId: "t" });
+    assert.ok(start.ok, `after=start must validate (got: ${start.ok ? "" : start.error})`);
+    for (const after of ["EOF", "end", "before", "18cd:after", "18cd:before"]) {
+        const v = validateEditRequest({ path: "unused.ts", edits: [{ ...base, after }], toolCallId: "t" });
+        assert.ok(!v.ok, `transfer after "${after}" must be rejected`);
+        assert.match(v.error, /transfer.*after/i);
+    }
+});
+
 test("validateEditRequest rejects malformed transfer range", () => {
     const cases: Array<{ range: unknown; match: RegExp }> = [
         { range: undefined, match: /range must be an object/ },

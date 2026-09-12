@@ -129,12 +129,27 @@ test("buildTransferInsertEdit: omits description when not provided", () => {
     assert.equal("description" in item, false);
 });
 
-test("buildTransferInsertEdit: EOF/new-file branch uses pos:EOF with no anchor and no description", () => {
-    const item = buildTransferInsertEdit(undefined, ["one", "two"]);
-    assert.deepEqual(item, {
-        hashline: { range: { pos: "EOF", end: "EOF" }, content: ["one", "two"] },
+test("buildTransferInsertEdit: EOF/new-file/end branches use pos:EOF with no anchor and no description", () => {
+    for (const dest of [undefined, "end", "EOF"] as Array<string | undefined>) {
+        const item = buildTransferInsertEdit(dest, ["one", "two"]);
+        assert.deepEqual(item, {
+            hashline: { range: { pos: "EOF", end: "EOF" }, content: ["one", "two"] },
+        });
+        assert.equal("description" in item, false);
+    }
+});
+
+test("buildTransferInsertEdit: start branch uses pos:start (prepend_file) and :before passes through", () => {
+    const start = buildTransferInsertEdit("start", ["one"], "copy from a.ts:5aa-5aa");
+    assert.deepEqual(start, {
+        hashline: { range: { pos: "start", end: "start" }, content: ["one"] },
+        description: "copy from a.ts:5aa-5aa",
     });
-    assert.equal("description" in item, false);
+    const before = buildTransferInsertEdit("18cd:before", ["one"]);
+    assert.deepEqual(before, {
+        hashline: { range: { pos: "18cd:before", end: "18cd:before" }, content: ["one"] },
+    });
+    assert.equal("description" in before, false);
 });
 
 test("buildTransferDeleteEdit: builds a content:null hashline delete over the given range", () => {

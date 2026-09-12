@@ -28,11 +28,13 @@ function makeMockManager(): { getServer: (id: string) => Promise<unknown>; calls
       return null;
     },
   };
-  return { getServer: manager.getServer.bind(manager), calls: () => count, manager };
+  const getServerMethod = manager.getServer as (id: string) => Promise<unknown>;
+  const getServer = getServerMethod.bind(manager);
+  return { getServer, calls: () => count, manager };
 }
 
 // Helper to register a SmartRead-like provider
-function registerProvider(bus: ReturnType<typeof makeBus>, handlerOverrides?: { capabilities?: unknown; diagnostics?: unknown | ((payload: unknown) => unknown | Promise<unknown>); delayMs?: number }) {
+function registerProvider(bus: ReturnType<typeof makeBus>, handlerOverrides?: { capabilities?: unknown; diagnostics?: unknown; delayMs?: number }) {
   let capCalls = 0;
   const server = createRpcServer({
     bus,
@@ -65,7 +67,7 @@ describe("SmartRead diagnostics client", () => {
     const { manager } = makeMockManager();
     // instrument manager.getServer to detect calls
     let getServerCalled = false;
-    const orig = manager.getServer;
+    const orig = manager.getServer as (id: string) => Promise<unknown>;
     manager.getServer = async (id: string) => { getServerCalled = true; return orig(id); };
     const result = await client.checkPostEditDiagnostics("/tmp/a.ts", "const x=1;", "typescript", "/tmp", manager);
     assert.equal(result.source, "lsp");
@@ -165,7 +167,7 @@ describe("SmartRead diagnostics client", () => {
     const bus = makeBus();
     // Server delays beyond 5000ms timeout
     const client = createSmartReadDiagnosticsClient(bus);
-    let capDone = false;
+    const capDone = false;
     const srv = createRpcServer({
       bus,
       channel: RPC_CHANNELS.languageIntelligence,

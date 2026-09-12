@@ -2168,10 +2168,39 @@ test("transfer: rejects a same-file move whose `after` anchor lands inside the s
         }],
     });
     const d = res.details as any;
-    assert.equal(d.status.kind, "failed", `expected failed, got ${JSON.stringify(d.status)}`);
+    assert.equal(d.status.kind, "rejected", `expected rejected, got ${JSON.stringify(d.status)}`);
     assert.ok(
-        String(d.diagnostics ?? "").match(/ambiguous/i),
-        `diagnostics should reflect the existing ambiguous-insert-boundary check (got: ${JSON.stringify(d.diagnostics)})`,
+        String(d.diagnostics ?? "").match(/transfer.*conflict|inside/i),
+        `diagnostics should reflect the transfer-specific same-file conflict (got: ${JSON.stringify(d.diagnostics)})`,
+    );
+    assert.equal(readFileSync(file, "utf8"), content, "file must be unchanged");
+});
+
+test("transfer: rejects a same-file move whose destination already contains the moved text (duplicate-dest)", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-xfer-")));
+    mkdirSync(workdir, { recursive: true });
+    const content = "beta\ngamma\nbeta\ndelta\n";
+    const file = join(workdir, "a.ts");
+    writeFileSync(file, content, "utf8");
+    const lines = content.split("\n");
+
+    const res = await execAutoInspect(workdir, {
+        path: "a.ts",
+        edits: [{
+            op: "move", from: "a.ts",
+            // Source range is line 1 ("beta").
+            range: { pos: anchorFor(1, lines[0]!), end: anchorFor(1, lines[0]!) },
+            // `after` targets line 2 ("gamma"); the line following that
+            // destination already holds "beta", so the move would land as
+            // an undetectable duplicate.
+            to: "a.ts", after: anchorFor(2, lines[1]!),
+        }],
+    });
+    const d = res.details as any;
+    assert.equal(d.status.kind, "rejected", `expected rejected, got ${JSON.stringify(d.status)}`);
+    assert.ok(
+        String(d.diagnostics ?? "").match(/silently dropped|duplicate/i),
+        `diagnostics should reflect the transfer-specific duplicate-destination conflict (got: ${JSON.stringify(d.diagnostics)})`,
     );
     assert.equal(readFileSync(file, "utf8"), content, "file must be unchanged");
 });
@@ -2435,7 +2464,7 @@ test("transfer: rejects when destination already exists and `after` is omitted",
     assert.equal(readFileSync(dstFile, "utf8"), dstContent, "destination must be unmodified");
 });
 
-test("transfer: an `after` anchor is tolerated (and ignored) when `to` is a brand-new file", async () => {
+test("transfer: a supplied `after` anchor is rejected when `to` is a brand-new file", async () => {
     const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-xfer-")));
     mkdirSync(workdir, { recursive: true });
     const srcContent = "one\ntwo\nthree\n";
@@ -2468,6 +2497,8 @@ test("transfer: an `after` anchor is tolerated (and ignored) when `to` is a bran
         toolCallId: "tc1",
     }, undefined, undefined, makeCtx(workdir));
     const d = res.details as any;
-    assert.equal(d.status.kind, "applied", `expected applied, got ${JSON.stringify(d.status)}`);
-    assert.equal(readFileSync(dstFile, "utf8"), "two");
+    assert.equal(d.status.kind, "rejected", `expected rejected, got ${JSON.stringify(d.status)}`);
+    assert.match(String(d.diagnostics ?? ""), /transfer.*after/i);
+    assert.equal(existsSync(dstFile), false, "destination must not be created");
+    assert.equal(readFileSync(srcFile, "utf8"), srcContent, "source must be unmodified");
 });
