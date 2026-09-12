@@ -3,6 +3,7 @@
  * Runs LSP, then compiler, then linter in order of priority.
  */
 
+import { createRequire } from "node:module";
 import { dirname, resolve } from "path";
 import { checkEslintDiagnostics } from "./eslint-runner.js";
 import {
@@ -142,6 +143,28 @@ function isRelevantDiagnostic(
     .some((candidate) => candidate === target);
 }
 
+const requireForTsc = createRequire(import.meta.url);
+
+let cachedTscPath: string | null | undefined;
+
+/**
+ * Absolute path to the repo-local tsc entrypoint, or `null` when the
+ * `typescript` package cannot be resolved. Spawning tsc by absolute path
+ * (via `process.execPath`) keeps diagnostics independent of the spawn
+ * `cwd` and `$PATH`: `npx --no-install tsc` run from a directory without
+ * `node_modules` (e.g. a tmp fixture dir, or CI with no global tsc)
+ * silently finds no compiler and yields zero diagnostics.
+ */
+function resolveLocalTscPath(): string | null {
+  if (cachedTscPath !== undefined) return cachedTscPath;
+  try {
+    cachedTscPath = requireForTsc.resolve("typescript/bin/tsc");
+  } catch {
+    cachedTscPath = null;
+  }
+  return cachedTscPath;
+}
+
 /**
  * Run TypeScript compiler and get diagnostics.
  */
@@ -151,12 +174,15 @@ export async function checkTscDiagnostics(
 ): Promise<DiagnosticResult> {
   const tsconfigPath = await findNearestTsconfig(filePath, cwd);
 
-  // Using npx tsc to catch global tsc vs local
-  const args = tsconfigPath
-    ? ["tsc", "--noEmit", "--pretty", "false", "-p", tsconfigPath]
-    : ["tsc", "--noEmit", "--pretty", "false", filePath];
+  const tscArgs = tsconfigPath
+    ? ["--noEmit", "--pretty", "false", "-p", tsconfigPath]
+    : ["--noEmit", "--pretty", "false", filePath];
 
-  const result = await safeSpawnAsync("npx", ["--no-install", ...args], {
+  const localTscPath = resolveLocalTscPath();
+  const command = localTscPath ? process.execPath : "npx";
+  const args = localTscPath ? [localTscPath, ...tscArgs] : ["--no-install", "tsc", ...tscArgs];
+
+  const result = await safeSpawnAsync(command, args, {
     cwd,
     timeout: 60000,
   });

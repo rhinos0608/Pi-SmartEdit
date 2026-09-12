@@ -105,7 +105,7 @@ describe("Diagnostic Dispatcher", () => {
       assert.strictEqual(typeof result.source, "string");
     });
 
-    testTsc("uses the nearest tsconfig and filters unrelated project diagnostics", async () => {
+    function writeTscFixture(): { rootDir: string; targetFile: string } {
       const rootDir = mkdtempSync(join(tmpdir(), "smart-edit-tsc-"));
       const srcDir = join(rootDir, "src");
       mkdirSync(srcDir, { recursive: true });
@@ -133,6 +133,12 @@ describe("Diagnostic Dispatcher", () => {
       const noisyFile = join(srcDir, "noisy.ts");
       writeFileSync(noisyFile, "const shouldBeNumber: number = 'x';\n");
 
+      return { rootDir, targetFile };
+    }
+
+    testTsc("uses the nearest tsconfig and filters unrelated project diagnostics", async () => {
+      const { rootDir, targetFile } = writeTscFixture();
+
       const result = await checkTscDiagnostics(targetFile, rootDir);
       const messages = result.diagnostics.map((diagnostic) => diagnostic.message);
 
@@ -150,6 +156,26 @@ describe("Diagnostic Dispatcher", () => {
         !messages.some((message) => message.includes("tsconfig.json is present but will not be loaded")),
         messages.join("\n"),
       );
+    });
+
+    testTsc("finds tsc without PATH lookup (CI has no global tsc)", async () => {
+      const { rootDir, targetFile } = writeTscFixture();
+
+      const savedPath = process.env.PATH;
+      process.env.PATH = "";
+      try {
+        const result = await checkTscDiagnostics(targetFile, rootDir);
+        const messages = result.diagnostics.map((diagnostic) => diagnostic.message);
+
+        assert.ok(
+          messages.some((message) =>
+            message.includes("Parameter 'value' implicitly has an 'any' type.")
+          ),
+          messages.join("\n"),
+        );
+      } finally {
+        process.env.PATH = savedPath;
+      }
     });
   });
 });
