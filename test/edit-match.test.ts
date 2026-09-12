@@ -125,7 +125,7 @@ describe("edit-match tier order", () => {
         MatchTier.RELATIVE_INDENT,
       ],
     );
-    assert.ok(telemetry.every((t: TierTelemetry) => t.success === false));
+    assert.ok(telemetry.every((t: TierTelemetry) => !t.success));
   });
 
   it("telemetry stops at the winning tier", () => {
