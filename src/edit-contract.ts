@@ -219,24 +219,40 @@ function validateEditOperation(e: Record<string, unknown>, i: number): string | 
     // every other edit shape. A valid transfer op is unconditionally
     // actionable, so it returns early rather than falling into the
     // oldText/newText/symbolic/structural/hashline actionable-boundary check.
+    // Only op/from/range/to/after/description may be present: path, replaceAll
+    // (even false), oldText, newText, target, lineRange, and hashline all reject.
     if (op !== undefined) {
         if (op !== "copy" && op !== "move")
             return `edit.edits[${i}].op must be "copy" or "move"`;
         if (path !== undefined || oldText !== undefined || newText !== undefined
-            || target !== undefined || lineRange !== undefined || hashline !== undefined)
-            return `edit.edits[${i}]: op is mutually exclusive with path, oldText, newText, target, lineRange, and hashline`;
+            || target !== undefined || lineRange !== undefined || hashline !== undefined
+            || replaceAll !== undefined)
+            return `edit.edits[${i}]: op is mutually exclusive with path, oldText, newText, replaceAll, target, lineRange, and hashline`;
         if (typeof from !== "string" || from.length === 0)
             return `edit.edits[${i}].from must be a non-empty string`;
         if (typeof to !== "string" || to.length === 0)
             return `edit.edits[${i}].to must be a non-empty string`;
-        if (after !== undefined && (typeof after !== "string" || after.length === 0))
-            return `edit.edits[${i}].after must be a non-empty string if present`;
+        if (after !== undefined) {
+            if (typeof after !== "string" || after.length === 0)
+                return `edit.edits[${i}].after must be a non-empty string if present`;
+            // Public destinations are an `after` anchor or `start` (prepend)
+            // only: EOF/end/before sentinels and `:after`/`:before` suffix
+            // tricks belong to the internal dest union, not the wire contract.
+            if (after === "EOF" || after === "end" || after === "BOF" || after === "before" || after.includes(":"))
+                return `edit.edits[${i}].transfer after "${after}" is not accepted: supply a destination anchor or \`start\``;
+        }
         if (!isPlainObject(range))
             return `edit.edits[${i}].range must be an object`;
         const rangeErr = validatePosEndRange(range, i, "range");
         if (rangeErr) return rangeErr;
         return null;
     }
+
+    // Transfer-only fields without `op` are a malformed transfer, not a
+    // text edit: reject transfer-specifically instead of falling through to
+    // the generic actionable-operation boundary below.
+    if (from !== undefined || range !== undefined || to !== undefined || after !== undefined)
+        return `edit.edits[${i}]: transfer fields (from, range, to, after) require op "copy" or "move"`;
 
     // Actionable-operation boundary: a text edit needs both oldText and newText;
     // otherwise the item must be self-actionable via a symbolic/structural target
@@ -332,14 +348,16 @@ export function validateEditRequest(
             return fail("edit.edits must be a non-empty array");
         const editList = edits as unknown[];
         let everyEditHasPath = true;
+        let everyEditTransfer = true;
         for (let i = 0; i < editList.length; i++) {
             const e = editList[i];
             if (!isPlainObject(e)) return fail(`edit.edits[${i}] must be an object`);
             const err = validateEditOperation(e, i);
             if (err) return fail(err);
             if (e.path === undefined) everyEditHasPath = false;
+            if ((e.op as string | undefined) !== "copy" && (e.op as string | undefined) !== "move") everyEditTransfer = false;
         }
-        if (path === undefined && !everyEditHasPath)
+        if (path === undefined && !everyEditHasPath && !everyEditTransfer)
             return fail("edit.path is required unless every edit provides its own path");
     }
 
@@ -463,7 +481,7 @@ export const EDIT_PARAMETERS = {
                         type: "string",
                         enum: ["copy", "move"],
                         description:
-                            "Relocate existing observed text by reference instead of reproducing it in newText: `copy` leaves the source intact, `move` deletes it after transfer, and `after` is required when `to` exists (omitted when creating a new file). Example: {\"op\":\"copy\",\"from\":\"a.ts\",\"range\":{\"pos\":\"10ab\",\"end\":\"12cd\"},\"to\":\"a.ts\",\"after\":\"40ef\"}",
+                            "Relocate existing observed text by reference instead of reproducing it in newText: `copy` leaves the source intact, `move` deletes it after transfer. `to` is always required; `after` is required when `to` is an existing file (omit it when creating a new file; `start` prepends). Example: {\"op\":\"copy\",\"from\":\"a.ts\",\"range\":{\"pos\":\"10ab\",\"end\":\"12cd\"},\"to\":\"a.ts\",\"after\":\"40ef\"}",
                     },
                     from: { type: "string", description: "Source file path for a transfer op." },
                     range: {
@@ -477,7 +495,7 @@ export const EDIT_PARAMETERS = {
                         required: ["pos", "end"],
                     },
                     to: { type: "string", description: "Destination file path for a transfer op." },
-                    after: { type: "string", minLength: 1, description: "Destination hashline anchor to insert after. Omit when `to` is a new file." },
+                    after: { type: "string", minLength: 1, description: "Destination hashline anchor to insert after, or `start` to prepend. Omit when `to` is a new file." },
                 },
                 // An edit item must be actionable: a text pair (oldText+newText) or
                 // a self-actionable target (symbolic op or structural pattern+replacement)
