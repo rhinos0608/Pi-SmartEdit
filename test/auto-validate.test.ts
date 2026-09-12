@@ -13,6 +13,10 @@ import {
   suggestDecomposition,
   resetRetryCounts,
   incrementRetryCount,
+  detectFormatter,
+  computeIndentScore,
+  generateEquivalenceDiff,
+  runFormatEquivalenceCheck,
 } from "../src/verification/auto-validate";
 import type { FakeLogicResult } from "../src/verification/fake-logic";
 import type { Diagnostic } from "../src/lsp/diagnostic-dispatcher";
@@ -543,5 +547,70 @@ describe("retry count tracking", () => {
     resetRetryCounts();
     const count = incrementRetryCount(tmpDir, "test.ts");
     assert.strictEqual(count, 1);
+  });
+});
+
+// ─── Format-Equivalence Tests ──────────────────────────────────────────
+
+describe("format-equivalence", () => {
+  test("computeIndentScore returns 0 for identical content", () => {
+    const content = "function a() {\n  return 1;\n}\n";
+    assert.strictEqual(computeIndentScore(content, content), 0);
+  });
+
+  test("computeIndentScore returns 1 when all indents differ", () => {
+    const original = "a\nb";
+    const formatted = "  a\n  b";
+    assert.strictEqual(computeIndentScore(original, formatted), 1);
+  });
+
+  test("computeIndentScore returns 0 for empty content", () => {
+    assert.strictEqual(computeIndentScore("", ""), 0);
+  });
+
+  test("generateEquivalenceDiff returns empty for identical content", () => {
+    const content = "const x = 1;\n";
+    assert.strictEqual(generateEquivalenceDiff(content, content), "");
+  });
+
+  test("generateEquivalenceDiff marks removed and added lines", () => {
+    const diff = generateEquivalenceDiff("const x=1;\n", "const x = 1;\n");
+    assert.ok(diff.includes("-const x=1;"));
+    assert.ok(diff.includes("+const x = 1;"));
+  });
+
+  test("generateEquivalenceDiff caps output at 50 lines", () => {
+    const original = Array.from({ length: 60 }, (_, i) => `line${i}`).join("\n");
+    const formatted = Array.from({ length: 60 }, (_, i) => `changed${i}`).join("\n");
+    const diff = generateEquivalenceDiff(original, formatted);
+    assert.ok(diff.includes("more changes"));
+    assert.ok(diff.split("\n").length <= 51);
+  });
+
+  test("detectFormatter returns null when no config present", () => {
+    mkdirSync(tmpDir, { recursive: true });
+    assert.strictEqual(detectFormatter(tmpDir, "plain.ts"), null);
+  });
+
+  test("detectFormatter finds biome.json", () => {
+    mkdirSync(tmpDir, { recursive: true });
+    const cfg = resolve(tmpDir, "biome.json");
+    writeFileSync(cfg, "{}");
+    try {
+      assert.strictEqual(detectFormatter(tmpDir, "plain.ts"), "bunx biome format");
+    } finally {
+      unlinkSync(cfg);
+    }
+  });
+
+  test("runFormatEquivalenceCheck is fail-open without formatter", async () => {
+    mkdirSync(tmpDir, { recursive: true });
+    const result = await runFormatEquivalenceCheck(
+      "const x = 1;\n",
+      "nofmt.ts",
+      tmpDir,
+    );
+    assert.strictEqual(result.equivalent, true);
+    assert.strictEqual(result.indentScore, 0);
   });
 });
