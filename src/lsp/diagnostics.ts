@@ -69,8 +69,8 @@ function waitForDiagnostics(
       done(allDiagnostics);
     }, timeoutMs);
 
-    // Don't let this timer keep Node alive if everything else is done
-    timer.unref();
+    // Keep this timeout ref'd so test environments don't cancel the pending
+    // promise before fallback diagnostic paths run.
 
     const unsubscribe = conn.onNotification?.(
       "textDocument/publishDiagnostics",
