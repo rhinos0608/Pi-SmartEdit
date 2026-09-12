@@ -365,6 +365,10 @@ New-file destination: omit `after` when `to` does not exist yet — the transfer
 
 Transfer text comes from retained observed content, never model regeneration; the source range and destination must have prior read authority. An edit in the same call cannot target text a transfer just created — use a follow-up edit to modify transferred content. Stale or ambiguous anchors fail closed with a corrective re-read message.
 
+`after: "start"` prepends to the destination file; omit `after` only for a new-file destination (content is appended to the created file). A supplied `after` on a new-file destination is rejected, as are non-public sentinels (`end`, `EOF`, `BOF`, `before`) and `:after`/`:before` suffix tricks — supply a destination anchor or `start`.
+
+Transfer rejections (all pre-write, transfer-specific `conflict`): same-file `move` whose destination lands inside or touching the source span; any transfer whose source lines already follow the destination anchor (the insert layer would otherwise silently drop it — pick a different anchor); overlapping `move` source spans in one call; `copy`/`move` combined with `replaceAll`.
+
 ## Architecture
 
 ```text
