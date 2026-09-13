@@ -63,11 +63,19 @@ interface MatchState {
 
 // ─── Constants ────────────────────────────────────────────────────────
 
-const MAX_TOTAL_NODES = 5000;
-const MAX_BOTTOM_UP_UNMATCHED = 500;
-const MATCH_CANDIDATE_LIMIT = 20;
+import {
+  COMMENT_TYPE_RE,
+  MATCH_CANDIDATE_LIMIT,
+  MAX_BOTTOM_UP_UNMATCHED,
+  MAX_TOTAL_NODES,
+} from "./structural-diff-constants.js";
 
-const COMMENT_TYPE_RE = /^comment$/i;
+export {
+  COMMENT_TYPE_RE,
+  MATCH_CANDIDATE_LIMIT,
+  MAX_BOTTOM_UP_UNMATCHED,
+  MAX_TOTAL_NODES,
+} from "./structural-diff-constants.js";
 
 // ─── Label extraction ────────────────────────────────────────────────
 

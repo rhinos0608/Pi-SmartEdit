@@ -39,38 +39,25 @@ interface CheckOptions {
 
 // ─── Constants ───────────────────────────────────────────────────────
 
-const MAX_FILE_BYTES = 1_000_000;
-const DEFAULT_MAX_FINDINGS = 10;
+import {
+  BODY_TYPES,
+  CATCH_NODE_TYPES,
+  COMMENT_TYPES,
+  DEFAULT_MAX_FINDINGS,
+  FUNCTION_NODE_TYPES,
+  LOOP_NODE_TYPES,
+  MAX_FILE_BYTES,
+} from "./fake-logic-constants.js";
 
-const FUNCTION_NODE_TYPES = new Set([
-  "function_declaration",
-  "method_definition",
-  "arrow_function",
-  "function_definition",
-]);
-
-const LOOP_NODE_TYPES = new Set([
-  "if_statement",
-  "while_statement",
-  "ternary_expression",
-  "conditional_expression",
-]);
-
-const CATCH_NODE_TYPES = new Set([
-  "catch_clause",
-  "except_clause",
-]);
-
-const BODY_TYPES = new Set([
-  "statement_block",
-  "block",
-]);
-
-const COMMENT_TYPES = new Set([
-  "comment",
-  "line_comment",
-  "block_comment",
-]);
+export {
+  BODY_TYPES,
+  CATCH_NODE_TYPES,
+  COMMENT_TYPES,
+  DEFAULT_MAX_FINDINGS,
+  FUNCTION_NODE_TYPES,
+  LOOP_NODE_TYPES,
+  MAX_FILE_BYTES,
+} from "./fake-logic-constants.js";
 
 // ─── Entry point ─────────────────────────────────────────────────────
 
