@@ -196,6 +196,20 @@ test("edit tool advertises canonical contract schema (raw, rich fields, no evide
     "agent-visible schema must not advertise `evidenceRef` (tool-owned authority)");
 });
 
+test("edit tool advertises flat refactor subschema with all five kinds", () => {
+  const pi = createMockPI();
+  init(pi);
+
+  const editTool = pi._tools.get("edit")!;
+  const params = editTool.parameters as { properties: Record<string, unknown> };
+  const refactor = params.properties.refactor as Record<string, unknown>;
+  assert.ok(refactor, "schema must advertise `refactor`");
+  assert.ok(!("oneOf" in refactor) && !("anyOf" in refactor) && !("allOf" in refactor),
+    "refactor subschema must stay flat for provider compat");
+  const kind = (refactor.properties as Record<string, { enum?: string[] }>).kind;
+  assert.deepEqual(kind?.enum, ["rename-preview", "apply-refactor-preview", "organize-imports-preview", "formatting-preview", "code-action-preview"]);
+});
+
 test("edit renderer names paths supplied only on multi-file edit items", () => {
   const pi = createMockPI();
   init(pi);

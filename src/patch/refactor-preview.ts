@@ -27,6 +27,13 @@ import type {
     RefactorRequestFields,
     PatchToolDetails,
 } from "./types.js";
+import type {
+    RenamePreviewRefactor,
+    ApplyRefactorPreviewRefactor,
+    OrganizeImportsPreviewRefactor,
+    FormattingPreviewRefactor,
+    CodeActionPreviewRefactor,
+} from "../edit-contract.js";
 import {
     freshChecks,
     freezeChecks,
@@ -34,6 +41,12 @@ import {
     makeRejected,
 } from "./result-builders.js";
 
+/**
+ * Legacy runtime helpers kept for backward-compatible imports. Required
+ * fields are enforced at validation time by `validateEditRequest` (kind-
+ * discriminated contract in `src/edit-contract.ts`), so handlers below
+ * receive narrowed variants and do not re-check required fields.
+ */
 export function isMissingRenamePreviewFields(path: string | undefined, line: number | undefined, character: number | undefined, newName: string | undefined): boolean {
     return path === undefined || line === undefined || character === undefined || newName === undefined;
 }
@@ -122,36 +135,24 @@ export function selectCodeActionWorkspaceEdit(actions: ReadonlyArray<{ readonly 
     return { ok: true, workspaceEdit: selected.workspaceEdit };
 }
 
-export async function handleRenamePreview(deps: PatchToolDeps, toolCallId: string, refactor: RefactorRequestFields): Promise<PatchResult> {
+export async function handleRenamePreview(deps: PatchToolDeps, toolCallId: string, refactor: RenamePreviewRefactor): Promise<PatchResult> {
     if (!deps.getBus?.()) return failResult(toolCallId, "failed: rename-preview requires bus", "bus unavailable", ["bus unavailable"]);
-    if (isMissingRenamePreviewFields(refactor.path, refactor.line, refactor.character, refactor.newName)) {
-        return failResult(toolCallId, "failed: rename-preview requires path, line, character, newName", "missing rename-preview fields", ["missing rename-preview fields"]);
-    }
-    const path = refactor.path as string;
-    const line = refactor.line as number;
-    const character = refactor.character as number;
-    const newName = refactor.newName as string;
+    const { path, line, character, newName } = refactor;
     return runBusPreview({ deps, toolCallId, label: "rename-preview",
         request: (bus) => requestRenamePreview(bus, { filePath: path, line, character, newName }),
         meta: { filePath: path, line, character, newName } });
 }
 
-export async function handleOrganizeImportsPreview(deps: PatchToolDeps, toolCallId: string, refactor: RefactorRequestFields): Promise<PatchResult> {
+export async function handleOrganizeImportsPreview(deps: PatchToolDeps, toolCallId: string, refactor: OrganizeImportsPreviewRefactor): Promise<PatchResult> {
     if (!deps.getBus?.()) return failResult(toolCallId, "failed: organize-imports-preview requires bus", "bus unavailable", ["bus unavailable"]);
-    if (refactor.path === undefined) {
-        return failResult(toolCallId, "failed: organize-imports-preview requires path", "missing organize-imports-preview path", ["missing organize-imports-preview path"]);
-    }
     const path = refactor.path;
     return runBusPreview({ deps, toolCallId, label: "organize-imports-preview",
         request: (bus) => requestOrganizeImports(bus, { filePath: path }),
         meta: { filePath: path, line: 0, character: 0, newName: "" } });
 }
 
-export async function handleFormattingPreview(deps: PatchToolDeps, toolCallId: string, refactor: RefactorRequestFields): Promise<PatchResult> {
+export async function handleFormattingPreview(deps: PatchToolDeps, toolCallId: string, refactor: FormattingPreviewRefactor): Promise<PatchResult> {
     if (!deps.getBus?.()) return failResult(toolCallId, "failed: formatting-preview requires bus", "bus unavailable", ["bus unavailable"]);
-    if (refactor.path === undefined) {
-        return failResult(toolCallId, "failed: formatting-preview requires path", "missing formatting-preview path", ["missing formatting-preview path"]);
-    }
     const path = refactor.path;
     const { tabSize, insertSpaces } = refactor;
     return runBusPreview({ deps, toolCallId, label: "formatting-preview",
@@ -159,20 +160,17 @@ export async function handleFormattingPreview(deps: PatchToolDeps, toolCallId: s
         meta: { filePath: path, line: 0, character: 0, newName: "" } });
 }
 
-export async function handleCodeActionPreview(deps: PatchToolDeps, toolCallId: string, refactor: RefactorRequestFields): Promise<PatchResult> {
+export async function handleCodeActionPreview(deps: PatchToolDeps, toolCallId: string, refactor: CodeActionPreviewRefactor): Promise<PatchResult> {
     const bus = deps.getBus?.() ?? null;
     if (!bus) return failResult(toolCallId, "failed: code-action-preview requires bus", "bus unavailable", ["bus unavailable"]);
     try {
-        if (isMissingCodeActionFields(refactor.path, refactor.line, refactor.character)) {
-            return failResult(toolCallId, "failed: code-action-preview requires path, line, character", "missing code-action-preview fields", ["missing code-action-preview fields"]);
-        }
-        const resp = await requestCodeAction(bus, { filePath: refactor.path as string, line: refactor.line as number, character: refactor.character as number, endLine: refactor.endLine, endCharacter: refactor.endCharacter, diagnostics: refactor.diagnostics as never, only: refactor.only as never });
+        const resp = await requestCodeAction(bus, { filePath: refactor.path, line: refactor.line, character: refactor.character, endLine: refactor.endLine, endCharacter: refactor.endCharacter, diagnostics: refactor.diagnostics as never, only: refactor.only as never });
         if (!resp.ok) {
             return failResult(toolCallId, `failed: code-action-preview: ${resp.error ?? "no actions"}`, resp.error ?? "code action failed", [resp.error ?? "code action failed"]);
         }
         const selected = selectCodeActionWorkspaceEdit(resp.actions ?? []);
         if (!selected.ok) return failResult(toolCallId, `failed: ${selected.reason}`, selected.reason, [selected.reason]);
-        return await planAndStorePreview(deps, toolCallId, selected.workspaceEdit, { filePath: refactor.path as string, line: refactor.line as number, character: refactor.character as number, newName: "", serverDescriptorId: resp.serverDescriptorId });
+        return await planAndStorePreview(deps, toolCallId, selected.workspaceEdit, { filePath: refactor.path, line: refactor.line, character: refactor.character, newName: "", serverDescriptorId: resp.serverDescriptorId });
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return failResult(toolCallId, `failed: code-action-preview ${msg}`, msg, [msg]);
@@ -219,7 +217,7 @@ export function mapApplyPreviewError(toolCallId: string, err: unknown): PatchRes
     return failResult(toolCallId, `failed: apply refactor ${msg}`, msg, [msg], "write");
 }
 
-export async function handleApplyRefactorPreview(deps: PatchToolDeps, toolCallId: string, refactor: RefactorRequestFields): Promise<PatchResult> {
+export async function handleApplyRefactorPreview(deps: PatchToolDeps, toolCallId: string, refactor: ApplyRefactorPreviewRefactor): Promise<PatchResult> {
     const sessionFilePath = deps.getSessionFilePath();
     if (!sessionFilePath) {
         return failResult(toolCallId, "failed: refactor preview requires an active session (no session file path available)", "no session file path", ["no session file path"]);
@@ -227,9 +225,6 @@ export async function handleApplyRefactorPreview(deps: PatchToolDeps, toolCallId
     const root = deps.getCanonicalWorkspaceRoot();
     const sid = hashSessionFilePath(sessionFilePath);
     const applyPreviewId = refactor.previewId;
-    if (applyPreviewId === undefined) {
-        return failResult(toolCallId, "failed: apply-refactor-preview requires previewId", "missing previewId", ["missing previewId"]);
-    }
     const cached = globalRenamePreviewCache.get(applyPreviewId, { sessionId: sid, sessionRoot: root });
     if (!cached) {
         return { content: [{ type: "text" as const, text: "rejected: preview not found or expired" }], details: makeRejected(toolCallId, "coverage", ["preview not found or expired"], { inspectionId: "", resourceIds: [] }, freshChecks()) };
@@ -264,9 +259,13 @@ export async function handleApplyRefactorPreview(deps: PatchToolDeps, toolCallId
 
 export async function handleRefactorRequest(deps: PatchToolDeps, toolCallId: string, refactor: RefactorRequestFields | undefined): Promise<PatchResult | null> {
     if (!refactor) return null;
-    if (refactor.kind === "rename-preview") return handleRenamePreview(deps, toolCallId, refactor);
-    if (refactor.kind === "organize-imports-preview") return handleOrganizeImportsPreview(deps, toolCallId, refactor);
-    if (refactor.kind === "formatting-preview") return handleFormattingPreview(deps, toolCallId, refactor);
-    if (refactor.kind === "code-action-preview") return handleCodeActionPreview(deps, toolCallId, refactor);
-    return handleApplyRefactorPreview(deps, toolCallId, refactor);
+    // The orchestrator validates via `validateEditRequest` before dispatch,
+    // so each branch narrows the broad wire type to its discriminated
+    // variant (defined in `src/edit-contract.ts`). Direct callers bypassing
+    // validation get the same narrowing by kind.
+    if (refactor.kind === "rename-preview") return handleRenamePreview(deps, toolCallId, refactor as unknown as RenamePreviewRefactor);
+    if (refactor.kind === "organize-imports-preview") return handleOrganizeImportsPreview(deps, toolCallId, refactor as unknown as OrganizeImportsPreviewRefactor);
+    if (refactor.kind === "formatting-preview") return handleFormattingPreview(deps, toolCallId, refactor as unknown as FormattingPreviewRefactor);
+    if (refactor.kind === "code-action-preview") return handleCodeActionPreview(deps, toolCallId, refactor as unknown as CodeActionPreviewRefactor);
+    return handleApplyRefactorPreview(deps, toolCallId, refactor as unknown as ApplyRefactorPreviewRefactor);
 }

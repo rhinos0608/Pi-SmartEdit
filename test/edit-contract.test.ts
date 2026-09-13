@@ -131,6 +131,24 @@ test("registered edit schema omits top-level oneOf for Anthropic input_schema co
     assert.ok(!("allOf" in params), "top-level allOf is rejected by the Anthropic API");
 });
 
+test("registered edit schema keeps refactor subschema flat (provider compat, discrimination in validator)", () => {
+    const params = registeredEditParams();
+    const properties = params.properties as Record<string, unknown>;
+    const refactor = properties.refactor as Record<string, unknown>;
+    assert.ok(refactor, "schema must advertise `refactor`");
+    assert.ok(!("oneOf" in refactor), "refactor subschema must stay flat: no oneOf");
+    assert.ok(!("anyOf" in refactor), "refactor subschema must stay flat: no anyOf");
+    assert.ok(!("allOf" in refactor), "refactor subschema must stay flat: no allOf");
+    const kind = (refactor.properties as Record<string, { enum?: string[] }>).kind;
+    assert.deepEqual(kind.enum, ["rename-preview", "apply-refactor-preview", "organize-imports-preview", "formatting-preview", "code-action-preview"]);
+});
+
+test("validateEditRequest rejects fields irrelevant to the refactor kind", () => {
+    const v = validateEditRequest({ refactor: { kind: "rename-preview", path: "a.ts", line: 1, character: 1, newName: "b", previewId: "x" } });
+    assert.ok(!v.ok, "previewId is irrelevant to rename-preview and must be rejected");
+    assert.match(v.error, /previewId.*rename-preview|not supported/);
+});
+
 test("registered edit tool keeps prepareArguments compatibility shim", () => {
     const pi = createMockPI();
     init(pi);
