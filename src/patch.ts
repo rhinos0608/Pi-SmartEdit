@@ -47,18 +47,13 @@ import {
     type ResourceInvalidation,
     type PostEditEvidence,
 } from "@rhinos0608/pi-workspace-protocol";
-import { formatBoundedDiagnostics, appendDiagnosticsToContent } from "./mutation/post-mutation.js";
-import { generateDiffString, stripBom, normalizeToLF } from "./core/edit-diff.js";
-import { resolveSourceRange, resolveDestination } from "./transfer/resolve.js";
-import { planTransfer, bindResolvedTransfer, planTransferMutations, buildTransferDescription, buildTransferInsertEdit, buildTransferDeleteEdit, type TransferPlan } from "./transfer/plan.js";
+import { generateDiffString } from "./core/edit-diff.js";
+import { materializeTransfers } from "./patch/transfer-staging.js";
 import { checkEditSafety } from "./safety/approval-gating.js";
 import { EDIT_PARAMETERS, validateEditRequest, type RefactorRequest } from "./edit-contract.js";
 import type { PriorAuthorityStore } from "./context/evidence-authority.js";
-import { planTextEdits, type StructuralResolver } from "./core/edit-planner.js";
 import { EditTransaction } from "./mutation/edit-transaction.js";
 import { saveTransactionUndoRecords } from "./undo/edit-history.js";
-import { MatchError } from "./core/errors.js";
-import type { AstResolverLike } from "./anchor/anchor-resolution.js";
 import type { EditItem, EditTarget, FileSnapshot, HashlineEditMetadata } from "./core/types.js";
 import type { RepairLoopResult } from "./verification/repair-loop.js";
 
@@ -78,7 +73,6 @@ import type {
     PreparedPatchRequest,
     ResolvedPatchTransfer,
     PatchDisplayDiff,
-    PatchToolDetails,
     PatchTool,
 } from "./patch/types.js";
 import { VERIFIER_TIMEOUT_MS } from "./patch/types.js";
@@ -102,7 +96,6 @@ export type {
 import {
     freshChecks,
     makeCheck,
-    freezeChecks,
     runVerifierCheck,
     failResult,
     makeRejected,
@@ -110,12 +103,13 @@ import {
     buildRollbackInfo,
     classifyRpcError,
 } from "./patch/result-builders.js";
+import { finalizeAppliedPatch } from "./patch/final-result.js";
 
-// ── Repair spans (shared kernel: ./patch/repair-spans.js) ────────────
-// Staged-to-preimage mapping and textual delta coverage live in the shared
-// kernel; imported here so the orchestrator keeps working untouched.
-// Pure move: zero logic change.
-import { mapRepairSpanToPreimage, changedLineRanges } from "./patch/repair-spans.js";
+// ── Group planning (shared kernel: ./patch/group-planning.js) ──────────
+// Per-group preimage authorization, candidate mutation planning, and
+// advisory repair integration live in the shared kernel; imported here so
+// the orchestrator keeps working untouched. Pure move: zero logic change.
+import { resolveAuthorizedGroupPreimage, planGroupMutation, applyAuthorizedRepair } from "./patch/group-planning.js";
 
 // ── Authorization (see ./context/patch-authorization.js) ───────────────────
 // Evidence authorization (types, resource selection, coverage validation,
@@ -131,13 +125,6 @@ export {
     isValidFullFileSha256,
     SHA256_RE,
     type AuthorizationResult,
-} from "./context/patch-authorization.js";
-import {
-    authorizeResource,
-    checkResourceCoverage,
-    validateResourceAuthority,
-    findResourceForCanonicalPath,
-    isValidFullFileSha256,
 } from "./context/patch-authorization.js";
 
 // ── Request preparation (shared kernel: ./patch/request-prep.js) ───
@@ -160,9 +147,6 @@ import {
 // orchestrator continues). isBlockingPostwriteFailure is shared with the
 // orchestrator postwrite loop (imported, not duplicated).
 import {
-    moveSpansOverlap,
-    isSameFileMoveCandidate,
-    isAfterLineInsideSourceSpan,
     isBlockingPostwriteFailure,
     handleRefactorRequest,
 } from "./patch/refactor-preview.js";
@@ -287,203 +271,22 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             // synthesized hashline EditItems. Runs before the main per-group
             // loop (which then treats these exactly like any other hashline
             // group) and inside this try so an early rejection here still
-            // triggers the finally-block rollback below.
-            const moveSourceSpans: Array<{ canonicalFrom: string; startLine: number; endLine: number }> = [];
-            for (const rt of resolvedTransfers) {
-                const snapshot = transaction.getSnapshot(rt.canonicalFrom);
-                if (!snapshot || !snapshot.exists) {
-                    diagnostics.push(`transfer source does not exist: ${rt.rawFrom}`);
-                    return {
-                        content: [{ type: "text" as const, text: `failed: transfer source does not exist: ${rt.rawFrom}` }],
-                        details: makeFailed(toolCallId, "stage", `transfer source does not exist: ${rt.rawFrom}`, evidenceRefForDetails, checks, diagnostics, usedEvidence, invalidations),
-                    };
-                }
-                const rawSourceContent = snapshot.content ? snapshot.content.toString("utf8") : "";
-                // Anchors address logical lines (BOM-stripped, LF-normalized);
-                // freshness below hashes the raw snapshot preimage instead.
-                const sourceLogicalLines = normalizeToLF(stripBom(rawSourceContent).text).split("\n");
-
-                // Plan the destination first: a supplied `after` on a new-file
-                // destination (or a non-public sentinel/suffix) is a pure
-                // planning error — reject pre-write with a transfer conflict
-                // before any source authority is consulted.
-                let transferPlan: TransferPlan;
-                try {
-                    transferPlan = planTransfer({ op: rt.op, from: rt.rawFrom, range: rt.range, to: rt.rawTo, after: rt.after, toIsNewFile: rt.toIsNewFile });
-                } catch (err) {
-                    const message = err instanceof Error ? err.message : String(err);
-                    diagnostics.push(message);
-                    return {
-                        content: [{ type: "text" as const, text: `rejected: ${message}` }],
-                        details: makeRejected(toolCallId, "conflict", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
-                    };
-                }
-
-                const resolved = resolveSourceRange(rawSourceContent, rt.range.pos, rt.range.end);
-                if (!resolved.ok) {
-                    diagnostics.push(`transfer: ${resolved.error} (${rt.rawFrom})`);
-                    return {
-                        content: [{ type: "text" as const, text: `failed: transfer range resolution (${rt.rawFrom})` }],
-                        details: makeFailed(toolCallId, "stage", `${resolved.error} (${rt.rawFrom})`, evidenceRefForDetails, checks, diagnostics, usedEvidence, invalidations),
-                    };
-                }
-
-                if (rt.op === "copy") {
-                    // `move`'s source becomes a real deletion group below and is
-                    // authorized through the main loop's existing per-group
-                    // pipeline; `copy` produces no mutation at the source, so it
-                    // never becomes a group and needs this standalone check.
-                    let sourceResource: InspectedResource | null = null;
-                    let usedPriorSourceAuthority = false;
-                    if (priorStore) {
-                        sourceResource = priorStore.select(rt.canonicalFrom);
-                        usedPriorSourceAuthority = sourceResource !== null;
-                    }
-                    if (!sourceResource && envelope) {
-                        sourceResource = findResourceForCanonicalPath(envelope, rt.canonicalFrom, evidenceRefForDetails.resourceIds);
-                    }
-                    if (!sourceResource) {
-                        diagnostics.push(`coverage: no authority for copy source ${rt.rawFrom}`);
-                        return {
-                            content: [{ type: "text" as const, text: `rejected: coverage (copy source ${rt.rawFrom})` }],
-                            details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
-                        };
-                    }
-                    const coverageError = validateResourceAuthority(sourceResource, [{ startLine: resolved.value.startLine, endLine: resolved.value.endLine }], false);
-                    if (coverageError) {
-                        diagnostics.push(`${coverageError} for copy source ${rt.rawFrom}`);
-                        return {
-                            content: [{ type: "text" as const, text: `rejected: coverage (copy source ${rt.rawFrom})` }],
-                            details: makeRejected(toolCallId, "coverage", diagnostics, {
-                                inspectionId: evidenceRefForDetails.inspectionId,
-                                resourceIds: [sourceResource.resourceId],
-                            }, checks, usedEvidence, invalidations),
-                        };
-                    }
-                    if (!isValidFullFileSha256(sourceResource.fullFileSha256)) {
-                        diagnostics.push(`coverage: missing or malformed fullFileSha256 for ${rt.rawFrom}; read the source file again before copying`);
-                        return {
-                            content: [{ type: "text" as const, text: `rejected: coverage (missing valid snapshot SHA for copy source ${rt.rawFrom})` }],
-                            details: makeRejected(toolCallId, "coverage", diagnostics, {
-                                inspectionId: evidenceRefForDetails.inspectionId,
-                                resourceIds: [sourceResource.resourceId],
-                            }, checks, usedEvidence, invalidations),
-                        };
-                    }
-                    // Freshness hashes the raw snapshot preimage (BOM/CRLF
-                    // included): normalized content would hash differently from
-                    // the attested fullFileSha256 on such files.
-                    if (sourceResource.fullFileSha256 !== sha256OfString(rawSourceContent)) {
-                        diagnostics.push(`stale: copy source ${rt.rawFrom} sha mismatch`);
-                        return {
-                            content: [{ type: "text" as const, text: `rejected: stale (copy source ${rt.rawFrom})` }],
-                            details: makeRejected(toolCallId, "stale", diagnostics, {
-                                inspectionId: evidenceRefForDetails.inspectionId,
-                                resourceIds: [sourceResource.resourceId],
-                            }, checks, usedEvidence, invalidations),
-                        };
-                    }
-                }
-
-                if (!rt.toIsNewFile && rt.after === undefined) {
-                    const message = `transfer destination ${rt.rawTo} already exists; \`after\` is required to choose an insertion point`;
-                    diagnostics.push(message);
-                    return {
-                        content: [{ type: "text" as const, text: `rejected: ${message}` }],
-                        details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
-                    };
-                }
-
-                // Overlapping move deletions resolve against the same original
-                // pre-transaction snapshot, so overlapping spans are a planning
-                // conflict — reject transfer-specifically rather than letting
-                // the unified overlap check report a generic failure.
-                if (rt.op === "move") {
-                    for (const seen of moveSourceSpans) {
-                        if (moveSpansOverlap(seen, rt.canonicalFrom, resolved.value.startLine, resolved.value.endLine)) {
-                            const message = `transfer source spans overlap in ${rt.rawFrom} ([${seen.startLine},${seen.endLine}] vs [${resolved.value.startLine},${resolved.value.endLine}]): refusing conflicting move deletions`;
-                            diagnostics.push(message);
-                            return {
-                                content: [{ type: "text" as const, text: `rejected: ${message}` }],
-                                details: makeRejected(toolCallId, "conflict", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
-                            };
-                        }
-                    }
-                    moveSourceSpans.push({ canonicalFrom: rt.canonicalFrom, startLine: resolved.value.startLine, endLine: resolved.value.endLine });
-                }
-                // Same-file destination landing inside or touching the source
-                // span (insert point between lines [startLine-1, endLine]) has
-                // no well-defined pre/post-delete meaning — reject with a
-                // transfer-specific conflict. Sentinel `start`/`end` dests are
-                // absolute file edges and never participate in this check.
-                if (isSameFileMoveCandidate(rt.op, rt.canonicalFrom, rt.canonicalTo, rt.after)) {
-                    const rebasedAfter = resolveDestination(rt.after, sourceLogicalLines);
-                    const afterLine = typeof rebasedAfter === "number" ? rebasedAfter : null;
-                    if (isAfterLineInsideSourceSpan(afterLine, resolved.value.startLine, resolved.value.endLine)) {
-                        const message = `transfer destination after anchor ${rt.after} lands inside or touching the source span [${resolved.value.startLine},${resolved.value.endLine}] in ${rt.rawFrom}: refusing conflicting same-file transfer`;
-                        diagnostics.push(message);
-                        return {
-                            content: [{ type: "text" as const, text: `rejected: ${message}` }],
-                            details: makeRejected(toolCallId, "conflict", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
-                        };
-                    }
-                }
-
-                // Hashline inserts are idempotent: an insert whose lines already
-                // follow the destination anchor is a silent no-op downstream
-                // (./core/edit-planner.js skips no-change spans; hashline append_at no-ops
-                // on identical following lines). Reject pre-write with a
-                // transfer-specific conflict instead of silently dropping the
-                // insert — covers same-file and cross-file. Generic hashline
-                // idempotence itself is unchanged.
-                const sourceLines = resolved.value.lines;
-                if (sourceLines.length > 0 && !rt.toIsNewFile) {
-                    let destLines: string[] | null = null;
-                    if (rt.canonicalFrom === rt.canonicalTo) {
-                        destLines = sourceLogicalLines;
-                    } else {
-                        const destSnapshot = transaction.getSnapshot(rt.canonicalTo);
-                        const rawDest = destSnapshot?.content ? destSnapshot.content.toString("utf8") : null;
-                        if (rawDest !== null) destLines = normalizeToLF(stripBom(rawDest).text).split("\n");
-                    }
-                    if (destLines !== null) {
-                        const linesEqual = (a: string[], b: string[]): boolean =>
-                            a.length === b.length && a.every((line, i) => line === b[i]);
-                        let existingAtDest: string[] | null = null;
-                        if (rt.after === "start") {
-                            existingAtDest = destLines.slice(0, sourceLines.length);
-                        } else if (rt.after !== undefined) {
-                            const destAfterLine = resolveDestination(rt.after, destLines);
-                            if (typeof destAfterLine === "number") existingAtDest = destLines.slice(destAfterLine, destAfterLine + sourceLines.length);
-                        }
-                        if (existingAtDest !== null && linesEqual(existingAtDest, sourceLines)) {
-                            const message = `transfer destination already contains the source lines after ${rt.after ?? "start"} in ${rt.rawTo}: refusing duplicate transfer that the insert layer would silently drop`;
-                            diagnostics.push(message);
-                            return {
-                                content: [{ type: "text" as const, text: `rejected: ${message}` }],
-                                details: makeRejected(toolCallId, "conflict", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
-                            };
-                        }
-                    }
-                }
-                // Literal mutation plan: destination insert + (for move) source
-                // delete as plain data, converted to hashline EditItems below.
-                // Transaction/evidence/verifier/rollback/undo/finalization stay
-                // shared in this pipeline — plan.ts owns no lifecycle engine.
-                const mutations = planTransferMutations(
-                    bindResolvedTransfer(transferPlan, { startLine: resolved.value.startLine, endLine: resolved.value.endLine, sourceLines }),
-                    buildTransferDescription({ op: rt.op, from: rt.rawFrom, range: rt.range, description: rt.description }),
-                );
-                const description = mutations.description;
-                const destAfter = mutations.insert.afterAnchor;
-                const toIdx = groups.findIndex((g) => g.absolutePath === rt.canonicalTo);
-                groups[toIdx] = { ...groups[toIdx], edits: [...groups[toIdx].edits, buildTransferInsertEdit(destAfter, mutations.insert.lines, description)] };
-
-                if (mutations.erase !== null) {
-                    const fromIdx = groups.findIndex((g) => g.absolutePath === rt.canonicalFrom);
-                    groups[fromIdx] = { ...groups[fromIdx], edits: [...groups[fromIdx].edits, buildTransferDeleteEdit(mutations.erase, description)] };
-                }
-            }
+            // triggers the finally-block rollback below. Staging lives in
+            // ./patch/transfer-staging.js (pure move, zero logic change).
+            const staged = materializeTransfers({
+                resolvedTransfers,
+                transaction,
+                groups,
+                priorStore,
+                envelope,
+                evidenceRefForDetails,
+                toolCallId,
+                checks,
+                diagnostics,
+                usedEvidence,
+                invalidations,
+            });
+            if (!staged.ok) return staged.result;
 
             for (const group of groups) {
                 // Skip bookkeeping placeholders (e.g. rename destination paths) that have
@@ -492,361 +295,77 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
 
                 stream(`  ${group.rawPath} — ${group.edits.length} edit(s)`);
 
-                // Resolve canonical path for this group.
-                let canonicalTarget: string;
-                let isNewFileGroup = false;
+                const preimage = await resolveAuthorizedGroupPreimage({
+                    group,
+                    newFileCanonicals,
+                    priorStore,
+                    envelope,
+                    evidenceRefForDetails,
+                    canonicalRoot,
+                    toolCallId,
+                    checks,
+                    diagnostics,
+                    usedEvidence,
+                    invalidations,
+                });
+                if (!preimage.ok) return preimage.result;
+                let canonicalTarget = preimage.canonicalTarget;
+                const isNewFileGroup = preimage.isNewFileGroup;
+                const resource = preimage.resource;
+                const currentContent = preimage.currentContent;
+                const currentSha = preimage.currentSha;
+                const usedPriorAuthority = preimage.usedPriorAuthority;
                 // Display/applied path for this group; reassigned to the new
                 // path after a successful rename so downstream diffs, applied
                 // lists, and finalization all reference where the file now
                 // lives (the old path no longer exists once renamed).
                 let displayPath: string = group.rawPath;
-                if (newFileCanonicals.has(group.absolutePath)) {
-                    // Synthesized new-file: there's no on-disk file to resolve, so
-                    // skip realpath and remember this fact for the rest of the loop.
-                    canonicalTarget = group.absolutePath;
-                    isNewFileGroup = true;
-                } else {
-                    try {
-                        canonicalTarget = realpathSync(group.absolutePath);
-                    } catch (err) {
-                        diagnostics.push(`file not found: ${group.absolutePath}`);
-                        return {
-                            content: [{ type: "text" as const, text: `failed: file not found: ${group.rawPath}` }],
-                            details: makeFailed(toolCallId, "stage", `file not found: ${group.rawPath}`, {
-                                ...evidenceRefForDetails,
-                                resourceIds: [""],
-                            }, checks, diagnostics, usedEvidence, invalidations),
-                        };
-                    }
-                }
 
-                // Select authority: a strong prior authority wins; otherwise
-                // fall back to the envelope resource. A selected prior grant is
-                // never overridden by caller evidenceRef and never falls back to
-                // full-file auto-inspection.
-                let resource: InspectedResource | null = null;
-                let usedPriorAuthority = false;
-                if (priorStore && !isNewFileGroup) {
-                    resource = priorStore.select(canonicalTarget);
-                    usedPriorAuthority = resource !== null;
-                }
-                if (!resource) {
-                    if (!envelope) {
-                        diagnostics.push(`coverage: no prior authority and no envelope for ${canonicalTarget}`);
-                        return {
-                            content: [{ type: "text" as const, text: `rejected: coverage (no authority for ${group.rawPath})` }],
-                            details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
-                        };
-                    }
-                    resource = findResourceForCanonicalPath(
-                        envelope,
-                        canonicalTarget,
-                        evidenceRefForDetails.resourceIds,
-                    );
-                }
-                if (!resource) {
-                    diagnostics.push(`coverage: no resource in envelope for ${canonicalTarget}`);
-                    return {
-                        content: [{ type: "text" as const, text: `rejected: coverage (no resource for ${group.rawPath})` }],
-                        details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
-                    };
-                }
-                const requiresFullEvidence = group.topology?.kind === "delete" || group.topology?.kind === "rename";
-                const authorization = authorizeResource({
-                    resources: [resource],
-                    canonicalPath: canonicalTarget,
-                    canonicalWorkspaceRoot: canonicalRoot,
-                    requestedResourceIds: [resource.resourceId],
-                    targetRanges: [],
-                    requireFull: requiresFullEvidence,
+                const planned = await planGroupMutation({
+                    group,
+                    canonicalTarget,
+                    resource,
+                    currentContent,
+                    currentSha,
+                    isNewFileGroup,
+                    usedPriorAuthority,
+                    deps,
+                    evidenceRefForDetails,
+                    toolCallId,
+                    checks,
+                    diagnostics,
+                    usedEvidence,
+                    invalidations,
+                    transaction,
+                    canonicalTxPath,
+                    displayPath,
+                    appliedFiles,
+                    appliedCanonical,
+                    appliedSummaries,
+                    displayDiffs,
+                    stream,
                 });
-                if (!authorization.ok) {
-                    const initialCoverageError = authorization.reason;
-                    diagnostics.push(`${initialCoverageError} for ${canonicalTarget} (path-mode inspect this file first)`);
-                    return {
-                        content: [{ type: "text" as const, text: `rejected: coverage (weak evidence for ${group.rawPath})` }],
-                        details: makeRejected(toolCallId, "coverage", diagnostics, {
-                            inspectionId: evidenceRefForDetails.inspectionId,
-                            resourceIds: [resource.resourceId],
-                        }, checks, usedEvidence, invalidations),
-                    };
-                }
-                usedEvidence.push(resource.resourceId);
-
-                // Read current content + compute sha.
-                let currentContent: string;
-                let currentSha: string;
-                if (isNewFileGroup) {
-                    // Synthesized new-file: the file does not exist on disk yet.
-                    // We treat current content as empty so the rest of the pipeline
-                    // (in-memory apply + verifiers + atomicWrite) operates as if the
-                    // file currently contains the empty string. Empty oldText is
-                    // expected to find its match at the start of the empty content.
-                    currentContent = "";
-                    currentSha = sha256OfString("");
-                } else {
-                    try {
-                        currentContent = await safeReadUtf8(canonicalTarget);
-                        currentSha = sha256OfString(currentContent);
-                    } catch (err) {
-                        diagnostics.push(`read failed: ${err instanceof Error ? err.message : String(err)}`);
-                        return {
-                            content: [{ type: "text" as const, text: `failed: read ${group.rawPath}` }],
-                            details: makeFailed(toolCallId, "stage", `read failed: ${group.rawPath}`, {
-                                inspectionId: evidenceRefForDetails.inspectionId,
-                                resourceIds: [resource.resourceId],
-                            }, checks, diagnostics, usedEvidence, invalidations),
-                        };
-                    }
-                }
-
-                // Freshness check. A selected prior line-range authority REQUIRES
-                // a freshness hash; missing SHA rejects rather than silently
-                // skipping freshness. A selected prior grant never falls back to
-                // full-file auto-inspection on staleness.
-                if (!isValidFullFileSha256(resource.fullFileSha256)) {
-                    diagnostics.push(`coverage: missing or malformed fullFileSha256 for ${canonicalTarget}; read the file again before editing`);
-                    return {
-                        content: [{ type: "text" as const, text: `rejected: coverage (missing valid snapshot SHA for ${group.rawPath})` }],
-                        details: makeRejected(toolCallId, "coverage", diagnostics, {
-                            inspectionId: evidenceRefForDetails.inspectionId,
-                            resourceIds: [resource.resourceId],
-                        }, checks, usedEvidence, invalidations),
-                    };
-                }
-                if (resource.fullFileSha256 !== currentSha) {
-                    diagnostics.push(`stale: current sha ${currentSha} != attested ${resource.fullFileSha256} for ${canonicalTarget}`);
-                    return {
-                        content: [{ type: "text" as const, text: `rejected: stale (${group.rawPath})` }],
-                        details: makeRejected(toolCallId, "stale", diagnostics, {
-                            inspectionId: evidenceRefForDetails.inspectionId,
-                            resourceIds: [resource.resourceId],
-                        }, checks, usedEvidence, invalidations),
-                    };
-                }
-
+                if (!planned.ok) return planned.result;
+                if (planned.kind === "deleted") continue;
                 const hasTextEdits = group.edits.length > 0;
+                let newContent = planned.newContent;
+                const preimageLineRanges = planned.preimageLineRanges;
+                const postimageLineRanges = planned.postimageLineRanges;
 
-                // Reject patches combining text edits with delete topology.
-                if (hasTextEdits && group.topology?.kind === "delete") {
-                    diagnostics.push(`text edits combined with delete topology for ${group.rawPath}: cannot edit and delete the same file in one group`);
-                    return {
-                        content: [{ type: "text" as const, text: `rejected: conflicting operations (${group.rawPath})` }],
-                        details: makeRejected(toolCallId, "conflict", diagnostics, {
-                            inspectionId: evidenceRefForDetails.inspectionId,
-                            resourceIds: [resource.resourceId],
-                        }, checks, usedEvidence, invalidations),
-                    };
-                }
-
-                // DELETE: there is no post-edit content to lint/typecheck.
-                // Perform the delete through the shared transaction, invalidate
-                // the resource, emit a diff entry, and count it in the applied
-                // total/changedResources — but skip evidence/diagnostics
-                // generation for this path (the reviewer's carved-out exception:
-                // add/rename flow through the full pipeline below, delete does
-                // not).
-                if (!hasTextEdits && group.topology?.kind === "delete") {
-                    // Advisory risk-warning check for topology-only delete
-                    // (path warnings). Non-blocking — delete proceeds regardless.
-                    const safetyResult = await checkEditSafety(canonicalTarget, [], undefined, []);
-                    if (safetyResult.warnings.length > 0) {
-                        for (const w of safetyResult.warnings) {
-                            checks.advisory.push(makeCheck("risk-warning", "pass", w));
-                        }
-                    }
-                    try {
-                        await transaction.remove(canonicalTxPath(group.absolutePath));
-                    } catch (err) {
-                        // Return a write-phase failure so the outer finally still
-                        // runs the transaction rollback for any earlier mutations.
-                        diagnostics.push(`topology delete failed: ${err instanceof Error ? err.message : String(err)}`);
-                        return {
-                            content: [{ type: "text" as const, text: `failed: delete ${group.rawPath}` }],
-                            details: makeFailed(toolCallId, "write", `delete failed: ${group.rawPath}`, {
-                                inspectionId: evidenceRefForDetails.inspectionId,
-                                resourceIds: [resource.resourceId],
-                            }, checks, diagnostics, usedEvidence, invalidations),
-                        };
-                    }
-                    invalidations.push({
-                        resourceId: resource.resourceId,
-                        canonicalPath: resource.canonicalPath,
-                        fullFileSha256: currentSha,
-                        coverage: resource.coverage,
-                    });
-                    const generatedDiff = generateDiffString(currentContent, "").diff;
-                    displayDiffs.push({ path: displayPath, diff: generatedDiff });
-                    appliedFiles.push(displayPath);
-                    appliedCanonical.push(canonicalTarget);
-                    appliedSummaries.push(`delete of ${displayPath}`);
-                    stream(`  ✓ deleted ${displayPath}`);
-                    continue;
-                }
-
-                // Stage edits through the planner (no writes). The planner routes
-                // text edits through applyEdits (fuzzy tiers, replaceAll, AST/lineRange
-                // scopes, literal $ replacement) and returns actual resolved spans.
-                // ADD and topology-only RENAME groups skip the planner — their
-                // content is already fully determined — but still flow through
-                // the exact same write/verify/evidence/finalization machinery
-                // below as a text edit would, rather than an early-exit
-                // shortcut that bypasses the compiler/LSP/post-edit pipeline.
-                let newContent: string;
-                let preimageLineRanges: ReadonlyArray<LineRange> = [];
-                let postimageLineRanges: ReadonlyArray<LineRange> = [];
-                if (!hasTextEdits && group.topology?.kind === "add") {
-                    newContent = group.topology.content;
-                    postimageLineRanges = [{ startLine: 1, endLine: Math.max(1, newContent.split("\n").length) }];
-                } else if (!hasTextEdits && group.topology?.kind === "rename") {
-                    // Content is unchanged; the rename itself happens further
-                    // below (after post-write verify), which reassigns
-                    // canonicalTarget/displayPath to the new path before any
-                    // evidence/finalization records anything against it.
-                    newContent = currentContent;
-                } else if (isNewFileGroup && group.edits.every((e) => typeof e.oldText === "string")) {
-                    // New-file creation via oldText:"": the empty oldText is implicit
-                    // at offset 0 of the (empty) current content. applyEdits rejects
-                    // empty oldText, so this path stays separate. A new-file group
-                    // built from a transfer op carries a hashline (append_file) edit
-                    // instead, which falls through to the planTextEdits branch below
-                    // (it operates on `currentContent` generically and needs no
-                    // special-casing for an empty starting file).
-                    newContent = currentContent;
-                    for (const edit of group.edits) {
-                        if (typeof edit.oldText !== "string" || typeof edit.newText !== "string") {
-                            // Pre-write: input shape problem. No file write happened.
-                            diagnostics.push(`edit missing oldText/newText in ${group.rawPath}`);
-                            return {
-                                content: [{ type: "text" as const, text: `failed: edit (missing fields) in ${group.rawPath}` }],
-                                details: makeFailed(toolCallId, "stage", `edit missing oldText/newText: ${group.rawPath}`, {
-                                    inspectionId: evidenceRefForDetails.inspectionId,
-                                    resourceIds: [resource.resourceId],
-                                }, checks, diagnostics, usedEvidence, invalidations),
-                            };
-                        }
-                        if (!newContent.includes(edit.oldText)) {
-                            diagnostics.push(`oldText not found in composed buffer for ${group.rawPath}`);
-                            return {
-                                content: [{ type: "text" as const, text: `failed: edit (oldText not found) in ${group.rawPath}` }],
-                                details: makeFailed(toolCallId, "stage", `oldText not found: ${group.rawPath}`, {
-                                    inspectionId: evidenceRefForDetails.inspectionId,
-                                    resourceIds: [resource.resourceId],
-                                }, checks, diagnostics, usedEvidence, invalidations),
-                            };
-                        }
-                        if (edit.replaceAll) {
-                            newContent = newContent.split(edit.oldText).join(edit.newText);
-                        } else {
-                            // slice-based: safe against $-pattern interpretation in edit.newText
-                            const idx = newContent.indexOf(edit.oldText);
-                            if (idx >= 0) {
-                                newContent = newContent.slice(0, idx) + edit.newText + newContent.slice(idx + edit.oldText.length);
-                            }
-                        }
-                    }
-                    preimageLineRanges = [{ startLine: 1, endLine: 1 }];
-                    postimageLineRanges = [{ startLine: 1, endLine: Math.max(1, newContent.split("\n").length) }];
-                } else {
-                    try {
-                        const planned = await planTextEdits({
-                            content: currentContent,
-                            edits: group.edits as EditItem[],
-                            filePath: canonicalTarget,
-                            astResolver: deps.getAstResolver?.() ?? null,
-                            structuralResolver: deps.getStructuralResolver?.() ?? null,
-                            getSnapshot: deps.getSnapshot ?? (() => null),
-                        });
-                        newContent = planned.newContent;
-                        preimageLineRanges = planned.preimageLineRanges;
-                        postimageLineRanges = planned.postimageLineRanges;
-                        for (const note of planned.matchNotes) diagnostics.push(note);
-                    } catch (err) {
-                        const msg = err instanceof Error ? err.message : String(err);
-                        diagnostics.push(msg);
-                        const matchCode = err instanceof MatchError ? err.code : null;
-                        const message = matchCode === "NOT_FOUND"
-                            ? `failed: target not found in ${group.rawPath}; re-inspect the file and retry with current exact text`
-                            : matchCode === "AMBIGUOUS"
-                                ? `failed: ambiguous edit in ${group.rawPath}; provide more surrounding context, add target/lineRange scope, or use replaceAll`
-                                : `failed: edit (${group.rawPath})`;
-                        return {
-                            content: [{ type: "text" as const, text: message }],
-                            details: {
-                                ...makeFailed(toolCallId, "stage", `edit planning failed: ${group.rawPath}`, {
-                                inspectionId: evidenceRefForDetails.inspectionId,
-                                resourceIds: [resource.resourceId],
-                            }, checks, diagnostics, usedEvidence, invalidations),
-                                ...(matchCode === "NOT_FOUND" || matchCode === "AMBIGUOUS" ? { matchFailure: matchCode } : {}),
-                            },
-                        };
-                    }
-                }
-
-                // Authorize using ACTUAL resolved spans (not an exact oldText
-                // lookup), so fuzzy/scoped matches authorize correctly and cannot
-                // escape prior line-range authority. For replaceAll, every actual
-                // span is authorized.
-                const coverageError = checkResourceCoverage(resource, preimageLineRanges);
-                if (coverageError) {
-                    diagnostics.push(`${coverageError} for ${canonicalTarget}`);
-                    if (usedPriorAuthority) {
-                        diagnostics.push(`coverage: prior authority is line-range for ${canonicalTarget}; a fresh full-file read is required to widen authority`);
-                    }
-                    return {
-                        content: [{ type: "text" as const, text: `rejected: coverage (${group.rawPath})` }],
-                        details: makeRejected(toolCallId, "coverage", diagnostics, {
-                            inspectionId: evidenceRefForDetails.inspectionId,
-                            resourceIds: [resource.resourceId],
-                        }, checks, usedEvidence, invalidations),
-                    };
-                }
-
-                // Repair is evaluated only against the in-memory candidate.
-                // A successful repair is still an untrusted new mutation: compute
-                // its changed preimage range and require the same evidence
-                // authority before it can reach a write.
-                const repairRunner = deps.runRepair;
-                const repair = repairRunner
-                    ? await repairRunner({ path: canonicalTarget, content: newContent, cwd: ctx.cwd }).catch((err: unknown): RepairLoopResult => ({
-                    passed: false,
-                    attempts: [],
-                    finalValidation: null,
-                    summary: `repair unavailable: ${err instanceof Error ? err.message : String(err)}`,
-                    repairedContent: null,
-                    }))
-                    : null;
-                if (repair) {
-                repairsByPath.set(canonicalTarget, repair);
-                if (repair.repairedContent && repair.repairedContent !== newContent) {
-                    const repairRanges = changedLineRanges(newContent, repair.repairedContent);
-                    // Repair ranges are computed in staged (post-edit) coordinates,
-                    // so they cannot be compared against the resource's pre-edit
-                    // allowedRanges. Map each repair span back to original
-                    // coordinates via the edit mapping, then require it to stay
-                    // within the edit's already-authorized preimage footprint.
-                    // Full-file grants accept any in-file repair; a repair that
-                    // cannot be re-authorized is skipped.
-                    const confinedToPreimage =
-                        resource.coverage === "full-file" ||
-                        (repairRanges.length > 0 &&
-                            repairRanges.every((r) => {
-                                const mapped = mapRepairSpanToPreimage(r, preimageLineRanges, postimageLineRanges);
-                                return mapped !== null &&
-                                    preimageLineRanges.some((p) => mapped.startLine >= p.startLine && mapped.endLine <= p.endLine);
-                            }));
-                    if (confinedToPreimage) {
-                        newContent = repair.repairedContent;
-                        diagnostics.push(`repair: accepted staged repair for ${canonicalTarget}`);
-                        checks.advisory.push(makeCheck(`repair:${group.rawPath}`, "pass", repair.summary));
-                    } else {
-                        diagnostics.push(`repair: skipped for ${canonicalTarget}; repaired content exceeded the edit's authorized preimage range`);
-                        checks.advisory.push(makeCheck(`repair:${group.rawPath}`, "skipped", "repaired content exceeded existing evidence authority"));
-                    }
-                } else if (!repair.passed) {
-                    checks.advisory.push(makeCheck(`repair:${group.rawPath}`, "skipped", repair.summary));
-                }
-                }
+                const repaired = await applyAuthorizedRepair({
+                    canonicalTarget,
+                    content: newContent,
+                    preimageLineRanges,
+                    postimageLineRanges,
+                    resource,
+                    rawPath: group.rawPath,
+                    deps,
+                    cwd: ctx.cwd,
+                    checks,
+                    diagnostics,
+                    repairsByPath,
+                });
+                newContent = repaired.content;
 
                 // Run allowlisted checks (per file). Postwrite-phase checks run
                 // only after the write (below); running them here would observe
@@ -1131,91 +650,34 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 }
             }
 
-            // Final-only lanes must observe committed state. They remain
-            // advisory: a diagnostic or bridge failure cannot turn a durable
-            // transaction into a reported rollback.
-            let finalization: unknown;
-            if (deps.runFinalSuccessLanes && finalizedFiles.length > 0) {
-                try {
-                    const result = await deps.runFinalSuccessLanes({ cwd: ctx.cwd, toolCallId, files: finalizedFiles });
-                    finalization = result.evidence;
-                    diagnostics.push(...(result.diagnostics ?? []));
-                    for (const lane of result.checks ?? []) {
-                        const check = makeCheck(lane.id, lane.outcome, lane.detail);
-                        checks.advisory.push(check);
-                        checks.completed.push(check);
-                    }
-                } catch (err) {
-                    const detail = err instanceof Error ? err.message : String(err);
-                    diagnostics.push(`finalization: ${detail}`);
-                    const check = makeCheck("finalization", "skipped", detail);
-                    checks.advisory.push(check);
-                    checks.completed.push(check);
-                }
-            }
-
-            // Surface evidence-pipeline uncertainty in skipped bucket.
-            if (autoInspected) {
-                checks.skipped.push(makeCheck("evidence-pipeline", "skipped", "auto-inspected (no prior inspect call); pipeline check was replaced by in-tool read+sha"));
-            } else {
-                checks.skipped.push(makeCheck("evidence-pipeline", "skipped", "evidence-pipeline check ran above; this row records pipeline uncertainty for the consumer"));
-            }
-
-            // Build the final details. For v3 multi-file, postEditEvidence is
-            // emitted per file via the postEditEvidenceByPath map, and the
-            // top-level postEditEvidence is the last (or only) file's value
-            // for backward compatibility with v1 single-file consumers.
-            // Post evidence is keyed by canonical target, not the caller's raw
-            // path. Use the per-applied canonical target so a symlinked or
-            // topology path resolves to its real file's evidence.
-            const lastCanonical = appliedCanonical.at(-1) ?? "";
-            const lastPost = lastCanonical ? postEditEvidenceByPath.get(lastCanonical) : undefined;
-
-            const singleDiff = displayDiffs.length === 1 ? displayDiffs[0] : undefined;
-            const combinedDiff = singleDiff
-                ? singleDiff.diff
-                : displayDiffs.map((entry) => `${entry.path}\n${entry.diff}`).join("\n\n");
-            const details: PatchToolDetails = {
-                tool: "patch",
-                status: { kind: "applied" },
+            return finalizeAppliedPatch({
+                deps,
+                ctx,
                 toolCallId,
-                evidenceRef: evidenceRefForDetails,
-                usedEvidence: [...new Set(usedEvidence)],
-                changedResources: invalidations,
-                postEditEvidence: lastPost,
-                checks: freezeChecks(checks),
-                diagnostics,
-                diff: combinedDiff,
-                diffs: displayDiffs,
-                repairs: Object.fromEntries(repairsByPath),
-                finalization,
-                rollback: rollbackInfo,
-            };
-            // Built from appliedSummaries (recorded per applied group at the
-            // point it was applied) rather than indexing groups[0], which does
-            // not necessarily correspond to appliedFiles[0] and previously
-            // reported "applied 0 edit(s)" for a topology-only group.
-            const summary = appliedSummaries.length === 1
-                ? `applied ${appliedSummaries[0]}`
-                : `applied: ${appliedSummaries.join("; ")}`;
-            // Diagnostics were already collected into `details.diagnostics` by
-            // runFinalSuccessLanes above; without this, they were only visible
-            // via `details` (not shown to the model) — surface a bounded copy
-            // in `content` too, advisory-only, without changing pass/fail.
-            const diagnosticsBlock = formatBoundedDiagnostics(diagnostics);
-            return {
-                content: appendDiagnosticsToContent(
-                    [{ type: "text" as const, text: summary }],
-                    diagnosticsBlock,
-                ) as { type: "text"; text: string }[],
-                details,
-            };
+                state: {
+                    checks,
+                    diagnostics,
+                    usedEvidence,
+                    invalidations,
+                    postEditEvidenceByPath,
+                    repairsByPath,
+                    finalizedFiles,
+                    appliedFiles,
+                    appliedCanonical,
+                    appliedSummaries,
+                    displayDiffs,
+                },
+                autoInspected,
+                evidenceRefForDetails,
+                rollbackInfo,
+            });
         },
     };
 }
 
 // Repair-span helpers (mapRepairSpanToPreimage, changedLineRanges) live in
-// the shared kernel (./patch/repair-spans.js); imported above.
+// the shared kernel (./patch/repair-spans.js), consumed by
+// ./patch/group-planning.js.
 
 // buildRollbackInfo, makeRejected, makeFailed, classifyRpcError live in
 // ./patch/result-builders.js (imported above).

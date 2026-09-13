@@ -12,6 +12,8 @@ import type {
     EvidenceRef,
     LineRange,
     CheckRecord,
+    ResourceInvalidation,
+    PostEditEvidence,
 } from "@rhinos0608/pi-workspace-protocol";
 import type { PriorAuthorityStore } from "../context/evidence-authority.js";
 import type { AstResolverLike } from "../anchor/anchor-resolution.js";
@@ -154,6 +156,32 @@ export interface BusPreviewResponse {
 }
 
 export type StagedPreviewFile = { filePath: string; originalContent: string; newContent: string; edits: Array<{ range: { start: { line: number }; end: { line: number } } }> };
+
+// ── Stage 2 execution-state types (internal-only; not re-exported by the ──
+// patch.ts public facade). PatchInvocation mirrors the execute() args of
+// createPatchTool; PatchExecutionState is the mutable accumulator bag execute
+// currently threads through as locals. Pure type move: zero logic change.
+export interface PatchInvocation {
+    readonly toolCallId: string;
+    readonly params: Record<string, unknown>;
+    readonly signal: AbortSignal | undefined;
+    readonly onUpdate: ((update: { content: Array<{ type: "text"; text: string }> }) => void) | undefined;
+    readonly ctx: { cwd: string; hasUI?: boolean; ui?: unknown; [k: string]: unknown };
+}
+
+export interface PatchExecutionState {
+    checks: MutableChecks;
+    diagnostics: string[];
+    usedEvidence: string[];
+    invalidations: ResourceInvalidation[];
+    postEditEvidenceByPath: Map<string, PostEditEvidence>;
+    repairsByPath: Map<string, RepairLoopResult>;
+    finalizedFiles: FinalSuccessFile[];
+    appliedFiles: string[];
+    appliedCanonical: string[];
+    appliedSummaries: string[];
+    displayDiffs: PatchDisplayDiff[];
+}
 
 export interface PreparedPatchRequest {
     requestEvidenceRef: EvidenceRef | undefined;
