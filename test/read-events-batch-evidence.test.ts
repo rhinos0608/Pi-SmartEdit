@@ -59,3 +59,24 @@ test("ingestWorkspaceEvidence ignores error results", () => {
     ingestWorkspaceEvidence({ toolName: "read_files", isError: true, details: { workspaceEvidence: makeEnvelope() } }, store);
     assert.equal(store.select(PATH), null);
 });
+
+test("ingestWorkspaceEvidence ingests intent_read envelope", () => {
+    const store = createPriorAuthorityStore({ sessionFilePath: SESSION, canonicalWorkspaceRoot: ROOT });
+    ingestWorkspaceEvidence({ toolName: "intent_read", isError: false, details: { workspaceEvidence: makeEnvelope() } }, store);
+    assert.notEqual(store.select(PATH), null);
+});
+
+test("ingestWorkspaceEvidence ignores intent_read error results", () => {
+    const store = createPriorAuthorityStore({ sessionFilePath: SESSION, canonicalWorkspaceRoot: ROOT });
+    ingestWorkspaceEvidence({ toolName: "intent_read", isError: true, details: { workspaceEvidence: makeEnvelope() } }, store);
+    assert.equal(store.select(PATH), null);
+});
+
+test("ingestWorkspaceEvidence ignores invalid/weak intent_read envelopes", () => {
+    const base = makeEnvelope();
+    const weak: WorkspaceEvidenceEnvelope = { ...base, resources: [{ ...base.resources[0]!, coverage: "search-match" }] };
+    const store = createPriorAuthorityStore({ sessionFilePath: SESSION, canonicalWorkspaceRoot: ROOT });
+    ingestWorkspaceEvidence({ toolName: "intent_read", isError: false, details: { workspaceEvidence: { bogus: true } } }, store);
+    ingestWorkspaceEvidence({ toolName: "intent_read", isError: false, details: { workspaceEvidence: weak } }, store);
+    assert.equal(store.select(PATH), null);
+});

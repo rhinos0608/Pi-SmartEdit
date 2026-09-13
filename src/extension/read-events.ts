@@ -41,7 +41,8 @@ export function ingestWorkspaceEvidence(
   try {
     const wsEvidence = (event.toolName === "read" ||
       event.toolName === "read_files" ||
-      event.toolName === "read_multiple_files") && !event.isError
+      event.toolName === "read_multiple_files" ||
+      event.toolName === "intent_read") && !event.isError
       ? (event.details as { workspaceEvidence?: unknown } | undefined)?.workspaceEvidence
       : undefined;
     if (wsEvidence) {
