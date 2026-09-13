@@ -129,25 +129,24 @@ function analyzeAst(
   const findings: FakeLogicFinding[] = [];
 
   walkTree(root, (node) => {
-    if (FUNCTION_NODE_TYPES.has(node.type)) {
-      const finding = checkStubBody(node);
-      if (finding) findings.push(finding);
-      return;
-    }
-
-    if (LOOP_NODE_TYPES.has(node.type)) {
-      const finding = checkConstantCondition(node);
-      if (finding) findings.push(finding);
-      return;
-    }
-
-    if (CATCH_NODE_TYPES.has(node.type)) {
-      const finding = checkEmptyCatch(node);
-      if (finding) findings.push(finding);
-    }
+    const finding = checkNodeForFakeLogic(node);
+    if (finding) findings.push(finding);
   });
 
   return findings;
+}
+
+function checkNodeForFakeLogic(node: Parser.SyntaxNode): FakeLogicFinding | null {
+  if (FUNCTION_NODE_TYPES.has(node.type)) {
+    return checkStubBody(node);
+  }
+  if (LOOP_NODE_TYPES.has(node.type)) {
+    return checkConstantCondition(node);
+  }
+  if (CATCH_NODE_TYPES.has(node.type)) {
+    return checkEmptyCatch(node);
+  }
+  return null;
 }
 
 // ─── Stub-body detection ─────────────────────────────────────────────
@@ -226,21 +225,11 @@ function checkConstantCondition(node: Parser.SyntaxNode): FakeLogicFinding | nul
   const cond = extractCondition(node);
   if (!cond) return null;
 
-  let message: string | null = null;
-
-  if (isLiteralBooleanOrNumber(cond)) {
-    message = `Constant condition: literal ${cond.text}`;
-  } else if (isSelfComparison(cond)) {
-    message = `Constant condition: self-comparison ${cond.text.replace(/\s+/g, " ").slice(0, 40)}`;
-  }
-
+  const message = classifyCondition(cond);
   if (!message) return null;
 
-  if (node.type === "while_statement" && isLiteralTrue(cond)) {
-    const body = getBodyNode(node);
-    if (body && bodyHasExit(body)) {
-      return null;
-    }
+  if (isBenignWhileTrue(node, cond)) {
+    return null;
   }
 
   return {
@@ -250,29 +239,80 @@ function checkConstantCondition(node: Parser.SyntaxNode): FakeLogicFinding | nul
   };
 }
 
-function extractCondition(node: Parser.SyntaxNode): Parser.SyntaxNode | null {
-  const cond = node.childForFieldName("condition");
-  if (cond) {
-    if (cond.type === "parenthesized_expression") {
-      return cond.namedChildren[0] ?? cond;
-    }
-    return cond;
+function classifyCondition(cond: Parser.SyntaxNode): string | null {
+  if (isLiteralBooleanOrNumber(cond)) {
+    return `Constant condition: literal ${cond.text}`;
   }
+  if (isSelfComparison(cond)) {
+    return `Constant condition: self-comparison ${cond.text.replace(/\s+/g, " ").slice(0, 40)}`;
+  }
+  return null;
+}
 
+function isBenignWhileTrue(node: Parser.SyntaxNode, cond: Parser.SyntaxNode): boolean {
+  if (node.type !== "while_statement") return false;
+  if (!isLiteralTrue(cond)) return false;
+  const body = getBodyNode(node);
+  if (!body) return false;
+  return bodyHasExit(body);
+}
+
+function extractCondition(node: Parser.SyntaxNode): Parser.SyntaxNode | null {
+  const viaField = extractFieldCondition(node);
+  if (viaField) return viaField;
+  if (node.type === "conditional_expression") {
+    return extractTernaryCondition(node);
+  }
+  return null;
+}
+
+function extractFieldCondition(node: Parser.SyntaxNode): Parser.SyntaxNode | null {
+  const cond = node.childForFieldName("condition");
+  if (!cond) return null;
+  return unwrapParenthesized(cond);
+}
+
+function unwrapParenthesized(cond: Parser.SyntaxNode): Parser.SyntaxNode {
+  if (cond.type !== "parenthesized_expression") return cond;
+  return cond.namedChildren[0] ?? cond;
+}
+
+function extractTernaryCondition(node: Parser.SyntaxNode): Parser.SyntaxNode | null {
   // Python conditional_expression has no named fields; the condition sits
   // between the "if" and "else" anonymous tokens.
-  if (node.type === "conditional_expression") {
-    const children = node.children;
-    const ifIndex = children.findIndex((c) => !c.isNamed && c.text === "if");
-    const elseIndex = children.findIndex((c) => !c.isNamed && c.text === "else");
-    if (ifIndex > 0 && elseIndex > ifIndex) {
-      for (let i = ifIndex + 1; i < elseIndex; i++) {
-        const child = children[i];
-        if (child.isNamed) return child;
-      }
-    }
-  }
+  const children = node.children;
+  const ifIndex = findAnonymousText(children, "if");
+  if (ifIndex <= 0) return null;
+  const elseIndex = findAnonymousText(children, "else", ifIndex + 1);
+  if (elseIndex <= ifIndex) return null;
+  return findFirstNamedBetween(children, ifIndex, elseIndex);
+}
 
+function findAnonymousText(
+  children: Parser.SyntaxNode[],
+  text: string,
+  from = 0,
+): number {
+  for (let i = from; i < children.length; i++) {
+    const child = children[i];
+    if (isAnonymousText(child, text)) return i;
+  }
+  return -1;
+}
+
+function isAnonymousText(node: Parser.SyntaxNode, text: string): boolean {
+  return !node.isNamed && node.text === text;
+}
+
+function findFirstNamedBetween(
+  children: Parser.SyntaxNode[],
+  start: number,
+  end: number,
+): Parser.SyntaxNode | null {
+  for (let i = start + 1; i < end; i++) {
+    const child = children[i];
+    if (child.isNamed) return child;
+  }
   return null;
 }
 
@@ -286,45 +326,79 @@ function isLiteralTrue(node: Parser.SyntaxNode): boolean {
 
 function isSelfComparison(node: Parser.SyntaxNode): boolean {
   if (node.type === "binary_expression") {
-    const op = node.children.find((c) => !c.isNamed && /^(===|==)$/.test(c.text));
-    if (!op) return false;
-    const left = node.childForFieldName("left");
-    const right = node.childForFieldName("right");
-    if (left && right && left.text === right.text) {
-      return true;
-    }
+    return isBinarySelfEquality(node);
   }
-
   if (node.type === "comparison_operator") {
-    const children = node.children;
-    const eqIndex = children.findIndex((c) => !c.isNamed && c.text === "==");
-    if (eqIndex > 0 && eqIndex < children.length - 1) {
-      const left = children[eqIndex - 1];
-      const right = children[eqIndex + 1];
-      if (left.isNamed && right.isNamed && left.text === right.text) {
-        return true;
-      }
-    }
+    return isComparisonOperatorSelfEquality(node);
   }
-
   return false;
 }
+
+function isBinarySelfEquality(node: Parser.SyntaxNode): boolean {
+  if (!hasStrictEqualityOp(node)) return false;
+  const left = node.childForFieldName("left");
+  const right = node.childForFieldName("right");
+  return textsEqual(left, right);
+}
+
+function hasStrictEqualityOp(node: Parser.SyntaxNode): boolean {
+  return node.children.some((c) => isEqualityOp(c));
+}
+
+function isEqualityOp(child: Parser.SyntaxNode): boolean {
+  if (child.isNamed) return false;
+  return child.text === "===" || child.text === "==";
+}
+
+function textsEqual(
+  left: Parser.SyntaxNode | null,
+  right: Parser.SyntaxNode | null,
+): boolean {
+  if (!left) return false;
+  if (!right) return false;
+  return left.text === right.text;
+}
+
+function isComparisonOperatorSelfEquality(node: Parser.SyntaxNode): boolean {
+  const eqIndex = findDoubleEquals(node.children);
+  if (eqIndex <= 0) return false;
+  if (eqIndex >= node.children.length - 1) return false;
+  const left = node.children[eqIndex - 1];
+  const right = node.children[eqIndex + 1];
+  if (!left.isNamed) return false;
+  if (!right.isNamed) return false;
+  return left.text === right.text;
+}
+
+function findDoubleEquals(children: Parser.SyntaxNode[]): number {
+  for (let i = 0; i < children.length; i++) {
+    const child = children[i];
+    if (isAnonymousText(child, "==")) return i;
+  }
+  return -1;
+}
+
+const EXIT_NODE_TYPES: ReadonlySet<string> = new Set([
+  "break_statement",
+  "return_statement",
+  "throw_statement",
+  "raise_statement",
+  "yield_expression",
+  "yield",
+]);
 
 function bodyHasExit(body: Parser.SyntaxNode): boolean {
   let exits = false;
   walkTree(body, (n) => {
-    if (
-      n.type === "break_statement" ||
-      n.type === "return_statement" ||
-      n.type === "throw_statement" ||
-      n.type === "raise_statement" ||
-      n.type === "yield_expression" ||
-      n.type === "yield"
-    ) {
+    if (isExitNode(n)) {
       exits = true;
     }
   });
   return exits;
+}
+
+function isExitNode(node: Parser.SyntaxNode): boolean {
+  return EXIT_NODE_TYPES.has(node.type);
 }
 
 // ─── Empty-catch detection ───────────────────────────────────────────
@@ -333,37 +407,11 @@ function checkEmptyCatch(node: Parser.SyntaxNode): FakeLogicFinding | null {
   const body = getBodyNode(node);
   if (!body) return null;
 
-  const comments: Parser.SyntaxNode[] = [];
-  const stmts: Parser.SyntaxNode[] = [];
+  const { comments, stmts } = splitCatchBody(body);
+  collectNodeComments(node, body, comments);
 
-  for (const child of body.children) {
-    if (!child.isNamed) continue;
-    if (COMMENT_TYPES.has(child.type)) {
-      comments.push(child);
-    } else {
-      stmts.push(child);
-    }
-  }
-
-  // Some grammars (Python) attach comments to the catch node directly rather
-  // than to the body block, so collect those too.
-  for (const child of node.children) {
-    if (child !== body && child.isNamed && COMMENT_TYPES.has(child.type)) {
-      comments.push(child);
-    }
-  }
-
-  const isEmpty =
-    stmts.length === 0 ||
-    (stmts.length === 1 && stmts[0].type === "pass_statement");
-
-  if (!isEmpty) return null;
-
-  for (const c of comments) {
-    if (/\b(intentional|ignore)\b/i.test(c.text)) {
-      return null;
-    }
-  }
+  if (!isEmptyCatchStmts(stmts)) return null;
+  if (hasJustifyingComment(comments)) return null;
 
   return {
     rule: "empty-catch",
@@ -372,61 +420,125 @@ function checkEmptyCatch(node: Parser.SyntaxNode): FakeLogicFinding | null {
   };
 }
 
+interface CatchBodyParts {
+  comments: Parser.SyntaxNode[];
+  stmts: Parser.SyntaxNode[];
+}
+
+function splitCatchBody(body: Parser.SyntaxNode): CatchBodyParts {
+  const comments: Parser.SyntaxNode[] = [];
+  const stmts: Parser.SyntaxNode[] = [];
+  for (const child of body.children) {
+    if (!child.isNamed) continue;
+    if (COMMENT_TYPES.has(child.type)) {
+      comments.push(child);
+    } else {
+      stmts.push(child);
+    }
+  }
+  return { comments, stmts };
+}
+
+function collectNodeComments(
+  node: Parser.SyntaxNode,
+  body: Parser.SyntaxNode,
+  comments: Parser.SyntaxNode[],
+): void {
+  // Some grammars (Python) attach comments to the catch node directly rather
+  // than to the body block, so collect those too.
+  for (const child of node.children) {
+    if (isExtraCatchComment(child, body)) {
+      comments.push(child);
+    }
+  }
+}
+
+function isExtraCatchComment(
+  child: Parser.SyntaxNode,
+  body: Parser.SyntaxNode,
+): boolean {
+  if (child === body) return false;
+  if (!child.isNamed) return false;
+  return COMMENT_TYPES.has(child.type);
+}
+
+function isEmptyCatchStmts(stmts: Parser.SyntaxNode[]): boolean {
+  if (stmts.length === 0) return true;
+  return stmts.length === 1 && isPassStatement(stmts[0]);
+}
+
+function isPassStatement(stmt: Parser.SyntaxNode): boolean {
+  return stmt.type === "pass_statement";
+}
+
+function hasJustifyingComment(comments: Parser.SyntaxNode[]): boolean {
+  return comments.some(isJustifyingComment);
+}
+
+function isJustifyingComment(comment: Parser.SyntaxNode): boolean {
+  return /\b(intentional|ignore)\b/i.test(comment.text);
+}
+
 // ─── Regex fallback ──────────────────────────────────────────────────
 
 function runRegexFallback(content: string, language: string): FakeLogicFinding[] {
-  const findings: FakeLogicFinding[] = [];
   const lang = language.toLowerCase();
   const isPy = lang === "python";
 
-  // Only the two low-risk patterns that are reliably detectable by regex.
-  if (!isPy) {
-    const ifRe = /\bif\s*\(\s*(true|false)\s*\)/g;
-    let m: RegExpExecArray | null;
-    while ((m = ifRe.exec(content)) !== null) {
-      findings.push({
-        rule: "constant-condition",
-        line: lineAtIndex(content, m.index),
-        message: `Constant condition: literal ${m[1]}`,
-      });
-    }
-  } else {
-    const ifRe = /\bif\s+(True|False)\s*:/g;
-    let m: RegExpExecArray | null;
-    while ((m = ifRe.exec(content)) !== null) {
-      findings.push({
-        rule: "constant-condition",
-        line: lineAtIndex(content, m.index),
-        message: `Constant condition: literal ${m[1]}`,
-      });
-    }
-  }
+  return [
+    ...collectLiteralConditionFallback(content, isPy),
+    ...collectCatchFallback(content),
+    ...collectExceptFallback(content),
+  ];
+}
 
-  // Empty catch (JS/TS) or except (Python).
+function collectLiteralConditionFallback(content: string, isPy: boolean): FakeLogicFinding[] {
+  // Only the low-risk literal pattern reliably detectable by regex.
+  const pattern = isPy ? /\bif\s+(True|False)\s*:/g : /\bif\s*\(\s*(true|false)\s*\)/g;
+  return collectPattern(content, pattern, (literal, index) => ({
+    rule: "constant-condition",
+    line: lineAtIndex(content, index),
+    message: `Constant condition: literal ${literal}`,
+  }));
+}
+
+function collectCatchFallback(content: string): FakeLogicFinding[] {
   const catchRe = /catch\s*\(\s*(?:[^)]*)\s*\)\s*\{(?:\s*(?:\/\/[^\n]*|\/\*[\s\S]*?\*\/|pass\s*;?)\s*)*\}/g;
-  let cm: RegExpExecArray | null;
-  while ((cm = catchRe.exec(content)) !== null) {
-    if (!hasIntentionalIgnore(content, cm.index, cm[0].length)) {
-      findings.push({
-        rule: "empty-catch",
-        line: lineAtIndex(content, cm.index),
-        message: "Empty catch block without justification",
-      });
-    }
-  }
+  return collectPattern(content, catchRe, (_match, index, full) => {
+    if (hasIntentionalIgnore(content, index, full.length)) return null;
+    return {
+      rule: "empty-catch",
+      line: lineAtIndex(content, index),
+      message: "Empty catch block without justification",
+    };
+  });
+}
 
+function collectExceptFallback(content: string): FakeLogicFinding[] {
   const exceptRe = /except(?:\s+\w+(?:\s+as\s+\w+)?)?\s*:(?:\s*(?:#[^\n]*|pass)\s*)*(?=\n|$)/g;
-  let em: RegExpExecArray | null;
-  while ((em = exceptRe.exec(content)) !== null) {
-    if (!hasIntentionalIgnore(content, em.index, em[0].length)) {
-      findings.push({
-        rule: "empty-catch",
-        line: lineAtIndex(content, em.index),
-        message: "Empty except block without justification",
-      });
-    }
-  }
+  return collectPattern(content, exceptRe, (_match, index, full) => {
+    if (hasIntentionalIgnore(content, index, full.length)) return null;
+    return {
+      rule: "empty-catch",
+      line: lineAtIndex(content, index),
+      message: "Empty except block without justification",
+    };
+  });
+}
 
+function collectPattern(
+  content: string,
+  pattern: RegExp,
+  build: (match: string, index: number, full: string) => FakeLogicFinding | null,
+): FakeLogicFinding[] {
+  const findings: FakeLogicFinding[] = [];
+  let m: RegExpExecArray | null;
+  pattern.lastIndex = 0;
+  while ((m = pattern.exec(content)) !== null) {
+    const literal = m[1] ?? m[0];
+    const finding = build(literal, m.index, m[0]);
+    if (finding) findings.push(finding);
+  }
   return findings;
 }
 
@@ -566,26 +678,49 @@ function normalizeLanguage(languageId: string | null, filePath: string): string 
 }
 
 function getBodyNode(node: Parser.SyntaxNode): Parser.SyntaxNode | null {
+  const viaField = getFieldBody(node);
+  if (viaField) return viaField;
+  return findTrailingBody(node);
+}
+
+function getFieldBody(node: Parser.SyntaxNode): Parser.SyntaxNode | null {
   const body = node.childForFieldName("body");
-  if (body && BODY_TYPES.has(body.type)) return body;
+  if (!body) return null;
+  if (!BODY_TYPES.has(body.type)) return null;
+  return body;
+}
+
+function findTrailingBody(node: Parser.SyntaxNode): Parser.SyntaxNode | null {
   for (let i = node.childCount - 1; i >= 0; i--) {
     const child = node.child(i);
-    if (child && child.isNamed && BODY_TYPES.has(child.type)) {
+    if (isNamedBodyChild(child)) {
       return child;
     }
   }
   return null;
 }
 
+function isNamedBodyChild(child: Parser.SyntaxNode | null): child is Parser.SyntaxNode {
+  if (!child) return false;
+  if (!child.isNamed) return false;
+  return BODY_TYPES.has(child.type);
+}
+
 function getNonCommentNamedChildren(node: Parser.SyntaxNode): Parser.SyntaxNode[] {
   const out: Parser.SyntaxNode[] = [];
   for (let i = 0; i < node.childCount; i++) {
     const child = node.child(i);
-    if (child && child.isNamed && !COMMENT_TYPES.has(child.type)) {
+    if (isKeptChild(child)) {
       out.push(child);
     }
   }
   return out;
+}
+
+function isKeptChild(child: Parser.SyntaxNode | null): child is Parser.SyntaxNode {
+  if (!child) return false;
+  if (!child.isNamed) return false;
+  return !COMMENT_TYPES.has(child.type);
 }
 
 function countNamedChildren(node: Parser.SyntaxNode): number {
@@ -606,20 +741,30 @@ function walkTree(
 
   while (stack.length > 0) {
     const frame = stack[stack.length - 1];
-    const node = frame.node;
-
-    if (frame.index === 0 && node.isNamed) {
-      visitor(node);
-    }
-
-    if (frame.index < node.childCount) {
-      const child = node.child(frame.index);
-      frame.index++;
-      if (child) {
-        stack.push({ node: child, index: 0 });
-      }
-    } else {
+    visitOnFirst(frame, visitor);
+    if (!descendOnce(frame, stack)) {
       stack.pop();
     }
   }
+}
+
+function visitOnFirst(
+  frame: { node: Parser.SyntaxNode; index: number },
+  visitor: (node: Parser.SyntaxNode) => void,
+): void {
+  if (frame.index !== 0) return;
+  if (!frame.node.isNamed) return;
+  visitor(frame.node);
+}
+
+function descendOnce(
+  frame: { node: Parser.SyntaxNode; index: number },
+  stack: Array<{ node: Parser.SyntaxNode; index: number }>,
+): boolean {
+  if (frame.index >= frame.node.childCount) return false;
+  const child = frame.node.child(frame.index);
+  frame.index++;
+  if (!child) return true;
+  stack.push({ node: child, index: 0 });
+  return true;
 }

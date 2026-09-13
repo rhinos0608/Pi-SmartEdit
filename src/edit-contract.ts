@@ -191,16 +191,21 @@ function validateCodeActionPreviewRefactor(r: Record<string, unknown>): string |
  * rejects keys irrelevant to the variant kind, then enforces the
  * per-kind required fields and field types with precise errors.
  */
-function validateRefactor(r: Record<string, unknown>): string | null {
-    const unknown = firstUnknownKey(r, REFACTOR_KEYS);
-    if (unknown) return `edit.refactor.${unknown} is not supported`;
-    const kind = r.kind;
+function checkRefactorKind(kind: unknown): string | null {
     const allowedKinds = new Set(Object.keys(REFACTOR_KEYS_BY_KIND));
     if (typeof kind !== "string" || !allowedKinds.has(kind))
         return "edit.refactor.kind must be \"rename-preview\", \"apply-refactor-preview\", \"organize-imports-preview\", \"formatting-preview\" or \"code-action-preview\"";
+    return null;
+}
+
+function checkRefactorIrrelevantKeys(r: Record<string, unknown>, kind: string): string | null {
     const allowed = REFACTOR_KEYS_BY_KIND[kind as string] ?? new Set<string>(["kind"]);
     const irrelevant = Object.keys(r).find((key) => key !== "kind" && !allowed.has(key)) ?? null;
     if (irrelevant) return `edit.refactor.${irrelevant} is not supported for kind "${kind}"`;
+    return null;
+}
+
+function validateRefactorByKind(kind: string, r: Record<string, unknown>): string | null {
     switch (kind as string) {
         case "rename-preview": return validateRenamePreviewRefactor(r);
         case "apply-refactor-preview": return validateApplyRefactorPreviewRefactor(r);
@@ -208,6 +213,16 @@ function validateRefactor(r: Record<string, unknown>): string | null {
         case "formatting-preview": return validateFormattingPreviewRefactor(r);
         default: return validateCodeActionPreviewRefactor(r);
     }
+}
+
+function validateRefactor(r: Record<string, unknown>): string | null {
+    const unknown = firstUnknownKey(r, REFACTOR_KEYS);
+    if (unknown) return `edit.refactor.${unknown} is not supported`;
+    const kindErr = checkRefactorKind(r.kind);
+    if (kindErr) return kindErr;
+    const irrelevantErr = checkRefactorIrrelevantKeys(r, r.kind as string);
+    if (irrelevantErr) return irrelevantErr;
+    return validateRefactorByKind(r.kind as string, r);
 }
 
 export interface EditRequest {
@@ -273,15 +288,26 @@ function checkTargetPatternPair(pattern: unknown, replacement: unknown, i: numbe
     return null;
 }
 
-function checkTargetIdentifierRequirement(
-    hasPattern: boolean,
-    name: unknown,
-    namePath: unknown,
-    line: unknown,
-    i: number,
-): string | null {
-    if (!hasPattern && !targetHasIdentifier(name, namePath, line))
+function checkTargetIdentifierRequirement(t: Record<string, unknown>, hasPattern: boolean, i: number): string | null {
+    if (!hasPattern && !targetHasIdentifier(t.name, t.namePath, t.line))
         return `edit.edits[${i}].target requires name, namePath, or line`;
+    return null;
+}
+
+function checkTargetStringFields(t: Record<string, unknown>, i: number): string | null {
+    const { name, namePath, kind, replaceBody, insertBefore, insertAfter, description, pattern, replacement } = t;
+    for (const [key, value] of Object.entries({
+        name, namePath, kind, replaceBody, insertBefore, insertAfter, description, pattern, replacement,
+    })) {
+        if (value !== undefined && typeof value !== "string")
+            return `edit.edits[${i}].target.${key} must be a string if present`;
+    }
+    return null;
+}
+
+function checkTargetLine(line: unknown, i: number): string | null {
+    if (line !== undefined && !isPositiveInteger(line))
+        return `edit.edits[${i}].target.line must be a positive integer if present`;
     return null;
 }
 
@@ -291,20 +317,12 @@ function validateTarget(t: Record<string, unknown>, i: number): string | null {
         "insertAfter", "description", "pattern", "replacement",
     ]));
     if (unknown) return `edit.edits[${i}].target.${unknown} is not supported`;
-    const { name, namePath, kind, line, replaceBody, insertBefore, insertAfter, description, pattern, replacement } = t;
-    for (const [key, value] of Object.entries({
-        name, namePath, kind, replaceBody, insertBefore, insertAfter, description, pattern, replacement,
-    })) {
-        if (value !== undefined && typeof value !== "string")
-            return `edit.edits[${i}].target.${key} must be a string if present`;
-    }
-    if (line !== undefined && !isPositiveInteger(line))
-        return `edit.edits[${i}].target.line must be a positive integer if present`;
-    const patternErr = checkTargetPatternPair(pattern, replacement, i);
-    if (patternErr) return patternErr;
-    const symbolicErr = checkTargetSymbolicOpsExclusive(replaceBody, insertBefore, insertAfter, i);
-    if (symbolicErr) return symbolicErr;
-    return checkTargetIdentifierRequirement(pattern !== undefined, name, namePath, line, i);
+    const { line, replaceBody, insertBefore, insertAfter, pattern, replacement } = t;
+    return checkTargetStringFields(t, i)
+        ?? checkTargetLine(line, i)
+        ?? checkTargetPatternPair(pattern, replacement, i)
+        ?? checkTargetSymbolicOpsExclusive(replaceBody, insertBefore, insertAfter, i)
+        ?? checkTargetIdentifierRequirement(t, pattern !== undefined, i);
 }
 
 function validatePosEndRange(range: Record<string, unknown>, i: number, field: string): string | null {
@@ -336,38 +354,84 @@ function checkHashlineSymbol(symbol: Record<string, unknown>, i: number): string
     return null;
 }
 
+function checkHashlineRange(h: Record<string, unknown>, i: number): string | null {
+    const { range } = h;
+    if (!isPlainObject(range))
+        return `edit.edits[${i}].hashline.range must be an object`;
+    return validatePosEndRange(range, i, "hashline.range");
+}
+
+function checkHashlineContent(content: unknown, i: number): string | null {
+    if (content !== undefined && !isValidHashlineContent(content))
+        return `edit.edits[${i}].hashline.content must be a string, array of strings, or null`;
+    return null;
+}
+
+function checkHashlineSymbolField(symbol: unknown, i: number): string | null {
+    if (symbol === undefined) return null;
+    if (!isPlainObject(symbol))
+        return `edit.edits[${i}].hashline.symbol must be an object if present`;
+    return checkHashlineSymbol(symbol, i);
+}
+
 function validateHashline(h: Record<string, unknown>, i: number): string | null {
     const unknown = firstUnknownKey(h, new Set(["range", "content", "symbol"]));
     if (unknown) return `edit.edits[${i}].hashline.${unknown} is not supported`;
-    const { range, content, symbol } = h;
-    if (!isPlainObject(range))
-        return `edit.edits[${i}].hashline.range must be an object`;
-    const rangeErr = validatePosEndRange(range, i, "hashline.range");
-    if (rangeErr) return rangeErr;
-    if (content !== undefined && !isValidHashlineContent(content))
-        return `edit.edits[${i}].hashline.content must be a string, array of strings, or null`;
-    if (symbol !== undefined) {
-        if (!isPlainObject(symbol))
-            return `edit.edits[${i}].hashline.symbol must be an object if present`;
-        const symbolErr = checkHashlineSymbol(symbol, i);
-        if (symbolErr) return symbolErr;
-    }
+    const { content, symbol } = h;
+    return checkHashlineRange(h, i)
+        ?? checkHashlineContent(content, i)
+        ?? checkHashlineSymbolField(symbol, i);
+}
+
+function isNonEmptyString(v: unknown): v is string {
+    return typeof v === "string" && v.length > 0;
+}
+
+function isMissingNonEmptyString(v: unknown): boolean {
+    return typeof v !== "string" || v.length === 0;
+}
+
+function checkScalarPath(e: Record<string, unknown>, i: number): string | null {
+    const { path } = e;
+    if (path !== undefined && isMissingNonEmptyString(path))
+        return `edit.edits[${i}].path must be a non-empty string if present`;
+    return null;
+}
+
+function checkScalarOldText(e: Record<string, unknown>, i: number): string | null {
+    if (e.oldText !== undefined && typeof e.oldText !== "string")
+        return `edit.edits[${i}].oldText must be a string if present`;
+    return null;
+}
+
+function checkScalarNewText(e: Record<string, unknown>, i: number): string | null {
+    if (e.newText !== undefined && typeof e.newText !== "string")
+        return `edit.edits[${i}].newText must be a string if present`;
+    return null;
+}
+
+function checkScalarDescription(e: Record<string, unknown>, i: number): string | null {
+    if (e.description !== undefined && typeof e.description !== "string")
+        return `edit.edits[${i}].description must be a string if present`;
+    return null;
+}
+
+function checkScalarReplaceAll(e: Record<string, unknown>, i: number): string | null {
+    if (e.replaceAll !== undefined && typeof e.replaceAll !== "boolean")
+        return `edit.edits[${i}].replaceAll must be a boolean if present`;
     return null;
 }
 
 function checkEditScalarFields(e: Record<string, unknown>, i: number): string | null {
-    const { path, oldText, newText, description, replaceAll } = e;
-    if (path !== undefined && (typeof path !== "string" || path.length === 0))
-        return `edit.edits[${i}].path must be a non-empty string if present`;
-    if (oldText !== undefined && typeof oldText !== "string")
-        return `edit.edits[${i}].oldText must be a string if present`;
-    if (newText !== undefined && typeof newText !== "string")
-        return `edit.edits[${i}].newText must be a string if present`;
-    if (description !== undefined && typeof description !== "string")
-        return `edit.edits[${i}].description must be a string if present`;
-    if (replaceAll !== undefined && typeof replaceAll !== "boolean")
-        return `edit.edits[${i}].replaceAll must be a boolean if present`;
-    return null;
+    return checkScalarPath(e, i)
+        ?? checkScalarOldText(e, i)
+        ?? checkScalarNewText(e, i)
+        ?? checkScalarDescription(e, i)
+        ?? checkScalarReplaceAll(e, i);
+}
+
+function isValidEndLine(endLine: unknown, startLine: number): boolean {
+    return typeof endLine === "number" && Number.isInteger(endLine) && endLine >= startLine;
 }
 
 function checkLineRangeField(lineRange: Record<string, unknown>, i: number): string | null {
@@ -376,37 +440,52 @@ function checkLineRangeField(lineRange: Record<string, unknown>, i: number): str
     const { startLine, endLine } = lineRange;
     if (!isPositiveInteger(startLine))
         return `edit.edits[${i}].lineRange.startLine must be a positive integer`;
-    if (typeof endLine !== "number" || !Number.isInteger(endLine) || endLine < (startLine as number))
+    if (!isValidEndLine(endLine, startLine as number))
         return `edit.edits[${i}].lineRange.endLine must be an integer >= startLine`;
     return null;
 }
 
+function checkTargetField(e: Record<string, unknown>, i: number): string | null {
+    const { target } = e;
+    if (target === undefined) return null;
+    if (!isPlainObject(target))
+        return `edit.edits[${i}].target must be an object if present`;
+    return validateTarget(target, i);
+}
+
+function checkLineRangeObject(e: Record<string, unknown>, i: number): string | null {
+    const { lineRange } = e;
+    if (lineRange === undefined) return null;
+    if (!isPlainObject(lineRange))
+        return `edit.edits[${i}].lineRange must be an object if present`;
+    return checkLineRangeField(lineRange, i);
+}
+
+function checkHashlineField(e: Record<string, unknown>, i: number): string | null {
+    const { hashline } = e;
+    if (hashline === undefined) return null;
+    if (!isPlainObject(hashline))
+        return `edit.edits[${i}].hashline must be an object if present`;
+    return validateHashline(hashline, i);
+}
+
 function checkAnchoredEditFields(e: Record<string, unknown>, i: number): string | null {
-    const { target, lineRange, hashline } = e;
-    if (target !== undefined) {
-        if (!isPlainObject(target))
-            return `edit.edits[${i}].target must be an object if present`;
-        const err = validateTarget(target, i);
-        if (err) return err;
-    }
-    if (lineRange !== undefined) {
-        if (!isPlainObject(lineRange))
-            return `edit.edits[${i}].lineRange must be an object if present`;
-        const err = checkLineRangeField(lineRange, i);
-        if (err) return err;
-    }
-    if (hashline !== undefined) {
-        if (!isPlainObject(hashline))
-            return `edit.edits[${i}].hashline must be an object if present`;
-        const err = validateHashline(hashline, i);
-        if (err) return err;
-    }
-    return null;
+    return checkTargetField(e, i)
+        ?? checkLineRangeObject(e, i)
+        ?? checkHashlineField(e, i);
+}
+
+function isTransferSentinel(after: string): boolean {
+    return after === "EOF" || after === "end" || after === "BOF" || after === "before";
+}
+
+function hasAnchorSeparator(after: string): boolean {
+    return after.includes(":");
 }
 
 function isAcceptedTransferAfter(after: string): boolean {
-    if (after === "EOF" || after === "end" || after === "BOF" || after === "before") return false;
-    return !after.includes(":");
+    if (isTransferSentinel(after)) return false;
+    return !hasAnchorSeparator(after);
 }
 
 function checkTransferAfter(after: unknown, i: number): string | null {
@@ -421,25 +500,54 @@ function checkTransferAfter(after: unknown, i: number): string | null {
     return null;
 }
 
-function checkTransferOp(e: Record<string, unknown>, i: number): string | null {
-    const { path, oldText, newText, replaceAll, target, lineRange, hashline, op, from, range, to, after } = e;
+function checkTransferOpKind(op: unknown, i: number): string | null {
     if (op !== "copy" && op !== "move")
         return `edit.edits[${i}].op must be "copy" or "move"`;
-    if (path !== undefined || oldText !== undefined || newText !== undefined
-        || target !== undefined || lineRange !== undefined || hashline !== undefined
-        || replaceAll !== undefined)
+    return null;
+}
+
+function hasTransferExclusiveConflict(e: Record<string, unknown>): boolean {
+    return e.path !== undefined
+        || e.oldText !== undefined
+        || e.newText !== undefined
+        || e.target !== undefined
+        || e.lineRange !== undefined
+        || e.hashline !== undefined
+        || e.replaceAll !== undefined;
+}
+
+function checkTransferExclusivity(e: Record<string, unknown>, i: number): string | null {
+    if (hasTransferExclusiveConflict(e))
         return `edit.edits[${i}]: op is mutually exclusive with path, oldText, newText, replaceAll, target, lineRange, and hashline`;
-    if (typeof from !== "string" || from.length === 0)
+    return null;
+}
+
+function checkTransferFrom(e: Record<string, unknown>, i: number): string | null {
+    if (isMissingNonEmptyString(e.from))
         return `edit.edits[${i}].from must be a non-empty string`;
-    if (typeof to !== "string" || to.length === 0)
+    return null;
+}
+
+function checkTransferTo(e: Record<string, unknown>, i: number): string | null {
+    if (isMissingNonEmptyString(e.to))
         return `edit.edits[${i}].to must be a non-empty string`;
-    const afterErr = checkTransferAfter(after, i);
-    if (afterErr) return afterErr;
+    return null;
+}
+
+function checkTransferRange(e: Record<string, unknown>, i: number): string | null {
+    const { range } = e;
     if (!isPlainObject(range))
         return `edit.edits[${i}].range must be an object`;
-    const rangeErr = validatePosEndRange(range, i, "range");
-    if (rangeErr) return rangeErr;
-    return null;
+    return validatePosEndRange(range, i, "range");
+}
+
+function checkTransferOp(e: Record<string, unknown>, i: number): string | null {
+    return checkTransferOpKind(e.op, i)
+        ?? checkTransferExclusivity(e, i)
+        ?? checkTransferFrom(e, i)
+        ?? checkTransferTo(e, i)
+        ?? checkTransferAfter(e.after, i)
+        ?? checkTransferRange(e, i);
 }
 
 function targetHasSymbolicOp(targetObj: Record<string, unknown>): boolean {
@@ -453,25 +561,48 @@ function targetHasStructuralOp(targetObj: Record<string, unknown>): boolean {
         && typeof targetObj.replacement === "string";
 }
 
-function checkActionableBoundary(
-    oldText: unknown,
-    newText: unknown,
-    target: unknown,
-    hashline: unknown,
-    i: number,
-): string | null {
-    const hasText = typeof oldText === "string" && typeof newText === "string";
-    const targetObj = (target !== undefined && isPlainObject(target))
-        ? (target as Record<string, unknown>)
-        : undefined;
-    const hasSelfActionable = !!targetObj
-        && (targetHasSymbolicOp(targetObj)
-            || targetHasStructuralOp(targetObj))
-        || (hashline !== undefined && isPlainObject(hashline));
-    if (hasText || hasSelfActionable) return null;
+function hasTextPair(oldText: unknown, newText: unknown): boolean {
+    return typeof oldText === "string" && typeof newText === "string";
+}
+
+function asTargetRecord(target: unknown): Record<string, unknown> | undefined {
+    if (target !== undefined && isPlainObject(target))
+        return target as Record<string, unknown>;
+    return undefined;
+}
+
+function isSelfActionableTarget(target: unknown): boolean {
+    const targetObj = asTargetRecord(target);
+    return !!targetObj
+        && (targetHasSymbolicOp(targetObj) || targetHasStructuralOp(targetObj));
+}
+
+function isSelfActionableHashline(hashline: unknown): boolean {
+    return hashline !== undefined && isPlainObject(hashline);
+}
+
+function checkHalfTextPair(oldText: unknown, newText: unknown, i: number): string | null {
     if ((oldText !== undefined) !== (newText !== undefined))
         return `edit.edits[${i}] oldText and newText must be provided together for a text edit`;
-    return `edit.edits[${i}] requires an actionable operation: provide both oldText and newText, or a symbolic/structural target or hashline`;
+    return null;
+}
+
+function checkActionableBoundary(e: Record<string, unknown>, i: number): string | null {
+    const { oldText, newText, target, hashline } = e;
+    if (hasTextPair(oldText, newText)) return null;
+    if (isSelfActionableTarget(target) || isSelfActionableHashline(hashline)) return null;
+    return checkHalfTextPair(oldText, newText, i)
+        ?? `edit.edits[${i}] requires an actionable operation: provide both oldText and newText, or a symbolic/structural target or hashline`;
+}
+
+function hasAnyTransferField(e: Record<string, unknown>): boolean {
+    return e.from !== undefined || e.range !== undefined || e.to !== undefined || e.after !== undefined;
+}
+
+function checkTransferFieldsWithoutOp(e: Record<string, unknown>, i: number): string | null {
+    if (hasAnyTransferField(e))
+        return `edit.edits[${i}]: transfer fields (from, range, to, after) require op "copy" or "move"`;
+    return null;
 }
 
 function validateEditOperation(e: Record<string, unknown>, i: number): string | null {
@@ -480,7 +611,7 @@ function validateEditOperation(e: Record<string, unknown>, i: number): string | 
         "lineRange", "hashline", "op", "from", "range", "to", "after",
     ]));
     if (unknown) return `edit.edits[${i}].${unknown} is not supported`;
-    const { op, from, range, to, after, oldText, newText, target, hashline } = e;
+    const { op } = e;
     const scalarErr = checkEditScalarFields(e, i);
     if (scalarErr) return scalarErr;
     const anchoredErr = checkAnchoredEditFields(e, i);
@@ -497,8 +628,8 @@ function validateEditOperation(e: Record<string, unknown>, i: number): string | 
     // Transfer-only fields without `op` are a malformed transfer, not a
     // text edit: reject transfer-specifically instead of falling through to
     // the generic actionable-operation boundary below.
-    if (from !== undefined || range !== undefined || to !== undefined || after !== undefined)
-        return `edit.edits[${i}]: transfer fields (from, range, to, after) require op "copy" or "move"`;
+    const transferFieldsErr = checkTransferFieldsWithoutOp(e, i);
+    if (transferFieldsErr) return transferFieldsErr;
 
     // Actionable-operation boundary: a text edit needs both oldText and newText;
     // otherwise the item must be self-actionable via a symbolic/structural target
@@ -506,7 +637,7 @@ function validateEditOperation(e: Record<string, unknown>, i: number): string | 
     // error naming the missing requirement. A scoping-only target (identifier
     // without a symbolic/structural op and without oldText/newText) is not
     // actionable on its own.
-    return checkActionableBoundary(oldText, newText, target, hashline, i);
+    return checkActionableBoundary(e, i);
 }
 
 /**
@@ -525,65 +656,129 @@ function checkRequestVariantExclusivity(hasEdits: boolean, hasRaw: boolean, hasR
     return null;
 }
 
+function isTransferEdit(e: Record<string, unknown>): boolean {
+    return e.op === "copy" || e.op === "move";
+}
+
+function checkSingleEditItem(editList: unknown[], i: number): string | null {
+    const e = editList[i];
+    if (!isPlainObject(e)) return `edit.edits[${i}] must be an object`;
+    return validateEditOperation(e, i);
+}
+
+function validateEditItems(editList: unknown[]): string | null {
+    for (let i = 0; i < editList.length; i++) {
+        const err = checkSingleEditItem(editList, i);
+        if (err) return err;
+    }
+    return null;
+}
+
+function editsNeedTopLevelPath(editList: unknown[]): boolean {
+    return editList.some((item) => {
+        const e = item as Record<string, unknown>;
+        return !isTransferEdit(e) && e.path === undefined;
+    });
+}
+
 function checkEditsList(edits: unknown, path: unknown): string | null {
     if (!Array.isArray(edits) || edits.length === 0)
         return "edit.edits must be a non-empty array";
     const editList = edits as unknown[];
-    let needsTopLevelPath = false;
-    for (let i = 0; i < editList.length; i++) {
-        const e = editList[i];
-        if (!isPlainObject(e)) return `edit.edits[${i}] must be an object`;
-        const err = validateEditOperation(e, i);
-        if (err) return err;
-        const isTransfer = (e.op as string | undefined) === "copy" || (e.op as string | undefined) === "move";
-        if (!isTransfer && e.path === undefined) needsTopLevelPath = true;
-    }
-    if (path === undefined && needsTopLevelPath)
+    const itemsErr = validateEditItems(editList);
+    if (itemsErr) return itemsErr;
+    if (path === undefined && editsNeedTopLevelPath(editList))
         return "edit.path is required unless every edit provides its own path";
     return null;
 }
 
-export function validateEditRequest(
-    input: unknown,
-): { ok: true; value: EditRequest } | { ok: false; error: string } {
+function checkTopLevelScalars(path: unknown, toolCallId: unknown): { ok: false; error: string } | null {
+    return checkTopLevelPath(path) ?? checkTopLevelToolCallId(toolCallId);
+}
+
+function checkTopLevelPath(path: unknown): { ok: false; error: string } | null {
+    if (path !== undefined && isMissingNonEmptyString(path))
+        return fail("edit.path, if present, must be a non-empty string");
+    return null;
+}
+
+function checkTopLevelToolCallId(toolCallId: unknown): { ok: false; error: string } | null {
+    if (toolCallId !== undefined && isMissingNonEmptyString(toolCallId))
+        return fail("edit.toolCallId must be a non-empty string");
+    return null;
+}
+
+function checkRawField(raw: unknown): { ok: false; error: string } | null {
+    if (isMissingNonEmptyString(raw))
+        return fail("edit.raw must be a non-empty string");
+    return null;
+}
+
+function checkRawVariant(hasRaw: boolean, raw: unknown): { ok: false; error: string } | null {
+    if (!hasRaw) return null;
+    return checkRawField(raw);
+}
+
+function checkEditsVariant(hasEdits: boolean, edits: unknown, path: unknown): { ok: false; error: string } | null {
+    if (!hasEdits) return null;
+    const editsErr = checkEditsList(edits, path);
+    if (editsErr) return fail(editsErr);
+    return null;
+}
+
+function checkRequestTopLevel(input: unknown): { normalized: Record<string, unknown> } | { ok: false; error: string } {
     if (!isPlainObject(input)) return fail("edit request must be an object");
     const normalized = normalizeFlatEditRequest(input);
     const unknown = firstUnknownKey(normalized, new Set([
         "path", "edits", "raw", "toolCallId", "evidenceRef", "refactor",
     ]));
     if (unknown) return fail(`edit.${unknown} is not supported`);
+    return { normalized };
+}
+
+function checkRefactorRequest(refactor: unknown, normalized: Record<string, unknown>): { ok: true; value: EditRequest } | { ok: false; error: string } | null {
+    if (refactor === undefined) return null;
+    if (!isPlainObject(refactor)) return fail("edit.refactor must be an object");
+    const err = validateRefactor(refactor as Record<string, unknown>);
+    if (err) return fail(err);
+    return ok(normalized as EditRequest);
+}
+
+function checkEvidenceField(evidenceRef: unknown): { ok: false; error: string } | null {
+    // evidenceRef is optional (tool-owned authority). If present, validate its
+    // shape so stored calls with a malformed ref fail cleanly rather than crash.
+    if (evidenceRef === undefined) return null;
+    const er = validateEvidenceRef(evidenceRef);
+    if (!er.ok) return er;
+    return null;
+}
+
+export function validateEditRequest(
+    input: unknown,
+): { ok: true; value: EditRequest } | { ok: false; error: string } {
+    const top = checkRequestTopLevel(input);
+    if (!("normalized" in top)) return top;
+    const { normalized } = top;
     const { path, edits, raw, toolCallId, evidenceRef, refactor } = normalized;
 
-    if (path !== undefined && (typeof path !== "string" || path.length === 0))
-        return fail("edit.path, if present, must be a non-empty string");
-    if (toolCallId !== undefined && (typeof toolCallId !== "string" || toolCallId.length === 0))
-        return fail("edit.toolCallId must be a non-empty string");
+    const scalarsErr = checkTopLevelScalars(path, toolCallId);
+    if (scalarsErr) return scalarsErr;
 
     const hasEdits = edits !== undefined;
     const hasRaw = raw !== undefined;
     const hasRefactor = refactor !== undefined;
     const variantErr = checkRequestVariantExclusivity(hasEdits, hasRaw, hasRefactor);
     if (variantErr) return fail(variantErr);
-    if (hasRefactor) {
-        if (!isPlainObject(refactor)) return fail("edit.refactor must be an object");
-        const err = validateRefactor(refactor as Record<string, unknown>);
-        if (err) return fail(err);
-        return ok(normalized as EditRequest);
-    }
-    if (hasRaw && (typeof raw !== "string" || raw.length === 0))
-        return fail("edit.raw must be a non-empty string");
+    const refactorResult = checkRefactorRequest(refactor, normalized);
+    if (refactorResult) return refactorResult;
+    const rawErr = checkRawVariant(hasRaw, raw);
+    if (rawErr) return rawErr;
 
-    if (hasEdits) {
-        const editsErr = checkEditsList(edits, path);
-        if (editsErr) return fail(editsErr);
-    }
+    const editsResult = checkEditsVariant(hasEdits, edits, path);
+    if (editsResult) return editsResult;
 
-    // evidenceRef is optional (tool-owned authority). If present, validate its
-    // shape so stored calls with a malformed ref fail cleanly rather than crash.
-    if (evidenceRef !== undefined) {
-        const er = validateEvidenceRef(evidenceRef);
-        if (!er.ok) return er;
-    }
+    const evidenceErr = checkEvidenceField(evidenceRef);
+    if (evidenceErr) return evidenceErr;
 
     return ok(normalized as EditRequest);
 }

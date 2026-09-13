@@ -8,6 +8,45 @@ import { KNOWN_GLOBALS_TS } from "./patch-correctness-config.js";
 import type { LangConfig } from "./patch-correctness-config.js";
 import type { PatchCheck } from "./patch-correctness-lexical.js";
 
+/** Names whose declaration count grew between old and new content. */
+function findIncreasedDeclarationNames(
+  oldDecls: Map<string, number>,
+  newDecls: Map<string, number>,
+): Set<string> {
+  const added = new Set<string>();
+  for (const [name, newCount] of newDecls) {
+    if (newCount > (oldDecls.get(name) ?? 0)) {
+      added.add(name);
+    }
+  }
+  return added;
+}
+
+/** Constrain candidate names to changedSymbols when provided. */
+function constrainToChangedSymbols(names: Iterable<string>, changedSymbols?: string[]): string[] {
+  const list = [...names];
+  if (changedSymbols && changedSymbols.length > 0) {
+    return list.filter((s) => changedSymbols.includes(s));
+  }
+  return list;
+}
+
+/** Of the candidates, keep names that already existed before the edit. */
+function findPreExistingDuplicates(
+  oldDecls: Map<string, number>,
+  newDecls: Map<string, number>,
+  candidates: string[],
+): string[] {
+  const duplicates: string[] = [];
+  for (const name of candidates) {
+    const oldCount = oldDecls.get(name) ?? 0;
+    if (oldCount > 0 && (newDecls.get(name) ?? 0) > oldCount) {
+      duplicates.push(name);
+    }
+  }
+  return duplicates;
+}
+
 /**
  * 2. Duplicate declarations: check if the edit introduces a symbol name
  *    that already exists in the file.
@@ -22,32 +61,18 @@ export function checkDuplicateDeclarations(
   const newDecls = countDeclarations(newContent, config);
 
   // Names whose declaration count increased (potential duplicates)
-  const addedDecls = new Set<string>();
-  for (const [name, newCount] of newDecls) {
-    const oldCount = oldDecls.get(name) ?? 0;
-    if (newCount > oldCount) {
-      addedDecls.add(name);
-    }
-  }
+  const addedDecls = findIncreasedDeclarationNames(oldDecls, newDecls);
 
   if (addedDecls.size === 0) {
     return { passed: true, details: "No new declarations introduced" };
   }
 
   // Constrain to changedSymbols when available
-  const candidates = changedSymbols && changedSymbols.length > 0
-    ? [...addedDecls].filter((s) => changedSymbols.includes(s))
-    : [...addedDecls];
+  const candidates = constrainToChangedSymbols(addedDecls, changedSymbols);
 
   // For each name whose declaration count increased, check if it
   // already existed in old content (potential duplicate).
-  const duplicates: string[] = [];
-  for (const name of candidates) {
-    const oldCount = oldDecls.get(name) ?? 0;
-    if (oldCount > 0 && (newDecls.get(name) ?? 0) > oldCount) {
-      duplicates.push(name);
-    }
-  }
+  const duplicates = findPreExistingDuplicates(oldDecls, newDecls, candidates);
 
   if (duplicates.length > 0) {
     return {
@@ -56,6 +81,31 @@ export function checkDuplicateDeclarations(
     };
   }
   return { passed: true, details: "No duplicate declarations detected" };
+}
+
+/** Symbols whose declaration count shrank between old and new content. */
+function findRemovedDeclarationNames(
+  oldDecls: Map<string, number>,
+  newDecls: Map<string, number>,
+): string[] {
+  const removed: string[] = [];
+  for (const [name, oldCount] of oldDecls) {
+    if ((newDecls.get(name) ?? 0) < oldCount) {
+      removed.push(name);
+    }
+  }
+  return removed;
+}
+
+/** Keep names still referenced in the given content. */
+function findStillReferenced(names: string[], content: string): string[] {
+  const orphans: string[] = [];
+  for (const name of names) {
+    if (symbolIsReferenced(content, name)) {
+      orphans.push(name);
+    }
+  }
+  return orphans;
 }
 
 /**
@@ -72,30 +122,17 @@ export function checkOrphanedReferences(
   const newDecls = countDeclarations(newContent, config);
 
   // Symbols removed by the edit
-  const removedDecls: string[] = [];
-  for (const [name, oldCount] of oldDecls) {
-    const newCount = newDecls.get(name) ?? 0;
-    if (newCount < oldCount) {
-      removedDecls.push(name);
-    }
-  }
+  const removedDecls = findRemovedDeclarationNames(oldDecls, newDecls);
 
   if (removedDecls.length === 0) {
     return { passed: true, details: "No declarations removed" };
   }
 
   // For each removed symbol, check if it's still referenced in new content
-  const orphans: string[] = [];
-  for (const name of removedDecls) {
-    if (symbolIsReferenced(newContent, name)) {
-      orphans.push(name);
-    }
-  }
+  const orphans = findStillReferenced(removedDecls, newContent);
 
   // Constrain to changedSymbols when available
-  const filteredOrphans = changedSymbols && changedSymbols.length > 0
-    ? orphans.filter((s) => changedSymbols.includes(s))
-    : orphans;
+  const filteredOrphans = constrainToChangedSymbols(orphans, changedSymbols);
 
   if (filteredOrphans.length > 0) {
     return {
@@ -104,6 +141,144 @@ export function checkOrphanedReferences(
     };
   }
   return { passed: true, details: "No orphaned references detected" };
+}
+
+const IMPORT_CHECKABLE_LANGUAGES = new Set([
+  "typescript",
+  "tsx",
+  "javascript",
+  "jsx",
+  "python",
+  "go",
+  "rust",
+  "java",
+  "kotlin",
+  "dart",
+]);
+
+function isImportCheckableLanguage(languageId: string): boolean {
+  return IMPORT_CHECKABLE_LANGUAGES.has(languageId.toLowerCase());
+}
+
+function isTsLike(languageId: string): boolean {
+  return (
+    languageId === "typescript" ||
+    languageId === "tsx" ||
+    languageId === "javascript" ||
+    languageId === "jsx"
+  );
+}
+
+/** Call-like identifiers present in newCalls but absent from oldCalls. */
+function findAddedCalls(oldCalls: Set<string>, newCalls: Set<string>): Set<string> {
+  const added = new Set<string>();
+  for (const call of newCalls) {
+    if (!oldCalls.has(call)) {
+      added.add(call);
+    }
+  }
+  return added;
+}
+
+function resolveKnownGlobals(lang: string): Set<string> {
+  return isTsLike(lang) ? KNOWN_GLOBALS_TS : new Set<string>();
+}
+
+const RUNTIME_DECLARATION_PATTERNS = [
+  /\bfunction\s+(\w+)\b/g,
+  /\b(?:const|let|var)\s+(\w+)\s*[:=]/g,
+  /\bclass\s+(\w+)\b/g,
+  /\benum\s+(\w+)\b/g,
+  /\bexport\s+(?:default\s+)?(?:function|class|const|let|var|enum)\s+(\w+)\b/g,
+];
+
+function collectTypeOnlyNames(content: string): Set<string> {
+  const typeNames = new Set<string>();
+  for (const m of content.matchAll(/\b(?:interface|type)\s+(\w+)\b/g)) {
+    if (m[1]) typeNames.add(m[1]);
+  }
+  return typeNames;
+}
+
+function collectRuntimeBindingNames(content: string): Set<string> {
+  const runtimeNames = new Set<string>();
+  for (const pattern of RUNTIME_DECLARATION_PATTERNS) {
+    for (const m of content.matchAll(new RegExp(pattern.source, pattern.flags))) {
+      if (m[1]) runtimeNames.add(m[1]);
+    }
+  }
+  return runtimeNames;
+}
+
+// Type-only bindings are not runtime callables: `interface Foo` / `type Foo`
+// must not suppress a missing import for a new `Foo()` call. Drop them
+// unless the same name also has a runtime binding (function/const/class…).
+function stripTypeOnlyDeclarations(
+  declared: Map<string, number>,
+  content: string,
+  lang: string,
+): void {
+  if (lang !== "typescript" && lang !== "tsx") {
+    return;
+  }
+  const typeNames = collectTypeOnlyNames(content);
+  if (typeNames.size === 0) {
+    return;
+  }
+  const runtimeNames = collectRuntimeBindingNames(content);
+  for (const name of typeNames) {
+    if (!runtimeNames.has(name)) declared.delete(name);
+  }
+}
+
+function isSkippableCallName(
+  call: string,
+  knownGlobals: Set<string>,
+  declared: Map<string, number>,
+): boolean {
+  if (call.length < 2) return true; // skip single-char names (variables, loop vars)
+  if (/^[A-Z][A-Z_0-9]+$/.test(call)) return true; // skip constants
+  if (call === call.toLowerCase() && call.length <= 2) return true; // skip very short lowercase names (i, j, k, x, y)
+  if (knownGlobals.has(call)) return true;
+  if (declared.has(call)) return true; // defined locally — not a missing import
+  return false;
+}
+
+// Check if this call might be a member expression (e.g., foo.bar())
+// where `call` is `bar` and the base identifier `foo` is imported.
+function isCoveredByMemberBaseImport(
+  content: string,
+  call: string,
+  imports: Set<string>,
+  knownGlobals: Set<string>,
+): boolean {
+  const memberBase = extractMemberCallBase(content, call);
+  if (!memberBase) {
+    return false;
+  }
+  return imports.has(memberBase) || knownGlobals.has(memberBase);
+}
+
+interface MissingImportContext {
+  content: string;
+  addedCalls: Set<string>;
+  imports: Set<string>;
+  knownGlobals: Set<string>;
+  declared: Map<string, number>;
+}
+
+function findMissingImports(ctx: MissingImportContext): string[] {
+  const missing: string[] = [];
+  for (const call of ctx.addedCalls) {
+    if (isSkippableCallName(call, ctx.knownGlobals, ctx.declared)) continue;
+    if (isCoveredByMemberBaseImport(ctx.content, call, ctx.imports, ctx.knownGlobals)) {
+      continue; // covered by the base identifier's import
+    }
+    if (!ctx.imports.has(call)) {
+      missing.push(call);
+    }
+  }
+  return missing;
 }
 
 /**
@@ -118,7 +293,7 @@ export function checkImportConsistency(
 ): PatchCheck {
   // Only meaningful for languages with explicit import systems
   const lang = languageId.toLowerCase();
-  if (!["typescript", "tsx", "javascript", "jsx", "python", "go", "rust", "java", "kotlin", "dart"].includes(lang)) {
+  if (!isImportCheckableLanguage(languageId)) {
     return { passed: true, details: "Import consistency not applicable for this language" };
   }
 
@@ -127,70 +302,23 @@ export function checkImportConsistency(
   const newCalls = extractFunctionCalls(newContent, lang);
 
   // Find new call-like identifiers added by the edit
-  const addedCalls = new Set<string>();
-  for (const call of newCalls) {
-    if (!oldCalls.has(call)) {
-      addedCalls.add(call);
-    }
-  }
+  const addedCalls = findAddedCalls(oldCalls, newCalls);
 
   if (addedCalls.size === 0) {
     return { passed: true, details: "No new API calls to verify" };
   }
 
-  const knownGlobals = lang === "typescript" || lang === "tsx" || lang === "javascript" || lang === "jsx"
-    ? KNOWN_GLOBALS_TS
-    : new Set<string>();
+  const knownGlobals = resolveKnownGlobals(lang);
   const declared = countDeclarations(newContent, config);
-  // Type-only bindings are not runtime callables: `interface Foo` / `type Foo`
-  // must not suppress a missing import for a new `Foo()` call. Drop them
-  // unless the same name also has a runtime binding (function/const/class…).
-  if (lang === "typescript" || lang === "tsx") {
-    const typeNames = new Set<string>();
-    for (const m of newContent.matchAll(/\b(?:interface|type)\s+(\w+)\b/g)) {
-      if (m[1]) typeNames.add(m[1]);
-    }
-    if (typeNames.size > 0) {
-      const runtimeNames = new Set<string>();
-      const runtimePatterns = [
-        /\bfunction\s+(\w+)\b/g,
-        /\b(?:const|let|var)\s+(\w+)\s*[:=]/g,
-        /\bclass\s+(\w+)\b/g,
-        /\benum\s+(\w+)\b/g,
-        /\bexport\s+(?:default\s+)?(?:function|class|const|let|var|enum)\s+(\w+)\b/g,
-      ];
-      for (const re of runtimePatterns) {
-        for (const m of newContent.matchAll(re)) {
-          if (m[1]) runtimeNames.add(m[1]);
-        }
-      }
-      for (const name of typeNames) {
-        if (!runtimeNames.has(name)) declared.delete(name);
-      }
-    }
-  }
+  stripTypeOnlyDeclarations(declared, newContent, lang);
 
-  const missing: string[] = [];
-  for (const call of addedCalls) {
-    if (call.length < 2) continue; // skip single-char names (variables, loop vars)
-    if (/^[A-Z][A-Z_0-9]+$/.test(call)) continue; // skip constants
-    if (call === call.toLowerCase() && call.length <= 2) continue; // skip very short lowercase names (i, j, k, x, y)
-    if (knownGlobals.has(call)) continue;
-    if (declared.has(call)) continue; // defined locally — not a missing import
-
-    // Check if this call might be a member expression (e.g., foo.bar())
-    // where `call` is `bar` and the base identifier `foo` is imported.
-    const memberBase = extractMemberCallBase(newContent, call);
-    if (memberBase) {
-      if (imports.has(memberBase) || knownGlobals.has(memberBase)) {
-        continue; // covered by the base identifier's import
-      }
-    }
-
-    if (!imports.has(call)) {
-      missing.push(call);
-    }
-  }
+  const missing = findMissingImports({
+    content: newContent,
+    addedCalls,
+    imports,
+    knownGlobals,
+    declared,
+  });
 
   if (missing.length > 0) {
     return {
@@ -199,6 +327,15 @@ export function checkImportConsistency(
     };
   }
   return { passed: true, details: "All referenced identifiers appear to have corresponding imports" };
+}
+
+/** A regex match is a countable declaration name. */
+function extractDeclarationName(match: RegExpExecArray): string | null {
+  const name = match[1];
+  if (name && /^\w+$/.test(name) && name.length > 0) {
+    return name;
+  }
+  return null;
 }
 
 /**
@@ -211,8 +348,8 @@ export function countDeclarations(content: string, config: LangConfig): Map<stri
     const re = new RegExp(rawPattern, "gm");
     let match: RegExpExecArray | null;
     while ((match = re.exec(content)) !== null) {
-      const name = match[1];
-      if (name && /^\w+$/.test(name) && name.length > 0) {
+      const name = extractDeclarationName(match);
+      if (name) {
         counts.set(name, (counts.get(name) ?? 0) + 1);
       }
     }
@@ -236,121 +373,141 @@ export function symbolIsReferenced(content: string, name: string): boolean {
   return re.test(content);
 }
 
+/** Run a global regex over content, collecting one binding per match. */
+function collectImportMatches(
+  content: string,
+  pattern: RegExp,
+  pick: (match: RegExpExecArray) => string | undefined,
+  imports: Set<string>,
+): void {
+  const re = new RegExp(pattern.source, pattern.flags);
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(content)) !== null) {
+    const name = pick(match);
+    if (name) imports.add(name);
+  }
+}
+
+/** Split a `{ a, b as c }`-style list into local binding names. */
+function addBraceImportList(rawList: string | undefined, imports: Set<string>): void {
+  if (!rawList) return;
+  for (const n of rawList.split(",")) {
+    const trimmed = n.trim();
+    if (!trimmed) continue;
+    // Handle "foo as bar" → bar is the local name
+    const parts = trimmed.split(/\s+as\s+/i);
+    imports.add(parts[parts.length - 1].trim());
+  }
+}
+
+function extractJsImports(content: string, imports: Set<string>): void {
+  // import foo from 'bar' → foo
+  collectImportMatches(content, /import\s+(\w+)\s+from\s+/g, (m) => m[1], imports);
+
+  // import { foo, bar as baz } from → foo, baz
+  collectImportMatches(
+    content,
+    /import\s*\{\s*([^}]+)\s*\}\s*from\s+/g,
+    (m) => {
+      addBraceImportList(m[1], imports);
+      return undefined;
+    },
+    imports,
+  );
+
+  // import * as foo from → foo
+  collectImportMatches(content, /import\s*\*\s*as\s+(\w+)\s+from\s+/g, (m) => m[1], imports);
+
+  // const foo = require('bar') → foo
+  collectImportMatches(
+    content,
+    /(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(/g,
+    (m) => m[1],
+    imports,
+  );
+
+  // import('bar') → no local binding — skip
+}
+
+function extractPythonImports(content: string, imports: Set<string>): void {
+  // import foo → foo
+  collectImportMatches(content, /^import\s+(\w+)/gm, (m) => m[1], imports);
+
+  // from foo import bar, baz → bar, baz
+  collectImportMatches(
+    content,
+    /from\s+\S+\s+import\s+([^#\n]+)/gm,
+    (m) => {
+      addBraceImportList(m[1], imports);
+      return undefined;
+    },
+    imports,
+  );
+
+  // import foo.bar.baz → just "foo" (module prefix)
+  collectImportMatches(content, /^import\s+(\w+)(?:\.\w+)*/gm, (m) => m[1], imports);
+}
+
+function extractGoImports(content: string, imports: Set<string>): void {
+  // import "foo" — no local name (package name used)
+  // import foo "bar" → foo
+  collectImportMatches(content, /import\s+(\w+)\s+"/g, (m) => m[1], imports);
+}
+
+function extractRustImports(content: string, imports: Set<string>): void {
+  // use foo::bar::baz → baz
+  // use foo::bar as baz → baz
+  collectImportMatches(
+    content,
+    /\buse\s+(?:\S+::)*(\w+)\s*(?:as\s+(\w+))?/g,
+    (m) => m[2] || m[1],
+    imports,
+  );
+}
+
+function extractJavaImports(content: string, imports: Set<string>): void {
+  // import foo.bar.Baz → Baz
+  collectImportMatches(content, /\bimport\s+(?:\w+\.)+(\w+)\s*;/g, (m) => m[1], imports);
+}
+
+function extractDartImports(content: string, imports: Set<string>): void {
+  // import 'package:foo/bar.dart' → no local name
+  // import 'foo.dart' as bar → bar
+  collectImportMatches(
+    content,
+    /\bimport\s+['"].*?['"]\s*(?:as\s+(\w+))?/g,
+    (m) => m[1],
+    imports,
+  );
+}
+
+type ImportExtractor = (content: string, imports: Set<string>) => void;
+
+const IMPORT_EXTRACTORS: Record<string, ImportExtractor> = {
+  typescript: extractJsImports,
+  tsx: extractJsImports,
+  javascript: extractJsImports,
+  jsx: extractJsImports,
+  python: extractPythonImports,
+  go: extractGoImports,
+  rust: extractRustImports,
+  java: extractJavaImports,
+  kotlin: extractJavaImports,
+  dart: extractDartImports,
+};
+
 /**
  * Extract import identifiers from content.
  * Returns a set of imported names (the local binding name).
  */
 export function extractImports(content: string, languageId: string): Set<string> {
   const imports = new Set<string>();
-
-  switch (languageId) {
-    case "typescript":
-    case "tsx":
-    case "javascript":
-    case "jsx": {
-      // import foo from 'bar' → foo
-      let re = /import\s+(\w+)\s+from\s+/g;
-      let match: RegExpExecArray | null;
-      while ((match = re.exec(content)) !== null) {
-        imports.add(match[1]);
-      }
-
-      // import { foo, bar as baz } from → foo, baz
-      re = /import\s*\{\s*([^}]+)\s*\}\s*from\s+/g;
-      while ((match = re.exec(content)) !== null) {
-        const names = match[1].split(",");
-        for (const n of names) {
-          const trimmed = n.trim();
-          // Handle "foo as bar" → bar is the local name
-          const parts = trimmed.split(/\s+as\s+/i);
-          imports.add(parts[parts.length - 1].trim());
-        }
-      }
-
-      // import * as foo from → foo
-      re = /import\s*\*\s*as\s+(\w+)\s+from\s+/g;
-      while ((match = re.exec(content)) !== null) {
-        imports.add(match[1]);
-      }
-
-      // const foo = require('bar') → foo
-      re = /(?:const|let|var)\s+(\w+)\s*=\s*require\s*\(/g;
-      while ((match = re.exec(content)) !== null) {
-        imports.add(match[1]);
-      }
-
-      // import('bar') → no local binding — skip
-      break;
-    }
-    case "python": {
-      // import foo → foo
-      let re = /^import\s+(\w+)/gm;
-      let match: RegExpExecArray | null;
-      while ((match = re.exec(content)) !== null) {
-        imports.add(match[1]);
-      }
-
-      // from foo import bar, baz → bar, baz
-      re = /from\s+\S+\s+import\s+([^#\n]+)/gm;
-      while ((match = re.exec(content)) !== null) {
-        const names = match[1].split(",");
-        for (const n of names) {
-          const trimmed = n.trim().split(/\s+as\s+/);
-          imports.add(trimmed[trimmed.length - 1].trim());
-        }
-      }
-
-      // import foo.bar.baz → just "foo" (module prefix)
-      re = /^import\s+(\w+)(?:\.\w+)*/gm;
-      while ((match = re.exec(content)) !== null) {
-        imports.add(match[1]);
-      }
-      break;
-    }
-    case "go": {
-      // import "foo" — no local name (package name used)
-      // import foo "bar" → foo
-      const re = /import\s+(\w+)\s+"/g;
-      let match: RegExpExecArray | null;
-      while ((match = re.exec(content)) !== null) {
-        imports.add(match[1]);
-      }
-      break;
-    }
-    case "rust": {
-      // use foo::bar::baz → baz
-      // use foo::bar as baz → baz
-      const re = /\buse\s+(?:\S+::)*(\w+)\s*(?:as\s+(\w+))?/g;
-      let match: RegExpExecArray | null;
-      while ((match = re.exec(content)) !== null) {
-        imports.add(match[2] || match[1]);
-      }
-      break;
-    }
-    case "java":
-    case "kotlin": {
-      // import foo.bar.Baz → Baz
-      const re = /\bimport\s+(?:\w+\.)+(\w+)\s*;/g;
-      let match: RegExpExecArray | null;
-      while ((match = re.exec(content)) !== null) {
-        imports.add(match[1]);
-      }
-      break;
-    }
-    case "dart": {
-      // import 'package:foo/bar.dart' → no local name
-      // import 'foo.dart' as bar → bar
-      const re = /\bimport\s+['"].*?['"]\s*(?:as\s+(\w+))?/g;
-      let match: RegExpExecArray | null;
-      while ((match = re.exec(content)) !== null) {
-        if (match[1]) imports.add(match[1]);
-      }
-      break;
-    }
-  }
-
+  IMPORT_EXTRACTORS[languageId]?.(content, imports);
   return imports;
 }
+
+/** Keywords that can precede `(` but are not function calls. */
+const NON_CALL_KEYWORDS = /^(if|while|for|switch|catch|return|yield|typeof|instanceof|void|delete|import|export|throw)\b/;
 
 /**
  * Extract function-call-like identifiers from content.
@@ -366,7 +523,7 @@ export function extractFunctionCalls(content: string, _languageId: string): Set<
   while ((match = re.exec(content)) !== null) {
     const name = match[1];
     // Skip language keywords that can be followed by (
-    if (/^(if|while|for|switch|catch|return|yield|typeof|instanceof|void|delete|import|export|throw)\b/.test(name)) {
+    if (NON_CALL_KEYWORDS.test(name)) {
       continue;
     }
     calls.add(name);
