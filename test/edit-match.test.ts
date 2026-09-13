@@ -159,6 +159,32 @@ describe("edit-match bulk + ambiguity counters", () => {
     assert.ok(secondBestScore >= 0.85);
   });
 
+  it("countSimilarityOccurrences scans past 2 candidates before dominance decision", () => {
+    const block = [
+      "function computeAlpha() {",
+      "  const first = loadFirstValue(100);",
+      "  const second = loadSecondValue(200);",
+      "  const total = first + second;",
+      "  return total;",
+      "}",
+    ].join("\n");
+    // 4/5 lines exact + 1-char change: above threshold but dominant-looking delta.
+    const nearBlock = block.replace("loadSecondValue(200)", "loadSecondValue(201)");
+    const filler = [
+      "// gap filler alpha one",
+      "// gap filler beta two",
+      "// gap filler gamma three",
+    ].join("\n");
+    // Third window is an exact tie scanned after the first two counted windows.
+    // Early-exit at count 2 misses it and mis-declares dominance.
+    const content = [block, filler, nearBlock, filler, block].join("\n");
+    const { count, bestScore, secondBestScore } = countSimilarityOccurrences(content, block);
+    assert.equal(count, 3);
+    assert.equal(bestScore, 1);
+    assert.equal(secondBestScore, 1);
+    assert.equal(isDominantFuzzyMatch(bestScore, secondBestScore), false);
+  });
+
   it("isDominantFuzzyMatch needs 97% best and 8% delta", () => {
     assert.equal(isDominantFuzzyMatch(0.98, 0.85), true);
     assert.equal(isDominantFuzzyMatch(0.96, 0.5), false);

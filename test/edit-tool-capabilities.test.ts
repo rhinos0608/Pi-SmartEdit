@@ -874,11 +874,12 @@ describe("raw formats through public execute", () => {
 
   test("executes raw topology changes through the transaction lifecycle", async () => {
     const cases = [
-      { raw: "*** Begin Atomic Patch\n*** Add File: new.ts\nnew\n*** End Atomic Patch", path: "new.ts", content: "new", removesSource: false },
+      { raw: "*** Begin Atomic Patch\n*** Add File: new.ts\nnew\n*** End Atomic Patch", path: "new.ts", content: "new\n", removesSource: false },
       { raw: "*** Begin Atomic Patch\n*** Delete File: a.ts\n*** End Atomic Patch", path: "a.ts", content: null, removesSource: true },
       { raw: "*** Begin Atomic Patch\n*** Rename File: a.ts -> moved.ts\n*** End Atomic Patch", path: "moved.ts", content: "old\n", removesSource: true },
       { raw: "*** Begin Atomic Patch\n*** Update File: a.ts\n@@\n-old\n+new\n*** Rename File: a.ts -> moved.ts\n*** End Atomic Patch", path: "moved.ts", content: "new\n", removesSource: true },
-      { raw: "*** Begin Patch\n*** Add File: new.ts\nnew\n*** End Patch", path: "new.ts", content: "new", removesSource: false },
+      // Codex Add contents carry canonical trailing newline per codex-rs (push '\n' per line); bare lenient lines normalize to same form.
+      { raw: "*** Begin Patch\n*** Add File: new.ts\nnew\n*** End Patch", path: "new.ts", content: "new\n", removesSource: false },
       { raw: "*** Begin Patch\n*** Delete File: a.ts\n*** End Patch", path: "a.ts", content: null, removesSource: true },
       { raw: "*** Begin Patch\n*** Update File: a.ts\n*** Move to: moved.ts\n@@ old\n-old\n+new\n*** End Patch", path: "moved.ts", content: "new\n", removesSource: true },
     ];
@@ -918,7 +919,7 @@ test("public: raw add of a new file flows through the full pipeline (finalizatio
       finalizationCalls++;
       assert.equal(files.length, 1);
       assert.equal(files[0].path, join(workdir, "new.ts"));
-      assert.equal(files[0].content, "const x = 1;\nconst y = 2;");
+      assert.equal(files[0].content, "const x = 1;\nconst y = 2;\n");
       assert.equal(files[0].oldContent, "");
       assert.ok(files[0].changedLineRanges.length > 0, "added content must carry a non-empty changed range for scoping");
       return { diagnostics: [], checks: [], evidence: { lane: "add-test" } };

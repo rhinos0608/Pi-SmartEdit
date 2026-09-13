@@ -1473,9 +1473,11 @@ function scanSimilarityOccurrenceWindows(
           (r) => startLine < r.end && endLine > r.start,
         );
         if (!overlaps) {
+          // No early-exit here: bestScore/secondBestScore must reflect ALL
+          // windows so the fuzzy-dominant check downstream sees later
+          // near-equal candidates. Count capping would hide ambiguity.
           countedRanges.push({ start: startLine, end: endLine });
           count++;
-          if (count >= 2) return { count, bestScore, secondBestScore };
         }
       }
     }

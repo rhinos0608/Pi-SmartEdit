@@ -62,6 +62,31 @@ describe("raw edit normalization", () => {
     );
   });
 
+  it("preserves interleaved Codex hunk line order in oldText/newText", () => {
+    const raw = [
+      "*** Begin Patch",
+      "*** Update File: foo.ts",
+      "@@",
+      " context-before",
+      "-old-one",
+      "+new-one",
+      " context-middle",
+      "-old-two",
+      "+new-two",
+      " context-after",
+      "*** Add File: other.txt",
+      "placeholder",
+      "*** End Patch",
+    ].join("\n");
+    const intent = normalizeRawEdit(raw).intents[0];
+    assert.equal(intent.kind, "text");
+    assert.deepEqual((intent as { operation: { oldText: string; newText: string } }).operation, {
+      path: "foo.ts",
+      oldText: "context-before\nold-one\ncontext-middle\nold-two\ncontext-after",
+      newText: "context-before\nnew-one\ncontext-middle\nnew-two\ncontext-after",
+    });
+  });
+
   it("preserves bare empty hunk lines on both sides of a unified diff", () => {
     // A bare removed empty line (`-`) survives in oldText; a bare added empty
     // line (`+`) survives in newText, so both sides keep their blank line.

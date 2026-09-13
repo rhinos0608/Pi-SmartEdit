@@ -4,7 +4,7 @@
  * Grammar (BNF):
  *   patch           = [ preamble ] , envelope-start , newline , { section } , [ envelope-end ] , [ postamble ]
  *   section         = add-section | delete-section | update-section
- *   add-section     = "*** Add File:" , ws , path , newline , { contents-line }
+ *   add-section     = "*** Add File:" , ws , path , newline , { "+" , text , newline }
  *   delete-section  = "*** Delete File:" , ws , path , newline
  *   update-section  = "*** Update File:" , ws , path , newline , [ "*** Move to:" , ws , path , newline ] , { hunk }
  *   hunk            = "@@" , [ ws , hunk-scope ] , newline , { hunk-line }
@@ -33,6 +33,13 @@ export type CodexHunk =
 /**
  * A single @@-delimited hunk within an UpdateFile section.
  */
+export type CodexHunkLineKind = 'context' | 'removed' | 'added';
+
+export interface CodexHunkLine {
+  kind: CodexHunkLineKind;
+  text: string;
+}
+
 export interface UpdateFileChunk {
   /** Multi-level scope path from @@ chain, e.g. ["class BaseClass", "  def method():"] */
   scope: string[];
@@ -42,6 +49,41 @@ export interface UpdateFileChunk {
   removedLines: string[];
   /** Lines prefixed with '+' (added content) */
   addedLines: string[];
+  /**
+   * Hunk lines in original order. Populated by the parser; optional so
+   * manually-constructed chunks without it keep legacy block-join behavior.
+   */
+  lines?: CodexHunkLine[];
+}
+
+/**
+ * Derive oldText preserving original hunk line order.
+ * Falls back to legacy context-then-removed join for manually-constructed
+ * chunks that lack ordered lines.
+ */
+export function updateChunkOldText(chunk: UpdateFileChunk): string {
+  if (chunk.lines) {
+    return chunk.lines
+      .filter((l) => l.kind === 'context' || l.kind === 'removed')
+      .map((l) => l.text)
+      .join('\n');
+  }
+  return [...chunk.contextLines, ...chunk.removedLines].join('\n');
+}
+
+/**
+ * Derive newText preserving original hunk line order.
+ * Falls back to legacy context-then-added join for manually-constructed
+ * chunks that lack ordered lines.
+ */
+export function updateChunkNewText(chunk: UpdateFileChunk): string {
+  if (chunk.lines) {
+    return chunk.lines
+      .filter((l) => l.kind === 'context' || l.kind === 'added')
+      .map((l) => l.text)
+      .join('\n');
+  }
+  return [...chunk.contextLines, ...chunk.addedLines].join('\n');
 }
 
 export interface PatchWarning {
@@ -184,21 +226,8 @@ export function codexHunkToEditItem(
 
     case 'UpdateFile': {
       return hunk.chunks.map(chunk => {
-        const contextBlock = chunk.contextLines.join('\n');
-        const removedBlock = chunk.removedLines.join('\n');
-        const addedBlock = chunk.addedLines.join('\n');
-
-        const oldParts: string[] = [];
-        const newParts: string[] = [];
-
-        if (contextBlock) oldParts.push(contextBlock);
-        if (removedBlock) oldParts.push(removedBlock);
-
-        if (contextBlock) newParts.push(contextBlock);
-        if (addedBlock) newParts.push(addedBlock);
-
-        const oldText = oldParts.length > 0 ? oldParts.join('\n') : '';
-        const newText = newParts.length > 0 ? newParts.join('\n') : '';
+        const oldText = updateChunkOldText(chunk);
+        const newText = updateChunkNewText(chunk);
 
         const result: { path: string; oldText: string; newText: string; anchor?: { symbolName?: string; symbolKind?: string } } = {
           path: hunk.movePath || hunk.path,
@@ -355,6 +384,14 @@ class CodexPatchParser extends PatchCursor {
    * Parse an Add File section.
    * Already consumed the *** Add File: <path> line.
    * Read all subsequent lines until another *** marker or end of input.
+   *
+   * Per Codex apply_patch grammar (add_line: "+" /(.+)/ LF), every content
+   * line carries a leading "+" prefix which is stripped; contents rejoin
+   * with a trailing newline per line, matching codex-rs streaming_parser.rs
+   * (contents.push_str(line_to_add); contents.push('\n')).
+   * Strict mode rejects lines without the "+" prefix. Lenient mode keeps
+   * historical backward compatibility: a bare line without "+" is accepted
+   * as literal content (unprefixed Add File sections predating this fix).
    */
   private parseAddSection(path: string): CodexHunk {
     const contentLines: string[] = [];
@@ -367,7 +404,19 @@ class CodexPatchParser extends PatchCursor {
         break;
       }
 
-      contentLines.push(this.consumeLine());
+      const raw = this.consumeLine();
+      if (raw.startsWith('+')) {
+        contentLines.push(raw.slice(1));
+      } else if (this.mode === 'strict') {
+        throw new PatchParseError(
+          `Expected '+' prefix in Add File section: "${raw.slice(0, 60)}"`,
+          this.line,
+          this.column,
+        );
+      } else {
+        // Lenient: accept bare line as literal content (legacy behavior).
+        contentLines.push(raw);
+      }
     }
 
     // Strip trailing blank lines from contents
@@ -378,7 +427,7 @@ class CodexPatchParser extends PatchCursor {
     return {
       kind: 'AddFile',
       path,
-      contents: contentLines.join('\n'),
+      contents: contentLines.length > 0 ? contentLines.join('\n') + '\n' : '',
     };
   }
 
@@ -472,6 +521,7 @@ class CodexPatchParser extends PatchCursor {
     const contextLines: string[] = [];
     const removedLines: string[] = [];
     const addedLines: string[] = [];
+    const lines: CodexHunkLine[] = [];
 
     let hasContent = false;
 
@@ -489,15 +539,18 @@ class CodexPatchParser extends PatchCursor {
       if (firstChar === ' ') {
         lineContent = nextLine.slice(1);
         contextLines.push(lineContent);
+        lines.push({ kind: 'context', text: lineContent });
         this.consumeLine();
       } else if (firstChar === '-') {
         lineContent = nextLine.slice(1);
         removedLines.push(lineContent);
+        lines.push({ kind: 'removed', text: lineContent });
         hasContent = true;
         this.consumeLine();
       } else if (firstChar === '+') {
         lineContent = nextLine.slice(1);
         addedLines.push(lineContent);
+        lines.push({ kind: 'added', text: lineContent });
         hasContent = true;
         this.consumeLine();
       } else if (firstChar === '\\') {
@@ -506,6 +559,7 @@ class CodexPatchParser extends PatchCursor {
       } else if (nextLine.trim() === '') {
         // Blank line within hunk — preserve as context (with empty content)
         contextLines.push('');
+        lines.push({ kind: 'context', text: '' });
         this.consumeLine();
       } else {
         // Unknown hunk line — skip in lenient mode
@@ -541,6 +595,7 @@ class CodexPatchParser extends PatchCursor {
       contextLines,
       removedLines,
       addedLines,
+      lines,
     };
   }
 

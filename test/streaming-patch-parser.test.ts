@@ -6,6 +6,7 @@
 import { describe, test } from "node:test";
 import assert from "node:assert";
 import { StreamingPatchParser } from "../src/formats/streaming-patch-parser";
+import { detectInputFormat } from "../src/formats/format-detector";
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 
@@ -57,6 +58,23 @@ describe("StreamingPatchParser — basic", () => {
     const lastMsg = messages[messages.length - 1];
     assert.ok(lastMsg.includes("complete") || lastMsg.includes("all"), 
       `Expected completion message, got: ${lastMsg}`);
+  });
+
+  test("emitted diff preserves interleaved hunk line order", () => {
+    const { onUpdate, messages } = makeCollector();
+    const parser = new StreamingPatchParser(onUpdate, 10);
+
+    parser.pushDelta("*** Begin Patch\n*** Update File: file.ts\n@@\n context-before\n-old-one\n+new-one\n context-middle\n-old-two\n+new-two\n context-after\n*** End Patch");
+    parser.finish();
+
+    const allText = messages.join("\n");
+    const order = [" context-before", "-old-one", "+new-one", " context-middle", "-old-two", "+new-two", " context-after"];
+    let prevIdx = -1;
+    for (const line of order) {
+      const idx = allText.indexOf(line);
+      assert.ok(idx > prevIdx, `Expected "${line}" in order, got: ${allText.slice(0, 300)}`);
+      prevIdx = idx;
+    }
   });
 
   test("single AddFile hunk emitted", () => {
@@ -272,6 +290,51 @@ describe("StreamingPatchParser — edge cases", () => {
 
     // Should not crash — lenient mode tolerates bad input
     assert.ok(messages.length >= 1, "Should still produce finish message");
+  });
+
+  test("P2-1: AddFile header counts true lines, no stray + line", () => {
+    const { onUpdate, messages } = makeCollector();
+    const parser = new StreamingPatchParser(onUpdate, 10);
+
+    parser.pushDelta("*** Begin Patch\n*** Add File: src/new.ts\nline1\nline2\n*** End Patch");
+    parser.finish();
+
+    const allText = messages.join("\n");
+    assert.ok(allText.includes("@@ -0,0 +1,2 @@"),
+      `Expected header +1,2, got: ${allText.slice(0, 400)}`);
+    const hasStrayPlus = allText.split("\n").some((l) => l === "+");
+    assert.ok(!hasStrayPlus, `Expected no stray "+" line, got: ${allText.slice(0, 400)}`);
+  });
+
+  test("P2-2: second same-scope chunk still emits", async () => {
+    const { onUpdate, messages } = makeCollector();
+    const parser = new StreamingPatchParser(onUpdate, 10);
+
+    parser.pushDelta("*** Begin Patch\n*** Update File: file.ts\n@@\n-old1\n+new1\n");
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    parser.pushDelta("@@\n-old2\n+new2\n*** End Patch");
+    parser.finish();
+
+    const allText = messages.join("\n");
+    assert.ok(allText.includes("new2"),
+      `Expected second chunk new2 emitted, got: ${allText.slice(0, 400)}`);
+  });
+
+  test("P2-3: progress total counts chunks not files", () => {
+    const { onUpdate, messages } = makeCollector();
+    const parser = new StreamingPatchParser(onUpdate, 10);
+
+    parser.pushDelta("*** Begin Patch\n*** Update File: file.ts\n@@ fn1\n-old1\n+new1\n@@ fn2\n-old2\n+new2\n*** End Patch");
+    parser.finish();
+
+    const allText = messages.join("\n");
+    assert.ok(allText.includes("2/2"),
+      `Expected chunk-counted progress 2/2, got: ${allText.slice(0, 400)}`);
+  });
+
+  test("P2-4: detector finds Begin marker after preamble", () => {
+    const fmt = detectInputFormat("some preamble text\n*** Begin Patch\n*** Update File: f\n@@ fn\n-old\n+new\n*** End Patch");
+    assert.strictEqual(fmt, "openai_patch");
   });
 
   test("constructor with default buffer interval", () => {

@@ -42,16 +42,34 @@ export function detectInputFormat(input: string): InputFormat {
     }
   }
 
-  if (normalized.includes('<<<<<<< SEARCH')) {
-    return 'search_replace';
+  // SEARCH marker must start a line (optional leading whitespace) and form a
+  // complete block with ======= / >>>>>>> REPLACE lines. Substring match
+  // anywhere misroutes JSON payloads whose oldText/newText merely mention
+  // the marker text (e.g. "see <<<<<<< SEARCH docs").
+  const hasSearchStart = lines.some((l) => l.trimStart().startsWith('<<<<<<< SEARCH'));
+  if (hasSearchStart) {
+    const hasSeparator = lines.some((l) => l.trimStart().startsWith('======='));
+    const hasReplace = lines.some((l) => l.trimStart().startsWith('>>>>>>> REPLACE'));
+    if (hasSeparator && hasReplace) {
+      return 'search_replace';
+    }
   }
 
-  // Check for atomic patch envelope first (more specific than codex patch)
-  if (firstLine.startsWith('*** Begin Atomic Patch') || firstLine.startsWith('***Begin Atomic Patch')) {
+  // Check for atomic patch envelope first (more specific than codex patch).
+  // Scan any line: the lenient parser skips preamble, so detection must too.
+  const hasAtomicBegin = lines.some((l) => {
+    const t = l.trim();
+    return t.startsWith('*** Begin Atomic Patch') || t.startsWith('***Begin Atomic Patch');
+  });
+  if (hasAtomicBegin) {
     return 'atomic_patch';
   }
 
-  if (firstLine.startsWith('*** Begin Patch') || firstLine.startsWith('***Begin Patch')) {
+  const hasBegin = lines.some((l) => {
+    const t = l.trim();
+    return t.startsWith('*** Begin Patch') || t.startsWith('***Begin Patch');
+  });
+  if (hasBegin) {
     // Check if patch contains Codex-specific markers that require the grammar parser
     const hasCodexMarkers =
       trimmed.includes('*** Add File:') ||

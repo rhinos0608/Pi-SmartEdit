@@ -131,7 +131,8 @@ function parseOpenAIPatchViaCodex(input: string): OpenAIPatch[] {
           path: hunk.path,
           contextAnchor: '',
           removedLines: [],
-          addedLines: hunk.contents.split('\n'),
+          // contents carries canonical trailing newline; drop it so addedLines holds true lines only.
+          addedLines: hunk.contents === '' ? [] : hunk.contents.replace(/\n$/, '').split('\n'),
         });
         break;
       }

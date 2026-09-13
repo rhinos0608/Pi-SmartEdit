@@ -179,9 +179,9 @@ export async function checkTscDiagnostics(
     : ["--noEmit", "--pretty", "false", filePath];
 
   const localTscPath = resolveLocalTscPath();
-  // Spawned without a shell: extensionless `npx` never resolves on Windows
-  // (and `npx.cmd` needs the safeSpawnAsync cmd.exe gate), so name the shim.
-  const command = localTscPath ? process.execPath : process.platform === "win32" ? "npx.cmd" : "npx";
+  // Bare `npx`: buildSpawnTargets expands the win32 bare + .cmd + .bat
+  // fallback chain (a suffixed `npx.cmd` would yield a single attempt).
+  const command = localTscPath ? process.execPath : "npx";
   const args = localTscPath ? [localTscPath, ...tscArgs] : ["--no-install", "tsc", ...tscArgs];
 
   const result = await safeSpawnAsync(command, args, {

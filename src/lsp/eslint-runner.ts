@@ -139,20 +139,20 @@ export interface EslintCommandSelection {
  * command paths, so an absolute local binary under a `configDir` containing
  * whitespace breaks. Paths with whitespace fall back to the `npx` form
  * (HEAD behavior); all other paths may attempt the direct local binary.
+ * Commands stay bare (`eslint`/`npx`): `buildSpawnTargets` expands the
+ * win32 bare + `.cmd` + `.bat` fallback chain, while a suffixed name would
+ * yield a single attempt and lose the `.bat` fallback.
+ * `isWin` is retained for call-signature compat but no longer selects a
+ * suffix; both platforms receive the bare name.
  * Pure over (`configDir`, `isWin`) so the branch is unit-testable on POSIX.
  */
 export function selectEslintCommand(
   configDir: string,
   isWin: boolean = process.platform === "win32",
 ): EslintCommandSelection {
-  const localEslint = join(
-    configDir,
-    "node_modules",
-    ".bin",
-    isWin ? "eslint.cmd" : "eslint",
-  );
+  const localEslint = join(configDir, "node_modules", ".bin", "eslint");
   if (/\s/.test(localEslint)) {
-    return { kind: "npx", command: isWin ? "npx.cmd" : "npx" };
+    return { kind: "npx", command: "npx" };
   }
   return { kind: "direct", command: localEslint };
 }
@@ -171,11 +171,12 @@ export async function checkEslintDiagnostics(
     // local install may provide only node_modules/.bin without a package
     // record `npx --no-install` resolves (observed Windows-only miss: the
     // fake was never invoked, source stayed "none"). Absolute path, so no
-    // PATH dependence. Spawned without a shell, so on Windows the .cmd
-    // shim name is required (CreateProcess ignores PATHEXT for
-    // extensionless names).
+    // PATH dependence. Spawned bare so buildSpawnTargets expands the win32
+    // fallback chain; resolvability is probed across the suffixed variants
+    // below because the file on disk carries .cmd/.bat on Windows.
     const isWin = process.platform === "win32";
-    const npxCommand = isWin ? "npx.cmd" : "npx";
+    // Bare `npx`: buildSpawnTargets expands the win32 bare + .cmd + .bat chain.
+    const npxCommand = "npx";
     const npxArgs = [
       "--no-install",
       "eslint",
@@ -191,13 +192,21 @@ export async function checkEslintDiagnostics(
     // (^-escaping without quoting); such paths stay on the npx form.
     const selection = selectEslintCommand(configDir, isWin);
     if (selection.kind === "direct") {
-      try {
-        await access(selection.command);
-        command = selection.command;
-        args = ["--format", "json", "--no-warn-ignored", filePath];
-        usedLocalDirect = true;
-      } catch {
-        // No local binary — fall back to npx resolution.
+      // Probe resolvability across the win32 expansion (.cmd/.bat on disk)
+      // but spawn the bare name so safeSpawnAsync keeps the full fallback.
+      const directCandidates = isWin
+        ? [selection.command, `${selection.command}.cmd`, `${selection.command}.bat`]
+        : [selection.command];
+      for (const candidate of directCandidates) {
+        try {
+          await access(candidate);
+          command = selection.command;
+          args = ["--format", "json", "--no-warn-ignored", filePath];
+          usedLocalDirect = true;
+          break;
+        } catch {
+          // No local binary under this suffix — try the next, else npx.
+        }
       }
     }
     let result = await safeSpawnAsync(command, args, {

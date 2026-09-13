@@ -11,6 +11,7 @@ import { delimiter } from "path";
 import { resolve } from "path";
 
 import { LSPConnection } from "./lsp-connection";
+import { buildSpawnTargets } from "./spawn-utils.js";
 
 export interface ServerConfig {
   command: string;
@@ -293,6 +294,28 @@ export class LSPManager {
         return fullPath;
       } catch {
         // Try next PATH entry.
+      }
+    }
+    // On win32, npm/RubyGems shims live on PATH as `.cmd`/`.bat` files, so a
+    // bare command name never matches the extensionless probe above. Reuse
+    // buildSpawnTargets as the single source of truth for which suffixed
+    // shims to try (suffix list + trailing dot/space trimming live there).
+    // POSIX returns exactly one target with no batchFile, so this is a no-op
+    // off win32: zero behavior change.
+    if (process.platform === "win32") {
+      const shims = buildSpawnTargets(command, [], "win32")
+        .map((target) => target.batchFile)
+        .filter((batchFile): batchFile is string => batchFile !== undefined);
+      for (const shim of shims) {
+        for (const dir of paths) {
+          const fullPath = resolve(dir, shim);
+          try {
+            await access(fullPath, constants.F_OK);
+            return fullPath;
+          } catch {
+            // Try next PATH entry.
+          }
+        }
       }
     }
     return null;

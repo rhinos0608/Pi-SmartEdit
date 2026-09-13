@@ -134,7 +134,18 @@ function normalizeDiagnosticPath(
 
 function uriToPath(uri: string): string {
   if (!uri.startsWith("file://")) return uri;
-  return fileURLToPath(uri);
+  try {
+    return fileURLToPath(uri);
+  } catch {
+    // POSIX-style URIs without a drive letter (e.g. test fixtures) throw
+    // on win32 fileURLToPath; fall back to the raw pathname so reference
+    // matching still works cross-platform.
+    try {
+      return decodeURIComponent(new URL(uri).pathname);
+    } catch {
+      return uri;
+    }
+  }
 }
 
 function samePath(a: string, b: string): boolean {

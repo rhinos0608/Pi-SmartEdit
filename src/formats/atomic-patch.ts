@@ -276,10 +276,11 @@ class AtomicPatchParser extends PatchCursor {
       contentLines.pop();
     }
 
+    // POSIX/Codex convention: non-empty Add ends with single trailing newline; empty stays "".
     return {
       kind: 'AddFile',
       path,
-      contents: contentLines.join('\n'),
+      contents: contentLines.length > 0 ? contentLines.join('\n') + '\n' : '',
     };
   }
 

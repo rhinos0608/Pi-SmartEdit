@@ -14,7 +14,7 @@
 
 import { diffLines } from "diff";
 
-import { parseCodexPatch, type CodexHunk, type CodexPatchResult } from "./codex-patch";
+import { parseCodexPatch, updateChunkNewText, updateChunkOldText, type CodexHunk, type CodexPatchResult, type UpdateFileChunk } from "./codex-patch";
 
 // ─── Types ──────────────────────────────────────────────────────────
 
@@ -45,7 +45,7 @@ export class StreamingPatchParser {
   private timer: ReturnType<typeof setTimeout> | null = null;
   /** Set of hunk signatures already emitted (dedup across re-parse cycles) */
   private emittedHunks = new Set<string>();
-  /** Total hunks seen in the most recent parse */
+  /** Total emittable units seen in the most recent parse (chunks for UpdateFile, 1 per Add/Delete) */
   private totalHunks = 0;
   /** Current file content for computing live diffs */
   private fileContent: string | undefined;
@@ -84,7 +84,7 @@ export class StreamingPatchParser {
 
     // Re-parse with lenient mode (tolerates partial text)
     const result = parseCodexPatch(this.accumulated, "lenient");
-    this.totalHunks = result.hunks.length;
+    this.totalHunks = this.countUnits(result.hunks);
 
     const newHunks = this.findNewHunks(result.hunks);
     if (newHunks.length === 0) return;
@@ -131,7 +131,7 @@ export class StreamingPatchParser {
 
     // Final parse
     const result = parseCodexPatch(this.accumulated, "lenient");
-    this.totalHunks = result.hunks.length;
+    this.totalHunks = this.countUnits(result.hunks);
     const newHunks = this.findNewHunks(result.hunks);
 
     if (newHunks.length > 0) {
@@ -140,6 +140,18 @@ export class StreamingPatchParser {
 
     // Emit final completion message (always, even if no new hunks)
     this.emit("finish");
+  }
+
+  /**
+   * Count emittable units — one per chunk for UpdateFile, one per file
+   * for AddFile/DeleteFile — so progress units match emittedHunks entries.
+   */
+  private countUnits(hunks: CodexHunk[]): number {
+    let n = 0;
+    for (const hunk of hunks) {
+      n += hunk.kind === "UpdateFile" ? hunk.chunks.length : 1;
+    }
+    return n;
   }
 
   /**
@@ -153,8 +165,11 @@ export class StreamingPatchParser {
       case "DeleteFile":
         return [`delete:${hunk.path}`];
       case "UpdateFile":
+        // Include chunk index + content so same/empty-scope chunks each get
+        // a distinct signature; otherwise a later chunk never emits.
         return hunk.chunks.map(
-          (chunk) => `update:${hunk.path}:${chunk.scope.join(" > ")}`,
+          (chunk, i) =>
+            `update:${hunk.path}:${i}:${chunk.scope.join(" > ")}:${chunk.removedLines.join("\x1f")}:${chunk.addedLines.join("\x1f")}`,
         );
       default: {
         const _exhaustive: never = hunk;
@@ -250,7 +265,8 @@ export class StreamingPatchParser {
       switch (hunk.kind) {
         case "AddFile": {
           // New file: show all content as added
-          const newLines = hunk.contents.split("\n");
+          // contents carries canonical trailing newline; drop it so the count holds true lines only.
+          const newLines = hunk.contents.replace(/\n$/, "").split("\n");
           const changes = diffLines("", hunk.contents);
           diffParts.push(`--- /dev/null`);
           diffParts.push(`+++ b/${hunk.path}`);
@@ -335,14 +351,13 @@ export class StreamingPatchParser {
    * @returns Object with oldText, newText, and whether scope was found
    */
   private extractRegionFromFile(
-    chunk: { scope: string[]; contextLines: string[]; removedLines: string[]; addedLines: string[] },
+    chunk: UpdateFileChunk,
     content: string,
   ): { oldText: string; newText: string; scopeFound: boolean } {
     const { scope, contextLines, removedLines, addedLines } = chunk;
 
-    // Build new text (context + added lines)
-    const newLines = [...contextLines, ...addedLines];
-    const newText = newLines.join("\n");
+    // Build new text preserving original hunk line order
+    const newText = updateChunkNewText(chunk);
 
     // Try to find the scope in the file content
     if (scope.length > 0) {
@@ -389,9 +404,8 @@ export class StreamingPatchParser {
       }
     }
 
-    // Cannot find region - use context lines as approximation
-    const oldLines = [...contextLines, ...removedLines];
-    return { oldText: oldLines.join("\n"), newText, scopeFound: false };
+    // Cannot find region - use order-preserving chunk text as approximation
+    return { oldText: updateChunkOldText(chunk), newText, scopeFound: false };
   }
 
   /**
@@ -404,8 +418,11 @@ export class StreamingPatchParser {
       case "AddFile":
         lines.push(`--- /dev/null`);
         lines.push(`+++ b/${hunk.path}`);
-        lines.push(`@@ -0,0 +1,${hunk.contents.split("\n").length} @@`);
-        lines.push(...hunk.contents.split("\n").map((l) => `+${l}`));
+        // contents carries canonical trailing newline; drop it so the header
+        // counts true lines and no phantom "+" line is emitted.
+        const contentLines = hunk.contents.replace(/\n$/, "").split("\n");
+        lines.push(`@@ -0,0 +1,${contentLines.length} @@`);
+        lines.push(...contentLines.map((l) => `+${l}`));
         lines.push("");
         break;
 
@@ -424,14 +441,21 @@ export class StreamingPatchParser {
             ? ` ${chunk.scope.join(" > ")}`
             : "";
           lines.push(`@@${scopeLabel} @@`);
-          for (const ctx of chunk.contextLines) {
-            lines.push(` ${ctx}`);
-          }
-          for (const rem of chunk.removedLines) {
-            lines.push(`-${rem}`);
-          }
-          for (const add of chunk.addedLines) {
-            lines.push(`+${add}`);
+          if (chunk.lines) {
+            for (const entry of chunk.lines) {
+              const prefix = entry.kind === "context" ? " " : entry.kind === "removed" ? "-" : "+";
+              lines.push(`${prefix}${entry.text}`);
+            }
+          } else {
+            for (const ctx of chunk.contextLines) {
+              lines.push(` ${ctx}`);
+            }
+            for (const rem of chunk.removedLines) {
+              lines.push(`-${rem}`);
+            }
+            for (const add of chunk.addedLines) {
+              lines.push(`+${add}`);
+            }
           }
           lines.push("");
         }

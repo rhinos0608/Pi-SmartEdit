@@ -15,6 +15,7 @@ import {
   checkEslintDiagnostics,
   selectEslintCommand,
 } from "../src/lsp/eslint-runner.js";
+import { buildSpawnTargets } from "../src/lsp/spawn-utils.js";
 
 function makeTempDir(prefix: string): string {
   return mkdtempSync(join(tmpdir(), prefix));
@@ -324,7 +325,8 @@ describe("eslint-runner", () => {
     it("selects the direct local binary when the path has no whitespace (win)", () => {
       const selection = selectEslintCommand("C:\\proj\\app", true);
       assert.strictEqual(selection.kind, "direct");
-      assert.ok(selection.command.endsWith("eslint.cmd"));
+      assert.ok(selection.command.endsWith("eslint"));
+      assert.ok(!/\.(cmd|bat|exe|com)$/i.test(selection.command));
       assert.ok(!/\s/.test(selection.command));
     });
 
@@ -334,10 +336,24 @@ describe("eslint-runner", () => {
       assert.strictEqual(selection.command, "npx");
     });
 
-    it("falls back to npx.cmd when the path contains whitespace (win)", () => {
+    it("falls back to bare npx when the path contains whitespace (win)", () => {
       const selection = selectEslintCommand("C:\\my proj\\app", true);
       assert.strictEqual(selection.kind, "npx");
-      assert.strictEqual(selection.command, "npx.cmd");
+      assert.strictEqual(selection.command, "npx");
+    });
+
+    it("returns bare names on win so buildSpawnTargets keeps the bare + .cmd + .bat fallback chain", () => {
+      const direct = selectEslintCommand("C:\\proj\\app", true);
+      assert.strictEqual(direct.kind, "direct");
+      assert.ok(!/\.(cmd|bat|exe|com)$/i.test(direct.command), `direct must be bare, got ${direct.command}`);
+      assert.strictEqual(buildSpawnTargets(direct.command, ["--version"], "win32").length, 3);
+
+      const npx = selectEslintCommand("C:\\my proj\\app", true);
+      assert.strictEqual(npx.kind, "npx");
+      assert.strictEqual(npx.command, "npx");
+      assert.strictEqual(buildSpawnTargets(npx.command, ["--version"], "win32").length, 3);
+      // Suffixed names yield a single attempt (no fallback) — the bug being fixed.
+      assert.strictEqual(buildSpawnTargets("npx.cmd", ["--version"], "win32").length, 1);
     });
   });
 });

@@ -3,7 +3,7 @@ import { detectInputFormat, type InputFormat } from "./format-detector.js";
 import { parseSearchReplace } from "./search-replace.js";
 import { parseUnifiedDiff } from "./unified-diff.js";
 import { parseOpenAIPatch, openAIPatchToEditItem } from "./openai-patch.js";
-import { parseCodexPatch } from "./codex-patch.js";
+import { parseCodexPatch, updateChunkNewText, updateChunkOldText } from "./codex-patch.js";
 import { parseAtomicPatchEnvelope } from "./atomic-patch.js";
 import { repairJson } from "./forgiving-parser.js";
 
@@ -111,7 +111,7 @@ export function normalizeRawEdit(raw: string, defaultPath?: string): NormalizedR
           if (h.kind === "AddFile") intents.push({ kind: "add", path: h.path, content: h.contents });
           else if (h.kind === "DeleteFile") intents.push({ kind: "delete", path: h.path });
           else {
-            for (const c of h.chunks) intents.push(text(h.path || defaultPath, [...c.contextLines, ...c.removedLines].join("\n"), [...c.contextLines, ...c.addedLines].join("\n")));
+            for (const c of h.chunks) intents.push(text(h.path || defaultPath, updateChunkOldText(c), updateChunkNewText(c)));
             if (h.movePath) intents.push({ kind: "rename", oldPath: h.path, newPath: h.movePath });
           }
         }

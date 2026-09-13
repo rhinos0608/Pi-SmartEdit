@@ -74,7 +74,7 @@ export const foo = "bar";
     const op = result.envelope.operations[0];
     assert.strictEqual(op.kind, 'AddFile');
     assert.strictEqual(op.path, 'src/new.ts');
-    assert.strictEqual(op.contents, 'export const foo = "bar";');
+    assert.strictEqual(op.contents, 'export const foo = "bar";\n');
   });
 
   test("parses delete file operation", () => {
@@ -184,7 +184,8 @@ export const foo = "bar";
     const result = parseAtomicPatchEnvelope(input);
     const op = result.envelope.operations[0] as { kind: 'AddFile'; contents: string };
     assert.strictEqual(op.kind, 'AddFile');
-    // Should not have trailing newlines
+    // POSIX/Codex convention: single trailing newline, no extra blank lines
+    assert.ok(op.contents.endsWith('\n'));
     assert.ok(!op.contents.endsWith('\n\n'));
   });
 
@@ -529,7 +530,7 @@ export const queued = true;
     assert.strictEqual(result.operations[0].status, 'applied');
 
     const content = readTestFile('queued-file.ts');
-    assert.strictEqual(content, 'export const queued = true;');
+    assert.strictEqual(content, 'export const queued = true;\n');
   });
 
   test("returns error for parse warnings", async () => {

@@ -89,6 +89,11 @@ const x = 2;
         assert.strictEqual(detectInputFormat(input), "search_replace");
     });
 
+    test("ignores SEARCH marker mentioned inside JSON payload", () => {
+        const input = JSON.stringify([{ oldText: "see <<<<<<< SEARCH docs for details", newText: "updated text" }]);
+        assert.strictEqual(detectInputFormat(input), "raw_edits");
+    });
+
     test("unified_diff requires @@ marker", () => {
         const input = `--- a/file.ts
 +++ b/file.ts
@@ -139,6 +144,21 @@ describe("codex-patch", () => {
             assert.strictEqual(result.hunks[0].path, "src/new.ts");
             assert.ok(result.hunks[0].contents.includes("return 42;"));
         }
+    });
+
+    test("strips + prefix in spec-compliant Add File section", () => {
+        const input = `*** Begin Patch\n*** Add File: hello.txt\n+Hello, world!\n+second line\n*** End Patch`;
+        const result = parseCodexPatch(input);
+        assert.strictEqual(result.hunks.length, 1);
+        assert.strictEqual(result.hunks[0].kind, "AddFile");
+        if (result.hunks[0].kind === "AddFile") {
+            assert.strictEqual(result.hunks[0].contents, "Hello, world!\nsecond line\n");
+        }
+    });
+
+    test("strict mode rejects unprefixed Add File lines", () => {
+        const input = `*** Begin Patch\n*** Add File: hello.txt\nbare line\n*** End Patch`;
+        assert.throws(() => parseCodexPatch(input, "strict"));
     });
 
     test("handles Delete File section", () => {
@@ -216,6 +236,25 @@ describe("codex-patch", () => {
         assert.strictEqual(items.length, 1);
         assert.ok(items[0].oldText.includes("old"));
         assert.ok(items[0].newText.includes("new"));
+    });
+
+    test("codexHunkToEditItem preserves interleaved hunk line order", () => {
+        const input = `*** Begin Patch
+*** Update File: src/main.ts
+@@
+ context-before
+-old-one
++new-one
+ context-middle
+-old-two
++new-two
+ context-after
+*** End Patch`;
+        const hunk = parseCodexPatch(input, "strict").hunks[0];
+        const items = codexHunkToEditItem(hunk);
+        assert.strictEqual(items.length, 1);
+        assert.strictEqual(items[0].oldText, "context-before\nold-one\ncontext-middle\nold-two\ncontext-after");
+        assert.strictEqual(items[0].newText, "context-before\nnew-one\ncontext-middle\nnew-two\ncontext-after");
     });
 
     test("strict mode throws on bad syntax", () => {
