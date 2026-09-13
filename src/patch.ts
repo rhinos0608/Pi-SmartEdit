@@ -154,6 +154,12 @@ import {
     handleRefactorRequest,
 } from "./patch/refactor-preview.js";
 
+// ── Execute orchestrator (shared kernel: ./patch/execute.js) ───────
+// dispatchValidatedRequest + preparePatchExecution + executePatch own the
+// execute() pipeline verbatim; patch.ts stays the stable public facade.
+// Pure move: zero logic change.
+import { executePatch } from "./patch/execute.js";
+
 // ── Patch tool factory ──────────────────────────────────────────────
 
 export function createPatchTool(deps: PatchToolDeps): PatchTool {
@@ -165,113 +171,12 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
         parameters: EDIT_PARAMETERS as unknown as Record<string, unknown>,
 
         async execute(toolCallId, params, signal, onUpdate, ctx) {
-            const stream = (text: string) => { onUpdate?.({ content: [{ type: "text", text }] }); };
-
-            // The wire payload from the model never includes toolCallId (Pi
-            // supplies it out-of-band as this function's first argument).
-            // Inject it before validating so the schema-conforming request
-            // the model actually sends can pass validation.
-            const v = validateEditRequest({ ...params, toolCallId });
-            // Refactor variants handle before generic session checks (but still validate shape via above)
-            // Refactor variants route to file-local helpers (Lane A extract-only).
-            if ((v as { ok: boolean; value?: { refactor?: { kind: string } } }).ok && (v as unknown as { value: { refactor?: { kind: string } } }).value?.refactor) {
-                // validateEditRequest accepted the payload above, so the broad wire shape narrows to RefactorRequest here.
-                const refactor = (v as unknown as { value: { refactor: RefactorRequest } }).value.refactor;
-                const handled = await handleRefactorRequest(deps, toolCallId, refactor);
-                if (handled) return handled;
-            }
-            if (!v.ok) {
-                return {
-                    content: [{ type: "text" as const, text: `invalid patch request: ${v.error}` }],
-                    details: makeRejected(toolCallId, "session", ["invalid patch request shape"], { inspectionId: "", resourceIds: [] }, freshChecks()),
-                };
-            }
-            // Preparation / transfer resolution / envelope acquisition live in
-            // file-local helpers (Lane A extract-only); orchestrator keeps the
-            // transaction begin/commit/finalize phases.
-            const prepared = preparePatchRequest({ validated: v, deps, ctx, toolCallId });
-            if (!prepared.ok) return prepared.result;
-            const requestEvidenceRef = prepared.prepared.requestEvidenceRef;
-            const sessionFilePath = prepared.prepared.sessionFilePath;
-            const canonicalRoot = prepared.prepared.canonicalRoot;
-            const groups = prepared.prepared.groups;
-            const checks: MutableChecks = prepared.prepared.checks;
-            const diagnostics: string[] = prepared.prepared.diagnostics;
-            const usedEvidence: string[] = [];
-            const totalEdits = groups.reduce((sum, g) => sum + g.edits.length, 0);
-            const fileWord = groups.length === 1 ? "file" : "files";
-            const editWord = totalEdits === 1 ? "edit" : "edits";
-            stream(`patch — ${totalEdits} ${editWord} across ${groups.length} ${fileWord}`);
-
-            const transfers = resolvePatchTransfers({ adaptedTransfers: prepared.prepared.adaptedTransfers, groups, ctx, toolCallId, requestEvidenceRef, checks });
-            if (!transfers.ok) return transfers.result;
-            const resolvedTransfers = transfers.resolvedTransfers;
-            const transferNewFileCanonicals = transfers.transferNewFileCanonicals;
-            const copySourceOnlyPaths = transfers.copySourceOnlyPaths;
-
-            const priorStore = deps.getPriorAuthority?.() ?? null;
-            const acquired = await acquirePatchEnvelope({ deps, groups, sessionFilePath, canonicalRoot, requestEvidenceRef, transferNewFileCanonicals, toolCallId, checks, diagnostics, usedEvidence, signal });
-            if (!acquired.ok) return acquired.result;
-            const envelope = acquired.envelope;
-            const autoInspected = acquired.autoInspected;
-            const evidenceRefForDetails = acquired.evidenceRefForDetails;
-            const newFileCanonicals = acquired.newFileCanonicals;
-
-            // ── Transaction lifecycle ──────────────────────────────────
-            // Begin/commit/rollback orchestration lives in
-            // ./patch/transaction-runner.js (pure move, zero logic change).
-            // The runner owns the try/finally: terminal returns inside its
-            // try still trigger its own rollback-on-not-committed finally.
-            // We validate and apply each file's edits in order. On the
-            // first failure, abort the whole batch and report.
-            const invalidations: ResourceInvalidation[] = [];
-            const postEditEvidenceByPath = new Map<string, PostEditEvidence>();
-            const repairsByPath = new Map<string, RepairLoopResult>();
-            const finalizedFiles: FinalSuccessFile[] = [];
-            const appliedFiles: string[] = [];
-            const appliedCanonical: string[] = [];
-            const appliedSummaries: string[] = [];
-            const displayDiffs: PatchDisplayDiff[] = [];
-            const state: PatchExecutionState = {
-                checks,
-                diagnostics,
-                usedEvidence,
-                invalidations,
-                postEditEvidenceByPath,
-                repairsByPath,
-                finalizedFiles,
-                appliedFiles,
-                appliedCanonical,
-                appliedSummaries,
-                displayDiffs,
-            };
-            const txResult = await runPatchTransaction({
-                deps,
-                ctx,
-                toolCallId,
-                evidenceRefForDetails,
-                canonicalRoot,
-                envelope,
-                priorStore,
-                groups,
-                resolvedTransfers,
-                copySourceOnlyPaths,
-                newFileCanonicals,
-                state,
-                stream,
-            });
-            if (!txResult.ok) return txResult.result;
-            const rollbackInfo = txResult.rollbackInfo;
-
-            return finalizeAppliedPatch({
-                deps,
-                ctx,
-                toolCallId,
-                state,
-                autoInspected,
-                evidenceRefForDetails,
-                rollbackInfo,
-            });
+            // Pipeline owned by ./patch/execute.js (dispatchValidatedRequest →
+            // preparePatchExecution → runPatchTransaction →
+            // finalizeAppliedPatch). The stream closure now builds inside
+            // executePatch; this facade only forwards the PatchInvocation.
+            // Pure move: zero logic change.
+            return executePatch(deps, { toolCallId, params, signal, onUpdate, ctx });
         },
     };
 }
