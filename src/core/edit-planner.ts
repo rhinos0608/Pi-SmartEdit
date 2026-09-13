@@ -160,342 +160,626 @@ const defaultStructuralResolver: StructuralResolver = {
   },
 };
 
-export async function planTextEdits(args: PlanTextEditsArgs): Promise<PlannedTextEdits> {
-  // Classify edits into text / symbolic / structural before any matching.
-  const textEdits: EditItem[] = [];
-  const textOriginalIndex: number[] = [];
-  const symbolicEdits: EditItem[] = [];
-  const symbolicOriginalIndex: number[] = [];
-  const structuralEdits: EditItem[] = [];
-  const structuralOriginalIndex: number[] = [];
-  const hashlineEdits: EditItem[] = [];
-  const hashlineOriginalIndex: number[] = [];
+/** Classified edit buckets with index alignment into the original edits array. */
+interface ClassifiedEdits {
+  textEdits: EditItem[];
+  textOriginalIndex: number[];
+  symbolicEdits: EditItem[];
+  symbolicOriginalIndex: number[];
+  structuralEdits: EditItem[];
+  structuralOriginalIndex: number[];
+  hashlineEdits: EditItem[];
+  hashlineOriginalIndex: number[];
+}
 
-  for (let i = 0; i < args.edits.length; i++) {
-    const e = args.edits[i];
-    if (e.hashline) {
-      hashlineEdits.push(e);
-      hashlineOriginalIndex.push(i);
-      continue;
-    }
-    const t = e.target;
-    const isSymbolic =
-      !!t &&
-      (t.replaceBody !== undefined || t.insertBefore !== undefined || t.insertAfter !== undefined);
-    const isStructural = !!t && t.pattern !== undefined;
-    if (isSymbolic && isStructural) {
-      throw new Error(`edits[${i}] cannot be both symbolic and structural`);
-    }
-    if (isSymbolic) {
-      symbolicEdits.push(e);
-      symbolicOriginalIndex.push(i);
-    } else if (isStructural) {
-      structuralEdits.push(e);
-      structuralOriginalIndex.push(i);
-    } else {
-      if (typeof e.oldText !== "string" || typeof e.newText !== "string") {
-        throw new Error(`edits[${i}] missing oldText/newText`);
-      }
-      textEdits.push(e);
-      textOriginalIndex.push(i);
-    }
+/** LF-normalized snapshot with BOM/line-ending preservation metadata. */
+interface NormalizedSnapshot {
+  bom: string;
+  normalized: string;
+  lineEnding: string;
+}
+
+/** Resolved explicit scopes, index-aligned with each classified bucket. */
+interface ResolvedScopes {
+  textScopes: (SearchScope | undefined)[];
+  symbolicScopes: (SearchScope | undefined)[];
+  structuralScopes: (SearchScope | undefined)[];
+  hashlineScopes: (SearchScope | undefined)[];
+}
+
+/** One batch contribution: mutations plus engine spans/notes. */
+interface BatchMutations {
+  mutations: ResolvedMutation[];
+  matchSpans: MatchSpan[];
+  matchNotes: string[];
+}
+
+/** Split mixed operations into text/symbolic/structural/hashline buckets. */
+function classifyEdits(edits: EditItem[]): ClassifiedEdits {
+  const classified: ClassifiedEdits = {
+    textEdits: [],
+    textOriginalIndex: [],
+    symbolicEdits: [],
+    symbolicOriginalIndex: [],
+    structuralEdits: [],
+    structuralOriginalIndex: [],
+    hashlineEdits: [],
+    hashlineOriginalIndex: [],
+  };
+  for (let i = 0; i < edits.length; i++) {
+    classifyOneEdit(edits[i], i, classified);
   }
+  return classified;
+}
 
-  const { bom, text } = stripBom(args.content);
-  const normalized = normalizeToLF(text);
-  const lineEnding = detectLineEnding(args.content);
+/** Route one operation into its bucket; validates text/symbolic shape. */
+function classifyOneEdit(edit: EditItem, index: number, classified: ClassifiedEdits): void {
+  if (edit.hashline) {
+    classified.hashlineEdits.push(edit);
+    classified.hashlineOriginalIndex.push(index);
+    return;
+  }
+  const t = edit.target;
+  if (isSymbolicTarget(t) && isStructuralTarget(t)) {
+    throw new Error(`edits[${index}] cannot be both symbolic and structural`);
+  }
+  if (isSymbolicTarget(t)) {
+    classified.symbolicEdits.push(edit);
+    classified.symbolicOriginalIndex.push(index);
+  } else if (isStructuralTarget(t)) {
+    classified.structuralEdits.push(edit);
+    classified.structuralOriginalIndex.push(index);
+  } else {
+    requireTextShape(edit, index);
+    classified.textEdits.push(edit);
+    classified.textOriginalIndex.push(index);
+  }
+}
 
-  // Resolve explicit scopes (AST target and/or lineRange) for text and
-  // structural edits. An explicit scope never falls back to whole-file.
-  const textScopes: (SearchScope | undefined)[] = [];
-  for (let i = 0; i < textEdits.length; i++) {
-    textScopes.push(
-      await resolveEditScope(textEdits[i], normalized, args.filePath, args.astResolver, textOriginalIndex[i]),
+/** True when the target carries a symbolic operation field. */
+function isSymbolicTarget(t: EditItem["target"]): boolean {
+  return !!t
+    && (t.replaceBody !== undefined || t.insertBefore !== undefined || t.insertAfter !== undefined);
+}
+
+/** True when the target carries a structural pattern field. */
+function isStructuralTarget(t: EditItem["target"]): boolean {
+  return !!t && t.pattern !== undefined;
+}
+
+/** Reject a text-routed operation missing its required payload. */
+function requireTextShape(edit: EditItem, index: number): void {
+  if (typeof edit.oldText !== "string" || typeof edit.newText !== "string") {
+    throw new Error(`edits[${index}] missing oldText/newText`);
+  }
+}
+
+/** Strip BOM, normalize to LF, and capture restoration metadata. */
+function snapshotContent(content: string): NormalizedSnapshot {
+  const { bom, text } = stripBom(content);
+  return { bom, normalized: normalizeToLF(text), lineEnding: detectLineEnding(content) };
+}
+
+/** Resolve one bucket's explicit scopes in order. */
+async function resolveScopeBucket(
+  bucket: EditItem[],
+  originalIndex: number[],
+  normalized: string,
+  filePath: string,
+  astResolver: AstResolverLike | null,
+): Promise<(SearchScope | undefined)[]> {
+  const scopes: (SearchScope | undefined)[] = [];
+  for (let i = 0; i < bucket.length; i++) {
+    scopes.push(await resolveEditScope(bucket[i], normalized, filePath, astResolver, originalIndex[i]));
+  }
+  return scopes;
+}
+
+/** Resolve explicit scopes for every bucket; explicit scopes never fall back. */
+async function resolveAllScopes(
+  classified: ClassifiedEdits,
+  normalized: string,
+  filePath: string,
+  astResolver: AstResolverLike | null,
+): Promise<ResolvedScopes> {
+  return {
+    textScopes: await resolveScopeBucket(
+      classified.textEdits,
+      classified.textOriginalIndex,
+      normalized,
+      filePath,
+      astResolver,
+    ),
+    symbolicScopes: await resolveScopeBucket(
+      classified.symbolicEdits,
+      classified.symbolicOriginalIndex,
+      normalized,
+      filePath,
+      astResolver,
+    ),
+    structuralScopes: await resolveScopeBucket(
+      classified.structuralEdits,
+      classified.structuralOriginalIndex,
+      normalized,
+      filePath,
+      astResolver,
+    ),
+    hashlineScopes: await resolveScopeBucket(
+      classified.hashlineEdits,
+      classified.hashlineOriginalIndex,
+      normalized,
+      filePath,
+      astResolver,
+    ),
+  };
+}
+
+/** True when a resolved span escapes its explicit scope (no scope = unconstrained). */
+function spanOutsideScope(
+  scope: SearchScope | undefined,
+  startByte: number,
+  endByte: number,
+): boolean {
+  return !!scope && (startByte < scope.startIndex || endByte > scope.endIndex);
+}
+
+/** Throw when a resolved span escapes its explicit scope; a missing scope never throws. */
+function assertSpanInScope(
+  scope: SearchScope | undefined,
+  startByte: number,
+  endByte: number,
+  editRef: number,
+  kind: string,
+  filePath: string,
+): void {
+  if (spanOutsideScope(scope, startByte, endByte)) {
+    throw new Error(
+      `edits[${editRef}] ${kind} span [${startByte},${endByte}) falls outside the explicit scope (${scope?.description}) in ${filePath}`,
     );
   }
-  const symbolicScopes: (SearchScope | undefined)[] = [];
+}
+
+/** Rethrow a text-batch failure unless it is a no-change tolerated by other buckets. */
+function throwUnlessToleratedTextNoChange(err: unknown, hasOtherEdits: boolean): void {
+  const msg = err instanceof Error ? err.message : String(err);
+  const isNoChange = /^No changes made to/.test(msg);
+  // A text-only no-change is a real failure; but when symbolic/structural
+  // or hashline edits are present, a no-op text batch must not abort the
+  // whole plan.
+  if (isNoChange && hasOtherEdits) return;
+  throw err;
+}
+
+/** Plan the text bucket via the applyEdits engine. A no-op text batch is
+ * tolerated only when another bucket may still produce the change; a
+ * text-only no-change is a real failure. */
+async function collectTextMutations(
+  normalized: string,
+  filePath: string,
+  textEdits: EditItem[],
+  textScopes: (SearchScope | undefined)[],
+  textOriginalIndex: number[],
+  hasOtherEdits: boolean,
+): Promise<BatchMutations> {
+  const batch: BatchMutations = { mutations: [], matchSpans: [], matchNotes: [] };
+  if (textEdits.length === 0) return batch;
+  let textResult: {
+    baseContent: string;
+    newContent: string;
+    matchNotes: string[];
+    replacementCount: number;
+    matchSpans: MatchSpan[];
+  };
+  try {
+    textResult = await applyEdits(normalized, textEdits, filePath, {
+      searchScopes: textScopes,
+    });
+  } catch (err) {
+    throwUnlessToleratedTextNoChange(err, hasOtherEdits);
+    return batch;
+  }
+  for (const span of textResult.matchSpans) {
+    batch.mutations.push({
+      startByte: span.matchIndex,
+      endByte: span.matchIndex + span.matchLength,
+      replacement: span.newText,
+      requestIndex: textOriginalIndex[span.editIndex],
+      capability: "oldText",
+      note: span.matchNote,
+    });
+    batch.matchSpans.push({ ...span, editIndex: textOriginalIndex[span.editIndex] });
+  }
+  for (const note of textResult.matchNotes) batch.matchNotes.push(note);
+  return batch;
+}
+
+/** Symbolic operation selected from a validated target (replace wins over inserts). */
+type SymbolicOp = "replaceBody" | "insertBefore" | "insertAfter";
+
+/** Pick the symbolic operation from its target shape. */
+function symbolicOpOf(t: NonNullable<EditItem["target"]>): SymbolicOp {
+  if (t.replaceBody !== undefined) return "replaceBody";
+  return t.insertBefore !== undefined ? "insertBefore" : "insertAfter";
+}
+
+/** Derive the true mutation span: whole symbol for replace, zero-length
+ * insert position for insertBefore/insertAfter. */
+function symbolicSpanOf(
+  op: SymbolicOp,
+  applied: { startIndex: number; endIndex: number },
+): { startByte: number; endByte: number } {
+  // applySymbolicEdits reports the whole symbol span in matchSpans even for
+  // inserts; derive the true zero-length insert position from `applied`.
+  const startByte =
+    op === "replaceBody" ? applied.startIndex : op === "insertAfter" ? applied.endIndex : applied.startIndex;
+  return { startByte, endByte: op === "replaceBody" ? applied.endIndex : startByte };
+}
+
+/** Resolve one symbolic edit to its mutation plus engine span. */
+async function resolveSymbolicMutation(
+  normalized: string,
+  filePath: string,
+  astResolver: AstResolverLike | null,
+  edit: EditItem,
+  scope: SearchScope | undefined,
+  editRef: number,
+): Promise<{ mutation: ResolvedMutation; span: MatchSpan }> {
+  const t = edit.target;
+  if (!t) {
+    throw new Error(`edits[${editRef}] symbolic edit requires a target`);
+  }
+  const op = symbolicOpOf(t);
+  const body = t[op];
+  if (typeof body !== "string") {
+    throw new Error(`edits[${editRef}] ${op} must be a string`);
+  }
+  const symbolicResult = await applySymbolicEdits({
+    content: normalized,
+    filePath,
+    astResolver: astResolver as never,
+    edits: [{ editIdx: editRef, target: t }],
+  });
+  const applied = symbolicResult.applied[0];
+  // Guard a missing applied entry: the engine reported success but resolved
+  // no span (e.g. an out-of-scope or malformed symbol). Fail with an
+  // actionable diagnostic instead of a TypeError on `applied.startIndex`.
+  if (!applied) {
+    throw new Error(
+      `edits[${editRef}] symbolic ${op} produced no applied span in ${filePath}`,
+    );
+  }
+  // applySymbolicEdits reports the whole symbol span in matchSpans even for
+  // inserts; derive the true zero-length insert position from `applied`.
+  const { startByte, endByte } = symbolicSpanOf(op, applied);
+  assertSpanInScope(scope, startByte, endByte, editRef, `symbolic ${op}`, filePath);
+  const replacement = normalizeToLF(body);
+  const note = `symbolic ${op} on ${applied.symbolName}`;
+  return {
+    mutation: {
+      startByte,
+      endByte,
+      replacement,
+      requestIndex: editRef,
+      capability: "symbolicEdit",
+      note,
+    },
+    span: {
+      editIndex: editRef,
+      matchIndex: startByte,
+      matchLength: endByte - startByte,
+      newText: replacement,
+      tier: "exact" as MatchSpan["tier"],
+      replaceAll: false,
+      matchNote: note,
+    },
+  };
+}
+
+/** Plan the symbolic bucket, resolving each edit independently so
+ * same-position zero-length inserts are not rejected by the engine's
+ * cross-edit overlap check; the unified applyMutations below owns
+ * overlap/ordering. */
+async function collectSymbolicMutations(
+  normalized: string,
+  filePath: string,
+  astResolver: AstResolverLike | null,
+  symbolicEdits: EditItem[],
+  symbolicScopes: (SearchScope | undefined)[],
+  symbolicOriginalIndex: number[],
+): Promise<BatchMutations> {
+  const batch: BatchMutations = { mutations: [], matchSpans: [], matchNotes: [] };
   for (let i = 0; i < symbolicEdits.length; i++) {
-    symbolicScopes.push(
-      await resolveEditScope(symbolicEdits[i], normalized, args.filePath, args.astResolver, symbolicOriginalIndex[i]),
+    const { mutation, span } = await resolveSymbolicMutation(
+      normalized,
+      filePath,
+      astResolver,
+      symbolicEdits[i],
+      symbolicScopes[i],
+      symbolicOriginalIndex[i],
+    );
+    batch.mutations.push(mutation);
+    batch.matchSpans.push(span);
+  }
+  return batch;
+}
+
+/** Validate a structural target into its pattern/replacement strings. */
+function requireStructuralPayload(
+  t: EditItem["target"],
+  editRef: number,
+): { pattern: string; replacement: string } {
+  if (!t) {
+    throw new Error(`edits[${editRef}] structural edit requires a target`);
+  }
+  const pattern = t.pattern;
+  const replacement = t.replacement;
+  if (typeof pattern !== "string" || typeof replacement !== "string") {
+    throw new Error(
+      `edits[${editRef}] structural edit requires pattern and replacement`,
     );
   }
-  const structuralScopes: (SearchScope | undefined)[] = [];
+  return { pattern, replacement };
+}
+
+/** Keep only resolved spans inside the explicit scope (no scope = unconstrained). */
+function filterStructuralToScope<T extends { startByte: number; endByte: number }>(
+  edits: readonly T[] | undefined,
+  scope: SearchScope | undefined,
+): T[] {
+  return (edits ?? []).filter(
+    (resolved) => !scope
+      || (resolved.startByte >= scope.startIndex && resolved.endByte <= scope.endIndex),
+  );
+}
+
+/** Throw when a structural pattern matched nothing (naming the scope when present). */
+function requireStructuralMatches<T>(
+  resolvedEdits: T[],
+  pattern: string,
+  scope: SearchScope | undefined,
+  editRef: number,
+  filePath: string,
+): T[] {
+  if (resolvedEdits.length === 0) {
+    const scopeDetail = scope ? ` within explicit scope (${scope.description})` : "";
+    throw new Error(
+      `edits[${editRef}] structural pattern "${pattern}" matched nothing${scopeDetail} in ${filePath}`,
+    );
+  }
+  return resolvedEdits;
+}
+
+/** Plan one structural edit: resolve via ast-grep, filter to the explicit scope. */
+async function collectOneStructuralMutation(
+  batch: BatchMutations,
+  normalized: string,
+  filePath: string,
+  resolver: StructuralResolver,
+  edit: EditItem,
+  scope: SearchScope | undefined,
+  editRef: number,
+): Promise<void> {
+  const { pattern, replacement } = requireStructuralPayload(edit.target, editRef);
+  const result = await resolver.resolve(normalized, filePath, pattern, replacement);
+  if (!result.ok) {
+    throw new Error(
+      `edits[${editRef}] structural edit failed: ${result.error ?? "unknown error"}`,
+    );
+  }
+  const resolvedEdits = requireStructuralMatches(
+    filterStructuralToScope(result.edits, scope),
+    pattern,
+    scope,
+    editRef,
+    filePath,
+  );
+  for (const e of resolvedEdits) {
+    batch.mutations.push({
+      startByte: e.startByte,
+      endByte: e.endByte,
+      replacement: normalizeToLF(e.text),
+      requestIndex: editRef,
+      capability: "astGrepAnchor",
+    });
+    batch.matchSpans.push({
+      editIndex: editRef,
+      matchIndex: e.startByte,
+      matchLength: Math.max(e.endByte - e.startByte, 0),
+      newText: normalizeToLF(e.text),
+      tier: "exact" as MatchSpan["tier"],
+      replaceAll: false,
+      matchNote: `structural pattern "${pattern}"`,
+    });
+  }
+}
+
+/** Plan the structural bucket via the ast-grep resolver, scoped per edit. */
+async function collectStructuralMutations(
+  normalized: string,
+  filePath: string,
+  resolver: StructuralResolver,
+  structuralEdits: EditItem[],
+  structuralScopes: (SearchScope | undefined)[],
+  structuralOriginalIndex: number[],
+): Promise<BatchMutations> {
+  const batch: BatchMutations = { mutations: [], matchSpans: [], matchNotes: [] };
   for (let i = 0; i < structuralEdits.length; i++) {
-    structuralScopes.push(
-      await resolveEditScope(structuralEdits[i], normalized, args.filePath, args.astResolver, structuralOriginalIndex[i]),
+    await collectOneStructuralMutation(
+      batch,
+      normalized,
+      filePath,
+      resolver,
+      structuralEdits[i],
+      structuralScopes[i],
+      structuralOriginalIndex[i],
     );
   }
-  const hashlineScopes: (SearchScope | undefined)[] = [];
+  return batch;
+}
+
+/** Adapter: applyHashlinePath passes a scope without the `source` field; findText
+ * only reads startIndex/endIndex/description, so adapt with a cast. */
+function makeHashlineFindText(): (
+  content: string,
+  oldText: string,
+  indentStyle: { char: "\t" | " "; width: number },
+  startOffset?: number,
+  scope?: { startIndex: number; endIndex: number; description: string },
+) => {
+  found: boolean;
+  index: number;
+  matchLength: number;
+  tier: string;
+  usedFuzzyMatch: boolean;
+  matchedText: string;
+  matchNote?: string;
+} {
+  return (content, oldText, indentStyle, startOffset?, scope?) =>
+    findText(content, oldText, indentStyle, startOffset, scope as SearchScope | undefined);
+}
+
+/** Adapter: resolve an anchor to a plain index range for the hashline path. */
+function makeHashlineScopeResolver(
+  filePath: string,
+  astResolver: AstResolverLike | null,
+): (
+  anchor: EditAnchor,
+  content: string,
+  path: string,
+) => Promise<{ startIndex: number; endIndex: number; description: string } | null> {
+  return async (anchor, content, _path) => {
+    const scope = await resolveAnchorToScope(
+      { anchor } as EditItem,
+      content,
+      filePath,
+      astResolver,
+    );
+    return scope
+      ? { startIndex: scope.startIndex, endIndex: scope.endIndex, description: scope.description }
+      : null;
+  };
+}
+
+/** Plan one hashline edit against the immutable snapshot into its actual changed span. */
+async function collectOneHashlineMutation(
+  batch: BatchMutations,
+  normalized: string,
+  filePath: string,
+  findTextFn: ReturnType<typeof makeHashlineFindText>,
+  resolveScopeFn: ReturnType<typeof makeHashlineScopeResolver>,
+  getSnapshot: (path: string) => FileSnapshot | null,
+  edit: EditItem,
+  scope: SearchScope | undefined,
+  editRef: number,
+): Promise<void> {
+  const h = edit.hashline;
+  if (!h) return;
+  const input: HashlineEditInput = {
+    anchor: { range: h.range, symbol: h.symbol },
+    content: h.content ?? null,
+  };
+  const snapshot = getSnapshot(filePath);
+  const result = await applyHashlinePath(
+    input,
+    normalized,
+    snapshot,
+    resolveScopeFn,
+    findTextFn,
+    detectIndentation,
+  );
+  const { startByte, endByte, replacement } = computeChangedSpan(normalized, result.newContent);
+  // A hashline whose target already matches (no before/after change) is a
+  // no-op: skip its mutation/span so it cannot inject an empty insert into
+  // the overlap check or mislead coverage in a mixed batch. When it is the
+  // only edit the final no-changes guard reports the no-op.
+  if (startByte === endByte && replacement === "") return;
+  assertSpanInScope(scope, startByte, endByte, editRef, `hashline ${result.tier}`, filePath);
+  batch.mutations.push({
+    startByte,
+    endByte,
+    replacement,
+    requestIndex: editRef,
+    capability: "hashline",
+    note: `hashline ${result.tier}${result.warnings.length ? ` (${result.warnings.join("; ")})` : ""}`,
+  });
+  batch.matchSpans.push({
+    editIndex: editRef,
+    matchIndex: startByte,
+    matchLength: endByte - startByte,
+    newText: replacement,
+    tier: "exact" as MatchSpan["tier"],
+    replaceAll: false,
+    matchNote: `hashline ${result.tier}`,
+  });
+  for (const w of result.warnings) batch.matchNotes.push(w);
+}
+
+/** Plan the hashline bucket: each edit resolves against the immutable
+ * LF-normalized snapshot into one ResolvedMutation span (the actual changed
+ * region), so mixed batches share overlap rejection, descending application,
+ * BOM+CRLF preservation, and preimage range authorization. The fallback's
+ * actual changed span is derived from the before/after content, so a stale
+ * hashline fallback can never broaden a selected prior line-range authority
+ * beyond its real changed region. */
+async function collectHashlineMutations(
+  normalized: string,
+  filePath: string,
+  astResolver: AstResolverLike | null,
+  getSnapshot: (path: string) => FileSnapshot | null,
+  hashlineEdits: EditItem[],
+  hashlineScopes: (SearchScope | undefined)[],
+  hashlineOriginalIndex: number[],
+): Promise<BatchMutations> {
+  const batch: BatchMutations = { mutations: [], matchSpans: [], matchNotes: [] };
+  if (hashlineEdits.length === 0) return batch;
+  const findTextFn = makeHashlineFindText();
+  const resolveScopeFn = makeHashlineScopeResolver(filePath, astResolver);
   for (let i = 0; i < hashlineEdits.length; i++) {
-    hashlineScopes.push(
-      await resolveEditScope(hashlineEdits[i], normalized, args.filePath, args.astResolver, hashlineOriginalIndex[i]),
+    await collectOneHashlineMutation(
+      batch,
+      normalized,
+      filePath,
+      findTextFn,
+      resolveScopeFn,
+      getSnapshot,
+      hashlineEdits[i],
+      hashlineScopes[i],
+      hashlineOriginalIndex[i],
     );
   }
+  return batch;
+}
 
-  const mutations: ResolvedMutation[] = [];
-  const matchSpans: MatchSpan[] = [];
-  const matchNotes: string[] = [];
+/** Capability ledger: one entry per bucket present, plus replaceAll/astAnchor flags. */
+function collectCapabilities(allEdits: EditItem[], classified: ClassifiedEdits): EditCapability[] {
+  const capabilities: EditCapability[] = [];
+  if (classified.textEdits.length > 0) capabilities.push("oldText");
+  if (allEdits.some((e) => e.replaceAll)) capabilities.push("replaceAll");
+  if (allEdits.some((e) => e.target)) capabilities.push("astAnchor");
+  if (classified.symbolicEdits.length > 0) capabilities.push("symbolicEdit");
+  if (classified.structuralEdits.length > 0) capabilities.push("astGrepAnchor");
+  if (classified.hashlineEdits.length > 0) capabilities.push("hashline");
+  return capabilities;
+}
 
-  // ── Text edits: reuse applyEdits matchSpans ────────────────────────
-  if (textEdits.length > 0) {
-    let textResult: {
-      baseContent: string;
-      newContent: string;
-      matchNotes: string[];
-      replacementCount: number;
-      matchSpans: MatchSpan[];
-    };
-    try {
-      textResult = await applyEdits(normalized, textEdits, args.filePath, {
-        searchScopes: textScopes,
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const isNoChange = /^No changes made to/.test(msg);
-      // A text-only no-change is a real failure; but when symbolic/structural
-      // or hashline edits are present, a no-op text batch must not abort the
-      // whole plan.
-      if (
-        isNoChange
-        && (symbolicEdits.length > 0 || structuralEdits.length > 0 || hashlineEdits.length > 0)
-      ) {
-        textResult = {
-          baseContent: normalized,
-          newContent: normalized,
-          matchNotes: [],
-          replacementCount: 0,
-          matchSpans: [],
-        };
-      } else {
-        throw err;
-      }
-    }
-    for (const span of textResult.matchSpans) {
-      mutations.push({
-        startByte: span.matchIndex,
-        endByte: span.matchIndex + span.matchLength,
-        replacement: span.newText,
-        requestIndex: textOriginalIndex[span.editIndex],
-        capability: "oldText",
-        note: span.matchNote,
-      });
-      matchSpans.push({ ...span, editIndex: textOriginalIndex[span.editIndex] });
-    }
-    for (const note of textResult.matchNotes) matchNotes.push(note);
-  }
-
-  // ── Symbolic edits: reuse applySymbolicEdits resolution ────────────
-  // Resolve each symbolic edit independently so same-position zero-length
-  // inserts are not rejected by the engine's cross-edit overlap check; the
-  // unified applyMutations below owns overlap/ordering.
-  if (symbolicEdits.length > 0) {
-    for (let i = 0; i < symbolicEdits.length; i++) {
-      const edit = symbolicEdits[i];
-      const t = edit.target;
-      if (!t) {
-        throw new Error(`edits[${symbolicOriginalIndex[i]}] symbolic edit requires a target`);
-      }
-      const op =
-        t.replaceBody !== undefined
-          ? "replaceBody"
-          : t.insertBefore !== undefined
-            ? "insertBefore"
-            : "insertAfter";
-      const body = t[op];
-      if (typeof body !== "string") {
-        throw new Error(`edits[${symbolicOriginalIndex[i]}] ${op} must be a string`);
-      }
-      const symbolicResult = await applySymbolicEdits({
-        content: normalized,
-        filePath: args.filePath,
-        astResolver: args.astResolver as never,
-        edits: [{ editIdx: symbolicOriginalIndex[i], target: t }],
-      });
-      const applied = symbolicResult.applied[0];
-      // Guard a missing applied entry: the engine reported success but resolved
-      // no span (e.g. an out-of-scope or malformed symbol). Fail with an
-      // actionable diagnostic instead of a TypeError on `applied.startIndex`.
-      if (!applied) {
-        throw new Error(
-          `edits[${symbolicOriginalIndex[i]}] symbolic ${op} produced no applied span in ${args.filePath}`,
-        );
-      }
-      // applySymbolicEdits reports the whole symbol span in matchSpans even for
-      // inserts; derive the true zero-length insert position from `applied`.
-      const startByte =
-        op === "replaceBody" ? applied.startIndex : op === "insertAfter" ? applied.endIndex : applied.startIndex;
-      const endByte = op === "replaceBody" ? applied.endIndex : startByte;
-      const scope = symbolicScopes[i];
-      if (scope && (startByte < scope.startIndex || endByte > scope.endIndex)) {
-        throw new Error(
-          `edits[${symbolicOriginalIndex[i]}] symbolic ${op} span [${startByte},${endByte}) falls outside the explicit scope (${scope.description}) in ${args.filePath}`,
-        );
-      }
-      const replacement = normalizeToLF(body);
-      mutations.push({
-        startByte,
-        endByte,
-        replacement,
-        requestIndex: symbolicOriginalIndex[i],
-        capability: "symbolicEdit",
-        note: `symbolic ${op} on ${applied.symbolName}`,
-      });
-      matchSpans.push({
-        editIndex: symbolicOriginalIndex[i],
-        matchIndex: startByte,
-        matchLength: endByte - startByte,
-        newText: replacement,
-        tier: "exact" as MatchSpan["tier"],
-        replaceAll: false,
-        matchNote: `symbolic ${op} on ${applied.symbolName}`,
-      });
-    }
-  }
-
-  // ── Structural edits: reuse ast-grep resolution, scoped ────────────
-  if (structuralEdits.length > 0) {
-    const resolver = args.structuralResolver ?? defaultStructuralResolver;
-    for (let i = 0; i < structuralEdits.length; i++) {
-      const edit = structuralEdits[i];
-      const t = edit.target;
-      if (!t) {
-        throw new Error(`edits[${structuralOriginalIndex[i]}] structural edit requires a target`);
-      }
-      const pattern = t.pattern;
-      const replacement = t.replacement;
-      if (typeof pattern !== "string" || typeof replacement !== "string") {
-        throw new Error(
-          `edits[${structuralOriginalIndex[i]}] structural edit requires pattern and replacement`,
-        );
-      }
-      const scope = structuralScopes[i];
-      const result = await resolver.resolve(normalized, args.filePath, pattern, replacement);
-      if (!result.ok) {
-        throw new Error(
-          `edits[${structuralOriginalIndex[i]}] structural edit failed: ${result.error ?? "unknown error"}`,
-        );
-      }
-      const resolvedEdits = (result.edits ?? []).filter(
-        (resolved) => !scope
-          || (resolved.startByte >= scope.startIndex && resolved.endByte <= scope.endIndex),
-      );
-      if (resolvedEdits.length === 0) {
-        const scopeDetail = scope ? ` within explicit scope (${scope.description})` : "";
-        throw new Error(
-          `edits[${structuralOriginalIndex[i]}] structural pattern "${pattern}" matched nothing${scopeDetail} in ${args.filePath}`,
-        );
-      }
-      for (const e of resolvedEdits) {
-        mutations.push({
-          startByte: e.startByte,
-          endByte: e.endByte,
-          replacement: normalizeToLF(e.text),
-          requestIndex: structuralOriginalIndex[i],
-          capability: "astGrepAnchor",
-        });
-        matchSpans.push({
-          editIndex: structuralOriginalIndex[i],
-          matchIndex: e.startByte,
-          matchLength: Math.max(e.endByte - e.startByte, 0),
-          newText: normalizeToLF(e.text),
-          tier: "exact" as MatchSpan["tier"],
-          replaceAll: false,
-          matchNote: `structural pattern "${t.pattern}"`,
-        });
-      }
-    }
-  }
-
-  // ── Hashline edits: reuse applyHashlinePath routing ────────────────
-  // Each hashline edit resolves against the immutable LF-normalized snapshot
-  // into one ResolvedMutation span (the actual changed region), so mixed
-  // hashline/text/symbolic/structural batches share overlap rejection,
-  // descending application, BOM+CRLF preservation, and preimage range
-  // authorization. The fallback's actual changed span is derived from the
-  // before/after content, so a stale hashline fallback can never broaden a
-  // selected prior line-range authority beyond its real changed region.
-  if (hashlineEdits.length > 0) {
-    const getSnapshot = args.getSnapshot ?? (() => null);
-    // applyHashlinePath passes a scope without the `source` field; findText
-    // only reads startIndex/endIndex/description, so adapt with a cast.
-    const findTextFn = (
-      content: string,
-      oldText: string,
-      indentStyle: { char: "\t" | " "; width: number },
-      startOffset?: number,
-      scope?: { startIndex: number; endIndex: number; description: string },
-    ) => findText(content, oldText, indentStyle, startOffset, scope as SearchScope | undefined);
-    const resolveScopeFn = async (
-      anchor: EditAnchor,
-      content: string,
-      _path: string,
-    ): Promise<{ startIndex: number; endIndex: number; description: string } | null> => {
-      const scope = await resolveAnchorToScope(
-        { anchor } as EditItem,
-        content,
-        args.filePath,
-        args.astResolver,
-      );
-      return scope
-        ? { startIndex: scope.startIndex, endIndex: scope.endIndex, description: scope.description }
-        : null;
-    };
-    for (let i = 0; i < hashlineEdits.length; i++) {
-      const edit = hashlineEdits[i];
-      const h = edit.hashline;
-      if (!h) continue;
-      const input: HashlineEditInput = {
-        anchor: { range: h.range, symbol: h.symbol },
-        content: h.content ?? null,
-      };
-      const snapshot = getSnapshot(args.filePath);
-      const result = await applyHashlinePath(
-        input,
-        normalized,
-        snapshot,
-        resolveScopeFn,
-        findTextFn,
-        detectIndentation,
-      );
-      const { startByte, endByte, replacement } = computeChangedSpan(normalized, result.newContent);
-      // A hashline whose target already matches (no before/after change) is a
-      // no-op: skip its mutation/span so it cannot inject an empty insert into
-      // the overlap check or mislead coverage in a mixed batch. When it is the
-      // only edit the final no-changes guard reports the no-op.
-      if (startByte === endByte && replacement === "") continue;
-      const scope = hashlineScopes[i];
-      if (scope && (startByte < scope.startIndex || endByte > scope.endIndex)) {
-        throw new Error(
-          `edits[${hashlineOriginalIndex[i]}] hashline ${result.tier} span [${startByte},${endByte}) falls outside the explicit scope (${scope.description}) in ${args.filePath}`,
-        );
-      }
-      mutations.push({
-        startByte,
-        endByte,
-        replacement,
-        requestIndex: hashlineOriginalIndex[i],
-        capability: "hashline",
-        note: `hashline ${result.tier}${result.warnings.length ? ` (${result.warnings.join("; ")})` : ""}`,
-      });
-      matchSpans.push({
-        editIndex: hashlineOriginalIndex[i],
-        matchIndex: startByte,
-        matchLength: endByte - startByte,
-        newText: replacement,
-        tier: "exact" as MatchSpan["tier"],
-        replaceAll: false,
-        matchNote: `hashline ${result.tier}`,
-      });
-      for (const w of result.warnings) matchNotes.push(w);
-    }
-  }
-
+/** Splice mutations, restore BOM/CRLF, and map pre/post line ranges. */
+function finalizePlan(
+  normalized: string,
+  lineEnding: string,
+  bom: string,
+  filePath: string,
+  allEdits: EditItem[],
+  classified: ClassifiedEdits,
+  mutations: ResolvedMutation[],
+  matchSpans: MatchSpan[],
+  matchNotes: string[],
+): PlannedTextEdits {
   // ── Unified overlap check + descending apply against the snapshot ──
-  const newContentNormalized = applyMutations(normalized, mutations, args.filePath);
+  const newContentNormalized = applyMutations(normalized, mutations, filePath);
 
   if (newContentNormalized === normalized) {
     throw new Error(
-      `No changes made to ${args.filePath}. The replacements produced identical content.`,
+      `No changes made to ${filePath}. The replacements produced identical content.`,
     );
   }
 
@@ -521,22 +805,103 @@ export async function planTextEdits(args: PlanTextEditsArgs): Promise<PlannedTex
   const postNewlineOffsets = buildNewlineOffsets(newContentNormalized);
   const postimageLineRanges = computePostimageLineRanges(mutations, postNewlineOffsets);
 
-  const capabilities: EditCapability[] = [];
-  if (textEdits.length > 0) capabilities.push("oldText");
-  if (args.edits.some((e) => e.replaceAll)) capabilities.push("replaceAll");
-  if (args.edits.some((e) => e.target)) capabilities.push("astAnchor");
-  if (symbolicEdits.length > 0) capabilities.push("symbolicEdit");
-  if (structuralEdits.length > 0) capabilities.push("astGrepAnchor");
-  if (hashlineEdits.length > 0) capabilities.push("hashline");
-
   return {
     newContent,
     matchSpans,
     preimageLineRanges,
     postimageLineRanges,
     matchNotes,
-    capabilities,
+    capabilities: collectCapabilities(allEdits, classified),
   };
+}
+
+export async function planTextEdits(args: PlanTextEditsArgs): Promise<PlannedTextEdits> {
+  // Classify edits into text / symbolic / structural before any matching.
+  const classified = classifyEdits(args.edits);
+  const { textEdits, textOriginalIndex } = classified;
+  const { symbolicEdits, symbolicOriginalIndex } = classified;
+  const { structuralEdits, structuralOriginalIndex } = classified;
+  const { hashlineEdits, hashlineOriginalIndex } = classified;
+
+  const snapshot = snapshotContent(args.content);
+  const bom = snapshot.bom;
+  const normalized = snapshot.normalized;
+  const lineEnding = snapshot.lineEnding;
+
+  // Resolve explicit scopes (AST target and/or lineRange) for text and
+  // structural edits. An explicit scope never falls back to whole-file.
+  const scopes = await resolveAllScopes(classified, normalized, args.filePath, args.astResolver);
+  const textScopes = scopes.textScopes;
+  const symbolicScopes = scopes.symbolicScopes;
+  const structuralScopes = scopes.structuralScopes;
+  const hashlineScopes = scopes.hashlineScopes;
+
+  const mutations: ResolvedMutation[] = [];
+  const matchSpans: MatchSpan[] = [];
+  const matchNotes: string[] = [];
+
+  // ── Batch planning: each bucket resolves against the immutable LF-normalized
+  // snapshot; the unified apply in finalizePlan owns overlap rejection and ordering ──
+  const hasOtherEdits =
+    symbolicEdits.length > 0 || structuralEdits.length > 0 || hashlineEdits.length > 0;
+  const textBatch = await collectTextMutations(
+    normalized,
+    args.filePath,
+    textEdits,
+    textScopes,
+    textOriginalIndex,
+    hasOtherEdits,
+  );
+  mutations.push(...textBatch.mutations);
+  matchSpans.push(...textBatch.matchSpans);
+  matchNotes.push(...textBatch.matchNotes);
+
+  const symbolicBatch = await collectSymbolicMutations(
+    normalized,
+    args.filePath,
+    args.astResolver,
+    symbolicEdits,
+    symbolicScopes,
+    symbolicOriginalIndex,
+  );
+  mutations.push(...symbolicBatch.mutations);
+  matchSpans.push(...symbolicBatch.matchSpans);
+
+  const structuralBatch = await collectStructuralMutations(
+    normalized,
+    args.filePath,
+    args.structuralResolver ?? defaultStructuralResolver,
+    structuralEdits,
+    structuralScopes,
+    structuralOriginalIndex,
+  );
+  mutations.push(...structuralBatch.mutations);
+  matchSpans.push(...structuralBatch.matchSpans);
+
+  const hashlineBatch = await collectHashlineMutations(
+    normalized,
+    args.filePath,
+    args.astResolver,
+    args.getSnapshot ?? (() => null),
+    hashlineEdits,
+    hashlineScopes,
+    hashlineOriginalIndex,
+  );
+  mutations.push(...hashlineBatch.mutations);
+  matchSpans.push(...hashlineBatch.matchSpans);
+  matchNotes.push(...hashlineBatch.matchNotes);
+
+  return finalizePlan(
+    normalized,
+    lineEnding,
+    bom,
+    args.filePath,
+    args.edits,
+    classified,
+    mutations,
+    matchSpans,
+    matchNotes,
+  );
 }
 
 /**
@@ -569,6 +934,57 @@ function computePostimageLineRanges(
   return result;
 }
 
+/** True when the target carries an AST-identifier field (name/namePath/line/kind). */
+function hasAstIdentifier(t: EditItem["target"]): boolean {
+  return !!t
+    && (t.name !== undefined || t.namePath !== undefined || t.line !== undefined || t.kind !== undefined);
+}
+
+/** Resolve the AST-target half of an explicit scope; null when no target fields. */
+async function resolveAstTargetScope(
+  edit: EditItem,
+  normalized: string,
+  filePath: string,
+  astResolver: AstResolverLike | null,
+  index: number,
+): Promise<SearchScope | null> {
+  if (!hasAstIdentifier(edit.target)) return null;
+  if (!astResolver) {
+    throw new Error(
+      `edits[${index}] requires AST support to resolve target.name/namePath/kind/line in ${filePath}`,
+    );
+  }
+  const resolveDiag: AnchorResolutionDiagnostics = {};
+  const astScope = await resolveAnchorToScope(edit, normalized, filePath, astResolver, resolveDiag);
+  if (!astScope) {
+    const parseHint = resolveDiag.parseError ? ` ${resolveDiag.parseError}` : "";
+    throw new Error(
+      `edits[${index}] could not resolve AST target${edit.description ? ` (${edit.description})` : ""} in ${filePath}.${parseHint} ` +
+        `Provide a resolvable target.name/namePath/kind/line or re-inspect the file.`,
+    );
+  }
+  return astScope;
+}
+
+/** Resolve the lineRange half of an explicit scope; null when absent. */
+function resolveLineRangeScope(
+  edit: EditItem,
+  normalized: string,
+  filePath: string,
+  index: number,
+): SearchScope | null {
+  const lineRange = edit.lineRange;
+  if (!lineRange) return null;
+  const lineScope = lineRangeToScope(normalized, lineRange);
+  if (!lineScope) {
+    throw new Error(
+      `edits[${index}] lineRange [${lineRange.startLine},${lineRange.endLine}] is out of range for ${filePath} ` +
+        `(${normalized.split("\n").length} lines).`,
+    );
+  }
+  return lineScope;
+}
+
 /**
  * Resolve an edit's explicit scope (AST target and/or lineRange) to a byte
  * range. Returns undefined when the edit carries no explicit scope. Throws an
@@ -582,48 +998,10 @@ async function resolveEditScope(
   astResolver: AstResolverLike | null,
   index: number,
 ): Promise<SearchScope | undefined> {
-  const t = edit.target;
-  const hasAstIdentifier =
-    !!t &&
-    (t.name !== undefined || t.namePath !== undefined || t.line !== undefined || t.kind !== undefined);
-  const hasTarget = hasAstIdentifier;
-  const hasLineRange = !!edit.lineRange;
-  if (!hasTarget && !hasLineRange) return undefined;
-
-  let astScope: SearchScope | null = null;
-  if (hasTarget) {
-    if (!astResolver) {
-      throw new Error(
-        `edits[${index}] requires AST support to resolve target.name/namePath/kind/line in ${filePath}`,
-      );
-    }
-    const resolveDiag: AnchorResolutionDiagnostics = {};
-    astScope = await resolveAnchorToScope(edit, normalized, filePath, astResolver, resolveDiag);
-    if (!astScope) {
-      const parseHint = resolveDiag.parseError ? ` ${resolveDiag.parseError}` : "";
-      throw new Error(
-        `edits[${index}] could not resolve AST target${edit.description ? ` (${edit.description})` : ""} in ${filePath}.${parseHint} ` +
-          `Provide a resolvable target.name/namePath/kind/line or re-inspect the file.`,
-      );
-    }
-  }
-
-  let lineScope: SearchScope | null = null;
-  const lineRange = edit.lineRange;
-  if (lineRange) {
-    lineScope = lineRangeToScope(normalized, lineRange);
-    if (!lineScope) {
-      throw new Error(
-        `edits[${index}] lineRange [${lineRange.startLine},${lineRange.endLine}] is out of range for ${filePath} ` +
-          `(${normalized.split("\n").length} lines).`,
-      );
-    }
-  }
-
-  let scope = astScope;
-  if (lineScope) {
-    scope = scope ? intersectScopes(scope, lineScope) : lineScope;
-  }
+  const astScope = await resolveAstTargetScope(edit, normalized, filePath, astResolver, index);
+  const lineScope = resolveLineRangeScope(edit, normalized, filePath, index);
+  if (!astScope && !lineScope) return undefined;
+  const scope = astScope && lineScope ? intersectScopes(astScope, lineScope) : (astScope ?? lineScope);
   if (!scope) {
     throw new Error(
       `edits[${index}] AST target and lineRange scopes do not intersect in ${filePath}. ` +
@@ -631,6 +1009,40 @@ async function resolveEditScope(
     );
   }
   return scope;
+}
+
+/** Reject intersecting non-zero spans, sorted by start byte. */
+function assertNonZeroDisjoint(nonZero: ResolvedMutation[], filePath: string): void {
+  const sortedNonZero = [...nonZero].sort((a, b) => a.startByte - b.startByte);
+  for (let i = 1; i < sortedNonZero.length; i++) {
+    const prev = sortedNonZero[i - 1];
+    const curr = sortedNonZero[i];
+    if (prev.endByte > curr.startByte) {
+      throw new Error(
+        `edits[${prev.requestIndex}] and edits[${curr.requestIndex}] overlap in ${filePath}. ` +
+          `Merge them into one edit or target disjoint regions.`,
+      );
+    }
+  }
+}
+
+/** Reject a zero-length insert sitting inside a non-zero span boundary. */
+function assertInsertsDisjoint(
+  inserts: ResolvedMutation[],
+  nonZero: ResolvedMutation[],
+  filePath: string,
+): void {
+  for (const ins of inserts) {
+    for (const nz of nonZero) {
+      if (ins.startByte >= nz.startByte && ins.startByte <= nz.endByte) {
+        throw new Error(
+          `edits[${ins.requestIndex}] insert at byte ${ins.startByte} is ambiguous with ` +
+            `edits[${nz.requestIndex}] span [${nz.startByte},${nz.endByte}) in ${filePath}. ` +
+            `Move the insert to a disjoint position.`,
+        );
+      }
+    }
+  }
 }
 
 /**
@@ -644,30 +1056,10 @@ function applyMutations(snapshot: string, mutations: ResolvedMutation[], filePat
   const inserts = mutations.filter((m) => m.endByte === m.startByte);
 
   // Non-zero spans must not intersect.
-  const sortedNonZero = [...nonZero].sort((a, b) => a.startByte - b.startByte);
-  for (let i = 1; i < sortedNonZero.length; i++) {
-    const prev = sortedNonZero[i - 1];
-    const curr = sortedNonZero[i];
-    if (prev.endByte > curr.startByte) {
-      throw new Error(
-        `edits[${prev.requestIndex}] and edits[${curr.requestIndex}] overlap in ${filePath}. ` +
-          `Merge them into one edit or target disjoint regions.`,
-      );
-    }
-  }
+  assertNonZeroDisjoint(nonZero, filePath);
 
   // A zero-length insert at the boundary of a non-zero span is ambiguous.
-  for (const ins of inserts) {
-    for (const nz of nonZero) {
-      if (ins.startByte >= nz.startByte && ins.startByte <= nz.endByte) {
-        throw new Error(
-          `edits[${ins.requestIndex}] insert at byte ${ins.startByte} is ambiguous with ` +
-            `edits[${nz.requestIndex}] span [${nz.startByte},${nz.endByte}) in ${filePath}. ` +
-            `Move the insert to a disjoint position.`,
-        );
-      }
-    }
-  }
+  assertInsertsDisjoint(inserts, nonZero, filePath);
 
   // Apply descending by start byte; for same-position inserts, apply higher
   // request index first so lower request index appears first (request order).
@@ -737,30 +1129,37 @@ function byteSpanToLineRange(newlineOffsets: number[], start: number, length: nu
   return { startLine, endLine };
 }
 
+/** Extension suffixes per ast-grep language id, checked in order via endsWith. */
+const STRUCTURAL_LANGUAGE_BY_EXTENSION: { suffixes: string[]; language: string }[] = [
+  { suffixes: [".ts", ".mts", ".cts"], language: "typescript" },
+  { suffixes: [".tsx"], language: "tsx" },
+  { suffixes: [".js", ".mjs", ".cjs"], language: "javascript" },
+  { suffixes: [".jsx"], language: "jsx" },
+  { suffixes: [".py"], language: "python" },
+  { suffixes: [".json"], language: "json" },
+  { suffixes: [".css"], language: "css" },
+  { suffixes: [".html"], language: "html" },
+  { suffixes: [".md"], language: "markdown" },
+  { suffixes: [".yaml", ".yml"], language: "yaml" },
+  { suffixes: [".sql"], language: "sql" },
+  { suffixes: [".rs"], language: "rust" },
+  { suffixes: [".go"], language: "go" },
+  { suffixes: [".java"], language: "java" },
+  { suffixes: [".rb"], language: "ruby" },
+  { suffixes: [".php"], language: "php" },
+  { suffixes: [".c"], language: "c" },
+  { suffixes: [".cpp", ".cc", ".h"], language: "cpp" },
+  { suffixes: [".cs"], language: "csharp" },
+  { suffixes: [".swift"], language: "swift" },
+  { suffixes: [".kt", ".kts"], language: "kotlin" },
+  { suffixes: [".sh", ".bash"], language: "bash" },
+];
+
 /** Map a file path to an ast-grep-compatible language id, or null. */
 function languageIdForStructural(filePath: string): string | null {
-  const ext = filePath.toLowerCase();
-  if (ext.endsWith(".ts") || ext.endsWith(".mts") || ext.endsWith(".cts")) return "typescript";
-  if (ext.endsWith(".tsx")) return "tsx";
-  if (ext.endsWith(".js") || ext.endsWith(".mjs") || ext.endsWith(".cjs")) return "javascript";
-  if (ext.endsWith(".jsx")) return "jsx";
-  if (ext.endsWith(".py")) return "python";
-  if (ext.endsWith(".json")) return "json";
-  if (ext.endsWith(".css")) return "css";
-  if (ext.endsWith(".html")) return "html";
-  if (ext.endsWith(".md")) return "markdown";
-  if (ext.endsWith(".yaml") || ext.endsWith(".yml")) return "yaml";
-  if (ext.endsWith(".sql")) return "sql";
-  if (ext.endsWith(".rs")) return "rust";
-  if (ext.endsWith(".go")) return "go";
-  if (ext.endsWith(".java")) return "java";
-  if (ext.endsWith(".rb")) return "ruby";
-  if (ext.endsWith(".php")) return "php";
-  if (ext.endsWith(".c")) return "c";
-  if (ext.endsWith(".cpp") || ext.endsWith(".cc") || ext.endsWith(".h")) return "cpp";
-  if (ext.endsWith(".cs")) return "csharp";
-  if (ext.endsWith(".swift")) return "swift";
-  if (ext.endsWith(".kt") || ext.endsWith(".kts")) return "kotlin";
-  if (ext.endsWith(".sh") || ext.endsWith(".bash")) return "bash";
+  const path = filePath.toLowerCase();
+  for (const { suffixes, language } of STRUCTURAL_LANGUAGE_BY_EXTENSION) {
+    if (suffixes.some((suffix) => path.endsWith(suffix))) return language;
+  }
   return null;
 }
