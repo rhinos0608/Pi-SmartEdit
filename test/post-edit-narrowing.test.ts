@@ -36,6 +36,8 @@ import {
     handleEditSuccessResult,
     parsePostEditDiff,
     narrowPostEditRanges,
+    type PostEditNarrowHint,
+    type NarrowHintsByPath,
 } from "../src/extension/post-lanes.js";
 import { createSessionState, buildMutationEvidence } from "../src/extension/session.js";
 
@@ -279,4 +281,45 @@ test("narrow-unit: substitution keeps prior window on the changed lines", () => 
     assert.deepEqual(narrowPostEditRanges([{ startLine: 5, endLine: 8 }], hint, 20), [
         { startLine: 5, endLine: 8 },
     ]);
+});
+
+test("narrow-unit: multi-diff same-path concatenates before parse (later chunk keeps delta)", async () => {
+    // First chunk inserts one line; the second chunk's substitution sits 1 line
+    // later in postimage coordinates. Parsing chunks separately would report
+    // the second block at newStart 10; concatenated parsing reports 11.
+    const chunk1 = "  5 ctx a\n+ 6 inserted\n  6 ctx b\n";
+    const chunk2 = "- 10 old\n+ 10 new\n";
+    let seenPaths: string[] | undefined;
+    let seenHints: NarrowHintsByPath | undefined;
+    const out = await handleEditSuccessResult(
+        {
+            toolName: "edit",
+            isError: false,
+            content: [],
+            details: {
+                status: { kind: "applied" },
+                diffs: [
+                    { path: "a.ts", diff: chunk1 },
+                    { path: "a.ts", diff: chunk2 },
+                ],
+            },
+        },
+        "/nonexistent-cwd",
+        (paths: string[], hints?: NarrowHintsByPath) => {
+            seenPaths = paths;
+            seenHints = hints;
+            return Promise.resolve(undefined);
+        },
+        null,
+    );
+    assert.equal(out, undefined);
+    assert.deepEqual(seenPaths, ["a.ts"]);
+    const hint: PostEditNarrowHint | undefined = seenHints?.get("a.ts");
+    assert.ok(hint, "same-path chunks must merge into one hint");
+    assert.deepEqual(hint!.changedRanges, [
+        { startLine: 6, endLine: 6 },
+        { startLine: 11, endLine: 11 },
+    ]);
+    assert.equal(hint!.blocks.length, 2);
+    assert.equal(hint!.blocks[1]!.newStartLine, 11);
 });

@@ -301,7 +301,12 @@ export function resolvePatchTransfers(args: {
             canonicalTo = realpathSync(pathResolve(ctx.cwd, rawTo));
         } catch (err) {
             if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-                canonicalTo = pathResolve(ctx.cwd, rawTo);
+                const absTo = pathResolve(ctx.cwd, rawTo);
+                try {
+                    canonicalTo = pathJoin(realpathSync(dirname(absTo)), basename(absTo));
+                } catch {
+                    canonicalTo = absTo;
+                }
                 toIsNewFile = true;
             } else {
                 const message = `transfer destination not found: ${rawTo} (${err instanceof Error ? err.message : String(err)})`;
@@ -398,6 +403,12 @@ export async function acquirePatchEnvelope(args: {
             return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${message}` }], details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks) } };
         }
         envelope = validated.value;
+        if (requestEvidenceRef && envelope.inspectionId !== requestEvidenceRef.inspectionId) {
+            const message = "envelope inspectionId mismatch (possible resolver spoof)";
+            diagnostics.push(message);
+            checks.completed.push(makeCheck("evidence-pipeline", "fail", message));
+            return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${message}` }], details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks) } };
+        }
         checks.completed.push(makeCheck("evidence-pipeline", "pass", "rpc resolve_evidence succeeded"));
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

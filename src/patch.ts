@@ -52,7 +52,7 @@ import { generateDiffString, stripBom, normalizeToLF } from "./core/edit-diff.js
 import { resolveSourceRange, resolveDestination } from "./transfer/resolve.js";
 import { planTransfer, bindResolvedTransfer, planTransferMutations, buildTransferDescription, buildTransferInsertEdit, buildTransferDeleteEdit, type TransferPlan } from "./transfer/plan.js";
 import { checkEditSafety } from "./safety/approval-gating.js";
-import { EDIT_PARAMETERS, validateEditRequest } from "./edit-contract.js";
+import { EDIT_PARAMETERS, validateEditRequest, type RefactorRequest } from "./edit-contract.js";
 import type { PriorAuthorityStore } from "./context/evidence-authority.js";
 import { planTextEdits, type StructuralResolver } from "./core/edit-planner.js";
 import { EditTransaction } from "./mutation/edit-transaction.js";
@@ -188,7 +188,8 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             // Refactor variants handle before generic session checks (but still validate shape via above)
             // Refactor variants route to file-local helpers (Lane A extract-only).
             if ((v as { ok: boolean; value?: { refactor?: { kind: string } } }).ok && (v as unknown as { value: { refactor?: { kind: string } } }).value?.refactor) {
-                const refactor = (v as unknown as { value: { refactor: { kind: string; path?: string; line?: number; character?: number; newName?: string; previewId?: string; tabSize?: number; insertSpaces?: boolean; endLine?: number; endCharacter?: number; diagnostics?: unknown; only?: unknown } } }).value.refactor;
+                // validateEditRequest accepted the payload above, so the broad wire shape narrows to RefactorRequest here.
+                const refactor = (v as unknown as { value: { refactor: RefactorRequest } }).value.refactor;
                 const handled = await handleRefactorRequest(deps, toolCallId, refactor);
                 if (handled) return handled;
             }

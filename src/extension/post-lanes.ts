@@ -308,19 +308,19 @@ export async function handleEditSuccessResult(
     // Narrow-mint hints: the diff hunks surfaced to the model carry the
     // postimage changed ranges plus the old→new line mapping, so the mint can
     // advance the SHA past the stale guard without broadening coverage.
-    const narrowHints = new Map<string, PostEditNarrowHint>();
+    // Group diff strings per path, then concatenate BEFORE parsing: parsePostEditDiff
+    // tracks a running delta, so parsing chunks separately and concatenating
+    // blocks would leave later chunks offset wrong when an earlier chunk shifts lines.
+    const diffsByPath = new Map<string, string[]>();
     for (const d of details.diffs) {
       const entry = d as { path?: unknown; diff?: unknown };
       if (typeof entry.path !== "string" || typeof entry.diff !== "string" || entry.diff.length === 0) continue;
-      const parsed = parsePostEditDiff(entry.diff);
-      const existing = narrowHints.get(entry.path);
-      if (existing) {
-        existing.changedRanges.push(...parsed.changedRanges);
-        existing.blocks.push(...parsed.blocks);
-      } else {
-        narrowHints.set(entry.path, parsed);
-      }
+      const chunks = diffsByPath.get(entry.path);
+      if (chunks) chunks.push(entry.diff);
+      else diffsByPath.set(entry.path, [entry.diff]);
     }
+    const narrowHints = new Map<string, PostEditNarrowHint>();
+    for (const [path, chunks] of diffsByPath) narrowHints.set(path, parsePostEditDiff(chunks.join("\n")));
     const workspaceEvidence = await buildMutationEvidence(uniquePaths, narrowHints);
     if (workspaceEvidence) {
       store?.record(workspaceEvidence);

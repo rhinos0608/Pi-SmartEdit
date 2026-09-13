@@ -145,6 +145,9 @@ export function appendEvent(root: string, event: MutationEvent): string | null {
   if (!Number.isFinite(event.timestamp)) {
     return "SmartRead bridge rejected malformed mutation event";
   }
+  if (event.timestamp < 0 || event.timestamp > Date.now() + 86400000) {
+    return "SmartRead bridge rejected malformed mutation event";
+  }
   const confidence = event.data.confidence;
   if (confidence !== undefined && (!Number.isFinite(confidence) || confidence < 0 || confidence > 1)) {
     return "SmartRead bridge rejected out-of-range confidence";

@@ -55,6 +55,31 @@ test("accepts boundary confidence 0 and 1", () => {
     assert.equal(readLines(root).length, 2);
 });
 
+test("drops negative and far-future timestamps", () => {
+    const root = makeRoot();
+    const neg = appendEvent(root, {
+        type: "breakage",
+        data: { from: "src/a.ts", to: "src/b.ts" },
+        timestamp: -1,
+    });
+    assert.notEqual(neg, null);
+    const future = appendEvent(root, {
+        type: "co_change",
+        data: { from: "src/a.ts", to: "src/b.ts" },
+        timestamp: Date.now() + 86400001,
+    });
+    assert.notEqual(future, null);
+    assert.deepEqual(readLines(root), []);
+});
+
+test("accepts boundary timestamps 0 and now+86400000", () => {
+    const root = makeRoot();
+    const now = Date.now();
+    assert.equal(appendEvent(root, { type: "breakage", data: { from: "src/a.ts", to: "src/b.ts" }, timestamp: 0 }), null);
+    assert.equal(appendEvent(root, { type: "co_change", data: { from: "src/a.ts", to: "src/b.ts" }, timestamp: now + 86400000 }), null);
+    assert.equal(readLines(root).length, 2);
+});
+
 test("rejects unknown source", () => {
     const root = makeRoot();
     const err = appendEvent(root, {

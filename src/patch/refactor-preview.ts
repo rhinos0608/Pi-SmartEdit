@@ -24,11 +24,11 @@ import type {
     PatchResult,
     BusPreviewResponse,
     StagedPreviewFile,
-    RefactorRequestFields,
     PatchToolDetails,
 } from "./types.js";
 import type {
     RenamePreviewRefactor,
+    RefactorRequest,
     ApplyRefactorPreviewRefactor,
     OrganizeImportsPreviewRefactor,
     FormattingPreviewRefactor,
@@ -257,15 +257,17 @@ export async function handleApplyRefactorPreview(deps: PatchToolDeps, toolCallId
     }
 }
 
-export async function handleRefactorRequest(deps: PatchToolDeps, toolCallId: string, refactor: RefactorRequestFields | undefined): Promise<PatchResult | null> {
+export async function handleRefactorRequest(deps: PatchToolDeps, toolCallId: string, refactor: RefactorRequest | undefined): Promise<PatchResult | null> {
     if (!refactor) return null;
     // The orchestrator validates via `validateEditRequest` before dispatch,
-    // so each branch narrows the broad wire type to its discriminated
-    // variant (defined in `src/edit-contract.ts`). Direct callers bypassing
-    // validation get the same narrowing by kind.
-    if (refactor.kind === "rename-preview") return handleRenamePreview(deps, toolCallId, refactor as unknown as RenamePreviewRefactor);
-    if (refactor.kind === "organize-imports-preview") return handleOrganizeImportsPreview(deps, toolCallId, refactor as unknown as OrganizeImportsPreviewRefactor);
-    if (refactor.kind === "formatting-preview") return handleFormattingPreview(deps, toolCallId, refactor as unknown as FormattingPreviewRefactor);
-    if (refactor.kind === "code-action-preview") return handleCodeActionPreview(deps, toolCallId, refactor as unknown as CodeActionPreviewRefactor);
-    return handleApplyRefactorPreview(deps, toolCallId, refactor as unknown as ApplyRefactorPreviewRefactor);
+    // so `refactor` arrives as the kind-discriminated `RefactorRequest` union
+    // (defined in `src/edit-contract.ts`) and each branch narrows without casts.
+    if (refactor.kind === "rename-preview") return handleRenamePreview(deps, toolCallId, refactor);
+    if (refactor.kind === "organize-imports-preview") return handleOrganizeImportsPreview(deps, toolCallId, refactor);
+    if (refactor.kind === "formatting-preview") return handleFormattingPreview(deps, toolCallId, refactor);
+    if (refactor.kind === "code-action-preview") return handleCodeActionPreview(deps, toolCallId, refactor);
+    if (refactor.kind === "apply-refactor-preview") return handleApplyRefactorPreview(deps, toolCallId, refactor);
+    const unknownKind = (refactor as { kind?: unknown }).kind;
+    const detail = `unknown refactor kind ${String(unknownKind)}`;
+    return failResult(toolCallId, `failed: ${detail}`, detail, [detail]);
 }

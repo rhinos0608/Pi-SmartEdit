@@ -1,6 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { validateEditRequest } from "../src/edit-contract.js";
+import { validateEditRequest, type RefactorRequest } from "../src/edit-contract.js";
+import { handleRefactorRequest } from "../src/patch/refactor-preview.js";
+import type { PatchToolDeps } from "../src/patch/types.js";
 
 describe("patch-refactor contract", () => {
   it("mutually exclusive edits/raw/refactor", () => {
@@ -75,5 +77,25 @@ describe("patch-refactor contract", () => {
       const v2 = validateEditRequest({ raw: "diff", refactor: base, toolCallId: "t" } as unknown as Record<string, unknown>);
       assert.equal(v2.ok, false, `${kind} should be mutually exclusive with raw`);
     }
+  });
+  it("unknown refactor kind returns unknown-kind failure (never routed to apply-preview)", async () => {
+    const deps = { getSessionFilePath: () => undefined } as unknown as PatchToolDeps;
+    const res = await handleRefactorRequest(deps, "t", { kind: "bogus" } as unknown as RefactorRequest);
+    assert.ok(res, "unknown kind must produce a result, not fall through");
+    assert.equal(res.details.status.kind, "failed");
+    assert.match(res.content[0]!.text, /unknown refactor kind/);
+    assert.ok(!/no session file path/.test(res.content[0]!.text), "must not reach the apply-preview path");
+  });
+  it("apply-refactor-preview kind still routes to apply-preview", async () => {
+    const deps = { getSessionFilePath: () => undefined } as unknown as PatchToolDeps;
+    const res = await handleRefactorRequest(deps, "t", { kind: "apply-refactor-preview", previewId: "x" });
+    assert.ok(res);
+    assert.match(res.content[0]!.text, /no session file path/);
+  });
+  it("rename-preview kind dispatches to the rename path", async () => {
+    const deps = {} as unknown as PatchToolDeps;
+    const res = await handleRefactorRequest(deps, "t", { kind: "rename-preview", path: "/a.ts", line: 1, character: 1, newName: "b" });
+    assert.ok(res);
+    assert.match(res.content[0]!.text, /requires bus/);
   });
 });

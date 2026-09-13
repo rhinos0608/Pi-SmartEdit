@@ -16,7 +16,7 @@ import {
     sha256OfString,
 } from "@rhinos0608/pi-workspace-protocol";
 import { mintRetryEvidenceFromSelection } from "../src/extension/retry-evidence.js";
-import { acquirePatchEnvelope, buildAutoInspectEnvelope } from "../src/patch/request-prep.js";
+import { acquirePatchEnvelope, buildAutoInspectEnvelope, resolvePatchTransfers } from "../src/patch/request-prep.js";
 import { freshChecks } from "../src/patch/result-builders.js";
 
 test("retry envelope inspectionId differs per range and matches provider recompute", async () => {
@@ -111,4 +111,95 @@ test("new-file synthetic resource uses parent-resolved canonical path", async ()
     assert.equal(built.envelope.resources[0]?.canonicalPath, expected);
     assert.equal(built.canonicalByGroup[0], expected);
     assert.ok(built.newFileCanonicals.has(expected));
+});
+
+test("mismatched-id envelope rejects (resolver-spoof guard)", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "proto-spoof-")));
+    const file = join(workdir, "a.ts");
+    writeFileSync(file, "alpha\nbeta\n", "utf8");
+    const requestedId = "a".repeat(64);
+    const otherId = "b".repeat(64);
+    const deps: Parameters<typeof acquirePatchEnvelope>[0]["deps"] = {
+        getRpcClient: () => ({
+            request: async () => ({
+                kind: "reply" as const,
+                schemaVersion: PROTOCOL_SCHEMA_VERSION,
+                requestId: "r1",
+                ok: true,
+                payload: {
+                    schemaVersion: PROTOCOL_SCHEMA_VERSION,
+                    inspectionId: otherId,
+                    sessionId: hashSessionFilePath("/sessions/proto-spoof.jsonl"),
+                    workspaceRoot: workdir,
+                    canonicalWorkspaceRoot: workdir,
+                    createdAt: new Date().toISOString(),
+                    resources: [
+                        {
+                            resourceId: "c".repeat(64),
+                            canonicalPath: realpathSync(file),
+                            kind: "full",
+                            coverage: "full-file",
+                            allowedRanges: [{ startLine: 1, endLine: 2 }],
+                            fullFileSha256: sha256OfString("alpha\nbeta\n"),
+                            fresh: true,
+                            byteLength: 11,
+                            lineCount: 2,
+                        },
+                    ],
+                    mode: "path",
+                },
+            }),
+            dispose: () => {},
+        }),
+        getSessionFilePath: () => "/sessions/proto-spoof.jsonl",
+        getCanonicalWorkspaceRoot: () => workdir,
+    };
+    const res = await acquirePatchEnvelope({
+        deps,
+        groups: [{ absolutePath: file, rawPath: "a.ts", edits: [] }],
+        sessionFilePath: "/sessions/proto-spoof.jsonl",
+        canonicalRoot: workdir,
+        requestEvidenceRef: { inspectionId: requestedId, resourceIds: ["r1"] },
+        transferNewFileCanonicals: new Set(),
+        toolCallId: "tc-spoof",
+        checks: freshChecks(),
+        diagnostics: [],
+        usedEvidence: [],
+        signal: undefined,
+    });
+    assert.equal(res.ok, false);
+});
+
+test("transfer ENOENT dest resolves parent realpath under symlinked parent", () => {
+    const realDir = realpathSync(mkdtempSync(join(tmpdir(), "proto-xfer-")));
+    const linkDir = `${realDir}-link`;
+    symlinkSync(realDir, linkDir);
+    const srcFile = join(realDir, "src.ts");
+    writeFileSync(srcFile, "hello\n", "utf8");
+    const groups: Parameters<typeof resolvePatchTransfers>[0]["groups"] = [];
+    const res = resolvePatchTransfers({
+        adaptedTransfers: {
+            ok: true as const,
+            value: [
+                {
+                    op: "copy",
+                    from: srcFile,
+                    to: join(linkDir, "new.ts"),
+                    range: { pos: "1aa", end: "1ab" },
+                    after: undefined,
+                    description: undefined,
+                },
+            ],
+        },
+        groups,
+        ctx: { cwd: "/" },
+        toolCallId: "tc-xfer",
+        requestEvidenceRef: undefined,
+        checks: freshChecks(),
+    });
+    assert.equal(res.ok, true);
+    if (!res.ok) return;
+    const expected = join(realpathSync(realDir), basename(join(linkDir, "new.ts")));
+    assert.equal(res.resolvedTransfers[0]?.canonicalTo, expected);
+    assert.ok(res.transferNewFileCanonicals.has(expected));
 });
