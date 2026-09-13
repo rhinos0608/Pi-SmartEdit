@@ -140,7 +140,9 @@ export function getLangConfig(languageId: string): LangConfig {
           /\btrait\s+(\w+)\b/.source,
           /\btype\s+(\w+)\b/.source,
           /\bconst\s+(\w+)\b/.source,
-          /\bimpl\s+(\w+)/.source,
+          // NOTE: no impl pattern — `impl Widget` / `impl Trait for Widget`
+          // blocks are implementations, not declarations. Counting them here
+          // made `struct Widget` + `impl Widget` look like duplicates.
         ],
         requiresSemicolons: false,
         semicolonsOptional: true,

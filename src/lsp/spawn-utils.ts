@@ -135,7 +135,28 @@ export function safeSpawnAsync(
       timeoutId = setTimeout(() => {
         timedOut = true;
         try {
-          activeChild?.kill("SIGKILL");
+          const target = activeChild;
+          if (process.platform === "win32" && target?.pid !== undefined) {
+            // Batch shims run under cmd.exe: killing the direct child alone
+            // orphans the real process. taskkill /t fells the whole tree.
+            try {
+              const killer = spawn("taskkill", ["/pid", String(target.pid), "/t", "/f"], {
+                stdio: "ignore",
+              });
+              killer.on("error", () => {
+                try {
+                  target.kill("SIGKILL");
+                } catch {
+                  // Fallback kill failed; close event or finish(-1) settles.
+                }
+              });
+              killer.unref?.();
+            } catch {
+              target.kill("SIGKILL");
+            }
+          } else {
+            target?.kill("SIGKILL");
+          }
         } catch {
           // A throwing kill delivers no terminal event; settle here to honor
           // the documented timeout contract instead of hanging the promise.
@@ -174,15 +195,15 @@ export function safeSpawnAsync(
         // not `error` — without this the `.bat` fallback would be dead when
         // only a later suffix exists. 9009 is cmd-specific (POSIX exit codes
         // are 8-bit); message-matching would break on non-English Windows.
-        // A tool that ran and diagnosed something wrote stdout, so an empty
-        // stdout separates lookup failure from a genuine 9009 exit — without
-        // this, a real 9009 (none of our callers produce one) with kept
-        // diagnostics could be discarded by the fallback. Never start new
+        // A tool that ran and diagnosed something wrote output, so empty
+        // stdout AND stderr separates lookup failure from a genuine 9009 exit
+        // — without this, a real 9009 (none of our callers produce one) with
+        // kept diagnostics could be discarded by the fallback. Never start new
         // work after the deadline either. A terminal lookup failure (all
         // suffixes exhausted) normalizes to -1, the missing-command status
         // on every OS — callers treat it as "tool absent", not as a
         // diagnostic exit code.
-        const lookupFailure = code === 9009 && stdout === "";
+        const lookupFailure = code === 9009 && stdout === "" && stderr === "";
         if (!timedOut && lookupFailure && index + 1 < targets.length) {
           index++;
           attempt();

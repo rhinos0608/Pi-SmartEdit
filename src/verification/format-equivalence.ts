@@ -62,6 +62,43 @@ export function detectFormatter(cwd: string, filePath: string): string | null {
 }
 
 /**
+ * Locate the nearest Prettier config file for `filePath`, walking ancestor
+ * directories from the file directory up through `cwd`. Returns the
+ * absolute config path, or null if none is found. Mirrors the discovery
+ * walk in detectFormatter so the retained path matches the detection.
+ */
+export function findPrettierConfigPath(cwd: string, filePath: string): string | null {
+  const root = resolve(cwd);
+  let dir = dirname(resolve(cwd, filePath));
+
+  const prettierConfigs = [
+    '.prettierrc',
+    '.prettierrc.json',
+    '.prettierrc.js',
+    '.prettierrc.yaml',
+    '.prettierrc.toml',
+    'prettier.config.js',
+    'prettier.config.mjs',
+    'prettier.config.cjs',
+  ];
+
+  for (;;) {
+    for (const config of prettierConfigs) {
+      const candidate = resolve(dir, config);
+      if (existsSync(candidate)) {
+        return candidate;
+      }
+    }
+    if (dir === root || !dir.startsWith(root)) break;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+
+  return null;
+}
+
+/**
  * Compute indentation score between original and formatted content.
  * Returns 0.0-1.0 where 0 = no indent differences, 1 = all lines differ.
  */
@@ -156,11 +193,14 @@ export async function runFormatEquivalenceCheck(
       // Read the formatted file
       formattedContent = readFileSync(tmpPath, 'utf-8');
     } else {
-      // Prettier
-      const result = await runFormatterCommand(
-        ['npx', 'prettier', '--write', tmpPath],
-        cwd,
-      );
+      // Prettier — retain the detected config path via --config so project
+      // rules apply to tmpPath (tmp file lives outside the project, so a
+      // bare --write would fall back to defaults).
+      const configPath = findPrettierConfigPath(cwd, filePath);
+      const prettierArgs = configPath
+        ? ['npx', 'prettier', '--write', '--config', configPath, tmpPath]
+        : ['npx', 'prettier', '--write', tmpPath];
+      const result = await runFormatterCommand(prettierArgs, cwd);
       if (result.error) {
         return { equivalent: true, indentScore: 0, error: result.error };
       }

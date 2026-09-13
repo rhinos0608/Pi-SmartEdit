@@ -711,6 +711,82 @@ export function materializeDotdotdots(
  * Wraps the standard findText function with timing instrumentation.
  * Returns match result + telemetry array.
  */
+interface TierAttemptOptions {
+  successNote?: string;
+  failNote?: string;
+}
+
+interface TierSearchContext {
+  telemetry: TierTelemetry[];
+  searchStart: number;
+  searchEnd: number;
+  searchScope?: SearchScope;
+}
+
+function isTierResultInScope(tierResult: MatchResult, ctx: TierSearchContext): boolean {
+  if (!ctx.searchScope) return true;
+  return tierResult.index >= ctx.searchStart && tierResult.index < ctx.searchEnd;
+}
+
+function attemptMatchTier(
+  tier: MatchTier,
+  run: () => MatchResult | null,
+  ctx: TierSearchContext,
+  options?: TierAttemptOptions,
+): MatchResult | null {
+  const tierStart = performance.now();
+  const tierResult = run();
+  const durationMs = performance.now() - tierStart;
+  if (tierResult && isTierResultInScope(tierResult, ctx)) {
+    const entry: TierTelemetry = { tier, durationMs, success: true, matchCount: 1 };
+    if (options?.successNote !== undefined) entry.note = options.successNote;
+    ctx.telemetry.push(entry);
+    return tierResult;
+  }
+  const entry: TierTelemetry = { tier, durationMs, success: false, matchCount: 0 };
+  if (options?.failNote !== undefined) entry.note = options.failNote;
+  ctx.telemetry.push(entry);
+  return null;
+}
+
+function tryExactMatch(
+  originalContent: string,
+  oldText: string,
+  searchContent: string,
+  ctx: TierSearchContext,
+): MatchResult | null {
+  let exactIndex = -1;
+  if (ctx.searchScope) {
+    const scopedIndex = originalContent.indexOf(oldText, ctx.searchStart);
+    if (scopedIndex !== -1 && scopedIndex < ctx.searchEnd) exactIndex = scopedIndex;
+  } else {
+    // No searchScope: search from searchStart position in originalContent.
+    exactIndex = searchContent.indexOf(oldText, ctx.searchStart);
+  }
+  if (exactIndex === -1) return null;
+  return {
+    found: true,
+    index: exactIndex,
+    matchLength: oldText.length,
+    tier: MatchTier.EXACT,
+    usedFuzzyMatch: false,
+    matchedText: oldText,
+    numericFuzz: 0,
+  };
+}
+
+function buildNoMatchResult(): MatchResult {
+  return {
+    found: false,
+    index: -1,
+    matchLength: 0,
+    tier: MatchTier.EXACT,
+    usedFuzzyMatch: false,
+    matchedText: "",
+    numericFuzz: -1,
+  };
+}
+
 export function findTextWithTelemetry(
   originalContent: string,
   oldText: string,
@@ -728,111 +804,60 @@ export function findTextWithTelemetry(
     ? originalContent.slice(searchStart, searchEnd)
     : originalContent;
 
+  const ctx: TierSearchContext = { telemetry, searchStart, searchEnd, searchScope };
+
   // Tier 1: Exact match
-  let tierStart = performance.now();
-  let exactIndex = -1;
-  if (searchScope) {
-    const scopedIndex = originalContent.indexOf(oldText, searchStart);
-    if (scopedIndex !== -1 && scopedIndex < searchEnd) exactIndex = scopedIndex;
-  } else {
-    // No searchScope: search from searchStart position in originalContent.
-    exactIndex = searchContent.indexOf(oldText, searchStart);
-  }
-  const exactDuration = performance.now() - tierStart;
-  if (exactIndex !== -1) {
-    telemetry.push({ tier: MatchTier.EXACT, durationMs: exactDuration, success: true, matchCount: 1 });
-    return {
-      result: {
-        found: true,
-        index: exactIndex,
-        matchLength: oldText.length,
-        tier: MatchTier.EXACT,
-        usedFuzzyMatch: false,
-        matchedText: oldText,
-        numericFuzz: 0,
-      },
-      telemetry,
-    };
-  }
-  telemetry.push({ tier: MatchTier.EXACT, durationMs: exactDuration, success: false, matchCount: 0 });
+  const exactResult = attemptMatchTier(
+    MatchTier.EXACT,
+    () => tryExactMatch(originalContent, oldText, searchContent, ctx),
+    ctx,
+  );
+  if (exactResult) return { result: exactResult, telemetry };
 
   // Tier 2: Indentation-normalized match
-  tierStart = performance.now();
-  const indentResult = tryIndentationMatch(originalContent, oldText, indentationStyle, searchStart, searchEnd);
-  const indentDuration = performance.now() - tierStart;
-  if (indentResult && (!searchScope || (indentResult.index >= searchStart && indentResult.index < searchEnd))) {
-    telemetry.push({
-      tier: MatchTier.INDENTATION,
-      durationMs: indentDuration,
-      success: true,
-      matchCount: 1,
-      note: `File uses ${indentationStyle.char === "\t" ? "tabs" : `${indentationStyle.width}-space`}`,
-    });
-    return { result: indentResult, telemetry };
-  }
-  telemetry.push({ tier: MatchTier.INDENTATION, durationMs: indentDuration, success: false, matchCount: 0 });
+  const indentResult = attemptMatchTier(
+    MatchTier.INDENTATION,
+    () => tryIndentationMatch(originalContent, oldText, indentationStyle, searchStart, searchEnd),
+    ctx,
+    { successNote: `File uses ${indentationStyle.char === "\t" ? "tabs" : `${indentationStyle.width}-space`}` },
+  );
+  if (indentResult) return { result: indentResult, telemetry };
 
   // Tier 3: Unicode-normalized match (maps back to original)
-  tierStart = performance.now();
-  const unicodeResult = tryUnicodeMatch(originalContent, oldText, searchStart, searchEnd);
-  const unicodeDuration = performance.now() - tierStart;
-  if (unicodeResult && (!searchScope || (unicodeResult.index >= searchStart && unicodeResult.index < searchEnd))) {
-    telemetry.push({ tier: MatchTier.UNICODE, durationMs: unicodeDuration, success: true, matchCount: 1 });
-    return { result: unicodeResult, telemetry };
-  }
-  telemetry.push({ tier: MatchTier.UNICODE, durationMs: unicodeDuration, success: false, matchCount: 0 });
+  const unicodeResult = attemptMatchTier(
+    MatchTier.UNICODE,
+    () => tryUnicodeMatch(originalContent, oldText, searchStart, searchEnd),
+    ctx,
+  );
+  if (unicodeResult) return { result: unicodeResult, telemetry };
 
   // Tier 4: Comment-prefix match (handles // vs uncommented inconsistencies)
-  tierStart = performance.now();
-  const commentPrefixResult = tryCommentPrefixMatch(originalContent, oldText, searchStart, searchEnd);
-  const commentPrefixDuration = performance.now() - tierStart;
-  if (commentPrefixResult && (!searchScope || (commentPrefixResult.index >= searchStart && commentPrefixResult.index < searchEnd))) {
-    telemetry.push({ tier: MatchTier.COMMENT_PREFIX, durationMs: commentPrefixDuration, success: true, matchCount: 1 });
-    return { result: commentPrefixResult, telemetry };
-  }
-  telemetry.push({ tier: MatchTier.COMMENT_PREFIX, durationMs: commentPrefixDuration, success: false, matchCount: 0 });
+  const commentPrefixResult = attemptMatchTier(
+    MatchTier.COMMENT_PREFIX,
+    () => tryCommentPrefixMatch(originalContent, oldText, searchStart, searchEnd),
+    ctx,
+  );
+  if (commentPrefixResult) return { result: commentPrefixResult, telemetry };
 
   // Tier 5: Similarity-scored match (safety net for near-matches)
-  tierStart = performance.now();
-  const similarityResult = allowFuzzy
-    ? trySimilarityMatch(originalContent, oldText, searchStart, searchEnd)
-    : null;
-  const similarityDuration = performance.now() - tierStart;
-  if (similarityResult && (!searchScope || (similarityResult.index >= searchStart && similarityResult.index < searchEnd))) {
-    telemetry.push({ tier: MatchTier.SIMILARITY, durationMs: similarityDuration, success: true, matchCount: 1 });
-    return { result: similarityResult, telemetry };
-  }
-  telemetry.push({
-    tier: MatchTier.SIMILARITY,
-    durationMs: similarityDuration,
-    success: false,
-    matchCount: 0,
-    note: allowFuzzy ? undefined : "Disabled by configuration",
-  });
+  const similarityResult = attemptMatchTier(
+    MatchTier.SIMILARITY,
+    () => (allowFuzzy ? trySimilarityMatch(originalContent, oldText, searchStart, searchEnd) : null),
+    ctx,
+    allowFuzzy ? undefined : { failNote: "Disabled by configuration" },
+  );
+  if (similarityResult) return { result: similarityResult, telemetry };
 
   // Tier 5: Stripped-indent match (handles indent-level shifts)
-  tierStart = performance.now();
-  const relIndentResult = tryStrippedIndentMatch(originalContent, oldText, searchStart, searchEnd);
-  const relIndentDuration = performance.now() - tierStart;
-  if (relIndentResult && (!searchScope || (relIndentResult.index >= searchStart && relIndentResult.index < searchEnd))) {
-    telemetry.push({ tier: MatchTier.RELATIVE_INDENT, durationMs: relIndentDuration, success: true, matchCount: 1 });
-    return { result: relIndentResult, telemetry };
-  }
-  telemetry.push({ tier: MatchTier.RELATIVE_INDENT, durationMs: relIndentDuration, success: false, matchCount: 0 });
+  const relIndentResult = attemptMatchTier(
+    MatchTier.RELATIVE_INDENT,
+    () => tryStrippedIndentMatch(originalContent, oldText, searchStart, searchEnd),
+    ctx,
+  );
+  if (relIndentResult) return { result: relIndentResult, telemetry };
 
   // No match found across all tiers
-  return {
-    result: {
-      found: false,
-      index: -1,
-      matchLength: 0,
-      tier: MatchTier.EXACT,
-      usedFuzzyMatch: false,
-      matchedText: "",
-      numericFuzz: -1,
-    },
-    telemetry,
-  };
+  return { result: buildNoMatchResult(), telemetry };
 }
 
 /**
@@ -1025,13 +1050,20 @@ function tryCommentPrefixMatch(
  * This is the equivalent of Aider's difflib tier — it rescues edits where
  * the text is "close enough" to the original.
  */
-function trySimilarityMatch(
+interface SimilaritySearchSetup {
+  searchEnd: number;
+  contentLines: string[];
+  oldLines: string[];
+  minWindowSize: number;
+  maxWindowSize: number;
+}
+
+function setupSimilaritySearch(
   originalContent: string,
   oldText: string,
-  startOffset: number = 0,
+  startOffset: number,
   endOffset?: number,
-  similarityThreshold: number = SIMILARITY_MATCH_THRESHOLD,
-): MatchResult | null {
+): SimilaritySearchSetup | null {
   // Empty or whitespace-only oldText cannot be matched meaningfully
   if (!oldText.trim()) return null;
 
@@ -1049,6 +1081,18 @@ function trySimilarityMatch(
   // Thresholds: 3000 lines for content, 200 lines for search block.
   if (contentLines.length > 3000 || oldLines.length > 200) return null;
 
+  // Try different window sizes (allowing for some line count variance)
+  const minWindowSize = Math.max(1, oldLines.length - 2);
+  const maxWindowSize = Math.min(oldLines.length + 2, contentLines.length);
+  return { searchEnd, contentLines, oldLines, minWindowSize, maxWindowSize };
+}
+
+function scanSimilarityWindows(
+  contentLines: string[],
+  oldLines: string[],
+  minWindowSize: number,
+  maxWindowSize: number,
+): { bestScore: number; bestStartLine: number; bestWindowSize: number } {
   // Search for the best matching window in the content
   let bestScore = 0;
   let bestStartLine = 0;
@@ -1057,10 +1101,6 @@ function trySimilarityMatch(
   // Wall-clock timeout: abort if search takes too long
   const startTime = Date.now();
   const TIMEOUT_MS = 100;
-
-  // Try different window sizes (allowing for some line count variance)
-  const minWindowSize = Math.max(1, oldLines.length - 2);
-  const maxWindowSize = Math.min(oldLines.length + 2, contentLines.length);
 
   for (let windowSize = minWindowSize; windowSize <= maxWindowSize; windowSize++) {
     // Check timeout before each window size iteration
@@ -1085,7 +1125,28 @@ function trySimilarityMatch(
     // Early termination: perfect match found
     if (bestScore >= 1.0) break;
   }
+  return { bestScore, bestStartLine, bestWindowSize };
+}
 
+interface SimilarityBestWindow {
+  bestStartLine: number;
+  bestWindowSize: number;
+  bestScore: number;
+}
+
+interface SimilarityResultBounds {
+  similarityThreshold: number;
+  startOffset: number;
+  searchEnd: number;
+}
+
+function buildSimilarityResult(
+  contentLines: string[],
+  best: SimilarityBestWindow,
+  bounds: SimilarityResultBounds,
+): MatchResult | null {
+  const { bestStartLine, bestWindowSize, bestScore } = best;
+  const { similarityThreshold, startOffset, searchEnd } = bounds;
   // If best match doesn't meet threshold, return null
   if (bestScore < similarityThreshold) {
     return null;
@@ -1114,6 +1175,29 @@ function trySimilarityMatch(
     numericFuzz: 3,
     matchNote: `Matched via similarity scoring (${(bestScore * 100).toFixed(1)}% similar) — near-match rescue tier.`,
   };
+}
+
+function trySimilarityMatch(
+  originalContent: string,
+  oldText: string,
+  startOffset: number = 0,
+  endOffset?: number,
+  similarityThreshold: number = SIMILARITY_MATCH_THRESHOLD,
+): MatchResult | null {
+  const setup = setupSimilaritySearch(originalContent, oldText, startOffset, endOffset);
+  if (!setup) return null;
+  const { searchEnd, contentLines, oldLines, minWindowSize, maxWindowSize } = setup;
+  const { bestScore, bestStartLine, bestWindowSize } = scanSimilarityWindows(
+    contentLines,
+    oldLines,
+    minWindowSize,
+    maxWindowSize,
+  );
+  return buildSimilarityResult(
+    contentLines,
+    { bestStartLine, bestWindowSize, bestScore },
+    { similarityThreshold, startOffset, searchEnd },
+  );
 }
 
 // ─── Tier 5: Stripped-indent match ────────────────────────────────────
@@ -1349,25 +1433,18 @@ export function countOccurrences(content: string, oldText: string): number {
  * Returns an object with the count plus the best and second-best similarity
  * scores found. The scores enable fuzzy-dominant auto-accept logic.
  */
-export function countSimilarityOccurrences(
-  content: string,
-  oldText: string,
-  threshold: number = SIMILARITY_MATCH_THRESHOLD,
+interface SimilarityScanBounds {
+  threshold: number;
+  minWindowSize: number;
+  maxWindowSize: number;
+}
+
+function scanSimilarityOccurrenceWindows(
+  contentLines: string[],
+  oldLines: string[],
+  bounds: SimilarityScanBounds,
 ): { count: number; bestScore: number; secondBestScore: number } {
-  const contentLines = content.split("\n");
-  const oldLines = oldText.split("\n");
-  if (contentLines.length === 0 || oldLines.length === 0) {
-    return { count: 0, bestScore: 0, secondBestScore: 0 };
-  }
-
-  // Performance guard (same thresholds as trySimilarityMatch).
-  if (contentLines.length > 3000 || oldLines.length > 200) {
-    return { count: 1, bestScore: 1, secondBestScore: 0 };
-  }
-
-  const minWindowSize = Math.max(1, oldLines.length - 2);
-  const maxWindowSize = Math.min(oldLines.length + 2, contentLines.length);
-
+  const { threshold, minWindowSize, maxWindowSize } = bounds;
   const countedRanges: Array<{ start: number; end: number }> = [];
   let count = 0;
   let bestScore = 0;
@@ -1407,12 +1484,84 @@ export function countSimilarityOccurrences(
   return { count, bestScore, secondBestScore };
 }
 
+export function countSimilarityOccurrences(
+  content: string,
+  oldText: string,
+  threshold: number = SIMILARITY_MATCH_THRESHOLD,
+): { count: number; bestScore: number; secondBestScore: number } {
+  const contentLines = content.split("\n");
+  const oldLines = oldText.split("\n");
+  if (contentLines.length === 0 || oldLines.length === 0) {
+    return { count: 0, bestScore: 0, secondBestScore: 0 };
+  }
+
+  // Performance guard (same thresholds as trySimilarityMatch).
+  if (contentLines.length > 3000 || oldLines.length > 200) {
+    return { count: 1, bestScore: 1, secondBestScore: 0 };
+  }
+
+  const minWindowSize = Math.max(1, oldLines.length - 2);
+  const maxWindowSize = Math.min(oldLines.length + 2, contentLines.length);
+
+  return scanSimilarityOccurrenceWindows(contentLines, oldLines, { threshold, minWindowSize, maxWindowSize });
+}
+
 // ─── Closest-match diagnostics ──────────────────────────────────────
 
 /**
  * Find the closest match to oldText in content using line-window comparison.
  * Returns the best candidate with similarity score, line range, and a hint.
  */
+function closestFirstPass(
+  contentLines: string[],
+  oldLines: string[],
+): { bestScore: number; bestStart: number; bestWindowSize: number } {
+  // First pass: fixed window size equal to oldLines.length (clamped to content).
+  // Cache the loop bound so mutations to bestWindowSize inside the loop
+  // (from a narrower window winning earlier) don't change the iteration count.
+  let bestScore = 0;
+  let bestStart = 0;
+  let bestWindowSize = Math.min(oldLines.length, contentLines.length);
+  const firstPassBound = contentLines.length - bestWindowSize;
+  for (let i = 0; i <= firstPassBound; i++) {
+    const window = contentLines.slice(i, i + Math.min(oldLines.length, contentLines.length - i));
+    const score = lineSimilarity(oldLines, window);
+    if (score > bestScore) {
+      bestScore = score;
+      bestStart = i;
+      bestWindowSize = window.length;
+    }
+  }
+  return { bestScore, bestStart, bestWindowSize };
+}
+
+interface ClosestBestState {
+  bestScore: number;
+  bestStart: number;
+  bestWindowSize: number;
+}
+
+function closestSecondPass(
+  contentLines: string[],
+  oldLines: string[],
+  incoming: ClosestBestState,
+): ClosestBestState {
+  let { bestScore, bestStart, bestWindowSize } = incoming;
+  // Second pass: try sliding with different window sizes for partial matches
+  for (let w = 1; w <= oldLines.length + 2 && w <= contentLines.length; w++) {
+    for (let i = 0; i <= contentLines.length - w; i++) {
+      const window = contentLines.slice(i, i + w);
+      const score = lineSimilarity(oldLines, window);
+      if (score > bestScore) {
+        bestScore = score;
+        bestStart = i;
+        bestWindowSize = w;
+      }
+    }
+  }
+  return { bestScore, bestStart, bestWindowSize };
+}
+
 export function findClosestMatch(
   content: string,
   oldText: string,
@@ -1429,36 +1578,11 @@ export function findClosestMatch(
   if (contentLines.length > 3000 || oldLines.length > 200) return null;
 
   // Slide a window of oldLines.length over content
-  let bestScore = 0;
-  let bestStart = 0;
-  let bestWindowSize = Math.min(oldLines.length, contentLines.length);
-
-  // First pass: fixed window size equal to oldLines.length (clamped to content).
-  // Cache the loop bound so mutations to bestWindowSize inside the loop
-  // (from a narrower window winning earlier) don't change the iteration count.
-  const firstPassBound = contentLines.length - bestWindowSize;
-  for (let i = 0; i <= firstPassBound; i++) {
-    const window = contentLines.slice(i, i + Math.min(oldLines.length, contentLines.length - i));
-    const score = lineSimilarity(oldLines, window);
-    if (score > bestScore) {
-      bestScore = score;
-      bestStart = i;
-      bestWindowSize = window.length;
-    }
-  }
-
-  // Second pass: try sliding with different window sizes for partial matches
-  for (let w = 1; w <= oldLines.length + 2 && w <= contentLines.length; w++) {
-    for (let i = 0; i <= contentLines.length - w; i++) {
-      const window = contentLines.slice(i, i + w);
-      const score = lineSimilarity(oldLines, window);
-      if (score > bestScore) {
-        bestScore = score;
-        bestStart = i;
-        bestWindowSize = w;
-      }
-    }
-  }
+  const firstPass = closestFirstPass(contentLines, oldLines);
+  const secondPass = closestSecondPass(contentLines, oldLines, firstPass);
+  const bestScore = secondPass.bestScore;
+  const bestStart = secondPass.bestStart;
+  const bestWindowSize = secondPass.bestWindowSize;
 
   if (bestScore < SIMILARITY_REPORT_THRESHOLD) return null;
 
@@ -1507,7 +1631,14 @@ export function textSimilarityRatio(a: string, b: string): number {
   return levenshteinRatio(normalizeForFuzzyMatch(a), normalizeForFuzzyMatch(b));
 }
 
+const MAX_LEVENSHTEIN_CHARS = 500;
+
 function levenshteinRatio(a: string, b: string): number {
+  // Cap inputs: DP is O(n*m), so uncapped long dissimilar lines blow past
+  // TIMEOUT_MS inside a single comparison (timeout is only checked between
+  // windows). Scoring within the cap is unchanged.
+  if (a.length > MAX_LEVENSHTEIN_CHARS) a = a.slice(0, MAX_LEVENSHTEIN_CHARS);
+  if (b.length > MAX_LEVENSHTEIN_CHARS) b = b.slice(0, MAX_LEVENSHTEIN_CHARS);
   if (a.length === 0 && b.length === 0) return 1;
   if (a.length === 0 || b.length === 0) return 0;
 

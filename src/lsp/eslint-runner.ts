@@ -1,4 +1,5 @@
-import { dirname, resolve } from "path";
+import { access } from "fs/promises";
+import { dirname, join, resolve } from "path";
 import type { Diagnostic, DiagnosticResult } from "./diagnostic-dispatcher.js";
 import {
   appendBounded,
@@ -126,6 +127,36 @@ export function parseEslintJsonOutput(
   return diagnostics;
 }
 
+export interface EslintCommandSelection {
+  kind: "direct" | "npx";
+  command: string;
+}
+
+/**
+ * Pure selector for the ESLint spawn command.
+ *
+ * The Windows `cmd.exe` gate in spawn-utils `^`-escapes but never quotes
+ * command paths, so an absolute local binary under a `configDir` containing
+ * whitespace breaks. Paths with whitespace fall back to the `npx` form
+ * (HEAD behavior); all other paths may attempt the direct local binary.
+ * Pure over (`configDir`, `isWin`) so the branch is unit-testable on POSIX.
+ */
+export function selectEslintCommand(
+  configDir: string,
+  isWin: boolean = process.platform === "win32",
+): EslintCommandSelection {
+  const localEslint = join(
+    configDir,
+    "node_modules",
+    ".bin",
+    isWin ? "eslint.cmd" : "eslint",
+  );
+  if (/\s/.test(localEslint)) {
+    return { kind: "npx", command: isWin ? "npx.cmd" : "npx" };
+  }
+  return { kind: "direct", command: localEslint };
+}
+
 export async function checkEslintDiagnostics(
   filePath: string,
   cwd: string,
@@ -136,17 +167,53 @@ export async function checkEslintDiagnostics(
   }
 
   try {
-    // Spawned without a shell, so on Windows the .cmd shim name is required
-    // (CreateProcess does not apply PATHEXT to extensionless names).
-    const npx = process.platform === "win32" ? "npx.cmd" : "npx";
-    const result = await safeSpawnAsync(
-      npx,
-      ["--no-install", "eslint", "--format", "json", "--no-warn-ignored", filePath],
-      {
+    // Prefer the config dir's local binary over npx package resolution: a
+    // local install may provide only node_modules/.bin without a package
+    // record `npx --no-install` resolves (observed Windows-only miss: the
+    // fake was never invoked, source stayed "none"). Absolute path, so no
+    // PATH dependence. Spawned without a shell, so on Windows the .cmd
+    // shim name is required (CreateProcess ignores PATHEXT for
+    // extensionless names).
+    const isWin = process.platform === "win32";
+    const npxCommand = isWin ? "npx.cmd" : "npx";
+    const npxArgs = [
+      "--no-install",
+      "eslint",
+      "--format",
+      "json",
+      "--no-warn-ignored",
+      filePath,
+    ];
+    let command = npxCommand;
+    let args = npxArgs;
+    let usedLocalDirect = false;
+    // Whitespace in the absolute local path breaks the Windows cmd.exe gate
+    // (^-escaping without quoting); such paths stay on the npx form.
+    const selection = selectEslintCommand(configDir, isWin);
+    if (selection.kind === "direct") {
+      try {
+        await access(selection.command);
+        command = selection.command;
+        args = ["--format", "json", "--no-warn-ignored", filePath];
+        usedLocalDirect = true;
+      } catch {
+        // No local binary — fall back to npx resolution.
+      }
+    }
+    let result = await safeSpawnAsync(command, args, {
+      cwd: configDir,
+      timeout: 30_000,
+    });
+    // TOCTOU: access() succeeded but the binary vanished before spawn.
+    // safeSpawnAsync normalizes lookup failure to status -1 with empty
+    // output; retry once via npx. Timeout kills also report -1 but carry
+    // partial output, so empty stdout+stderr separates the two cases.
+    if (usedLocalDirect && result.status === -1 && !result.stdout && !result.stderr) {
+      result = await safeSpawnAsync(npxCommand, npxArgs, {
         cwd: configDir,
         timeout: 30_000,
-      },
-    );
+      });
+    }
 
     const diagnostics = parseEslintJsonOutput(
       result.stdout || result.stderr || "",

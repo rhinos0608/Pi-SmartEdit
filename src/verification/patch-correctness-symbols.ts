@@ -142,6 +142,33 @@ export function checkImportConsistency(
     ? KNOWN_GLOBALS_TS
     : new Set<string>();
   const declared = countDeclarations(newContent, config);
+  // Type-only bindings are not runtime callables: `interface Foo` / `type Foo`
+  // must not suppress a missing import for a new `Foo()` call. Drop them
+  // unless the same name also has a runtime binding (function/const/class…).
+  if (lang === "typescript" || lang === "tsx") {
+    const typeNames = new Set<string>();
+    for (const m of newContent.matchAll(/\b(?:interface|type)\s+(\w+)\b/g)) {
+      if (m[1]) typeNames.add(m[1]);
+    }
+    if (typeNames.size > 0) {
+      const runtimeNames = new Set<string>();
+      const runtimePatterns = [
+        /\bfunction\s+(\w+)\b/g,
+        /\b(?:const|let|var)\s+(\w+)\s*[:=]/g,
+        /\bclass\s+(\w+)\b/g,
+        /\benum\s+(\w+)\b/g,
+        /\bexport\s+(?:default\s+)?(?:function|class|const|let|var|enum)\s+(\w+)\b/g,
+      ];
+      for (const re of runtimePatterns) {
+        for (const m of newContent.matchAll(re)) {
+          if (m[1]) runtimeNames.add(m[1]);
+        }
+      }
+      for (const name of typeNames) {
+        if (!runtimeNames.has(name)) declared.delete(name);
+      }
+    }
+  }
 
   const missing: string[] = [];
   for (const call of addedCalls) {

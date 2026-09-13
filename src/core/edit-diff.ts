@@ -12,6 +12,7 @@
 import * as Diff from "diff";
 import type {
   EditItem,
+  IndentationStyle,
   MatchSpan,
   ClosestMatchDiagnostic,
   SearchScope,
@@ -311,20 +312,21 @@ function checkIdempotency(
  * @param path - File path for error messages
  * @param options - Optional configuration for anchor resolution and conflict detection
  */
-export async function applyEdits(
-  normalizedContent: string,
-  edits: EditItem[],
-  path: string,
-  options?: ApplyEditsOptions,
-): Promise<{
-  baseContent: string;
-  newContent: string;
-  matchNotes: string[];
-  replacementCount: number;
-  matchSpans: MatchSpan[];
-}> {
-  // Normalize edit texts to LF. Metadata-only edits are routed before this pipeline.
-  const normalizedEdits: Array<EditItem & { oldText: string; newText: string }> = [];
+// ─── applyEdits seam helpers (file-local, extract-only) ───────────────
+
+type NormalizedEdit = EditItem & { oldText: string; newText: string };
+
+interface MatchBuildContext {
+  normalizedContent: string;
+  indentationStyle: IndentationStyle;
+  allowFuzzy: boolean;
+  path: string;
+  totalEdits: number;
+}
+
+/** Seam: normalize (LF). Metadata-only edits are routed before this pipeline. */
+function normalizeEditTexts(edits: EditItem[]): NormalizedEdit[] {
+  const normalizedEdits: NormalizedEdit[] = [];
   for (let i = 0; i < edits.length; i++) {
     const edit = edits[i];
     if (typeof edit.oldText !== "string") {
@@ -340,19 +342,25 @@ export async function applyEdits(
       newText: typeof edit.newText === "string" ? normalizeToLF(edit.newText) : "",
     });
   }
+  return normalizedEdits;
+}
 
-  // Validate: no empty oldText
+/** Seam: normalize validation — no empty oldText. */
+function assertNonEmptyOldText(normalizedEdits: NormalizedEdit[], path: string): void {
   for (let i = 0; i < normalizedEdits.length; i++) {
     if (normalizedEdits[i].oldText.length === 0) {
       throw getEmptyOldTextError(path, i, normalizedEdits.length);
     }
   }
+}
 
-  // Detect file indentation style once
-  const indentationStyle = detectIndentation(normalizedContent);
-  const allowFuzzy = options?.allowFuzzy ?? true;
-
-  // Resolve search scopes for edits with anchors or lineRanges
+/** Seam: scopes — resolve search scopes for edits with anchors or lineRanges. */
+async function resolveSearchScopes(
+  normalizedEdits: NormalizedEdit[],
+  normalizedContent: string,
+  path: string,
+  options?: ApplyEditsOptions,
+): Promise<(SearchScope | undefined)[]> {
   const searchScopes: (SearchScope | undefined)[] = [];
   if (options?.searchScopes || options?.onResolveAnchor) {
     for (let i = 0; i < normalizedEdits.length; i++) {
@@ -370,66 +378,425 @@ export async function applyEdits(
       }
     }
   }
+  return searchScopes;
+}
+
+function hasEofTrailingBlanks(oldText: string): boolean {
+  return oldText.endsWith('\n\n') || oldText.endsWith(' \n');
+}
+
+function isDeletionMissingTrailingNewline(edit: NormalizedEdit): boolean {
+  return (
+    edit.newText.length === 0 &&
+    edit.oldText.length > 0 &&
+    !edit.oldText.endsWith("\n")
+  );
+}
+
+/** Seam: preprocess — EOF context anchor (`*** End of File` pattern). */
+function stripEofContextAnchor(
+  edit: NormalizedEdit,
+  normalizedContent: string,
+  index: number,
+  matchNotes: string[],
+): NormalizedEdit {
+  if (!hasEofTrailingBlanks(edit.oldText)) return edit;
+  const trimmedOld = edit.oldText.trimEnd();
+  if (!trimmedOld) return edit;
+  if (normalizedContent.includes(edit.oldText)) return edit;
+  if (!normalizedContent.includes(trimmedOld)) return edit;
+  const potentialIdx = normalizedContent.indexOf(trimmedOld);
+  if (potentialIdx === -1) return edit;
+  const afterMatch = normalizedContent.slice(potentialIdx + trimmedOld.length);
+  if (afterMatch.trim()) return edit;
+  matchNotes.push(`edits[${index}]: trailing blank lines in oldText stripped (EOF context anchor).`);
+  return { ...edit, oldText: trimmedOld };
+}
+
+/** Seam: preprocess — trailing newline edge case (deletion leaving orphan blank line). */
+function extendDeletionWithTrailingNewline(
+  edit: NormalizedEdit,
+  normalizedContent: string,
+): NormalizedEdit {
+  if (!isDeletionMissingTrailingNewline(edit)) return edit;
+  const withNewline = edit.oldText + "\n";
+  if (!normalizedContent.includes(withNewline)) return edit;
+  return { ...edit, oldText: withNewline };
+}
+
+/** Seam: preprocess — materialize `...` elisions before matching. */
+function materializeEllipsis(
+  edit: NormalizedEdit,
+  normalizedContent: string,
+  index: number,
+  matchNotes: string[],
+): NormalizedEdit {
+  const DOT_LINE_RE = /^[ \t]*\.\.\.[ \t]*$/m;
+  if (!DOT_LINE_RE.test(edit.oldText)) return edit;
+  const materialized = materializeDotdotdots(
+    edit.oldText,
+    edit.newText,
+    normalizedContent,
+  );
+  if (!materialized) return edit;
+  matchNotes.push(`edits[${index}]: ... ellipsis materialized (numericFuzz=4, dotdotdots).`);
+  return {
+    ...edit,
+    oldText: materialized.materializedOld,
+    newText: materialized.materializedNew,
+  };
+}
+
+/** Seam: preprocess — EOF anchor, trailing-newline, dotdotdots in fixed order. */
+function preprocessEdit(
+  edit: NormalizedEdit,
+  normalizedContent: string,
+  index: number,
+  matchNotes: string[],
+): NormalizedEdit {
+  let next = stripEofContextAnchor(edit, normalizedContent, index, matchNotes);
+  next = extendDeletionWithTrailingNewline(next, normalizedContent);
+  next = materializeEllipsis(next, normalizedContent, index, matchNotes);
+  return next;
+}
+
+function idempotencyNote(
+  scopedContent: string,
+  edit: NormalizedEdit,
+  path: string,
+  index: number,
+): string | null {
+  if (!checkIdempotency(scopedContent, edit.oldText, edit.newText, path, index, edit.description)) {
+    return null;
+  }
+  return (
+    `edits[${index}]${edit.description ? ` (${edit.description})` : ''}: ` +
+    `replacement text already present in ${path} — edit is a no-op.`
+  );
+}
+
+function throwNotFound(
+  normalizedContent: string,
+  edit: NormalizedEdit,
+  index: number,
+  ctx: MatchBuildContext,
+): never {
+  const diagnostic = findClosestMatch(normalizedContent, edit.oldText);
+  throw getNotFoundError(
+    ctx.path, index, ctx.totalEdits, diagnostic, edit.description, ctx.allowFuzzy,
+  );
+}
+
+function pushTierNote(
+  matchNote: string | undefined,
+  tier: MatchTier,
+  index: number,
+  matchNotes: string[],
+): void {
+  if (tier === MatchTier.EXACT || !matchNote) return;
+  matchNotes.push(matchNote.replace(
+    "Matched via",
+    `edits[${index}] matched via`,
+  ));
+}
+
+function adaptReplacementText(
+  newText: string,
+  edit: NormalizedEdit,
+  ctx: MatchBuildContext,
+  matchedText: string,
+  matchIndex: number,
+  matchLength: number,
+): string {
+  const adapted = adaptNewTextIndentation(
+    newText,
+    edit.oldText,
+    ctx.indentationStyle,
+    matchedText,
+  );
+  return preserveQuoteStyle(
+    adapted,
+    ctx.normalizedContent,
+    matchIndex,
+    matchLength,
+    ctx.path,
+  );
+}
+
+/** Seam: replace-all spans. */
+function buildReplaceAllSpans(
+  edit: NormalizedEdit,
+  index: number,
+  ctx: MatchBuildContext,
+  searchScope: SearchScope | undefined,
+  scopedContent: string,
+  matchNotes: string[],
+): MatchSpan[] {
+  const match = findText(
+    ctx.normalizedContent,
+    edit.oldText,
+    ctx.indentationStyle,
+    0,
+    searchScope,
+    ctx.allowFuzzy,
+  );
+  if (!match.found) {
+    const note = idempotencyNote(scopedContent, edit, ctx.path, index);
+    if (note) {
+      matchNotes.push(note);
+      return [];
+    }
+    throwNotFound(ctx.normalizedContent, edit, index, ctx);
+  }
+  // Lock to this tier and find all matches
+  const allMatches = findAllMatches(
+    ctx.normalizedContent,
+    edit.oldText,
+    ctx.indentationStyle,
+    match.tier,
+    searchScope,
+    ctx.allowFuzzy,
+  );
+  if (allMatches.length === 0) {
+    throwNotFound(ctx.normalizedContent, edit, index, ctx);
+  }
+  const spans: MatchSpan[] = [];
+  for (const m of allMatches) {
+    let newText = edit.newText;
+    if (m.tier !== MatchTier.EXACT) {
+      newText = adaptReplacementText(newText, edit, ctx, m.matchedText, m.index, m.matchLength);
+    } else {
+      newText = preserveQuoteStyle(
+        newText,
+        ctx.normalizedContent,
+        m.index,
+        m.matchLength,
+        ctx.path,
+      );
+    }
+    spans.push({
+      editIndex: index,
+      matchIndex: m.index,
+      matchLength: m.matchLength,
+      newText,
+      tier: m.tier,
+      matchNote: m.matchNote,
+      replaceAll: true,
+      description: edit.description,
+    });
+  }
+  pushTierNote(match.matchNote, match.tier, index, matchNotes);
+  return spans;
+}
+
+function assertUnicodeUnique(
+  scopedContent: string,
+  edit: NormalizedEdit,
+  index: number,
+  ctx: MatchBuildContext,
+): void {
+  const fuzzyContent = normalizeForFuzzyMatch(scopedContent);
+  const fuzzyOldText = normalizeForFuzzyMatch(edit.oldText);
+  let fuzzyCount = 0;
+  let pos = 0;
+  while ((pos = fuzzyContent.indexOf(fuzzyOldText, pos)) !== -1) {
+    fuzzyCount++;
+    pos += fuzzyOldText.length;
+  }
+  if (fuzzyCount > 1) {
+    throw getAmbiguousError(
+      ctx.path, index, ctx.totalEdits, fuzzyCount, undefined, edit.description,
+    );
+  }
+}
+
+function assertSimilarityUnique(
+  scopedContent: string,
+  edit: NormalizedEdit,
+  index: number,
+  ctx: MatchBuildContext,
+  matchNotes: string[],
+): void {
+  const { count: similarityCount, bestScore, secondBestScore } = countSimilarityOccurrences(
+    scopedContent,
+    edit.oldText,
+  );
+  if (similarityCount <= 1) return;
+  // Fuzzy-dominant auto-accept: if one match is clearly better, accept it.
+  if (isDominantFuzzyMatch(bestScore, secondBestScore)) {
+    matchNotes.push(
+      `edits[${index}]${edit.description ? ` (${edit.description})` : ''}: ` +
+      `fuzzy-dominant auto-accepted (best=${(bestScore * 100).toFixed(1)}%, ` +
+      `delta=${((bestScore - secondBestScore) * 100).toFixed(1)}% > ` +
+      `${(DOMINANT_FUZZY_DELTA * 100).toFixed(0)}% threshold).`,
+    );
+    return;
+  }
+  throw getAmbiguousError(
+    ctx.path, index, ctx.totalEdits, similarityCount, undefined, edit.description,
+  );
+}
+
+function assertExactTierUnique(
+  scopedContent: string,
+  edit: NormalizedEdit,
+  index: number,
+  ctx: MatchBuildContext,
+): void {
+  const strippedOld = edit.oldText.replace(/^[\t ]+/gm, '');
+  const strippedContent = scopedContent.replace(/^[\t ]+/gm, '');
+  const exactCount = countOccurrences(strippedContent, strippedOld);
+  if (exactCount > 1) {
+    throw getAmbiguousError(
+      ctx.path, index, ctx.totalEdits, exactCount, undefined, edit.description,
+    );
+  }
+}
+
+/** Seam: single-match ambiguity check across tiers (scoped to search scope). */
+function assertSingleMatchUnique(
+  tier: MatchTier,
+  scopedContent: string,
+  edit: NormalizedEdit,
+  index: number,
+  ctx: MatchBuildContext,
+  matchNotes: string[],
+): void {
+  if (tier === MatchTier.UNICODE) {
+    assertUnicodeUnique(scopedContent, edit, index, ctx);
+  } else if (tier === MatchTier.SIMILARITY) {
+    assertSimilarityUnique(scopedContent, edit, index, ctx, matchNotes);
+  } else {
+    assertExactTierUnique(scopedContent, edit, index, ctx);
+  }
+}
+
+/** Seam: single-match span. Returns [] when the edit is an idempotent no-op. */
+function buildSingleMatchSpan(
+  edit: NormalizedEdit,
+  index: number,
+  ctx: MatchBuildContext,
+  searchScope: SearchScope | undefined,
+  scopedContent: string,
+  matchNotes: string[],
+): MatchSpan[] {
+  const match = findText(
+    ctx.normalizedContent,
+    edit.oldText,
+    ctx.indentationStyle,
+    0,
+    searchScope,
+    ctx.allowFuzzy,
+  );
+  if (!match.found) {
+    const note = idempotencyNote(scopedContent, edit, ctx.path, index);
+    if (note) {
+      matchNotes.push(note);
+      return [];
+    }
+    throwNotFound(ctx.normalizedContent, edit, index, ctx);
+  }
+  assertSingleMatchUnique(match.tier, scopedContent, edit, index, ctx, matchNotes);
+  let newText = edit.newText;
+  if (match.tier !== MatchTier.EXACT || match.usedFuzzyMatch) {
+    newText = adaptNewTextIndentation(
+      newText,
+      edit.oldText,
+      ctx.indentationStyle,
+      match.matchedText,
+    );
+    newText = preserveQuoteStyle(
+      newText,
+      ctx.normalizedContent,
+      match.index,
+      match.matchLength,
+      ctx.path,
+    );
+  }
+  pushTierNote(match.matchNote, match.tier, index, matchNotes);
+  return [{
+    editIndex: index,
+    matchIndex: match.index,
+    matchLength: match.matchLength,
+    newText,
+    tier: match.tier,
+    matchNote: match.matchNote,
+    replaceAll: false,
+    description: edit.description,
+  }];
+}
+
+/** Seam: overlap — reject overlapping spans with replaceAll-aware messages. */
+function validateNoOverlappingSpans(matchSpans: MatchSpan[], path: string): void {
+  matchSpans.sort((a, b) => a.matchIndex - b.matchIndex);
+  for (let i = 1; i < matchSpans.length; i++) {
+    const prev = matchSpans[i - 1];
+    const curr = matchSpans[i];
+    if (prev.matchIndex + prev.matchLength <= curr.matchIndex) continue;
+    const prevDesc = prev.description ? ` (${prev.description})` : "";
+    const currDesc = curr.description ? ` (${curr.description})` : "";
+    if (prev.replaceAll || curr.replaceAll) {
+      throw new Error(
+        `edits[${prev.editIndex}]${prevDesc}${prev.replaceAll ? " (replaceAll)" : ""} and ` +
+        `edits[${curr.editIndex}]${currDesc}${curr.replaceAll ? " (replaceAll)" : ""} overlap ` +
+        `in ${path}. If you need to replace all occurrences except one specific case, ` +
+        `split into two calls: first apply the specific edit, then replaceAll for the rest.`,
+      );
+    }
+    throw new Error(
+      `edits[${prev.editIndex}]${prevDesc} and edits[${curr.editIndex}]${currDesc} ` +
+      `overlap in ${path}. Merge them into one edit or target disjoint regions.`,
+    );
+  }
+}
+
+/** Seam: reverse/no-change — apply spans in reverse order against ORIGINAL content. */
+function applySpansInReverse(normalizedContent: string, matchSpans: MatchSpan[]): string {
+  let newContent = normalizedContent;
+  matchSpans.sort((a, b) => a.matchIndex - b.matchIndex);
+  for (let i = matchSpans.length - 1; i >= 0; i--) {
+    const span = matchSpans[i];
+    newContent =
+      newContent.slice(0, span.matchIndex) +
+      span.newText +
+      newContent.slice(span.matchIndex + span.matchLength);
+  }
+  return newContent;
+}
+
+export async function applyEdits(
+  normalizedContent: string,
+  edits: EditItem[],
+  path: string,
+  options?: ApplyEditsOptions,
+): Promise<{
+  baseContent: string;
+  newContent: string;
+  matchNotes: string[];
+  replacementCount: number;
+  matchSpans: MatchSpan[];
+}> {
+  const normalizedEdits = normalizeEditTexts(edits);
+  assertNonEmptyOldText(normalizedEdits, path);
+
+  // Detect file indentation style once
+  const indentationStyle = detectIndentation(normalizedContent);
+  const allowFuzzy = options?.allowFuzzy ?? true;
+  const searchScopes = await resolveSearchScopes(normalizedEdits, normalizedContent, path, options);
+  const ctx: MatchBuildContext = {
+    normalizedContent,
+    indentationStyle,
+    allowFuzzy,
+    path,
+    totalEdits: normalizedEdits.length,
+  }
 
   // Phase 1: Match phase — find all spans in ORIGINAL content
   const matchSpans: MatchSpan[] = [];
   const matchNotes: string[] = [];
 
   for (let i = 0; i < normalizedEdits.length; i++) {
-    let edit = normalizedEdits[i];
-
-    // ── EOF context anchor ──
-    // If oldText has trailing blank lines but the file doesn't, trim them.
-    // This handles the `*** End of File` pattern from codex patches.
-    if (edit.oldText.endsWith('\n\n') || edit.oldText.endsWith(' \n')) {
-      const trimmedOld = edit.oldText.trimEnd();
-      if (trimmedOld && !normalizedContent.includes(edit.oldText) && normalizedContent.includes(trimmedOld)) {
-        // Only apply if the match is at/near EOF
-        const potentialIdx = normalizedContent.indexOf(trimmedOld);
-        if (potentialIdx !== -1) {
-          const afterMatch = normalizedContent.slice(potentialIdx + trimmedOld.length);
-          if (!afterMatch.trim()) {
-            edit = { ...edit, oldText: trimmedOld };
-            matchNotes.push(`edits[${i}]: trailing blank lines in oldText stripped (EOF context anchor).`);
-          }
-        }
-      }
-    }
-
-    // ── Trailing newline edge case (Phase 8) ──
-    // When deleting code (newText === "") and oldText doesn't end with \n
-    // but the file has it after oldText, include the trailing newline in the match.
-    // This prevents leaving an orphan blank line.
-    if (
-        edit.newText.length === 0 &&
-        edit.oldText.length > 0 &&
-        !edit.oldText.endsWith("\n")
-      ) {
-        // Check if the file has oldText followed by \n
-        const withNewline = edit.oldText + "\n";
-        if (normalizedContent.includes(withNewline)) {
-          edit = { ...edit, oldText: withNewline };
-      }
-    }
-
-    // ── Dotdotdots preprocessing ──
-    // Materialize `...` elisions before matching
-    const DOT_LINE_RE = /^[ \t]*\.\.\.[ \t]*$/m;
-    if (DOT_LINE_RE.test(edit.oldText)) {
-      const materialized = materializeDotdotdots(
-        edit.oldText,
-        edit.newText,
-        normalizedContent,
-      );
-      if (materialized) {
-        edit = {
-          ...edit,
-          oldText: materialized.materializedOld,
-          newText: materialized.materializedNew,
-        };
-        matchNotes.push(`edits[${i}]: ... ellipsis materialized (numericFuzz=4, dotdotdots).`);
-      }
-    }
+    const edit = preprocessEdit(normalizedEdits[i], normalizedContent, i, matchNotes);
 
     const searchScope = searchScopes[i];
     const scopedContent = searchScope
@@ -437,228 +804,14 @@ export async function applyEdits(
       : normalizedContent;
 
     if (edit.replaceAll) {
-      // Find all occurrences
-      const match = findText(
-        normalizedContent,
-        edit.oldText,
-        indentationStyle,
-        0,
-        searchScopes[i],
-        allowFuzzy,
-      );
-      if (!match.found) {
-        // Idempotency: if the replacement is already in place, treat as no-op
-        if (checkIdempotency(scopedContent, edit.oldText, edit.newText, path, i, edit.description)) {
-          matchNotes.push(
-            `edits[${i}]${edit.description ? ` (${edit.description})` : ''}: ` +
-            `replacement text already present in ${path} — edit is a no-op.`,
-          );
-          continue;
-        }
-        const diagnostic = findClosestMatch(normalizedContent, edit.oldText);
-        throw getNotFoundError(
-          path, i, normalizedEdits.length, diagnostic, edit.description, allowFuzzy,
-        );
-      }
-
-      // Lock to this tier and find all matches
-      const allMatches = findAllMatches(
-        normalizedContent,
-        edit.oldText,
-        indentationStyle,
-        match.tier,
-        searchScopes[i],
-        allowFuzzy,
-      );
-
-      if (allMatches.length === 0) {
-        const diagnostic = findClosestMatch(normalizedContent, edit.oldText);
-        throw getNotFoundError(
-          path, i, normalizedEdits.length, diagnostic, edit.description, allowFuzzy,
-        );
-      }
-
-      for (const m of allMatches) {
-        let newText = edit.newText;
-        // Adapt newText indentation
-        if (m.tier !== MatchTier.EXACT) {
-          newText = adaptNewTextIndentation(
-            newText,
-            edit.oldText,
-            indentationStyle,
-            m.matchedText,
-          );
-        }
-        // Preserve quote style
-        newText = preserveQuoteStyle(
-          newText,
-          normalizedContent,
-          m.index,
-          m.matchLength,
-          path,
-        );
-
-        matchSpans.push({
-          editIndex: i,
-          matchIndex: m.index,
-          matchLength: m.matchLength,
-          newText,
-          tier: m.tier,
-          matchNote: m.matchNote,
-          replaceAll: true,
-          description: edit.description,
-        });
-      }
-
-      if (match.tier !== MatchTier.EXACT && match.matchNote) {
-        matchNotes.push(match.matchNote.replace(
-          "Matched via",
-          `edits[${i}] matched via`,
-        ));
-      }
+      matchSpans.push(...buildReplaceAllSpans(edit, i, ctx, searchScope, scopedContent, matchNotes));
     } else {
-      // Single match required
-      const match = findText(
-        normalizedContent,
-        edit.oldText,
-        indentationStyle,
-        0,
-        searchScopes[i],
-        allowFuzzy,
-      );
-
-      if (!match.found) {
-        // Idempotency: if the replacement is already in place, treat as no-op
-        if (checkIdempotency(scopedContent, edit.oldText, edit.newText, path, i, edit.description)) {
-          matchNotes.push(
-            `edits[${i}]${edit.description ? ` (${edit.description})` : ''}: ` +
-            `replacement text already present in ${path} — edit is a no-op.`,
-          );
-          continue;
-        }
-        const diagnostic = findClosestMatch(normalizedContent, edit.oldText);
-        throw getNotFoundError(
-          path, i, normalizedEdits.length, diagnostic, edit.description, allowFuzzy,
-        );
-      }
-
-      // Check for ambiguity across all tiers
-      if (match.tier === MatchTier.UNICODE) {
-        // Unicode tier: count occurrences in fuzzy-normalized space, scoped to
-        // the search scope when one is set (scopedContent already computed above).
-        const fuzzyContent = normalizeForFuzzyMatch(scopedContent);
-        const fuzzyOldText = normalizeForFuzzyMatch(edit.oldText);
-        let fuzzyCount = 0;
-        let pos = 0;
-        while ((pos = fuzzyContent.indexOf(fuzzyOldText, pos)) !== -1) {
-          fuzzyCount++;
-          pos += fuzzyOldText.length;
-        }
-        if (fuzzyCount > 1) {
-          throw getAmbiguousError(
-            path, i, normalizedEdits.length, fuzzyCount, undefined, edit.description,
-          );
-        }
-      } else if (match.tier === MatchTier.SIMILARITY) {
-        // Similarity tier: count how many windows meet the threshold
-        // using the same sliding-window approach as trySimilarityMatch.
-        // Also track best/second-best scores for dominant-fuzzy auto-accept.
-        const { count: similarityCount, bestScore, secondBestScore } = countSimilarityOccurrences(
-          scopedContent,
-          edit.oldText,
-        );
-        if (similarityCount > 1) {
-          // Fuzzy-dominant auto-accept: if one match is clearly better,
-          // accept it instead of throwing an ambiguity error.
-          if (isDominantFuzzyMatch(bestScore, secondBestScore)) {
-            matchNotes.push(
-              `edits[${i}]${edit.description ? ` (${edit.description})` : ''}: ` +
-              `fuzzy-dominant auto-accepted (best=${(bestScore * 100).toFixed(1)}%, ` +
-              `delta=${((bestScore - secondBestScore) * 100).toFixed(1)}% > ` +
-              `${(DOMINANT_FUZZY_DELTA * 100).toFixed(0)}% threshold).`,
-            );
-          } else {
-            throw getAmbiguousError(
-              path, i, normalizedEdits.length, similarityCount, undefined, edit.description,
-            );
-          }
-        }
-      } else {
-        // Exact and indentation tiers: count occurrences using stripped text,
-        // scoped to the search scope when one is set (so a scoped edit is not
-        // rejected for duplicates outside its scope). scopedContent is already
-        // computed above.
-        const strippedOld = edit.oldText.replace(/^[\t ]+/gm, '');
-        const strippedContent = scopedContent.replace(/^[\t ]+/gm, '');
-        const exactCount = countOccurrences(strippedContent, strippedOld);
-        if (exactCount > 1) {
-          throw getAmbiguousError(
-            path, i, normalizedEdits.length, exactCount, undefined, edit.description,
-          );
-        }
-      }
-
-      let newText = edit.newText;
-
-      // Adapt newText to file style
-      if (match.tier !== MatchTier.EXACT || match.usedFuzzyMatch) {
-        newText = adaptNewTextIndentation(
-          newText,
-          edit.oldText,
-          indentationStyle,
-          match.matchedText,
-        );
-        newText = preserveQuoteStyle(
-          newText,
-          normalizedContent,
-          match.index,
-          match.matchLength,
-          path,
-        );
-      }
-
-      matchSpans.push({
-        editIndex: i,
-        matchIndex: match.index,
-        matchLength: match.matchLength,
-        newText,
-        tier: match.tier,
-        matchNote: match.matchNote,
-        replaceAll: false,
-        description: edit.description,
-      });
-
-      if (match.tier !== MatchTier.EXACT && match.matchNote) {
-        matchNotes.push(match.matchNote.replace(
-          "Matched via",
-          `edits[${i}] matched via`,
-        ));
-      }
+      matchSpans.push(...buildSingleMatchSpan(edit, i, ctx, searchScope, scopedContent, matchNotes));
     }
   }
 
   // Phase 2: Check for overlaps
-  matchSpans.sort((a, b) => a.matchIndex - b.matchIndex);
-  for (let i = 1; i < matchSpans.length; i++) {
-    const prev = matchSpans[i - 1];
-    const curr = matchSpans[i];
-    if (prev.matchIndex + prev.matchLength > curr.matchIndex) {
-      const prevDesc = prev.description ? ` (${prev.description})` : "";
-      const currDesc = curr.description ? ` (${curr.description})` : "";
-      if (prev.replaceAll || curr.replaceAll) {
-        throw new Error(
-          `edits[${prev.editIndex}]${prevDesc}${prev.replaceAll ? " (replaceAll)" : ""} and ` +
-          `edits[${curr.editIndex}]${currDesc}${curr.replaceAll ? " (replaceAll)" : ""} overlap ` +
-          `in ${path}. If you need to replace all occurrences except one specific case, ` +
-          `split into two calls: first apply the specific edit, then replaceAll for the rest.`,
-        );
-      }
-      throw new Error(
-        `edits[${prev.editIndex}]${prevDesc} and edits[${curr.editIndex}]${currDesc} ` +
-        `overlap in ${path}. Merge them into one edit or target disjoint regions.`,
-      );
-    }
-  }
+  validateNoOverlappingSpans(matchSpans, path);
 
   // Phase 2.5: Pre-apply hooks (conflict detection, etc.)
   // Only run hooks after structural validation so invalid batches cannot
@@ -669,16 +822,7 @@ export async function applyEdits(
 
   // Phase 3: Apply replacements in reverse order against ORIGINAL content
   const baseContent = normalizedContent;
-  let newContent = normalizedContent;
-
-  matchSpans.sort((a, b) => a.matchIndex - b.matchIndex);
-  for (let i = matchSpans.length - 1; i >= 0; i--) {
-    const span = matchSpans[i];
-    newContent =
-      newContent.slice(0, span.matchIndex) +
-      span.newText +
-      newContent.slice(span.matchIndex + span.matchLength);
-  }
+  const newContent = applySpansInReverse(normalizedContent, matchSpans);
 
   if (baseContent === newContent) {
     throw getNoChangeError(path, normalizedEdits.length);

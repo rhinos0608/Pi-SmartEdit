@@ -404,6 +404,512 @@ async function buildAutoInspectEnvelope(args: {
     return { ok: true, envelope, canonicalByGroup, newFileCanonicals };
 }
 
+// ── Extract-only helpers (Lane A): file-local, behavior-preserving ──
+// These helpers exist only to split createPatchTool.execute's Brain Method
+// without changing patch semantics. Transaction begin/commit/finalize stay
+// in the orchestrator; materialization + group pipeline stay in try/finally.
+
+interface RefactorRequestFields {
+    readonly kind: string;
+    readonly path?: string;
+    readonly line?: number;
+    readonly character?: number;
+    readonly newName?: string;
+    readonly previewId?: string;
+    readonly tabSize?: number;
+    readonly insertSpaces?: boolean;
+    readonly endLine?: number;
+    readonly endCharacter?: number;
+    readonly diagnostics?: unknown;
+    readonly only?: unknown;
+}
+
+type PatchResult = { content: Array<{ type: "text"; text: string }>; details: PatchToolDetails };
+
+function failResult(toolCallId: string, text: string, message: string, reasons: string[], phase: "stage" | "write" = "stage"): PatchResult {
+    return {
+        content: [{ type: "text" as const, text }],
+        details: makeFailed(toolCallId, phase, message, { inspectionId: "", resourceIds: [] }, freshChecks(), reasons),
+    };
+}
+
+function isMissingRenamePreviewFields(path: string | undefined, line: number | undefined, character: number | undefined, newName: string | undefined): boolean {
+    return path === undefined || line === undefined || character === undefined || newName === undefined;
+}
+
+function isMissingCodeActionFields(path: string | undefined, line: number | undefined, character: number | undefined): boolean {
+    return path === undefined || line === undefined || character === undefined;
+}
+
+function moveSpansOverlap(seen: { canonicalFrom: string; startLine: number; endLine: number }, canonicalFrom: string, startLine: number, endLine: number): boolean {
+    return seen.canonicalFrom === canonicalFrom && startLine <= seen.endLine && seen.startLine <= endLine;
+}
+
+function isSameFileMoveCandidate(op: string, canonicalFrom: string, canonicalTo: string, after: string | undefined): boolean {
+    return op === "move" && canonicalFrom === canonicalTo && after !== undefined && after !== "start";
+}
+
+function isAfterLineInsideSourceSpan(afterLine: number | null, startLine: number, endLine: number): boolean {
+    return afterLine !== null && afterLine >= startLine - 1 && afterLine <= endLine;
+}
+
+function isBlockingPostwriteFailure(kind: string, outcome: string): boolean {
+    return kind === "blocking" && (outcome === "fail" || outcome === "timeout");
+}
+
+async function storeRefactorPreview(args: {
+    deps: PatchToolDeps;
+    toolCallId: string;
+    workspaceEdit: unknown;
+    planned: { stagedFiles: Array<{ filePath: string; newContent: string }>; diffString: string };
+    meta: { filePath: string; line: number; character: number; newName: string; serverDescriptorId: unknown };
+}): Promise<PatchResult | null> {
+    const { deps, toolCallId, workspaceEdit, planned, meta } = args;
+    const sessionFilePath = deps.getSessionFilePath();
+    if (!sessionFilePath) {
+        return failResult(toolCallId, "failed: refactor preview requires an active session (no session file path available)", "no session file path", ["no session file path"]);
+    }
+    const root = deps.getCanonicalWorkspaceRoot();
+    const sid = hashSessionFilePath(sessionFilePath);
+    const previewId = globalRenamePreviewCache.store(workspaceEdit as never, planned as never, { ...meta, serverDescriptorId: meta.serverDescriptorId as never, sessionId: sid, sessionRoot: root });
+    return {
+        content: [{ type: "text" as const, text: `preview ${previewId}: ${planned.stagedFiles.length} file(s)\n${planned.diffString.slice(0, 4000)}` }],
+        details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: planned.diffString, diffs: planned.stagedFiles.map((sf) => ({ path: sf.filePath, diff: sf.newContent })), previewId, stagedFiles: planned.stagedFiles.length } as unknown as PatchToolDetails,
+    };
+}
+
+interface BusPreviewResponse {
+    readonly ok: boolean;
+    readonly workspaceEdit?: unknown;
+    readonly serverDescriptorId?: unknown;
+    readonly error?: string;
+}
+
+async function planAndStorePreview(
+    deps: PatchToolDeps,
+    toolCallId: string,
+    workspaceEdit: unknown,
+    meta: { filePath: string; line: number; character: number; newName: string; serverDescriptorId: unknown },
+): Promise<PatchResult> {
+    const planned = await planPositionalEdits(workspaceEdit as never, async (p) => (await fsReadFile(p)).toString("utf8"));
+    const stored = await storeRefactorPreview({ deps, toolCallId, workspaceEdit, planned, meta });
+    if (stored) return stored;
+    return failResult(toolCallId, "failed: refactor preview requires an active session (no session file path available)", "no session file path", ["no session file path"]);
+}
+
+async function runBusPreview(args: {
+    deps: PatchToolDeps;
+    toolCallId: string;
+    label: string;
+    request: (bus: NonNullable<ReturnType<NonNullable<PatchToolDeps["getBus"]>>>) => Promise<BusPreviewResponse>;
+    meta: { filePath: string; line: number; character: number; newName: string };
+}): Promise<PatchResult> {
+    const { deps, toolCallId, label, request, meta } = args;
+    const bus = deps.getBus?.() ?? null;
+    if (!bus) return failResult(toolCallId, `failed: ${label} requires bus`, "bus unavailable", ["bus unavailable"]);
+    try {
+        const resp = await request(bus);
+        if (!resp.ok || !resp.workspaceEdit) {
+            return failResult(toolCallId, `failed: ${label}: ${resp.error ?? "no edit"}`, resp.error ?? "no workspaceEdit", [resp.error ?? "no workspaceEdit"]);
+        }
+        return await planAndStorePreview(deps, toolCallId, resp.workspaceEdit, { ...meta, serverDescriptorId: resp.serverDescriptorId });
+    } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return failResult(toolCallId, `failed: ${label} ${msg}`, msg, [msg]);
+    }
+}
+
+function selectCodeActionWorkspaceEdit(actions: ReadonlyArray<{ readonly workspaceEdit?: unknown; readonly isPreferred?: boolean }>): { ok: true; workspaceEdit: unknown } | { ok: false; reason: string } {
+    if (actions.length === 0) return { ok: false, reason: "no code actions available" };
+    const withEdit = actions.filter((a) => !!a.workspaceEdit);
+    if (withEdit.length === 0) return { ok: false, reason: "no applicable code action" };
+    const selected = withEdit.length === 1 ? withEdit[0] : (withEdit.find((a) => a.isPreferred) ?? withEdit[0]);
+    if (!selected?.workspaceEdit) return { ok: false, reason: "no applicable code action" };
+    return { ok: true, workspaceEdit: selected.workspaceEdit };
+}
+
+async function handleRenamePreview(deps: PatchToolDeps, toolCallId: string, refactor: RefactorRequestFields): Promise<PatchResult> {
+    if (!deps.getBus?.()) return failResult(toolCallId, "failed: rename-preview requires bus", "bus unavailable", ["bus unavailable"]);
+    if (isMissingRenamePreviewFields(refactor.path, refactor.line, refactor.character, refactor.newName)) {
+        return failResult(toolCallId, "failed: rename-preview requires path, line, character, newName", "missing rename-preview fields", ["missing rename-preview fields"]);
+    }
+    const path = refactor.path as string;
+    const line = refactor.line as number;
+    const character = refactor.character as number;
+    const newName = refactor.newName as string;
+    return runBusPreview({ deps, toolCallId, label: "rename-preview",
+        request: (bus) => requestRenamePreview(bus, { filePath: path, line, character, newName }),
+        meta: { filePath: path, line, character, newName } });
+}
+
+async function handleOrganizeImportsPreview(deps: PatchToolDeps, toolCallId: string, refactor: RefactorRequestFields): Promise<PatchResult> {
+    if (!deps.getBus?.()) return failResult(toolCallId, "failed: organize-imports-preview requires bus", "bus unavailable", ["bus unavailable"]);
+    if (refactor.path === undefined) {
+        return failResult(toolCallId, "failed: organize-imports-preview requires path", "missing organize-imports-preview path", ["missing organize-imports-preview path"]);
+    }
+    const path = refactor.path;
+    return runBusPreview({ deps, toolCallId, label: "organize-imports-preview",
+        request: (bus) => requestOrganizeImports(bus, { filePath: path }),
+        meta: { filePath: path, line: 0, character: 0, newName: "" } });
+}
+
+async function handleFormattingPreview(deps: PatchToolDeps, toolCallId: string, refactor: RefactorRequestFields): Promise<PatchResult> {
+    if (!deps.getBus?.()) return failResult(toolCallId, "failed: formatting-preview requires bus", "bus unavailable", ["bus unavailable"]);
+    if (refactor.path === undefined) {
+        return failResult(toolCallId, "failed: formatting-preview requires path", "missing formatting-preview path", ["missing formatting-preview path"]);
+    }
+    const path = refactor.path;
+    const { tabSize, insertSpaces } = refactor;
+    return runBusPreview({ deps, toolCallId, label: "formatting-preview",
+        request: (bus) => requestFormatting(bus, { filePath: path, tabSize, insertSpaces }),
+        meta: { filePath: path, line: 0, character: 0, newName: "" } });
+}
+
+async function handleCodeActionPreview(deps: PatchToolDeps, toolCallId: string, refactor: RefactorRequestFields): Promise<PatchResult> {
+    const bus = deps.getBus?.() ?? null;
+    if (!bus) return failResult(toolCallId, "failed: code-action-preview requires bus", "bus unavailable", ["bus unavailable"]);
+    try {
+        if (isMissingCodeActionFields(refactor.path, refactor.line, refactor.character)) {
+            return failResult(toolCallId, "failed: code-action-preview requires path, line, character", "missing code-action-preview fields", ["missing code-action-preview fields"]);
+        }
+        const resp = await requestCodeAction(bus, { filePath: refactor.path as string, line: refactor.line as number, character: refactor.character as number, endLine: refactor.endLine, endCharacter: refactor.endCharacter, diagnostics: refactor.diagnostics as never, only: refactor.only as never });
+        if (!resp.ok) {
+            return failResult(toolCallId, `failed: code-action-preview: ${resp.error ?? "no actions"}`, resp.error ?? "code action failed", [resp.error ?? "code action failed"]);
+        }
+        const selected = selectCodeActionWorkspaceEdit(resp.actions ?? []);
+        if (!selected.ok) return failResult(toolCallId, `failed: ${selected.reason}`, selected.reason, [selected.reason]);
+        return await planAndStorePreview(deps, toolCallId, selected.workspaceEdit, { filePath: refactor.path as string, line: refactor.line as number, character: refactor.character as number, newName: "", serverDescriptorId: resp.serverDescriptorId });
+    } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return failResult(toolCallId, `failed: code-action-preview ${msg}`, msg, [msg]);
+    }
+}
+
+type StagedPreviewFile = { filePath: string; originalContent: string; newContent: string; edits: Array<{ range: { start: { line: number }; end: { line: number } } }> };
+
+async function findStalePreviewFiles(files: StagedPreviewFile[]): Promise<string[]> {
+    const staleFiles: string[] = [];
+    for (const sf of files) {
+        try {
+            const current = (await fsReadFile(sf.filePath)).toString("utf8");
+            if (current !== sf.originalContent) staleFiles.push(sf.filePath);
+        } catch {
+            staleFiles.push(sf.filePath);
+        }
+    }
+    return staleFiles;
+}
+
+function findPreviewUnauthorizedFiles(deps: PatchToolDeps, files: StagedPreviewFile[]): string[] {
+    const priorStore = deps.getPriorAuthority?.() ?? null;
+    const unauthorized: string[] = [];
+    for (const sf of files) {
+        let canonical: string;
+        try { canonical = realpathSync(sf.filePath); } catch { canonical = sf.filePath; }
+        let res = priorStore ? priorStore.select(canonical) : null;
+        if (!res) res = priorStore ? priorStore.select(sf.filePath) : null;
+        if (!res) { unauthorized.push(`${sf.filePath} (no prior read authority)`); continue; }
+        const preimageSha = sha256OfString(sf.originalContent);
+        if (res.fullFileSha256 !== preimageSha) { unauthorized.push(`${sf.filePath} (SHA mismatch: authority ${String(res.fullFileSha256).slice(0, 8)} != preimage ${preimageSha.slice(0, 8)})`); continue; }
+        const touched: Array<{ startLine: number; endLine: number }> = sf.edits.length === 0 ? [] : sf.edits.map((e) => ({ startLine: e.range.start.line + 1, endLine: e.range.end.line + 1 }));
+        if (touched.length === 0) continue;
+        const covErr = checkResourceCoverage(res, touched);
+        if (covErr) unauthorized.push(`${sf.filePath} (${covErr})`);
+    }
+    return unauthorized;
+}
+
+function mapApplyPreviewError(toolCallId: string, err: unknown): PatchResult {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("rejected:")) {
+        return { content: [{ type: "text" as const, text: msg }], details: makeRejected(toolCallId, "coverage", [msg], { inspectionId: "", resourceIds: [] }, freshChecks()) };
+    }
+    return failResult(toolCallId, `failed: apply refactor ${msg}`, msg, [msg], "write");
+}
+
+async function handleApplyRefactorPreview(deps: PatchToolDeps, toolCallId: string, refactor: RefactorRequestFields): Promise<PatchResult> {
+    const sessionFilePath = deps.getSessionFilePath();
+    if (!sessionFilePath) {
+        return failResult(toolCallId, "failed: refactor preview requires an active session (no session file path available)", "no session file path", ["no session file path"]);
+    }
+    const root = deps.getCanonicalWorkspaceRoot();
+    const sid = hashSessionFilePath(sessionFilePath);
+    const applyPreviewId = refactor.previewId;
+    if (applyPreviewId === undefined) {
+        return failResult(toolCallId, "failed: apply-refactor-preview requires previewId", "missing previewId", ["missing previewId"]);
+    }
+    const cached = globalRenamePreviewCache.get(applyPreviewId, { sessionId: sid, sessionRoot: root });
+    if (!cached) {
+        return { content: [{ type: "text" as const, text: "rejected: preview not found or expired" }], details: makeRejected(toolCallId, "coverage", ["preview not found or expired"], { inspectionId: "", resourceIds: [] }, freshChecks()) };
+    }
+    const files = cached.plannedRename.stagedFiles;
+    try {
+        const { EditTransaction: ET } = await import("./edit-transaction.js");
+        const tx = await ET.begin(files.map((f) => f.filePath));
+        try {
+            const staleFiles = await findStalePreviewFiles(files);
+            if (staleFiles.length > 0) {
+                await tx.rollback();
+                return { content: [{ type: "text", text: `rejected: files changed since preview: ${staleFiles.join(", ")}` }], details: makeRejected(toolCallId, "stale", [`files changed since preview: ${staleFiles.join(", ")}`], { inspectionId: "", resourceIds: [] }, freshChecks()) };
+            }
+            const unauthorized = findPreviewUnauthorizedFiles(deps, files);
+            if (unauthorized.length > 0) {
+                await tx.rollback();
+                return { content: [{ type: "text", text: `rejected: missing read authority for: ${unauthorized.join(", ")} — read the file first, then retry` }], details: makeRejected(toolCallId, "coverage", [`missing read authority for: ${unauthorized.join(", ")}`], { inspectionId: "", resourceIds: [] }, freshChecks()) };
+            }
+            for (const sf of files) await tx.write(sf.filePath, sf.newContent);
+            await tx.commit();
+        } catch (e) {
+            try { await tx.rollback(); } catch {}
+            throw e;
+        }
+        globalRenamePreviewCache.delete(applyPreviewId);
+        return { content: [{ type: "text" as const, text: `applied refactor ${applyPreviewId}: ${files.length} file(s)` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: cached.plannedRename.diffString } as unknown as PatchToolDetails };
+    } catch (err) {
+        return mapApplyPreviewError(toolCallId, err);
+    }
+}
+
+async function handleRefactorRequest(deps: PatchToolDeps, toolCallId: string, refactor: RefactorRequestFields | undefined): Promise<PatchResult | null> {
+    if (!refactor) return null;
+    if (refactor.kind === "rename-preview") return handleRenamePreview(deps, toolCallId, refactor);
+    if (refactor.kind === "organize-imports-preview") return handleOrganizeImportsPreview(deps, toolCallId, refactor);
+    if (refactor.kind === "formatting-preview") return handleFormattingPreview(deps, toolCallId, refactor);
+    if (refactor.kind === "code-action-preview") return handleCodeActionPreview(deps, toolCallId, refactor);
+    return handleApplyRefactorPreview(deps, toolCallId, refactor);
+}
+
+interface PreparedPatchRequest {
+    requestEvidenceRef: EvidenceRef | undefined;
+    sessionFilePath: string;
+    canonicalRoot: string;
+    textOps: EditOperation[];
+    adaptedTransfers: { ok: true; value: Array<{ op: "copy" | "move"; from: string; to: string; range: { pos: string; end: string }; after: string | undefined; description: string | undefined }> };
+    groups: EditGroup[];
+    checks: MutableChecks;
+    diagnostics: string[];
+}
+
+function preparePatchRequest(args: {
+    validated: { ok: true; value: { evidenceRef?: EvidenceRef; edits?: EditOperation[]; raw?: unknown; path?: string } };
+    deps: PatchToolDeps;
+    ctx: { cwd: string };
+    toolCallId: string;
+}): { ok: true; prepared: PreparedPatchRequest } | { ok: false; result: PatchResult } {
+    const { validated, deps, ctx, toolCallId } = args;
+    const requestEvidenceRef = validated.value.evidenceRef;
+    const sessionFilePath = deps.getSessionFilePath();
+    if (typeof sessionFilePath !== "string" || sessionFilePath.length === 0) {
+        return { ok: false, result: { content: [{ type: "text" as const, text: "rejected: ephemeral session identity" }], details: makeRejected(toolCallId, "session", ["no real session file path"], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks()) } };
+    }
+    const canonicalRoot = deps.getCanonicalWorkspaceRoot();
+    if (typeof canonicalRoot !== "string" || canonicalRoot.length === 0) {
+        return { ok: false, result: { content: [{ type: "text" as const, text: "rejected: missing canonical workspace root" }], details: makeRejected(toolCallId, "session", ["no canonical workspace root"], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks()) } };
+    }
+    let requestEdits: ReadonlyArray<EditOperation> = validated.value.edits ?? [];
+    let rawTopology: RawTopology[] = [];
+    const rawWarnings: string[] = [];
+    if (validated.value.raw !== undefined) {
+        const normalized = normalizeRawEdit(validated.value.raw as never, validated.value.path);
+        rawWarnings.push(...normalized.warnings);
+        if (normalized.diagnostics.length > 0 || normalized.intents.length === 0) {
+            const diagnostics = [...rawWarnings, ...normalized.diagnostics, "Raw patch parsed into no executable update operations."];
+            return { ok: false, result: { content: [{ type: "text" as const, text: "failed: raw patch parsing" }], details: makeFailed(toolCallId, "stage", "raw patch normalization failed", { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks(), diagnostics) } };
+        }
+        rawTopology = normalized.intents.flatMap((intent): RawTopology[] => {
+            if (intent.kind === "text") return [];
+            return intent.kind === "rename" ? [{ kind: "rename", oldPath: intent.oldPath, newPath: intent.newPath }] : [intent];
+        });
+        requestEdits = normalized.intents.flatMap((intent) => intent.kind === "text" ? [intent.operation] : []);
+    }
+    const transferOps = requestEdits.filter((e) => (e as { op?: unknown }).op !== undefined);
+    const textOps = requestEdits.filter((e) => (e as { op?: unknown }).op === undefined);
+    const adaptedTransfers = adaptTransferOps(transferOps, validated.value.path);
+    if (!adaptedTransfers.ok) {
+        return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${adaptedTransfers.error}` }], details: makeRejected(toolCallId, "session", [adaptedTransfers.error], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks()) } };
+    }
+    const grouping = groupEditsByPath(ctx.cwd, validated.value.path ?? "", textOps);
+    if (!grouping.ok) {
+        return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${grouping.error}` }], details: makeRejected(toolCallId, "session", [grouping.error], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks()) } };
+    }
+    const groups = grouping.groups;
+    const topologyConflicts: Array<{ path: string; existingKind: string; newKind: string }> = [];
+    for (const op of rawTopology) {
+        const entries = op.kind === "rename" ? [[op.oldPath, op], [op.newPath, undefined]] : [[op.path, op]];
+        for (const [rawPath, topology] of entries as Array<[string, RawTopology | undefined]>) {
+            const absolutePath = pathResolve(ctx.cwd, rawPath);
+            const existingIdx = groups.findIndex((g) => g.absolutePath === absolutePath);
+            if (existingIdx >= 0) {
+                const existingTopology = groups[existingIdx].topology;
+                if (topology) {
+                    if (existingTopology) topologyConflicts.push({ path: rawPath, existingKind: existingTopology.kind, newKind: topology.kind });
+                    else groups[existingIdx] = { ...groups[existingIdx], topology };
+                } else if (existingTopology && op.kind === "rename") {
+                    topologyConflicts.push({ path: rawPath, existingKind: existingTopology.kind, newKind: op.kind });
+                }
+            } else groups.push({ absolutePath, rawPath, edits: [], ...(topology ? { topology } : {}) });
+        }
+    }
+    if (topologyConflicts.length > 0) {
+        const message = topologyConflicts.map((c) => `conflicting topology operations for path '${c.path}': ${c.existingKind} vs ${c.newKind}`).join("; ");
+        return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${message}` }], details: makeRejected(toolCallId, "conflict", [message], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks()) } };
+    }
+    const checks: MutableChecks = freshChecks();
+    const diagnostics: string[] = [...rawWarnings];
+    return { ok: true, prepared: { requestEvidenceRef, sessionFilePath, canonicalRoot, textOps, adaptedTransfers: adaptedTransfers as PreparedPatchRequest["adaptedTransfers"], groups, checks, diagnostics } };
+}
+
+interface ResolvedPatchTransfer {
+    op: "copy" | "move";
+    canonicalFrom: string;
+    canonicalTo: string;
+    range: { pos: string; end: string };
+    after: string | undefined;
+    rawFrom: string;
+    rawTo: string;
+    toIsNewFile: boolean;
+    description: string | undefined;
+}
+
+function resolvePatchTransfers(args: {
+    adaptedTransfers: PreparedPatchRequest["adaptedTransfers"];
+    groups: EditGroup[];
+    ctx: { cwd: string };
+    toolCallId: string;
+    requestEvidenceRef: EvidenceRef | undefined;
+    checks: MutableChecks;
+}): { ok: true; resolvedTransfers: ResolvedPatchTransfer[]; transferNewFileCanonicals: Set<string>; copySourceOnlyPaths: Set<string> } | { ok: false; result: PatchResult } {
+    const { adaptedTransfers, groups, ctx, toolCallId, requestEvidenceRef, checks } = args;
+    const resolvedTransfers: ResolvedPatchTransfer[] = [];
+    const transferNewFileCanonicals = new Set<string>();
+    const copySourceOnlyPaths = new Set<string>();
+    for (const transferReq of adaptedTransfers.value) {
+        const op = transferReq.op;
+        const rawFrom = transferReq.from;
+        const rawTo = transferReq.to;
+        const range = transferReq.range;
+        const after = transferReq.after;
+        let canonicalFrom: string;
+        try {
+            canonicalFrom = realpathSync(pathResolve(ctx.cwd, rawFrom));
+        } catch (err) {
+            const message = `transfer source not found: ${rawFrom} (${err instanceof Error ? err.message : String(err)})`;
+            return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${message}` }], details: makeRejected(toolCallId, "coverage", [message], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, checks) } };
+        }
+        let canonicalTo: string;
+        let toIsNewFile = false;
+        try {
+            canonicalTo = realpathSync(pathResolve(ctx.cwd, rawTo));
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+                canonicalTo = pathResolve(ctx.cwd, rawTo);
+                toIsNewFile = true;
+            } else {
+                const message = `transfer destination not found: ${rawTo} (${err instanceof Error ? err.message : String(err)})`;
+                return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${message}` }], details: makeRejected(toolCallId, "coverage", [message], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, checks) } };
+            }
+        }
+        if (toIsNewFile) transferNewFileCanonicals.add(canonicalTo);
+        const description = transferReq.description;
+        resolvedTransfers.push({ op, canonicalFrom, canonicalTo, range, after, rawFrom, rawTo, toIsNewFile, description });
+        const buckets: Array<[string, string]> = op === "move" ? [[canonicalTo, rawTo], [canonicalFrom, rawFrom]] : [[canonicalTo, rawTo]];
+        for (const [absolutePath, rawPath] of buckets) {
+            if (!groups.some((g) => g.absolutePath === absolutePath)) groups.push({ absolutePath, rawPath, edits: [] });
+        }
+        if (op === "copy") copySourceOnlyPaths.add(canonicalFrom);
+    }
+    return { ok: true, resolvedTransfers, transferNewFileCanonicals, copySourceOnlyPaths };
+}
+
+async function acquirePatchEnvelope(args: {
+    deps: PatchToolDeps;
+    groups: EditGroup[];
+    groupsNeedingEnvelopeHint?: undefined;
+    sessionFilePath: string;
+    canonicalRoot: string;
+    requestEvidenceRef: EvidenceRef | undefined;
+    transferNewFileCanonicals: ReadonlySet<string>;
+    toolCallId: string;
+    checks: MutableChecks;
+    diagnostics: string[];
+    usedEvidence: string[];
+    signal: AbortSignal | undefined;
+}): Promise<{ ok: true; envelope: WorkspaceEvidenceEnvelope | null; autoInspected: boolean; evidenceRefForDetails: EvidenceRef; newFileCanonicals: ReadonlySet<string> } | { ok: false; result: PatchResult }> {
+    const { deps, groups, sessionFilePath, canonicalRoot, requestEvidenceRef, transferNewFileCanonicals, toolCallId, checks, diagnostics, usedEvidence, signal } = args;
+    const priorStore = deps.getPriorAuthority?.() ?? null;
+    const groupsNeedingEnvelope: EditGroup[] = [];
+    for (const g of groups) {
+        let prior: InspectedResource | null = null;
+        if (priorStore) {
+            try {
+                const canonical = realpathSync(g.absolutePath);
+                prior = priorStore.select(canonical);
+            } catch {
+                // file does not exist — no prior authority possible
+            }
+        }
+        if (!prior) groupsNeedingEnvelope.push(g);
+    }
+    let envelope: WorkspaceEvidenceEnvelope | null = null;
+    let autoInspected = false;
+    let evidenceRefForDetails: EvidenceRef;
+    let newFileCanonicals: ReadonlySet<string> = new Set();
+    if (groupsNeedingEnvelope.length === 0) {
+        evidenceRefForDetails = { inspectionId: "", resourceIds: [] };
+        return { ok: true, envelope, autoInspected, evidenceRefForDetails, newFileCanonicals };
+    }
+    if (!requestEvidenceRef) {
+        const existingWithoutPrior = groupsNeedingEnvelope.filter((g) => existsSync(g.absolutePath));
+        if (existingWithoutPrior.length > 0) {
+            const message = `no prior strong read authority for ${existingWithoutPrior.map((g) => g.rawPath).join(", ")}; read the file first (full file or target range), then retry`;
+            diagnostics.push(message);
+            return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: coverage (${message})` }], details: makeRejected(toolCallId, "coverage", diagnostics, { inspectionId: "", resourceIds: [] }, checks) } };
+        }
+        const built = await buildAutoInspectEnvelope({ sessionFilePath, canonicalRoot, groups: groupsNeedingEnvelope, newFileAllowed: transferNewFileCanonicals });
+        if (!built.ok) {
+            diagnostics.push(built.error);
+            checks.completed.push(makeCheck("auto-inspect", "fail", built.error));
+            return { ok: false, result: { content: [{ type: "text" as const, text: `failed: ${built.error}` }], details: makeFailed(toolCallId, "stage", built.error, { inspectionId: "", resourceIds: [] }, checks, diagnostics) } };
+        }
+        envelope = built.envelope;
+        autoInspected = true;
+        newFileCanonicals = built.newFileCanonicals;
+        evidenceRefForDetails = { inspectionId: envelope.inspectionId, resourceIds: envelope.resources.map((r) => r.resourceId) };
+        checks.completed.push(makeCheck("auto-inspect", "pass", `synthesized envelope for ${envelope.resources.length} file(s)`));
+        return { ok: true, envelope, autoInspected, evidenceRefForDetails, newFileCanonicals };
+    }
+    evidenceRefForDetails = { inspectionId: requestEvidenceRef.inspectionId, resourceIds: [...requestEvidenceRef.resourceIds] };
+    const rpc = deps.getRpcClient();
+    try {
+        const reply = await rpc.request("resolve_evidence" as RpcMethod, { inspectionId: requestEvidenceRef.inspectionId, sessionFilePath, workspaceRoot: canonicalRoot }, { signal });
+        if (!reply.ok || !reply.payload) {
+            checks.completed.push(makeCheck("evidence-pipeline", "fail", reply.error ?? "rpc returned no payload"));
+            return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${reply.error ?? "unknown rpc error"}` }], details: makeRejected(toolCallId, classifyRpcError(reply.error), [reply.error ?? "rpc failure"], evidenceRefForDetails, checks) } };
+        }
+        envelope = reply.payload as WorkspaceEvidenceEnvelope;
+        checks.completed.push(makeCheck("evidence-pipeline", "pass", "rpc resolve_evidence succeeded"));
+    } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        diagnostics.push(msg);
+        checks.completed.push(makeCheck("evidence-pipeline", "timeout", msg));
+        return { ok: false, result: { content: [{ type: "text" as const, text: `failed: ${msg}` }], details: makeFailed(toolCallId, "stage", msg, evidenceRefForDetails, checks, diagnostics) } };
+    } finally {
+        rpc.dispose();
+    }
+    if (envelope) {
+        const expectedSessionId = hashSessionFilePath(sessionFilePath);
+        if (envelope.sessionId !== expectedSessionId) {
+            diagnostics.push("envelope session identity mismatch");
+            return { ok: false, result: { content: [{ type: "text" as const, text: "rejected: session identity mismatch" }], details: makeRejected(toolCallId, "session", diagnostics, evidenceRefForDetails, checks, usedEvidence) } };
+        }
+        if (envelope.canonicalWorkspaceRoot !== canonicalRoot) {
+            diagnostics.push("envelope workspace root mismatch");
+            return { ok: false, result: { content: [{ type: "text" as const, text: "rejected: workspace mismatch" }], details: makeRejected(toolCallId, "session", diagnostics, evidenceRefForDetails, checks, usedEvidence) } };
+        }
+    }
+    return { ok: true, envelope, autoInspected, evidenceRefForDetails, newFileCanonicals };
+}
+
 // ── Patch tool factory ──────────────────────────────────────────────
 
 export interface PatchDisplayDiff {
@@ -452,222 +958,11 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             // the model actually sends can pass validation.
             const v = validateEditRequest({ ...params, toolCallId });
             // Refactor variants handle before generic session checks (but still validate shape via above)
+            // Refactor variants route to file-local helpers (Lane A extract-only).
             if ((v as { ok: boolean; value?: { refactor?: { kind: string } } }).ok && (v as unknown as { value: { refactor?: { kind: string } } }).value?.refactor) {
                 const refactor = (v as unknown as { value: { refactor: { kind: string; path?: string; line?: number; character?: number; newName?: string; previewId?: string; tabSize?: number; insertSpaces?: boolean; endLine?: number; endCharacter?: number; diagnostics?: unknown; only?: unknown } } }).value.refactor;
-                if (refactor.kind === "rename-preview") {
-                    const bus = deps.getBus?.() ?? null;
-                    if (!bus) {
-                        return { content: [{ type: "text" as const, text: "failed: rename-preview requires bus" }], details: makeFailed(toolCallId, "stage", "bus unavailable", { inspectionId: "", resourceIds: [] }, freshChecks(), ["bus unavailable"]) };
-                    }
-                    try {
-                        const renamePath = refactor.path;
-                        const renameLine = refactor.line;
-                        const renameCharacter = refactor.character;
-                        const renameNewName = refactor.newName;
-                        if (renamePath === undefined || renameLine === undefined || renameCharacter === undefined || renameNewName === undefined) {
-                            return { content: [{ type: "text" as const, text: "failed: rename-preview requires path, line, character, newName" }], details: makeFailed(toolCallId, "stage", "missing rename-preview fields", { inspectionId: "", resourceIds: [] }, freshChecks(), ["missing rename-preview fields"]) };
-                        }
-                        const resp = await requestRenamePreview(bus, { filePath: renamePath, line: renameLine, character: renameCharacter, newName: renameNewName });
-                        if (!resp.ok || !resp.workspaceEdit) {
-                            return { content: [{ type: "text" as const, text: `failed: rename-preview: ${resp.error ?? "no edit"}` }], details: makeFailed(toolCallId, "stage", resp.error ?? "no workspaceEdit", { inspectionId: "", resourceIds: [] }, freshChecks(), [resp.error ?? "no workspaceEdit"]) };
-                        }
-                        const planned = await planPositionalEdits(resp.workspaceEdit, async (p) => (await fsReadFile(p)).toString("utf8"));
-                        {
-                            const _sfp = deps.getSessionFilePath();
-                            if (!_sfp) {
-                                return { content: [{ type: "text" as const, text: "failed: refactor preview requires an active session (no session file path available)" }], details: makeFailed(toolCallId, "stage", "no session file path", { inspectionId: "", resourceIds: [] }, freshChecks(), ["no session file path"]) };
-                            }
-                            const _root = deps.getCanonicalWorkspaceRoot();
-                            const _sid = hashSessionFilePath(_sfp);
-                            const previewId = globalRenamePreviewCache.store(resp.workspaceEdit, planned, { filePath: renamePath, line: renameLine, character: renameCharacter, newName: renameNewName, serverDescriptorId: resp.serverDescriptorId, sessionId: _sid, sessionRoot: _root });
-                            return { content: [{ type: "text" as const, text: `preview ${previewId}: ${planned.stagedFiles.length} file(s)\n${planned.diffString.slice(0, 4000)}` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: planned.diffString, diffs: planned.stagedFiles.map((sf) => ({ path: sf.filePath, diff: sf.newContent })), previewId, stagedFiles: planned.stagedFiles.length } as unknown as PatchToolDetails };
-                        }
-                    } catch (err) {
-                        const msg = err instanceof Error ? err.message : String(err);
-                        return { content: [{ type: "text" as const, text: `failed: rename-preview ${msg}` }], details: makeFailed(toolCallId, "stage", msg, { inspectionId: "", resourceIds: [] }, freshChecks(), [msg]) };
-                    }
-                } else if (refactor.kind === "organize-imports-preview") {
-                    const bus = deps.getBus?.() ?? null;
-                    if (!bus) {
-                        return { content: [{ type: "text" as const, text: "failed: organize-imports-preview requires bus" }], details: makeFailed(toolCallId, "stage", "bus unavailable", { inspectionId: "", resourceIds: [] }, freshChecks(), ["bus unavailable"]) };
-                    }
-                    try {
-                        const organizePath = refactor.path;
-                        if (organizePath === undefined) {
-                            return { content: [{ type: "text" as const, text: "failed: organize-imports-preview requires path" }], details: makeFailed(toolCallId, "stage", "missing organize-imports-preview path", { inspectionId: "", resourceIds: [] }, freshChecks(), ["missing organize-imports-preview path"]) };
-                        }
-                        const resp = await requestOrganizeImports(bus, { filePath: organizePath });
-                        if (!resp.ok || !resp.workspaceEdit) {
-                            return { content: [{ type: "text" as const, text: `failed: organize-imports-preview: ${resp.error ?? "no edit"}` }], details: makeFailed(toolCallId, "stage", resp.error ?? "no workspaceEdit", { inspectionId: "", resourceIds: [] }, freshChecks(), [resp.error ?? "no workspaceEdit"]) };
-                        }
-                        const planned = await planPositionalEdits(resp.workspaceEdit, async (p) => (await fsReadFile(p)).toString("utf8"));
-                        {
-                            const _sfp2 = deps.getSessionFilePath();
-                            if (!_sfp2) {
-                                return { content: [{ type: "text" as const, text: "failed: refactor preview requires an active session (no session file path available)" }], details: makeFailed(toolCallId, "stage", "no session file path", { inspectionId: "", resourceIds: [] }, freshChecks(), ["no session file path"]) };
-                            }
-                            const _root2 = deps.getCanonicalWorkspaceRoot();
-                            const _sid2 = hashSessionFilePath(_sfp2);
-                            const previewId = globalRenamePreviewCache.store(resp.workspaceEdit, planned, { filePath: organizePath, line: 0, character: 0, newName: "", serverDescriptorId: resp.serverDescriptorId, sessionId: _sid2, sessionRoot: _root2 });
-                            return { content: [{ type: "text" as const, text: `preview ${previewId}: ${planned.stagedFiles.length} file(s)\n${planned.diffString.slice(0, 4000)}` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: planned.diffString, diffs: planned.stagedFiles.map((sf) => ({ path: sf.filePath, diff: sf.newContent })), previewId, stagedFiles: planned.stagedFiles.length } as unknown as PatchToolDetails };
-                        }
-                    } catch (err) {
-                        const msg = err instanceof Error ? err.message : String(err);
-                        return { content: [{ type: "text" as const, text: `failed: organize-imports-preview ${msg}` }], details: makeFailed(toolCallId, "stage", msg, { inspectionId: "", resourceIds: [] }, freshChecks(), [msg]) };
-                    }
-                } else if (refactor.kind === "formatting-preview") {
-                    const bus = deps.getBus?.() ?? null;
-                    if (!bus) {
-                        return { content: [{ type: "text" as const, text: "failed: formatting-preview requires bus" }], details: makeFailed(toolCallId, "stage", "bus unavailable", { inspectionId: "", resourceIds: [] }, freshChecks(), ["bus unavailable"]) };
-                    }
-                    try {
-                        const formattingPath = refactor.path;
-                        if (formattingPath === undefined) {
-                            return { content: [{ type: "text" as const, text: "failed: formatting-preview requires path" }], details: makeFailed(toolCallId, "stage", "missing formatting-preview path", { inspectionId: "", resourceIds: [] }, freshChecks(), ["missing formatting-preview path"]) };
-                        }
-                        const resp = await requestFormatting(bus, { filePath: formattingPath, tabSize: refactor.tabSize, insertSpaces: refactor.insertSpaces });
-                        if (!resp.ok || !resp.workspaceEdit) {
-                            return { content: [{ type: "text" as const, text: `failed: formatting-preview: ${resp.error ?? "no edit"}` }], details: makeFailed(toolCallId, "stage", resp.error ?? "no workspaceEdit", { inspectionId: "", resourceIds: [] }, freshChecks(), [resp.error ?? "no workspaceEdit"]) };
-                        }
-                        const planned = await planPositionalEdits(resp.workspaceEdit, async (p) => (await fsReadFile(p)).toString("utf8"));
-                        {
-                            const _sfp3 = deps.getSessionFilePath();
-                            if (!_sfp3) {
-                                return { content: [{ type: "text" as const, text: "failed: refactor preview requires an active session (no session file path available)" }], details: makeFailed(toolCallId, "stage", "no session file path", { inspectionId: "", resourceIds: [] }, freshChecks(), ["no session file path"]) };
-                            }
-                            const _root3 = deps.getCanonicalWorkspaceRoot();
-                            const _sid3 = hashSessionFilePath(_sfp3);
-                            const previewId = globalRenamePreviewCache.store(resp.workspaceEdit, planned, { filePath: formattingPath, line: 0, character: 0, newName: "", serverDescriptorId: resp.serverDescriptorId, sessionId: _sid3, sessionRoot: _root3 });
-                            return { content: [{ type: "text" as const, text: `preview ${previewId}: ${planned.stagedFiles.length} file(s)\n${planned.diffString.slice(0, 4000)}` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: planned.diffString, diffs: planned.stagedFiles.map((sf) => ({ path: sf.filePath, diff: sf.newContent })), previewId, stagedFiles: planned.stagedFiles.length } as unknown as PatchToolDetails };
-                        }
-                    } catch (err) {
-                        const msg = err instanceof Error ? err.message : String(err);
-                        return { content: [{ type: "text" as const, text: `failed: formatting-preview ${msg}` }], details: makeFailed(toolCallId, "stage", msg, { inspectionId: "", resourceIds: [] }, freshChecks(), [msg]) };
-                    }
-                } else if (refactor.kind === "code-action-preview") {
-                    const bus = deps.getBus?.() ?? null;
-                    if (!bus) {
-                        return { content: [{ type: "text" as const, text: "failed: code-action-preview requires bus" }], details: makeFailed(toolCallId, "stage", "bus unavailable", { inspectionId: "", resourceIds: [] }, freshChecks(), ["bus unavailable"]) };
-                    }
-                    try {
-                        const codeActionPath = refactor.path;
-                        const codeActionLine = refactor.line;
-                        const codeActionCharacter = refactor.character;
-                        if (codeActionPath === undefined || codeActionLine === undefined || codeActionCharacter === undefined) {
-                            return { content: [{ type: "text" as const, text: "failed: code-action-preview requires path, line, character" }], details: makeFailed(toolCallId, "stage", "missing code-action-preview fields", { inspectionId: "", resourceIds: [] }, freshChecks(), ["missing code-action-preview fields"]) };
-                        }
-                        const resp = await requestCodeAction(bus, { filePath: codeActionPath, line: codeActionLine, character: codeActionCharacter, endLine: refactor.endLine, endCharacter: refactor.endCharacter, diagnostics: refactor.diagnostics as never, only: refactor.only as never });
-                        if (!resp.ok) {
-                            return { content: [{ type: "text" as const, text: `failed: code-action-preview: ${resp.error ?? "no actions"}` }], details: makeFailed(toolCallId, "stage", resp.error ?? "code action failed", { inspectionId: "", resourceIds: [] }, freshChecks(), [resp.error ?? "code action failed"]) };
-                        }
-                        const actions = resp.actions ?? [];
-                        if (actions.length === 0) {
-                            return { content: [{ type: "text" as const, text: "failed: no code actions available" }], details: makeFailed(toolCallId, "stage", "no code actions available", { inspectionId: "", resourceIds: [] }, freshChecks(), ["no code actions available"]) };
-                        }
-                        let selected: typeof actions[number] | undefined;
-                        const withEdit = actions.filter((a) => !!a.workspaceEdit);
-                        if (withEdit.length === 0) {
-                            return { content: [{ type: "text" as const, text: "failed: no applicable code action" }], details: makeFailed(toolCallId, "stage", "no applicable code action", { inspectionId: "", resourceIds: [] }, freshChecks(), ["no applicable code action"]) };
-                        }
-                        if (withEdit.length === 1) {
-                            selected = withEdit[0];
-                        } else {
-                            selected = withEdit.find((a) => a.isPreferred) ?? withEdit[0];
-                        }
-                        if (!selected?.workspaceEdit) {
-                            return { content: [{ type: "text" as const, text: "failed: no applicable code action" }], details: makeFailed(toolCallId, "stage", "no applicable code action", { inspectionId: "", resourceIds: [] }, freshChecks(), ["no applicable code action"]) };
-                        }
-                        const workspaceEdit = selected.workspaceEdit;
-                        const planned = await planPositionalEdits(workspaceEdit, async (p) => (await fsReadFile(p)).toString("utf8"));
-                        const _sfp4 = deps.getSessionFilePath();
-                        if (!_sfp4) {
-                            return { content: [{ type: "text" as const, text: "failed: refactor preview requires an active session (no session file path available)" }], details: makeFailed(toolCallId, "stage", "no session file path", { inspectionId: "", resourceIds: [] }, freshChecks(), ["no session file path"]) };
-                        }
-                        const _root4 = deps.getCanonicalWorkspaceRoot();
-                        const _sid4 = hashSessionFilePath(_sfp4);
-                        const previewId = globalRenamePreviewCache.store(workspaceEdit, planned, { filePath: codeActionPath, line: codeActionLine, character: codeActionCharacter, newName: "", serverDescriptorId: resp.serverDescriptorId, sessionId: _sid4, sessionRoot: _root4 });
-                        return { content: [{ type: "text" as const, text: `preview ${previewId}: ${planned.stagedFiles.length} file(s)\n${planned.diffString.slice(0, 4000)}` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: planned.diffString, diffs: planned.stagedFiles.map((sf) => ({ path: sf.filePath, diff: sf.newContent })), previewId, stagedFiles: planned.stagedFiles.length } as unknown as PatchToolDetails };
-                    } catch (err) {
-                        const msg = err instanceof Error ? err.message : String(err);
-                        return { content: [{ type: "text" as const, text: `failed: code-action-preview ${msg}` }], details: makeFailed(toolCallId, "stage", msg, { inspectionId: "", resourceIds: [] }, freshChecks(), [msg]) };
-                    }
-                } else {
-                    const _sfpGet = deps.getSessionFilePath();
-                    if (!_sfpGet) {
-                        return { content: [{ type: "text" as const, text: "failed: refactor preview requires an active session (no session file path available)" }], details: makeFailed(toolCallId, "stage", "no session file path", { inspectionId: "", resourceIds: [] }, freshChecks(), ["no session file path"]) };
-                    }
-                    const _rootGet = deps.getCanonicalWorkspaceRoot();
-                    const _sidGet = hashSessionFilePath(_sfpGet);
-                    const applyPreviewId = refactor.previewId;
-                    if (applyPreviewId === undefined) {
-                        return { content: [{ type: "text" as const, text: "failed: apply-refactor-preview requires previewId" }], details: makeFailed(toolCallId, "stage", "missing previewId", { inspectionId: "", resourceIds: [] }, freshChecks(), ["missing previewId"]) };
-                    }
-                    const cached = globalRenamePreviewCache.get(applyPreviewId, { sessionId: _sidGet, sessionRoot: _rootGet });
-                    if (!cached) {
-                        return { content: [{ type: "text" as const, text: "rejected: preview not found or expired" }], details: makeRejected(toolCallId, "coverage", ["preview not found or expired"], { inspectionId: "", resourceIds: [] }, freshChecks()) };
-                    }
-                    // Apply via transaction: write each staged file atomically
-                    const files = cached.plannedRename.stagedFiles;
-                    try {
-                        const { EditTransaction: ET } = await import("./edit-transaction.js");
-                        const tx = await ET.begin(files.map((f) => f.filePath));
-                        try {
-                            // Finding 4: freshness check inside transaction before writes
-                            const staleFiles: string[] = [];
-                            for (const sf of files) {
-                                try {
-                                    const current = (await fsReadFile(sf.filePath)).toString("utf8");
-                                    if (current !== sf.originalContent) {
-                                        staleFiles.push(sf.filePath);
-                                    }
-                                } catch {
-                                    staleFiles.push(sf.filePath);
-                                }
-                            }
-                            if (staleFiles.length > 0) {
-                                await tx.rollback();
-                                return { content: [{ type: "text", text: `rejected: files changed since preview: ${staleFiles.join(", ")}` }], details: makeRejected(toolCallId, "stale", [`files changed since preview: ${staleFiles.join(", ")}`], { inspectionId: "", resourceIds: [] }, freshChecks()) };
-                            }
-                            // F1: canonical evidence authorization — SHA + range coverage per staged file
-                            const priorStore = deps.getPriorAuthority?.() ?? null;
-                            const unauthorized: string[] = [];
-                            for (const sf of files) {
-                                let canonical: string;
-                                try { canonical = realpathSync(sf.filePath); } catch { canonical = sf.filePath; }
-                                let res = priorStore ? priorStore.select(canonical) : null;
-                                if (!res) res = priorStore ? priorStore.select(sf.filePath) : null;
-                                if (!res) { unauthorized.push(`${sf.filePath} (no prior read authority)`); continue; }
-                                const preimageSha = sha256OfString(sf.originalContent);
-                                if (res.fullFileSha256 !== preimageSha) { unauthorized.push(`${sf.filePath} (SHA mismatch: authority ${String(res.fullFileSha256).slice(0, 8)} != preimage ${preimageSha.slice(0, 8)})`); continue; }
-                                const touched: Array<{ startLine: number; endLine: number }> = sf.edits.length === 0 ? [] : sf.edits.map((e) => ({ startLine: e.range.start.line + 1, endLine: e.range.end.line + 1 }));
-                                if (touched.length > 0) {
-                                    const covErr = checkResourceCoverage(res, touched);
-                                    if (covErr) unauthorized.push(`${sf.filePath} (${covErr})`);
-                                }
-                            }
-                            if (unauthorized.length > 0) {
-                                await tx.rollback();
-                                return { content: [{ type: "text", text: `rejected: missing read authority for: ${unauthorized.join(", ")} — read the file first, then retry` }], details: makeRejected(toolCallId, "coverage", [`missing read authority for: ${unauthorized.join(", ")}`], { inspectionId: "", resourceIds: [] }, freshChecks()) };
-                            }
-                            for (const sf of files) {
-                                await tx.write(sf.filePath, sf.newContent);
-                            }
-                            await tx.commit();
-                        } catch (e) {
-                            try { await tx.rollback(); } catch {}
-                            throw e;
-                        }
-                        globalRenamePreviewCache.delete(applyPreviewId);
-                        return { content: [{ type: "text" as const, text: `applied refactor ${applyPreviewId}: ${files.length} file(s)` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: cached.plannedRename.diffString } as unknown as PatchToolDetails };
-                    } catch (err) {
-                        const msg = err instanceof Error ? err.message : String(err);
-                        // If already formatted as rejected (contains "rejected:"), preserve it
-                        if (msg.includes("rejected:")) {
-                            return { content: [{ type: "text" as const, text: msg }], details: makeRejected(toolCallId, "coverage", [msg], { inspectionId: "", resourceIds: [] }, freshChecks()) };
-                        }
-                        return { content: [{ type: "text" as const, text: `failed: apply refactor ${msg}` }], details: makeFailed(toolCallId, "write", msg, { inspectionId: "", resourceIds: [] }, freshChecks(), [msg]) };
-                    }
-                }
+                const handled = await handleRefactorRequest(deps, toolCallId, refactor);
+                if (handled) return handled;
             }
             if (!v.ok) {
                 return {
@@ -675,142 +970,17 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     details: makeRejected(toolCallId, "session", ["invalid patch request shape"], { inspectionId: "", resourceIds: [] }, freshChecks()),
                 };
             }
-            const requestEvidenceRef = v.value.evidenceRef;
-
-            const sessionFilePath = deps.getSessionFilePath();
-            if (typeof sessionFilePath !== "string" || sessionFilePath.length === 0) {
-                return {
-                    content: [{ type: "text" as const, text: "rejected: ephemeral session identity" }],
-                    details: makeRejected(toolCallId, "session", ["no real session file path"], {
-                        inspectionId: requestEvidenceRef?.inspectionId ?? "",
-                        resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [],
-                    }, freshChecks()),
-                };
-            }
-
-            const canonicalRoot = deps.getCanonicalWorkspaceRoot();
-            if (typeof canonicalRoot !== "string" || canonicalRoot.length === 0) {
-                return {
-                    content: [{ type: "text" as const, text: "rejected: missing canonical workspace root" }],
-                    details: makeRejected(toolCallId, "session", ["no canonical workspace root"], {
-                        inspectionId: requestEvidenceRef?.inspectionId ?? "",
-                        resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [],
-                    }, freshChecks()),
-                };
-            }
-
-            // Raw parsing is pure. All intents enter one transaction lifecycle.
-            let requestEdits: ReadonlyArray<EditOperation> = v.value.edits ?? [];
-            let rawTopology: RawTopology[] = [];
-            const rawWarnings: string[] = [];
-            if (v.value.raw !== undefined) {
-                const normalized = normalizeRawEdit(v.value.raw, v.value.path);
-                rawWarnings.push(...normalized.warnings);
-                if (normalized.diagnostics.length > 0 || normalized.intents.length === 0) {
-                    const diagnostics = [
-                        ...rawWarnings,
-                        ...normalized.diagnostics,
-                        "Raw patch parsed into no executable update operations.",
-                    ];
-                    return {
-                        content: [{ type: "text" as const, text: "failed: raw patch parsing" }],
-                        details: makeFailed(toolCallId, "stage", "raw patch normalization failed", {
-                            inspectionId: requestEvidenceRef?.inspectionId ?? "",
-                            resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [],
-                        }, freshChecks(), diagnostics),
-                    };
-                }
-                rawTopology = normalized.intents.flatMap((intent): RawTopology[] => {
-                    if (intent.kind === "text") return [];
-                    return intent.kind === "rename"
-                        ? [{ kind: "rename", oldPath: intent.oldPath, newPath: intent.newPath }]
-                        : [intent];
-                });
-                requestEdits = normalized.intents.flatMap((intent) => intent.kind === "text" ? [intent.operation] : []);
-            }
-
-            // Split transfer (copy/move) ops out of the plain-edit path so
-            // groupEditsByPath's existing behavior for text/symbolic/structural/
-            // hashline edits stays byte-for-byte unchanged. Raw patches never
-            // produce `op`, so this is a no-op split when v.value.raw was used.
-            const transferOps = requestEdits.filter((e) => e.op !== undefined);
-            const textOps = requestEdits.filter((e) => e.op === undefined);
-            // Strict transfer adapter: only op/from/range/to/after/description
-            // may be present (path/replaceAll/oldText/newText/target/lineRange/
-            // hashline reject, mirroring the validator). Defense-in-depth — the
-            // request validator normally rejects these before patch runs.
-            // Transfer addressing is pathless (from/to carry the paths); the
-            // top-level path is accepted-but-ignored here.
-            const adaptedTransfers = adaptTransferOps(transferOps, v.value.path);
-            if (!adaptedTransfers.ok) {
-                return {
-                    content: [{ type: "text" as const, text: `rejected: ${adaptedTransfers.error}` }],
-                    details: makeRejected(toolCallId, "session", [adaptedTransfers.error], {
-                        inspectionId: requestEvidenceRef?.inspectionId ?? "",
-                        resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [],
-                    }, freshChecks()),
-                };
-            }
-
-            // Group edits by file path (per-edit path overrides top-level).
-            // v.value.path may be undefined when every edit supplies its own
-            // path (validator enforces this invariant).
-            const grouping = groupEditsByPath(ctx.cwd, v.value.path ?? "", textOps);
-            if (!grouping.ok) {
-                return {
-                    content: [{ type: "text" as const, text: `rejected: ${grouping.error}` }],
-                    details: makeRejected(toolCallId, "session", [grouping.error], {
-                        inspectionId: requestEvidenceRef?.inspectionId ?? "",
-                        resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [],
-                    }, freshChecks()),
-                };
-            }
-            const groups = grouping.groups;
-            // Include topology source/destination paths in evidence and transaction plan.
-            // A second topology op targeting the same absolutePath as a group
-            // that already carries a topology is a hard conflict (e.g. delete
-            // old.ts, then rename old.ts -> moved.ts, in the same call):
-            // silently letting the later op overwrite the earlier one drops
-            // caller intent without telling them. Collect every such conflict
-            // and reject the whole batch atomically — before any lock is
-            // acquired or file touched — rather than attempt a full ordered
-            // multi-op-per-path execution engine.
-            const topologyConflicts: Array<{ path: string; existingKind: string; newKind: string }> = [];
-            for (const op of rawTopology) {
-                const entries = op.kind === "rename" ? [[op.oldPath, op], [op.newPath, undefined]] : [[op.path, op]];
-                for (const [rawPath, topology] of entries as Array<[string, RawTopology | undefined]>) {
-                    const absolutePath = pathResolve(ctx.cwd, rawPath);
-                    const existingIdx = groups.findIndex((g) => g.absolutePath === absolutePath);
-                    if (existingIdx >= 0) {
-                        const existingTopology = groups[existingIdx].topology;
-                        if (topology) {
-                            if (existingTopology) {
-                                topologyConflicts.push({ path: rawPath, existingKind: existingTopology.kind, newKind: topology.kind });
-                            } else {
-                                // Replace immutably, preserving the group's existing fields.
-                                groups[existingIdx] = { ...groups[existingIdx], topology };
-                            }
-                        } else if (existingTopology && op.kind === "rename") {
-                            // Rename destination conflicts with existing group's topology
-                            topologyConflicts.push({ path: rawPath, existingKind: existingTopology.kind, newKind: op.kind });
-                        }
-                    } else groups.push({ absolutePath, rawPath, edits: [], ...(topology ? { topology } : {}) });
-                }
-            }
-            if (topologyConflicts.length > 0) {
-                const message = topologyConflicts
-                    .map((c) => `conflicting topology operations for path '${c.path}': ${c.existingKind} vs ${c.newKind}`)
-                    .join("; ");
-                return {
-                    content: [{ type: "text" as const, text: `rejected: ${message}` }],
-                    details: makeRejected(toolCallId, "conflict", [message], {
-                        inspectionId: requestEvidenceRef?.inspectionId ?? "",
-                        resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [],
-                    }, freshChecks()),
-                };
-            }
-            const checks: MutableChecks = freshChecks();
-            const diagnostics: string[] = [...rawWarnings];
+            // Preparation / transfer resolution / envelope acquisition live in
+            // file-local helpers (Lane A extract-only); orchestrator keeps the
+            // transaction begin/commit/finalize phases.
+            const prepared = preparePatchRequest({ validated: v, deps, ctx, toolCallId });
+            if (!prepared.ok) return prepared.result;
+            const requestEvidenceRef = prepared.prepared.requestEvidenceRef;
+            const sessionFilePath = prepared.prepared.sessionFilePath;
+            const canonicalRoot = prepared.prepared.canonicalRoot;
+            const groups = prepared.prepared.groups;
+            const checks: MutableChecks = prepared.prepared.checks;
+            const diagnostics: string[] = prepared.prepared.diagnostics;
             const usedEvidence: string[] = [];
 
             const totalEdits = groups.reduce((sum, g) => sum + g.edits.length, 0);
@@ -818,211 +988,19 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             const editWord = totalEdits === 1 ? "edit" : "edits";
             stream(`patch — ${totalEdits} ${editWord} across ${groups.length} ${fileWord}`);
 
-            // ── Transfer (copy/move) ops: resolve from/to canonical paths ──
-            // Both files must already exist (no create-via-transfer in v1).
-            // Reserve a bucket in `groups` for the `to` path (and, for `move`,
-            // the `from` path too) so evidence resolution and the transaction
-            // path list cover them — mirrors the rename-destination placeholder
-            // pattern above. `copy`'s source deliberately does NOT get a group
-            // (it produces no mutation; authorized separately below).
-            const resolvedTransfers: Array<{
-                op: "copy" | "move";
-                canonicalFrom: string;
-                canonicalTo: string;
-                range: { pos: string; end: string };
-                after: string | undefined;
-                rawFrom: string;
-                rawTo: string;
-                toIsNewFile: boolean;
-                description: string | undefined;
-            }> = [];
-            // Transfer destinations that don't exist yet: allowed to be created
-            // by the transfer (the append_file / EOF branch), authorized the
-            // same way as an oldText:"" new-file group.
-            const transferNewFileCanonicals = new Set<string>();
-            // `copy`'s source deliberately does not get a `groups` bucket (no
-            // mutation happens there), but its content must still be snapshotted
-            // by the transaction for resolveSourceRange/staleness to read it.
-            const copySourceOnlyPaths = new Set<string>();
-            for (const transferReq of adaptedTransfers.value) {
-                const op = transferReq.op;
-                const rawFrom = transferReq.from;
-                const rawTo = transferReq.to;
-                const range = transferReq.range;
-                const after = transferReq.after;
-
-                let canonicalFrom: string;
-                try {
-                    canonicalFrom = realpathSync(pathResolve(ctx.cwd, rawFrom));
-                } catch (err) {
-                    const message = `transfer source not found: ${rawFrom} (${err instanceof Error ? err.message : String(err)})`;
-                    return {
-                        content: [{ type: "text" as const, text: `rejected: ${message}` }],
-                        details: makeRejected(toolCallId, "coverage", [message], {
-                            inspectionId: requestEvidenceRef?.inspectionId ?? "",
-                            resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [],
-                        }, checks),
-                    };
-                }
-                let canonicalTo: string;
-                let toIsNewFile = false;
-                try {
-                    canonicalTo = realpathSync(pathResolve(ctx.cwd, rawTo));
-                } catch (err) {
-                    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-                        canonicalTo = pathResolve(ctx.cwd, rawTo);
-                        toIsNewFile = true;
-                    } else {
-                        const message = `transfer destination not found: ${rawTo} (${err instanceof Error ? err.message : String(err)})`;
-                        return {
-                            content: [{ type: "text" as const, text: `rejected: ${message}` }],
-                            details: makeRejected(toolCallId, "coverage", [message], {
-                                inspectionId: requestEvidenceRef?.inspectionId ?? "",
-                                resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [],
-                            }, checks),
-                        };
-                    }
-                }
-                if (toIsNewFile) transferNewFileCanonicals.add(canonicalTo);
-
-                const description = transferReq.description;
-                resolvedTransfers.push({ op, canonicalFrom, canonicalTo, range, after, rawFrom, rawTo, toIsNewFile, description });
-
-                const buckets: Array<[string, string]> = op === "move"
-                    ? [[canonicalTo, rawTo], [canonicalFrom, rawFrom]]
-                    : [[canonicalTo, rawTo]];
-                for (const [absolutePath, rawPath] of buckets) {
-                    if (!groups.some((g) => g.absolutePath === absolutePath)) {
-                        groups.push({ absolutePath, rawPath, edits: [] });
-                    }
-                }
-                if (op === "copy") copySourceOnlyPaths.add(canonicalFrom);
-            }
-
-
-            // ── Acquire envelope ──────────────────────────────────────
-            // Tool-owned evidence policy B: existing targets require strong
-            // prior authority. Mutation-time reads can check freshness only;
-            // they never mint authority.
+            const transfers = resolvePatchTransfers({ adaptedTransfers: prepared.prepared.adaptedTransfers, groups, ctx, toolCallId, requestEvidenceRef, checks });
+            if (!transfers.ok) return transfers.result;
+            const resolvedTransfers = transfers.resolvedTransfers;
+            const transferNewFileCanonicals = transfers.transferNewFileCanonicals;
+            const copySourceOnlyPaths = transfers.copySourceOnlyPaths;
 
             const priorStore = deps.getPriorAuthority?.() ?? null;
-            const groupsNeedingEnvelope: EditGroup[] = [];
-            for (const g of groups) {
-                let prior: InspectedResource | null = null;
-                if (priorStore) {
-                    try {
-                        const canonical = realpathSync(g.absolutePath);
-                        prior = priorStore.select(canonical);
-                    } catch {
-                        // file does not exist — no prior authority possible
-                    }
-                }
-                if (!prior) groupsNeedingEnvelope.push(g);
-            }
-
-            let envelope: WorkspaceEvidenceEnvelope | null = null;
-            let autoInspected = false;
-            let evidenceRefForDetails: EvidenceRef;
-            let newFileCanonicals: ReadonlySet<string> = new Set();
-
-            if (groupsNeedingEnvelope.length === 0) {
-                // Every group has a strong prior authority; no envelope needed.
-                evidenceRefForDetails = { inspectionId: "", resourceIds: [] };
-            } else if (!requestEvidenceRef) {
-                const existingWithoutPrior = groupsNeedingEnvelope.filter((g) => existsSync(g.absolutePath));
-                if (existingWithoutPrior.length > 0) {
-                    const message = `no prior strong read authority for ${existingWithoutPrior.map((g) => g.rawPath).join(", ")}; read the file first (full file or target range), then retry`;
-                    diagnostics.push(message);
-                    return {
-                        content: [{ type: "text" as const, text: `rejected: coverage (${message})` }],
-                        details: makeRejected(toolCallId, "coverage", diagnostics, { inspectionId: "", resourceIds: [] }, checks),
-                    };
-                }
-                // Explicit empty-file semantics remain valid for genuinely new
-                // in-root files; synthesize authority only for those paths.
-                const built = await buildAutoInspectEnvelope({
-                    sessionFilePath,
-                    canonicalRoot,
-                    groups: groupsNeedingEnvelope,
-                    newFileAllowed: transferNewFileCanonicals,
-                });
-                if (!built.ok) {
-                    diagnostics.push(built.error);
-                    checks.completed.push(makeCheck("auto-inspect", "fail", built.error));
-                    return {
-                        content: [{ type: "text" as const, text: `failed: ${built.error}` }],
-                        details: makeFailed(toolCallId, "stage", built.error, {
-                            inspectionId: "",
-                            resourceIds: [],
-                        }, checks, diagnostics),
-                    };
-                }
-                envelope = built.envelope;
-                autoInspected = true;
-                newFileCanonicals = built.newFileCanonicals;
-                evidenceRefForDetails = {
-                    inspectionId: envelope.inspectionId,
-                    resourceIds: envelope.resources.map((r) => r.resourceId),
-                };
-                checks.completed.push(makeCheck("auto-inspect", "pass", `synthesized envelope for ${envelope.resources.length} file(s)`));
-            } else {
-                evidenceRefForDetails = {
-                    inspectionId: requestEvidenceRef.inspectionId,
-                    resourceIds: [...requestEvidenceRef.resourceIds],
-                };
-                const rpc = deps.getRpcClient();
-                try {
-                    const reply = await rpc.request(
-                        "resolve_evidence" as RpcMethod,
-                        {
-                            inspectionId: requestEvidenceRef.inspectionId,
-                            sessionFilePath,
-                            workspaceRoot: canonicalRoot,
-                        },
-                        { signal },
-                    );
-                    if (!reply.ok || !reply.payload) {
-                        checks.completed.push(makeCheck("evidence-pipeline", "fail", reply.error ?? "rpc returned no payload"));
-                        return {
-                            content: [{ type: "text" as const, text: `rejected: ${reply.error ?? "unknown rpc error"}` }],
-                            details: makeRejected(toolCallId, classifyRpcError(reply.error), [reply.error ?? "rpc failure"], evidenceRefForDetails, checks),
-                        };
-                    }
-                    envelope = reply.payload as WorkspaceEvidenceEnvelope;
-                    checks.completed.push(makeCheck("evidence-pipeline", "pass", "rpc resolve_evidence succeeded"));
-                } catch (err) {
-                    const msg = err instanceof Error ? err.message : String(err);
-                    diagnostics.push(msg);
-                    checks.completed.push(makeCheck("evidence-pipeline", "timeout", msg));
-                    return {
-                        content: [{ type: "text" as const, text: `failed: ${msg}` }],
-                        details: makeFailed(toolCallId, "stage", msg, evidenceRefForDetails, checks, diagnostics),
-                    };
-                } finally {
-                    rpc.dispose();
-                }
-            }
-
-            // Verify session/workspace binding on the envelope (only when an
-            // envelope was acquired; prior authority was already validated at
-            // record time).
-            if (envelope) {
-                const expectedSessionId = hashSessionFilePath(sessionFilePath);
-                if (envelope.sessionId !== expectedSessionId) {
-                    diagnostics.push("envelope session identity mismatch");
-                    return {
-                        content: [{ type: "text" as const, text: "rejected: session identity mismatch" }],
-                        details: makeRejected(toolCallId, "session", diagnostics, evidenceRefForDetails, checks, usedEvidence),
-                    };
-                }
-                if (envelope.canonicalWorkspaceRoot !== canonicalRoot) {
-                    diagnostics.push("envelope workspace root mismatch");
-                    return {
-                        content: [{ type: "text" as const, text: "rejected: workspace mismatch" }],
-                        details: makeRejected(toolCallId, "session", diagnostics, evidenceRefForDetails, checks, usedEvidence),
-                    };
-                }
-            }
+            const acquired = await acquirePatchEnvelope({ deps, groups, sessionFilePath, canonicalRoot, requestEvidenceRef, transferNewFileCanonicals, toolCallId, checks, diagnostics, usedEvidence, signal });
+            if (!acquired.ok) return acquired.result;
+            const envelope = acquired.envelope;
+            const autoInspected = acquired.autoInspected;
+            const evidenceRefForDetails = acquired.evidenceRefForDetails;
+            const newFileCanonicals = acquired.newFileCanonicals;
 
             // ── Per-group application ────────────────────────────────
             // We validate and apply each file's edits in order. On the
@@ -1193,8 +1171,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 // the unified overlap check report a generic failure.
                 if (rt.op === "move") {
                     for (const seen of moveSourceSpans) {
-                        if (seen.canonicalFrom === rt.canonicalFrom
-                            && resolved.value.startLine <= seen.endLine && seen.startLine <= resolved.value.endLine) {
+                        if (moveSpansOverlap(seen, rt.canonicalFrom, resolved.value.startLine, resolved.value.endLine)) {
                             const message = `transfer source spans overlap in ${rt.rawFrom} ([${seen.startLine},${seen.endLine}] vs [${resolved.value.startLine},${resolved.value.endLine}]): refusing conflicting move deletions`;
                             diagnostics.push(message);
                             return {
@@ -1210,10 +1187,10 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                 // no well-defined pre/post-delete meaning — reject with a
                 // transfer-specific conflict. Sentinel `start`/`end` dests are
                 // absolute file edges and never participate in this check.
-                if (rt.op === "move" && rt.canonicalFrom === rt.canonicalTo && rt.after !== undefined && rt.after !== "start") {
+                if (isSameFileMoveCandidate(rt.op, rt.canonicalFrom, rt.canonicalTo, rt.after)) {
                     const rebasedAfter = resolveDestination(rt.after, sourceLogicalLines);
                     const afterLine = typeof rebasedAfter === "number" ? rebasedAfter : null;
-                    if (afterLine !== null && afterLine >= resolved.value.startLine - 1 && afterLine <= resolved.value.endLine) {
+                    if (isAfterLineInsideSourceSpan(afterLine, resolved.value.startLine, resolved.value.endLine)) {
                         const message = `transfer destination after anchor ${rt.after} lands inside or touching the source span [${resolved.value.startLine},${resolved.value.endLine}] in ${rt.rawFrom}: refusing conflicting same-file transfer`;
                         diagnostics.push(message);
                         return {
@@ -1811,7 +1788,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
                     checks.completed.push(check);
                     if (v.kind === "advisory") checks.advisory.push(check);
                     else checks.blocking.push(check);
-                    if (v.kind === "blocking" && (outcome === "fail" || outcome === "timeout")) {
+                    if (isBlockingPostwriteFailure(v.kind, outcome)) {
                         diagnostics.push(`blocking post-write check failed: ${check.id}`);
                         return {
                             content: [{ type: "text" as const, text: `failed: post-write check (${group.rawPath})` }],

@@ -9,7 +9,7 @@
  *   or load ./src/index.ts for repository-local use.
  */
 
-import type { ExtensionAPI, Theme } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, Theme, ToolResultEvent } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth, visibleWidth, type Component } from "@mariozechner/pi-tui";
 
 import { realpathSync, statSync } from "fs";
@@ -309,6 +309,601 @@ let smartReadDiagnosticsClient: ReturnType<typeof createSmartReadDiagnosticsClie
 
 export { sortHashlineEditsForApplication, formatHashlineBatchSummary };
 
+// ─── Lane B file-local helpers (extract-only; no behavior change) ───
+
+type RetryToolEvent = {
+  input?: unknown;
+  details?: unknown;
+  content?: unknown;
+  isError?: boolean;
+  toolName?: string;
+};
+
+type RetrySessionState = {
+  sessionFilePath: string | null;
+  canonicalWorkspaceRoot: string | null;
+  priorAuthority: PriorAuthorityStore | null;
+};
+
+type RetryEligibility = {
+  canonicalPath: string;
+  content: string;
+  sha: string;
+  resource: NonNullable<ReturnType<PriorAuthorityStore["select"]>>;
+  explicitRange?: { startLine: number; endLine: number };
+  matchFailure: "NOT_FOUND" | "AMBIGUOUS";
+  oldText: string;
+};
+
+/** buildRetryEvidence seam: eligibility + target resolution + prior-authority freshness. */
+async function checkRetryEligibility(
+  event: RetryToolEvent,
+  cwd: string,
+  state: RetrySessionState,
+): Promise<RetryEligibility | undefined> {
+  if (event.toolName !== "edit" || event.isError || !state.sessionFilePath || !state.canonicalWorkspaceRoot) return undefined;
+  const details = event.details as { status?: { kind?: string; phase?: string }; matchFailure?: string } | undefined;
+  if (details?.status?.kind !== "failed" || details.status.phase !== "stage") return undefined;
+  if (details.matchFailure !== "NOT_FOUND" && details.matchFailure !== "AMBIGUOUS") return undefined;
+  const input = event.input as { path?: unknown; edits?: unknown; raw?: unknown } | undefined;
+  if (!input || input.raw !== undefined || !Array.isArray(input.edits) || input.edits.length !== 1) return undefined;
+  const edit = input.edits[0] as { path?: unknown; oldText?: unknown; target?: unknown; lineRange?: unknown; hashline?: unknown };
+  if (typeof edit?.oldText !== "string" || edit.target !== undefined || edit.hashline !== undefined) return undefined;
+  if (input.path !== undefined && typeof input.path !== "string") return undefined;
+  if (edit.path !== undefined && typeof edit.path !== "string") return undefined;
+  if (input.path !== undefined && edit.path !== undefined && resolve(cwd, input.path) !== resolve(cwd, edit.path)) return undefined;
+  const targetPath = typeof input.path === "string" ? input.path : edit.path;
+  if (typeof targetPath !== "string" || targetPath.length === 0) return undefined;
+  const lineRange = edit.lineRange as { startLine?: unknown; endLine?: unknown } | undefined;
+  const explicitRange = lineRange && Number.isInteger(lineRange.startLine) && Number.isInteger(lineRange.endLine)
+    ? { startLine: lineRange.startLine as number, endLine: lineRange.endLine as number } : undefined;
+  const resolvedPath = resolve(cwd, targetPath);
+  let canonicalPath: string;
+  try { canonicalPath = realpathSync(resolvedPath); } catch { return undefined; }
+  const resource = state.priorAuthority?.select(canonicalPath);
+  if (!resource || (resource.coverage !== "full-file" && resource.coverage !== "line-range") || typeof resource.fullFileSha256 !== "string") return undefined;
+  let content: string;
+  try { content = (await fsReadFile(canonicalPath)).toString("utf8"); } catch { return undefined; }
+  const sha = sha256OfString(content);
+  if (sha !== resource.fullFileSha256) return undefined;
+  return { canonicalPath, content, sha, resource, explicitRange, matchFailure: details.matchFailure, oldText: edit.oldText };
+}
+
+/** buildRetryEvidence seam: context-window collection around the failure site. */
+function collectRetryWindows(
+  content: string,
+  explicitRange: { startLine: number; endLine: number } | undefined,
+  matchFailure: "NOT_FOUND" | "AMBIGUOUS",
+  oldText: string,
+): LineRange[] | undefined {
+  const lines = content.split("\n");
+  const ranges: LineRange[] = [];
+  const addWindow = (line: number) => {
+    if (!Number.isInteger(line) || line < 1 || line > lines.length) return;
+    ranges.push({ startLine: Math.max(1, line - 2), endLine: Math.min(lines.length, line + 2) });
+  };
+  if (explicitRange) addWindow(explicitRange.startLine);
+  if (matchFailure === "AMBIGUOUS" && !explicitRange && oldText.length > 0) {
+    let from = 0;
+    while (ranges.length < 3) {
+      const at = content.indexOf(oldText, from);
+      if (at < 0) break;
+      addWindow(content.slice(0, at).split("\n").length);
+      from = at + Math.max(1, oldText.length);
+    }
+  }
+  if (ranges.length === 0) return undefined;
+  return ranges;
+}
+
+/** buildRetryEvidence seam: intersect candidate windows with prior authority. */
+function authorizeRetryWindows(
+  resource: RetryEligibility["resource"],
+  ranges: LineRange[],
+): LineRange[] {
+  const authorized = resource.coverage === "full-file" ? ranges : ranges.flatMap((candidate) => resource.allowedRanges.flatMap((allowed) => {
+    const startLine = Math.max(candidate.startLine, allowed.startLine);
+    const endLine = Math.min(candidate.endLine, allowed.endLine);
+    return startLine <= endLine ? [{ startLine, endLine }] : [];
+  }));
+  return [...new Map(authorized.map((range) => [`${range.startLine}:${range.endLine}`, range])).values()].slice(0, 3);
+}
+
+/** buildRetryEvidence seam: cap windows by count, line budget, byte budget. */
+function applyRetryBudget(unique: LineRange[], lines: string[]): LineRange[] | undefined {
+  const selected: LineRange[] = [];
+  let bytes = 0;
+  for (const range of unique) {
+    const source = lines.slice(range.startLine - 1, range.endLine).join("\n");
+    const size = Buffer.byteLength(source, "utf8");
+    if (selected.length >= 3 || selected.reduce((n, r) => n + r.endLine - r.startLine + 1, 0) + range.endLine - range.startLine + 1 > 24 || bytes + size > 8192) break;
+    selected.push(range); bytes += size;
+  }
+  if (selected.length === 0) return undefined;
+  return selected;
+}
+
+/** buildRetryEvidence seam: freshness re-read + envelope mint (keeps session/root recheck). */
+async function mintRetryEvidenceFromSelection(
+  selected: LineRange[],
+  canonicalPath: string,
+  sha: string,
+  state: RetrySessionState,
+): Promise<{ envelope: WorkspaceEvidenceEnvelope; text: string } | undefined> {
+  // Re-read after range selection: a concurrent write must never mint retry authority.
+  let confirm: string;
+  try { confirm = (await fsReadFile(canonicalPath)).toString("utf8"); } catch { return undefined; }
+  if (sha256OfString(confirm) !== sha) return undefined;
+  const resources = selected.map((range) => ({
+    resourceId: resourceIdFor({ canonicalPath, kind: "range", range }), canonicalPath, kind: "range" as const,
+    coverage: "line-range" as const, allowedRanges: [range], fullFileSha256: sha,
+    fresh: true, byteLength: Buffer.byteLength(confirm, "utf8"), lineCount: confirm.split("\n").length,
+  }));
+  const sessionFilePath = state.sessionFilePath;
+  const workspaceRoot = state.canonicalWorkspaceRoot;
+  if (!sessionFilePath || !workspaceRoot) return undefined;
+  const sessionId = hashSessionFilePath(sessionFilePath);
+  const envelope: WorkspaceEvidenceEnvelope = {
+    schemaVersion: PROTOCOL_SCHEMA_VERSION,
+    inspectionId: inspectionIdFor({ sessionId, workspaceRoot, resources: resources.map((r) => ({ canonicalPath: r.canonicalPath, allowedRanges: r.allowedRanges })) }),
+    sessionId, workspaceRoot, canonicalWorkspaceRoot: workspaceRoot,
+    createdAt: new Date().toISOString(), resources, mode: "path",
+  };
+  const text = selected.map((range) => `lineRange ${range.startLine}-${range.endLine}:\n${confirm.split("\n").slice(range.startLine - 1, range.endLine).join("\n")}`).join("\n");
+  return { envelope, text };
+}
+
+/** tool_result seam: release diagnostics claim on failed mutation. */
+function releaseClaimOnFailedMutation(event: { toolName?: string; isError?: boolean; toolCallId: string }): void {
+  if (
+    (event.toolName === "write" || event.toolName === "edit") &&
+    event.isError
+  ) {
+    releaseDiagnosticsOwner(event.toolCallId);
+  }
+}
+
+/** tool_result seam: ingest SmartRead workspace evidence into prior authority store. */
+function ingestWorkspaceEvidence(
+  event: { toolName?: string; isError?: boolean; details?: unknown },
+  store: PriorAuthorityStore | null,
+): void {
+  try {
+    const wsEvidence = event.toolName === "read" && !event.isError
+      ? (event.details as { workspaceEvidence?: unknown } | undefined)?.workspaceEvidence
+      : undefined;
+    if (wsEvidence) {
+      store?.record(wsEvidence);
+    }
+  } catch {
+    /* silently ignore evidence ingestion errors */
+  }
+}
+
+type SingleReadInput = { path?: string; offset?: number; limit?: number };
+
+/** tool_result single-read seam: offset/limit (partial) branch. */
+async function recordOffsetLimitSingleRead(
+  input: SingleReadInput,
+  toolCwd: string,
+  inputPath: string,
+  fullText: string,
+): Promise<void> {
+  const readOffset = input?.offset ?? 1;
+  const lines = fullText.split("\n");
+  const hashline = smartEditRuntimeConfig.useHashlineEditing
+    ? await buildHashlineAnchors(lines, readOffset)
+    : undefined;
+  recordRead(inputPath, toolCwd, fullText, true, hashline, readOffset);
+  const explicitLimit = input?.limit;
+  if (explicitLimit === undefined) {
+    let totalFileLines = lines.length + readOffset - 1;
+    try {
+      const snapshot = getSnapshot(inputPath, toolCwd);
+      if (snapshot?.hashline?.formattedLines?.length) {
+        totalFileLines = snapshot.hashline.formattedLines.length;
+      }
+    } catch {
+      // Fall back to computed value
+    }
+    recordReadSession(inputPath, toolCwd, readOffset, -1, totalFileLines, "read");
+  } else {
+    recordReadSession(inputPath, toolCwd, readOffset, explicitLimit, lines.length + readOffset - 1, "read");
+  }
+}
+
+/** tool_result single-read seam: full (possibly truncated) branch. */
+async function recordCompleteSingleRead(toolCwd: string, inputPath: string, fullText: string): Promise<void> {
+  let isTruncated = false;
+  try {
+    const resolvedPath = resolve(toolCwd, inputPath);
+    const fileStat = statSync(resolvedPath);
+    if (fileStat.size > fullText.length) {
+      isTruncated = true;
+    }
+  } catch {
+    // file may not exist or stat failed — record normally
+  }
+  const lines = fullText.split("\n");
+  const hashline = smartEditRuntimeConfig.useHashlineEditing
+    ? await buildHashlineAnchors(lines)
+    : undefined;
+  recordRead(inputPath, toolCwd, fullText, isTruncated, hashline);
+  recordReadSession(inputPath, toolCwd, 1, -1, lines.length, "read");
+}
+
+/**
+ * tool_result seam: single-read cache population.
+ * Returns true when the event was a single read (caller preserves the
+ * original early return after the offset/limit branch).
+ */
+async function handleSingleReadResult(
+  event: { toolName?: string; isError?: boolean; content?: unknown; input?: unknown },
+  toolCwd: string,
+): Promise<boolean> {
+  if (
+    event.toolName !== "read" ||
+    event.isError ||
+    !event.content
+  ) {
+    return false;
+  }
+  try {
+    const isOffsetLimitRead =
+      (event.input as SingleReadInput | undefined)?.offset != null || (event.input as SingleReadInput | undefined)?.limit != null;
+    const contentBlocks = Array.isArray(event.content) ? event.content : [];
+    const fullText = contentBlocks
+      .filter((c) => (c as { type?: string }).type === "text")
+      .map((c) => coerceText((c as { text?: unknown }).text))
+      .join("");
+    const inputPath = (event.input as { path?: string } | undefined)?.path;
+    if (!fullText || !inputPath) return true;
+    if (isOffsetLimitRead) {
+      await recordOffsetLimitSingleRead(event.input as SingleReadInput, toolCwd, inputPath, fullText);
+      return true;
+    }
+    await recordCompleteSingleRead(toolCwd, inputPath, fullText);
+    return true;
+  } catch {
+    /* silently ignore cache population errors */
+    return true;
+  }
+}
+
+/** tool_result seam: read_files / read_multiple_files cache population. */
+async function handleMultiReadResult(
+  event: { toolName?: string; isError?: boolean; details?: unknown; input?: unknown },
+  toolCwd: string,
+): Promise<void> {
+  if (
+    (event.toolName !== "read_files" && event.toolName !== "read_multiple_files") ||
+    event.isError
+  ) {
+    return;
+  }
+  try {
+    const rawDetailFiles = (event.details as { files?: Array<{ path: string; ok?: boolean }> } | undefined)?.files;
+    const detailFiles = Array.isArray(rawDetailFiles) ? rawDetailFiles : undefined;
+    const rawInputFiles = (event.input as { files?: Array<{ path: string; offset?: number; limit?: number }> } | undefined)?.files;
+    const inputFiles = Array.isArray(rawInputFiles) ? rawInputFiles : undefined;
+    const filesToProcess = (detailFiles ?? inputFiles) ?? [];
+    if (filesToProcess.length > 0) {
+      const inputMap = new Map<string, { offset?: number; limit?: number }>();
+      if (inputFiles) {
+        for (const f of inputFiles) inputMap.set(f.path, { offset: f.offset, limit: f.limit });
+      }
+      for (const file of filesToProcess) {
+        if ("ok" in file && file.ok === false) continue;
+        try {
+          const resolvedPath = resolve(toolCwd, file.path);
+          const content = (await fsReadFile(resolvedPath)).toString("utf-8");
+          if (content) {
+            const inputInfo = inputMap.get(file.path);
+            const isPartial = inputInfo?.offset != null || inputInfo?.limit != null;
+            const lines = content.split("\n");
+            const hashline = smartEditRuntimeConfig.useHashlineEditing
+              ? await buildHashlineAnchors(lines)
+              : undefined;
+            recordRead(file.path, toolCwd, content, isPartial, hashline);
+            const readOffset = inputInfo?.offset ?? 1;
+            const readLimit = inputInfo?.limit ?? -1;
+            recordReadSession(file.path, toolCwd, readOffset, readLimit, lines.length, "read_files");
+          }
+        } catch {
+          // File may not exist or can't be read — skip silently
+        }
+      }
+    }
+  } catch {
+    /* silently ignore cache population errors */
+  }
+}
+
+/** tool_result seam: intent_read cache population. */
+async function handleIntentReadResult(
+  event: { toolName?: string; isError?: boolean; details?: unknown },
+  toolCwd: string,
+): Promise<void> {
+  if (
+    event.toolName !== "intent_read" ||
+    event.isError
+  ) {
+    return;
+  }
+  try {
+    const rawDetailFiles = (event.details as { files?: Array<{ path: string; ok: boolean; inclusion?: string }> } | undefined)?.files;
+    const detailFiles = Array.isArray(rawDetailFiles) ? rawDetailFiles : undefined;
+    if (detailFiles && detailFiles.length > 0) {
+      for (const file of detailFiles) {
+        if (!file.ok) continue;
+        try {
+          const resolvedPath = resolve(toolCwd, file.path);
+          const content = (await fsReadFile(resolvedPath)).toString("utf-8");
+          if (content) {
+            const isPartial = file.inclusion !== "full";
+            const lines = content.split("\n");
+            const hashline = smartEditRuntimeConfig.useHashlineEditing
+              ? await buildHashlineAnchors(lines)
+              : undefined;
+            recordRead(file.path, toolCwd, content, isPartial, hashline);
+            recordReadSession(file.path, toolCwd, 1, -1, lines.length, "intent_read");
+          }
+        } catch {
+          // File may not exist or can't be read — skip silently
+        }
+      }
+    }
+  } catch {
+    /* silently ignore cache population errors */
+  }
+}
+
+/**
+ * Shared single-file read+record+validation helper, hoisted out of the
+ * tool_result callback (used by the write post-processing path).
+ */
+async function validateFileAndBuildFeedback(
+  filePath: string,
+  cwd: string,
+): Promise<
+  | {
+    path: string;
+    feedback: string;
+    retryCount: number;
+    shouldDecompose: boolean;
+  }
+  | undefined
+> {
+  const resolvedPath = resolve(cwd, filePath);
+  const content = (await fsReadFile(resolvedPath)).toString("utf-8");
+  recordRead(filePath, cwd, content);
+  const lines = content.split("\n");
+  recordReadSession(filePath, cwd, 1, -1, lines.length, "edit");
+  if (!content) {
+    return undefined;
+  }
+  const validationResult = await runAutoValidation(filePath, content, {
+    cwd,
+    maxRetries: 3,
+    enabled: true,
+  });
+  if (validationResult.passed) return undefined;
+  const feedback = formatValidationFeedback(validationResult);
+  if (!feedback) return undefined;
+  return {
+    path: filePath,
+    feedback,
+    retryCount: validationResult.retryCount,
+    shouldDecompose: validationResult.shouldDecompose,
+  };
+}
+
+/** Lightweight read-cache refresh (no validation), hoisted out of tool_result. */
+async function refreshReadCacheAfterEdit(filePath: string, cwd: string): Promise<void> {
+  const resolvedPath = resolve(cwd, filePath);
+  const content = (await fsReadFile(resolvedPath)).toString("utf-8");
+  recordRead(filePath, cwd, content);
+  const lines = content.split("\n");
+  recordReadSession(filePath, cwd, 1, -1, lines.length, "edit");
+}
+
+/** tool_result seam: write diagnostics lane (awaited + returned, not fire-and-forget). */
+async function handleWriteResult(
+  event: { toolName?: string; isError?: boolean; input?: unknown; content?: unknown; details?: unknown },
+  toolCwd: string,
+  buildMutationEvidence: (paths: string[]) => Promise<WorkspaceEvidenceEnvelope | undefined>,
+  store: PriorAuthorityStore | null,
+): Promise<{ content: ToolResultEvent["content"]; details: unknown } | undefined> {
+  const writePath = (event.input as { path?: string } | undefined)?.path;
+  if (
+    event.toolName !== "write" ||
+    event.isError ||
+    !writePath
+  ) {
+    return undefined;
+  }
+  try {
+    const entry = await validateFileAndBuildFeedback(writePath, toolCwd);
+    const workspaceEvidence = await buildMutationEvidence([writePath]);
+    if (workspaceEvidence) store?.record(workspaceEvidence);
+    if (entry || workspaceEvidence) {
+      const block = entry ? `\n\nPost-write diagnostics:\n${entry.feedback}` : "";
+      return {
+        content: block ? appendDiagnosticsToContent(event.content as Array<{ type: string; text?: unknown }>, block) as ToolResultEvent["content"] : event.content as ToolResultEvent["content"],
+        details: {
+          ...((event.details as Record<string, unknown> | undefined) ?? {}),
+          ...(entry ? {
+            postEditDiagnostics: { schemaVersion: 1, paths: [writePath], checked: true },
+            validationRetries: entry.retryCount,
+            shouldDecompose: entry.shouldDecompose,
+          } : {}),
+          ...(workspaceEvidence ? { workspaceEvidence } : {}),
+        },
+      };
+    }
+    return undefined;
+  } catch {
+    // File might not exist yet or can't be read — skip silently
+    return undefined;
+  }
+}
+
+/** tool_result seam: failed classic-text retry-evidence minting. */
+async function handleEditRetryResult(
+  event: RetryToolEvent,
+  toolCwd: string,
+  buildRetryEvidence: (event: RetryToolEvent, cwd: string) => Promise<{ envelope: WorkspaceEvidenceEnvelope; text: string } | undefined>,
+  store: PriorAuthorityStore | null,
+): Promise<{ content: ToolResultEvent["content"]; details: unknown } | undefined> {
+  if (event.toolName !== "edit" || event.isError) return undefined;
+  try {
+    const retry = await buildRetryEvidence(event, toolCwd);
+    if (retry) {
+      store?.record(retry.envelope);
+      return {
+        content: appendDiagnosticsToContent(event.content as Array<{ type: string; text?: unknown }>, `\n\n${retry.text}\nRe-edit using exact text and lineRange above; no separate read needed.`) as ToolResultEvent["content"],
+        details: { ...(event.details as Record<string, unknown> ?? {}), workspaceEvidence: retry.envelope },
+      };
+    }
+    return undefined;
+  } catch {
+    // Retry context is advisory; failed reads and races produce no evidence.
+    return undefined;
+  }
+}
+
+/** tool_result seam: edit success read-cache refresh + evidence mint. */
+async function handleEditSuccessResult(
+  event: { toolName?: string; isError?: boolean; content?: unknown; details?: unknown },
+  toolCwd: string,
+  buildMutationEvidence: (paths: string[]) => Promise<WorkspaceEvidenceEnvelope | undefined>,
+  store: PriorAuthorityStore | null,
+): Promise<{ content: ToolResultEvent["content"]; details: unknown } | undefined> {
+  if (
+    event.toolName !== "edit" ||
+    event.isError
+  ) {
+    return undefined;
+  }
+  try {
+    const details = (event as unknown as { details?: PatchToolDetails }).details;
+    if (
+      details?.status?.kind !== "applied" ||
+      !Array.isArray(details.diffs) ||
+      details.diffs.length === 0
+    ) {
+      return undefined;
+    }
+    const uniquePaths = [
+      ...new Set(
+        details.diffs
+          .map((d) => d.path)
+          .filter((p): p is string => typeof p === "string"),
+      ),
+    ];
+    for (const p of uniquePaths) {
+      await refreshReadCacheAfterEdit(p, toolCwd).catch(() => {
+        // File might not exist yet or can't be read — skip silently
+      });
+    }
+    const workspaceEvidence = await buildMutationEvidence(uniquePaths);
+    if (workspaceEvidence) {
+      store?.record(workspaceEvidence);
+      return {
+        content: event.content as ToolResultEvent["content"],
+        details: { ...(event.details as Record<string, unknown> ?? {}), workspaceEvidence },
+      };
+    }
+    return undefined;
+  } catch {
+    // Edit post-processing is advisory — silent degradation
+    return undefined;
+  }
+}
+
+type FinalLaneFile = {
+  readonly path: string;
+  readonly content: string;
+  readonly oldContent: string;
+  readonly changedLineRanges: ReadonlyArray<{ readonly startLine: number; readonly endLine: number }>;
+};
+
+type FinalLaneContext = {
+  cwd: string;
+  diagnostics: string[];
+  checks: Array<{ id: string; outcome: "pass" | "fail" | "skipped" | "timeout"; detail?: string }>;
+  evidence: unknown[];
+  editedPaths: string[];
+  lspManager: LSPManager | null;
+  diagnosticsClient: ReturnType<typeof createSmartReadDiagnosticsClient> | null;
+};
+
+/** runFinalSuccessLanes seam: per-file diagnostics + evidence finalization. */
+async function runSingleFileFinalLanes(file: FinalLaneFile, ctx: FinalLaneContext): Promise<void> {
+  const languageId = detectLanguageFromExtension(file.path);
+  if (!languageId) {
+    ctx.checks.push({ id: `diagnostics:${file.path}`, outcome: "skipped", detail: "no language diagnostic lane" });
+    return;
+  }
+  let lspConfirmed = false;
+  if (ctx.lspManager) {
+    const lsp = ctx.diagnosticsClient
+      ? await ctx.diagnosticsClient.checkPostEditDiagnostics(file.path, file.content, languageId, ctx.cwd, ctx.lspManager)
+      : await checkPostEditDiagnostics(file.path, file.content, languageId, ctx.lspManager);
+    if (lsp.status === "confirmed") {
+      lspConfirmed = true;
+      const lspHasError = lsp.diagnostics.some((d) => d.severity === 1);
+      ctx.checks.push({ id: `lsp:${file.path}`, outcome: lspHasError ? "fail" : "pass", detail: `${lsp.diagnostics.length} diagnostic(s), ${lsp.source}, ${lsp.status}` });
+      ctx.diagnostics.push(...lsp.diagnostics.map((d) => `lsp ${file.path}:${d.range.start.line + 1}: ${d.message}`));
+    } else {
+      ctx.checks.push({ id: `lsp:${file.path}`, outcome: "skipped", detail: `${lsp.diagnostics.length} diagnostic(s), ${lsp.source}, ${lsp.status}` });
+    }
+  }
+  const compiler = !lspConfirmed ? getCompilerForLanguage(languageId) : null;
+  if (compiler) {
+    const result = await compiler(file.path, ctx.cwd);
+    const compilerHasError = result.diagnostics.some((d) => d.severity === 1);
+    ctx.checks.push({ id: `compiler:${file.path}`, outcome: compilerHasError ? "fail" : "pass", detail: `${result.diagnostics.length} diagnostic(s), ${result.source}` });
+    ctx.diagnostics.push(...result.diagnostics.map((d) => `${d.source} ${file.path}:${d.range.start.line + 1}: ${d.message}`));
+    for (const diagnostic of result.diagnostics) {
+      if (!diagnostic.filePath) continue;
+      let canonicalDiagPath: string;
+      try {
+        canonicalDiagPath = realpathSync(resolve(ctx.cwd, diagnostic.filePath));
+      } catch {
+        canonicalDiagPath = resolve(ctx.cwd, diagnostic.filePath);
+      }
+      if (canonicalDiagPath !== file.path) {
+        const bridgeError = recordBreakage(ctx.cwd, file.path, canonicalDiagPath, diagnostic.message);
+        if (bridgeError) ctx.diagnostics.push(bridgeError);
+      }
+    }
+  }
+  const post = await runPostEditEvidencePipeline({
+    cwd: ctx.cwd,
+    path: file.path,
+    content: file.content,
+    oldContent: file.oldContent,
+    languageId,
+    matchSpans: file.changedLineRanges.map((range) => lineRangeToOffsets(file.content, range)),
+    editedPaths: ctx.editedPaths,
+    lspManager: ctx.lspManager as unknown as { getServer(languageId: string): unknown } | null,
+    config: { repair: { enabled: false, maxRetries: 0, autoRepair: false, notifyOnRetry: false } },
+  });
+  ctx.evidence.push(post);
+  ctx.diagnostics.push(...post.notes);
+}
+
+/** runFinalSuccessLanes seam: pairwise co-change recording. */
+function recordFileCoChanges(files: readonly FinalLaneFile[], cwd: string, diagnostics: string[]): void {
+  for (let i = 0; i < files.length; i++) {
+    for (let j = i + 1; j < files.length; j++) {
+      const bridgeError = recordCoChange(cwd, files[i].path, files[j].path, "committed in one SmartEdit transaction");
+      if (bridgeError) diagnostics.push(bridgeError);
+    }
+  }
+}
+
 
 // ─── Extension entry point ──────────────────────────────────────────
 
@@ -372,85 +967,21 @@ export default function smartEdit(pi: ExtensionAPI) {
     event: { input?: unknown; details?: unknown; content?: unknown; isError?: boolean; toolName?: string },
     cwd: string,
   ): Promise<{ envelope: WorkspaceEvidenceEnvelope; text: string } | undefined> => {
-    if (event.toolName !== "edit" || event.isError || !currentSessionFilePath || !currentCanonicalWorkspaceRoot) return undefined;
-    const details = event.details as { status?: { kind?: string; phase?: string }; matchFailure?: string } | undefined;
-    if (details?.status?.kind !== "failed" || details.status.phase !== "stage") return undefined;
-    if (details.matchFailure !== "NOT_FOUND" && details.matchFailure !== "AMBIGUOUS") return undefined;
-    const input = event.input as { path?: unknown; edits?: unknown; raw?: unknown } | undefined;
-    if (!input || input.raw !== undefined || !Array.isArray(input.edits) || input.edits.length !== 1) return undefined;
-    const edit = input.edits[0] as { path?: unknown; oldText?: unknown; target?: unknown; lineRange?: unknown; hashline?: unknown };
-    if (typeof edit?.oldText !== "string" || edit.target !== undefined || edit.hashline !== undefined) return undefined;
-    if (input.path !== undefined && typeof input.path !== "string") return undefined;
-    if (edit.path !== undefined && typeof edit.path !== "string") return undefined;
-    if (input.path !== undefined && edit.path !== undefined && resolve(cwd, input.path) !== resolve(cwd, edit.path)) return undefined;
-    const targetPath = typeof input.path === "string" ? input.path : edit.path;
-    if (typeof targetPath !== "string" || targetPath.length === 0) return undefined;
-    const lineRange = edit.lineRange as { startLine?: unknown; endLine?: unknown } | undefined;
-    const explicitRange = lineRange && Number.isInteger(lineRange.startLine) && Number.isInteger(lineRange.endLine)
-      ? { startLine: lineRange.startLine as number, endLine: lineRange.endLine as number } : undefined;
-    const resolvedPath = resolve(cwd, targetPath);
-    let canonicalPath: string;
-    try { canonicalPath = realpathSync(resolvedPath); } catch { return undefined; }
-    const resource = priorAuthorityStore?.select(canonicalPath);
-    if (!resource || (resource.coverage !== "full-file" && resource.coverage !== "line-range") || typeof resource.fullFileSha256 !== "string") return undefined;
-    const readFresh = async () => (await fsReadFile(canonicalPath)).toString("utf8");
-    let content: string;
-    try { content = await readFresh(); } catch { return undefined; }
-    const sha = sha256OfString(content);
-    if (sha !== resource.fullFileSha256) return undefined;
-    const lines = content.split("\n");
-    const ranges: LineRange[] = [];
-    const addWindow = (line: number) => {
-      if (!Number.isInteger(line) || line < 1 || line > lines.length) return;
-      ranges.push({ startLine: Math.max(1, line - 2), endLine: Math.min(lines.length, line + 2) });
+    const retryState = {
+      sessionFilePath: currentSessionFilePath,
+      canonicalWorkspaceRoot: currentCanonicalWorkspaceRoot,
+      priorAuthority: priorAuthorityStore,
     };
-    if (explicitRange) addWindow(explicitRange.startLine);
-    if (details.matchFailure === "AMBIGUOUS" && !explicitRange && edit.oldText.length > 0) {
-      let from = 0;
-      while (ranges.length < 3) {
-        const at = content.indexOf(edit.oldText, from);
-        if (at < 0) break;
-        addWindow(content.slice(0, at).split("\n").length);
-        from = at + Math.max(1, edit.oldText.length);
-      }
-    }
-    if (ranges.length === 0) return undefined;
-    const authorized = resource.coverage === "full-file" ? ranges : ranges.flatMap((candidate) => resource.allowedRanges.flatMap((allowed) => {
-      const startLine = Math.max(candidate.startLine, allowed.startLine);
-      const endLine = Math.min(candidate.endLine, allowed.endLine);
-      return startLine <= endLine ? [{ startLine, endLine }] : [];
-    }));
-    const unique = [...new Map(authorized.map((range) => [`${range.startLine}:${range.endLine}`, range])).values()].slice(0, 3);
-    const selected: LineRange[] = [];
-    let bytes = 0;
-    for (const range of unique) {
-      const source = lines.slice(range.startLine - 1, range.endLine).join("\n");
-      const size = Buffer.byteLength(source, "utf8");
-      if (selected.length >= 3 || selected.reduce((n, r) => n + r.endLine - r.startLine + 1, 0) + range.endLine - range.startLine + 1 > 24 || bytes + size > 8192) break;
-      selected.push(range); bytes += size;
-    }
-    if (selected.length === 0) return undefined;
-    // Re-read after range selection: a concurrent write must never mint retry authority.
-    let confirm: string;
-    try { confirm = await readFresh(); } catch { return undefined; }
-    if (sha256OfString(confirm) !== sha) return undefined;
-    const resources = selected.map((range) => ({
-      resourceId: resourceIdFor({ canonicalPath, kind: "range", range }), canonicalPath, kind: "range" as const,
-      coverage: "line-range" as const, allowedRanges: [range], fullFileSha256: sha,
-      fresh: true, byteLength: Buffer.byteLength(confirm, "utf8"), lineCount: confirm.split("\n").length,
-    }));
-    const sessionFilePath = currentSessionFilePath;
-    const workspaceRoot = currentCanonicalWorkspaceRoot;
-    if (!sessionFilePath || !workspaceRoot) return undefined;
-    const sessionId = hashSessionFilePath(sessionFilePath);
-    const envelope: WorkspaceEvidenceEnvelope = {
-      schemaVersion: PROTOCOL_SCHEMA_VERSION,
-      inspectionId: inspectionIdFor({ sessionId, workspaceRoot, resources: resources.map((r) => ({ canonicalPath: r.canonicalPath, allowedRanges: r.allowedRanges })) }),
-      sessionId, workspaceRoot, canonicalWorkspaceRoot: workspaceRoot,
-      createdAt: new Date().toISOString(), resources, mode: "path",
-    };
-    const text = selected.map((range) => `lineRange ${range.startLine}-${range.endLine}:\n${confirm.split("\n").slice(range.startLine - 1, range.endLine).join("\n")}`).join("\n");
-    return { envelope, text };
+    const eligible = await checkRetryEligibility(event, cwd, retryState);
+    if (!eligible) return undefined;
+    const ranges = collectRetryWindows(eligible.content, eligible.explicitRange, eligible.matchFailure, eligible.oldText);
+    if (!ranges) return undefined;
+    const unique = authorizeRetryWindows(eligible.resource, ranges);
+    const selected = applyRetryBudget(unique, eligible.content.split("\n"));
+    if (!selected) return undefined;
+    retryState.sessionFilePath = currentSessionFilePath;
+    retryState.canonicalWorkspaceRoot = currentCanonicalWorkspaceRoot;
+    return mintRetryEvidenceFromSelection(selected, eligible.canonicalPath, eligible.sha, retryState);
   };
 
   // ── Claim post-mutation diagnostics ownership for write/edit ──
@@ -469,330 +1000,37 @@ export default function smartEdit(pi: ExtensionAPI) {
     const toolCwd = process.cwd();
 
     // Release the claim on a failed mutation — SmartEdit only owns
-    // diagnostics for mutations that actually succeeded; a failed write/edit
-    // must fall back to SmartRead (or nothing) rather than silently owning
-    // and then never delivering diagnostics.
-    if (
-      (event.toolName === "write" || event.toolName === "edit") &&
-      event.isError
-    ) {
-      releaseDiagnosticsOwner(event.toolCallId);
-    }
+    // diagnostics for mutations that actually succeeded.
+    releaseClaimOnFailedMutation(event);
 
     // ── Ingest SmartRead workspace evidence into prior authority store ──
     // Tool-owned evidence policy B: validated `details.workspaceEvidence`
     // envelopes are recorded as they arrive; the store indexes the latest
     // strong resource per canonical path and ignores weak evidence.
-    try {
-      const wsEvidence = event.toolName === "read" && !event.isError
-        ? (event.details as { workspaceEvidence?: unknown } | undefined)?.workspaceEvidence
-        : undefined;
-      if (wsEvidence) {
-        priorAuthorityStore?.record(wsEvidence);
-      }
-    } catch {
-      /* silently ignore evidence ingestion errors */
-    }
+    ingestWorkspaceEvidence(event, priorAuthorityStore);
 
-    if (
-      event.toolName === "read" &&
-      !event.isError &&
-      event.content
-    ) {
-      try {
-        // Determine if this is a partial read (user-specified offset/limit)
-        const isOffsetLimitRead =
-          event.input?.offset != null || event.input?.limit != null;
-
-        // Build full content from result blocks
-        const contentBlocks = Array.isArray(event.content) ? event.content : [];
-        const fullText = contentBlocks
-          .filter((c) => c.type === "text")
-          .map((c) => coerceText((c as { text?: unknown }).text))
-          .join("");
-
-        const inputPath = (event.input as { path?: string } | undefined)?.path;
-        if (fullText && inputPath) {
-          if (isOffsetLimitRead) {
-            // Offset/limit reads are intentionally partial — record as partial.
-            // Hashline anchors are only computed in the experimental mode.
-            const readOffset = (event.input as { offset?: number })?.offset ?? 1;
-            const lines = fullText.split("\n");
-            const hashline = smartEditRuntimeConfig.useHashlineEditing
-              ? await buildHashlineAnchors(lines, readOffset)
-              : undefined;
-            recordRead(inputPath, toolCwd, fullText, true, hashline, readOffset);
-
-            // Track read range for coverage validation
-            const explicitLimit = (event.input as { limit?: number })?.limit;
-
-            // When no explicit limit is given (offset-only read), use -1 to mean
-            // "through end of file" so range coverage can validate correctly.
-            // Determine the actual total file line count from snapshot data if
-            // available rather than relying on the returned output, which may be
-            // truncated by Pi's output limit.
-            if (explicitLimit === undefined) {
-              let totalFileLines = lines.length + readOffset - 1;
-              try {
-                const snapshot = getSnapshot(inputPath, toolCwd);
-                if (snapshot?.hashline?.formattedLines?.length) {
-                  totalFileLines = snapshot.hashline.formattedLines.length;
-                }
-              } catch {
-                // Fall back to computed value
-              }
-              recordReadSession(inputPath, toolCwd, readOffset, -1, totalFileLines, "read");
-            } else {
-              recordReadSession(inputPath, toolCwd, readOffset, explicitLimit, lines.length + readOffset - 1, "read");
-            }
-            return;
-          }
-
-          // Detect Pi's automatic output truncation: if the file on disk is
-          // larger than the content returned, the read was truncated.
-          // We record as partial so the stale check only verifies mtime.
-          let isTruncated = false;
-          try {
-            const resolvedPath = resolve(toolCwd, inputPath);
-            const fileStat = statSync(resolvedPath);
-            if (fileStat.size > fullText.length) {
-              isTruncated = true;
-            }
-          } catch {
-            // file may not exist or stat failed — record normally
-          }
-
-          // Build hashline anchors only in the experimental mode.
-          const lines = fullText.split("\n");
-          const hashline = smartEditRuntimeConfig.useHashlineEditing
-            ? await buildHashlineAnchors(lines)
-            : undefined;
-          recordRead(inputPath, toolCwd, fullText, isTruncated, hashline);
-
-          // Track read range for coverage validation
-          recordReadSession(inputPath, toolCwd, 1, -1, lines.length, "read");
-        }
-      } catch {
-        /* silently ignore cache population errors */
-      }
-    }
+    // ── Populate read cache for SmartRead single `read` results ──
+    // Delegated to handleSingleReadResult (file-local); the single-read
+    // early return is preserved via its boolean result.
+    if (await handleSingleReadResult(event, toolCwd)) return;
 
     // ── Track read_files results ──
-    // Populates the snapshot cache for each file read, so edits are allowed.
-    // Accepts both "read_files" (current Pi-SmartRead name) and "read_multiple_files"
-    // (legacy ToolDefinition.name) for backward compatibility.
-    if (
-      (event.toolName === "read_files" || event.toolName === "read_multiple_files") &&
-      !event.isError
-    ) {
-      try {
-        // Prefer event.details.files (has ok status from read-many) over event.input.files
-        const rawDetailFiles = (event.details as { files?: Array<{ path: string; ok?: boolean }> } | undefined)?.files;
-        const detailFiles = Array.isArray(rawDetailFiles) ? rawDetailFiles : undefined;
-        const rawInputFiles = (event.input as { files?: Array<{ path: string; offset?: number; limit?: number }> } | undefined)?.files;
-        const inputFiles = Array.isArray(rawInputFiles) ? rawInputFiles : undefined;
-
-        // Merge detail status with input params (offset/limit)
-        const filesToProcess = (detailFiles ?? inputFiles) ?? [];
-        if (filesToProcess.length > 0) {
-          // Build lookup from input files for offset/limit info
-          const inputMap = new Map<string, { offset?: number; limit?: number }>();
-          if (inputFiles) {
-            for (const f of inputFiles) inputMap.set(f.path, { offset: f.offset, limit: f.limit });
-          }
-
-          for (const file of filesToProcess) {
-            // Skip files that failed to read
-            if ('ok' in file && file.ok === false) continue;
-
-            try {
-              const resolvedPath = resolve(toolCwd, file.path);
-              const content = (await fsReadFile(resolvedPath)).toString("utf-8");
-              if (content) {
-                const inputInfo = inputMap.get(file.path);
-                const isPartial = inputInfo?.offset != null || inputInfo?.limit != null;
-                const lines = content.split("\n");
-                const hashline = smartEditRuntimeConfig.useHashlineEditing
-                  ? await buildHashlineAnchors(lines)
-                  : undefined;
-                recordRead(file.path, toolCwd, content, isPartial, hashline);
-
-                // Track read range for coverage validation
-                const readOffset = inputInfo?.offset ?? 1;
-                const readLimit = inputInfo?.limit ?? -1;
-                recordReadSession(file.path, toolCwd, readOffset, readLimit, lines.length, "read_files");
-              }
-            } catch {
-              // File may not exist or can't be read — skip silently
-            }
-          }
-        }
-      } catch {
-        /* silently ignore cache population errors */
-      }
-    }
+    // Delegated to handleMultiReadResult (file-local).
+    await handleMultiReadResult(event, toolCwd);
 
     // ── Track intent_read results ──
-    // Populates the snapshot cache for each successfully-read file.
-    // Uses event.details.files (which includes directory-resolved files)
-    // rather than event.input.files for completeness.
-    if (
-      event.toolName === "intent_read" &&
-      !event.isError
-    ) {
-      try {
-        const rawDetailFiles = (event.details as { files?: Array<{ path: string; ok: boolean; inclusion?: string }> } | undefined)?.files;
-        const detailFiles = Array.isArray(rawDetailFiles) ? rawDetailFiles : undefined;
-        if (detailFiles && detailFiles.length > 0) {
-          for (const file of detailFiles) {
-            if (!file.ok) continue;
-
-            try {
-              const resolvedPath = resolve(toolCwd, file.path);
-              const content = (await fsReadFile(resolvedPath)).toString("utf-8");
-              if (content) {
-                // Mark as partial if the file wasn't fully included in output
-                // due to packing limits or truncation (omitted files are still
-                // recorded so the edit stale-check knows they were seen).
-                const isPartial = file.inclusion !== "full";
-                const lines = content.split("\n");
-                const hashline = smartEditRuntimeConfig.useHashlineEditing
-                  ? await buildHashlineAnchors(lines)
-                  : undefined;
-                recordRead(file.path, toolCwd, content, isPartial, hashline);
-
-                // Track read range for coverage validation
-                // intent_read reads full files, so offset=1, limit=-1 (full file)
-                recordReadSession(file.path, toolCwd, 1, -1, lines.length, "intent_read");
-              }
-            } catch {
-              // File may not exist or can't be read — skip silently
-            }
-          }
-        }
-      } catch {
-        /* silently ignore cache population errors */
-      }
-    }
-
-    // ── Shared single-file read+record+validation helper ──
-    // Used by both write and edit post-processing paths. Returns undefined when
-    // the file is empty, validation passed, or no feedback was produced.
-    const validateFileAndBuildFeedback = async (
-      filePath: string,
-      cwd: string,
-    ): Promise<
-      | {
-          path: string;
-          feedback: string;
-          retryCount: number;
-          shouldDecompose: boolean;
-        }
-      | undefined
-    > => {
-      const resolvedPath = resolve(cwd, filePath);
-      const content = (await fsReadFile(resolvedPath)).toString("utf-8");
-
-      recordRead(filePath, cwd, content);
-      const lines = content.split("\n");
-      recordReadSession(filePath, cwd, 1, -1, lines.length, "edit");
-
-      if (!content) {
-        // Empty files are recorded as reads but skip validation; this matches
-        // the existing write-path behavior and makes edit-path behavior consistent.
-        return undefined;
-      }
-
-      // ── Auto-validation hook (SmallCode-inspired) ──
-      // After a write/edit, run structural + compiler/linter validation.
-      // Feed errors back as structured data on the event for the model to see.
-      //
-      // This is awaited synchronously so the caller's diagnostics are resolved
-      // before this function returns.
-      const validationResult = await runAutoValidation(filePath, content, {
-        cwd,
-        maxRetries: 3,
-        enabled: true,
-      });
-      if (validationResult.passed) return undefined;
-      const feedback = formatValidationFeedback(validationResult);
-      if (!feedback) return undefined;
-      return {
-        path: filePath,
-        feedback,
-        retryCount: validationResult.retryCount,
-        shouldDecompose: validationResult.shouldDecompose,
-      };
-    };
-
-    // ── Lightweight read-cache refresh (no validation) ──
-    // Used by the edit post-processing path below. Unlike
-    // validateFileAndBuildFeedback, this does NOT run runAutoValidation —
-    // see the comment on the "edit" branch for why the edit tool's own
-    // synchronous lanes (pre-write repair + post-write runFinalSuccessLanes,
-    // both wired through patch.ts) already cover compiler/lint diagnostics
-    // for edits, making a second async validation pass pure duplicate work.
-    const refreshReadCacheAfterEdit = async (filePath: string, cwd: string): Promise<void> => {
-      const resolvedPath = resolve(cwd, filePath);
-      const content = (await fsReadFile(resolvedPath)).toString("utf-8");
-      recordRead(filePath, cwd, content);
-      const lines = content.split("\n");
-      recordReadSession(filePath, cwd, 1, -1, lines.length, "edit");
-    };
+    // Delegated to handleIntentReadResult (file-local).
+    await handleIntentReadResult(event, toolCwd);
 
     // ── Track writes so write-then-edit flow doesn't trigger stale-file guard ──
-    // Also SmartEdit's diagnostics lane for the native `write` tool: this is
-    // awaited and returned (not fire-and-forget) so the model actually sees
-    // it — the previous `.then()` mutated `event` after this async handler
-    // had already resolved, which the runner's emitToolResult never observes
-    // (it only honors a handler's return value).
-    const writePath = (event.input as { path?: string } | undefined)?.path;
-    if (
-      event.toolName === "write" &&
-      !event.isError &&
-      writePath
-    ) {
-      try {
-        const entry = await validateFileAndBuildFeedback(writePath, toolCwd);
-        const workspaceEvidence = await buildMutationEvidence([writePath]);
-        if (workspaceEvidence) priorAuthorityStore?.record(workspaceEvidence);
-        if (entry || workspaceEvidence) {
-          const block = entry ? `\n\nPost-write diagnostics:\n${entry.feedback}` : "";
-          return {
-            content: block ? appendDiagnosticsToContent(event.content, block) as typeof event.content : event.content,
-            details: {
-              ...((event.details as Record<string, unknown> | undefined) ?? {}),
-              ...(entry ? {
-                postEditDiagnostics: { schemaVersion: 1, paths: [writePath], checked: true },
-                validationRetries: entry.retryCount,
-                shouldDecompose: entry.shouldDecompose,
-              } : {}),
-              ...(workspaceEvidence ? { workspaceEvidence } : {}),
-            },
-          };
-        }
-      } catch {
-        // File might not exist yet or can't be read — skip silently
-      }
-    }
+    // Delegated to handleWriteResult (file-local); awaited + returned as before.
+    const writeResult = await handleWriteResult(event, toolCwd, buildMutationEvidence, priorAuthorityStore);
+    if (writeResult) return writeResult;
 
     // Failed classic-text matches may return narrowly authorized retry context.
-    // This path never ingests caller-supplied evidence; it mints only from the
-    // tool-owned prior authority after a fresh, double-checked filesystem read.
-    if (event.toolName === "edit" && !event.isError) {
-      try {
-        const retry = await buildRetryEvidence(event, toolCwd);
-        if (retry) {
-          priorAuthorityStore?.record(retry.envelope);
-          return {
-            content: appendDiagnosticsToContent(event.content, `\n\n${retry.text}\nRe-edit using exact text and lineRange above; no separate read needed.`) as typeof event.content,
-            details: { ...(event.details ?? {}), workspaceEvidence: retry.envelope },
-          };
-        }
-      } catch {
-        // Retry context is advisory; failed reads and races produce no evidence.
-      }
-    }
+    // Delegated to handleEditRetryResult (file-local).
+    const retryResult = await handleEditRetryResult(event, toolCwd, buildRetryEvidence, priorAuthorityStore);
+    if (retryResult) return retryResult;
 
     // ── Track edits so edit-then-edit flow doesn't trigger stale-file guard ──
     //
@@ -825,42 +1063,10 @@ export default function smartEdit(pi: ExtensionAPI) {
     //
     // The `write` tool's diagnostics lane above is unrelated: it is the only
     // diagnostic lane for `write`, so no duplication applies.
-    if (
-      event.toolName === "edit" &&
-      !event.isError
-    ) {
-      try {
-        const details = (event as unknown as { details?: PatchToolDetails }).details;
-        if (
-          details?.status?.kind === "applied" &&
-          Array.isArray(details.diffs) &&
-          details.diffs.length > 0
-        ) {
-          const uniquePaths = [
-            ...new Set(
-              details.diffs
-                .map((d) => d.path)
-                .filter((p): p is string => typeof p === "string"),
-            ),
-          ];
-          for (const p of uniquePaths) {
-            await refreshReadCacheAfterEdit(p, toolCwd).catch(() => {
-              // File might not exist yet or can't be read — skip silently
-            });
-          }
-          const workspaceEvidence = await buildMutationEvidence(uniquePaths);
-          if (workspaceEvidence) {
-            priorAuthorityStore?.record(workspaceEvidence);
-            return {
-              content: event.content,
-              details: { ...(event.details ?? {}), workspaceEvidence },
-            };
-          }
-        }
-      } catch {
-        // Edit post-processing is advisory — silent degradation
-      }
-    }
+    // Delegated to handleEditSuccessResult (file-local); only the
+    // read-cache refresh + evidence mint below is preserved (see comment above).
+    const editResult = await handleEditSuccessResult(event, toolCwd, buildMutationEvidence, priorAuthorityStore);
+    if (editResult) return editResult;
   });
 
   // ── Initialize per-session state ──
@@ -962,75 +1168,13 @@ export default function smartEdit(pi: ExtensionAPI) {
         const checks: Array<{ id: string; outcome: "pass" | "fail" | "skipped" | "timeout"; detail?: string }> = [];
         const evidence: unknown[] = [];
         for (const file of files) {
-          const languageId = detectLanguageFromExtension(file.path);
-          if (!languageId) {
-            checks.push({ id: `diagnostics:${file.path}`, outcome: "skipped", detail: "no language diagnostic lane" });
-            continue;
-          }
-          // Track whether LSP actually produced a diagnosis for this file.
-          // The compiler lane is a fallback ONLY when LSP is absent
-          // (source: "none") — not merely when LSP reported no errors — so
-          // we never double-report the same file when an LSP server exists.
-          // LSP diagnostic honesty: only "confirmed" (publishDiagnostics match including empty or successful pull including empty) is authoritative.
-          // Extension seam: future mutating autofix/format and external security-scanner triage would plug in here — keep status handling additive (check === "confirmed", not exhaustive switch).
-          let lspConfirmed = false;
-          if (lspManager) {
-            const lsp = smartReadDiagnosticsClient
-              ? await smartReadDiagnosticsClient.checkPostEditDiagnostics(file.path, file.content, languageId, cwd, lspManager)
-              : await checkPostEditDiagnostics(file.path, file.content, languageId, lspManager);
-            // Additive-friendly: only "confirmed" is definitive; future statuses (e.g. "needs-triage") fall through to skipped.
-            if (lsp.status === "confirmed") {
-              lspConfirmed = true;
-              const lspHasError = lsp.diagnostics.some((d) => d.severity === 1);
-              checks.push({ id: `lsp:${file.path}`, outcome: lspHasError ? "fail" : "pass", detail: `${lsp.diagnostics.length} diagnostic(s), ${lsp.source}, ${lsp.status}` });
-              diagnostics.push(...lsp.diagnostics.map((d) => `lsp ${file.path}:${d.range.start.line + 1}: ${d.message}`));
-            } else {
-              checks.push({ id: `lsp:${file.path}`, outcome: "skipped", detail: `${lsp.diagnostics.length} diagnostic(s), ${lsp.source}, ${lsp.status}` });
-            }
-          }
-          const compiler = !lspConfirmed ? getCompilerForLanguage(languageId) : null;
-          if (compiler) {
-            const result = await compiler(file.path, cwd);
-            const compilerHasError = result.diagnostics.some((d) => d.severity === 1);
-            checks.push({ id: `compiler:${file.path}`, outcome: compilerHasError ? "fail" : "pass", detail: `${result.diagnostics.length} diagnostic(s), ${result.source}` });
-            diagnostics.push(...result.diagnostics.map((d) => `${d.source} ${file.path}:${d.range.start.line + 1}: ${d.message}`));
-            for (const diagnostic of result.diagnostics) {
-              if (!diagnostic.filePath) continue;
-              // Canonicalize the compiler-reported path before recording a
-              // breakage edge (realpath resolves symlinks), while preserving
-              // the edited-file and context arguments.
-              let canonicalDiagPath: string;
-              try {
-                canonicalDiagPath = realpathSync(resolve(cwd, diagnostic.filePath));
-              } catch {
-                canonicalDiagPath = resolve(cwd, diagnostic.filePath);
-              }
-              if (canonicalDiagPath !== file.path) {
-                const bridgeError = recordBreakage(cwd, file.path, canonicalDiagPath, diagnostic.message);
-                if (bridgeError) diagnostics.push(bridgeError);
-              }
-            }
-          }
-          const post = await runPostEditEvidencePipeline({
-            cwd,
-            path: file.path,
-            content: file.content,
-            oldContent: file.oldContent,
-            languageId,
-            matchSpans: file.changedLineRanges.map((range) => lineRangeToOffsets(file.content, range)),
+          await runSingleFileFinalLanes(file, {
+            cwd, diagnostics, checks, evidence,
             editedPaths: files.map((entry) => entry.path),
-            lspManager: lspManager as unknown as { getServer(languageId: string): unknown } | null,
-            config: { repair: { enabled: false, maxRetries: 0, autoRepair: false, notifyOnRetry: false } },
+            lspManager, diagnosticsClient: smartReadDiagnosticsClient,
           });
-          evidence.push(post);
-          diagnostics.push(...post.notes);
         }
-        for (let i = 0; i < files.length; i++) {
-          for (let j = i + 1; j < files.length; j++) {
-            const bridgeError = recordCoChange(cwd, files[i].path, files[j].path, "committed in one SmartEdit transaction");
-            if (bridgeError) diagnostics.push(bridgeError);
-          }
-        }
+        recordFileCoChanges(files, cwd, diagnostics);
         return { diagnostics, checks, evidence };
       },
     };

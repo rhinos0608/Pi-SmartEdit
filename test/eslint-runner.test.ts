@@ -6,12 +6,14 @@ import {
   writeFileSync,
   chmodSync,
   rmSync,
+  existsSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   parseEslintJsonOutput,
   checkEslintDiagnostics,
+  selectEslintCommand,
 } from "../src/lsp/eslint-runner.js";
 
 function makeTempDir(prefix: string): string {
@@ -40,6 +42,7 @@ function installFakeEslint(
       join(binDir, "eslint-fake.js"),
       "const fs = require('fs');\n" +
         "const path = require('path');\n" +
+        "try { fs.writeFileSync(path.join(__dirname, 'eslint-invoked.marker'), 'invoked', 'utf8'); } catch (e) { /* marker best-effort */ void e; }\n" +
         "const fixture = JSON.parse(fs.readFileSync(path.join(__dirname, 'eslint-fixture.json'), 'utf8'));\n" +
         "process.stdout.write(fixture.output);\n" +
         "process.exit(fixture.exitCode);\n",
@@ -52,14 +55,20 @@ function installFakeEslint(
     );
     return;
   }
+  const marker = join(binDir, "eslint-invoked.marker");
   const script = join(binDir, "eslint");
-  const shell = `#!/bin/sh\nprintf '%s' ${shellEscape(stdout)}\nexit ${exitCode}\n`;
+  const shell =
+    `#!/bin/sh\ntouch ${shellEscape(marker)}\nprintf '%s' ${shellEscape(stdout)}\nexit ${exitCode}\n`;
   writeFileSync(script, shell, "utf-8");
   chmodSync(script, 0o755);
 }
 
 function shellEscape(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function fakeInvoked(dir: string): boolean {
+  return existsSync(join(dir, "node_modules", ".bin", "eslint-invoked.marker"));
 }
 
 function writeEslintConfig(dir: string): void {
@@ -196,6 +205,7 @@ describe("eslint-runner", () => {
       const result = await checkEslintDiagnostics(filePath, dir);
 
       assert.ok(result);
+      assert.ok(fakeInvoked(dir), "fake eslint must run, not be skipped");
       assert.strictEqual(result.diagnostics.length, 0);
       assert.strictEqual(result.source, "none");
     });
@@ -230,9 +240,44 @@ describe("eslint-runner", () => {
 
       const result = await checkEslintDiagnostics(filePath, configDir);
 
+      assert.ok(fakeInvoked(configDir), "fake eslint must run, not be skipped");
       assert.strictEqual(result.source, "eslint");
       assert.strictEqual(result.diagnostics.length, 1);
       assert.strictEqual(result.diagnostics[0].severity, 1);
+      assert.strictEqual(result.diagnostics[0].message, "[semi] Missing semicolon.");
+    });
+
+    it("round-trips diagnostics for metachar filenames (&|()%!^)", async () => {
+      const dir = makeTempDir("smart-edit-eslint-metachar-");
+      tempDirs.push(dir);
+      writeEslintConfig(dir);
+      const filePath = join(dir, "we&ird|na(me)%!^.ts");
+      writeFileSync(filePath, "const x = 1\n", "utf-8");
+      installFakeEslint(
+        dir,
+        JSON.stringify([
+          {
+            filePath,
+            messages: [
+              {
+                ruleId: "semi",
+                severity: 2,
+                message: "Missing semicolon.",
+                line: 1,
+                column: 1,
+              },
+            ],
+          },
+        ]),
+        0,
+      );
+
+      const result = await checkEslintDiagnostics(filePath, dir);
+
+      assert.ok(fakeInvoked(dir), "fake eslint must run, not be skipped");
+      assert.strictEqual(result.source, "eslint");
+      assert.strictEqual(result.diagnostics.length, 1);
+      assert.strictEqual(result.diagnostics[0].filePath, filePath);
       assert.strictEqual(result.diagnostics[0].message, "[semi] Missing semicolon.");
     });
 
@@ -256,8 +301,39 @@ describe("eslint-runner", () => {
 
       const result = await checkEslintDiagnostics(filePath, dir);
 
+      assert.ok(fakeInvoked(dir), "fake eslint must run, not be skipped");
       assert.strictEqual(result.source, "none");
       assert.strictEqual(result.diagnostics.length, 0);
+    });
+  });
+
+  describe("selectEslintCommand", () => {
+    it("selects the direct local binary when the path has no whitespace (posix)", () => {
+      const selection = selectEslintCommand("/proj/app", false);
+      assert.strictEqual(selection.kind, "direct");
+      assert.strictEqual(
+        selection.command,
+        join("/proj/app", "node_modules", ".bin", "eslint"),
+      );
+    });
+
+    it("selects the direct local binary when the path has no whitespace (win)", () => {
+      const selection = selectEslintCommand("C:\\proj\\app", true);
+      assert.strictEqual(selection.kind, "direct");
+      assert.ok(selection.command.endsWith("eslint.cmd"));
+      assert.ok(!/\s/.test(selection.command));
+    });
+
+    it("falls back to npx when the path contains whitespace (posix)", () => {
+      const selection = selectEslintCommand("/my proj/app", false);
+      assert.strictEqual(selection.kind, "npx");
+      assert.strictEqual(selection.command, "npx");
+    });
+
+    it("falls back to npx.cmd when the path contains whitespace (win)", () => {
+      const selection = selectEslintCommand("C:\\my proj\\app", true);
+      assert.strictEqual(selection.kind, "npx");
+      assert.strictEqual(selection.command, "npx.cmd");
     });
   });
 });
