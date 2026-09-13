@@ -8,6 +8,7 @@
 
 import type { ChildProcess, SpawnOptions } from "child_process";
 import { spawn } from "child_process";
+import { buildPersistentSpawnTarget } from "./spawn-utils";
 
 export interface LSPRequest {
   id: number;
@@ -60,9 +61,18 @@ export class LSPConnection {
    * @param args     Arguments passed to the command
    */
   constructor(command: string, args: string[], options?: SpawnOptions) {
-    this.process = spawn(command, args, {
+    // Route win32 `.cmd`/`.bat` shims through cmd.exe (Node CVE-2024-27980
+    // mitigation rejects raw-spawning them with EINVAL). Gate fields stay
+    // authoritative: caller options cannot override the pipe triple or the
+    // mapped verbatim flag.
+    const target = buildPersistentSpawnTarget(command, args);
+    const { stdio: _ignoredStdio, windowsVerbatimArguments: _ignoredVerbatim, ...restOptions } = options ?? {};
+    this.process = spawn(target.command, target.args, {
+      ...restOptions,
       stdio: ["pipe", "pipe", "pipe"],
-      ...options,
+      ...(target.windowsVerbatimArguments !== undefined
+        ? { windowsVerbatimArguments: target.windowsVerbatimArguments }
+        : {}),
     });
 
     // Handle stdout — parse Content-Length headers and dispatch JSON messages

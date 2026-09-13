@@ -344,7 +344,7 @@ test("end-to-end: rejects coverage when target line range is outside resource.al
     assert.equal(d.status.reason, "coverage");
 });
 
-test("end-to-end: rejects when resolver returns missing-inspection error (status:rejected session)", async () => {
+test("end-to-end: rejects when resolver returns missing-inspection error (status:rejected coverage)", async () => {
     const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-")));
     mkdirSync(workdir, { recursive: true });
     const { res } = await runApply({
@@ -357,7 +357,7 @@ test("end-to-end: rejects when resolver returns missing-inspection error (status
     });
     const d = res.details as any;
     assert.equal(d.status.kind, "rejected");
-    assert.equal(d.status.reason, "session");
+    assert.equal(d.status.reason, "coverage");
 });
 
 test("end-to-end: toolCallId carried through details on rejection", async () => {

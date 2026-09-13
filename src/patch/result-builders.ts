@@ -128,6 +128,7 @@ export function makeFailed(
 export function classifyRpcError(msg: string | undefined): "stale" | "coverage" | "conflict" | "approval" | "session" {
     if (!msg) return "session";
     if (/coverage/i.test(msg)) return "coverage";
+    if (/unknown inspectionId|not in tool result/i.test(msg)) return "coverage";
     if (/stale/i.test(msg)) return "stale";
     if (/conflict|duplicate/i.test(msg)) return "conflict";
     return "session";

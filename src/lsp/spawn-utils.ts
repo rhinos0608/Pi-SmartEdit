@@ -54,6 +54,32 @@ export interface SpawnTarget {
 }
 
 /**
+ * Persistent-spawn target for long-lived stdio children (e.g. LSP servers).
+ *
+ * Same win32 `.cmd`/`.bat` → `cmd.exe` gate as {@link buildSpawnTarget},
+ * evaluated against the real `process.platform`. Unlike {@link safeSpawnAsync}
+ * (one-shot, captures output, resolves on exit), this returns the mapped
+ * target so callers can hold live pipes open.
+ */
+export interface PersistentSpawnTarget {
+  command: string;
+  args: string[];
+  windowsVerbatimArguments?: boolean;
+}
+
+export function buildPersistentSpawnTarget(
+  command: string,
+  args: string[],
+): PersistentSpawnTarget {
+  const target = buildSpawnTarget(command, args);
+  const mapped: PersistentSpawnTarget = { command: target.command, args: target.args };
+  if (target.windowsVerbatimArguments !== undefined) {
+    mapped.windowsVerbatimArguments = target.windowsVerbatimArguments;
+  }
+  return mapped;
+}
+
+/**
  * Map a spawn target through the Windows batch-file gate.
  *
  * Everything except win32 `.cmd`/`.bat` passes through unchanged

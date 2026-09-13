@@ -39,7 +39,9 @@ export function ingestWorkspaceEvidence(
   store: PriorAuthorityStore | null,
 ): void {
   try {
-    const wsEvidence = event.toolName === "read" && !event.isError
+    const wsEvidence = (event.toolName === "read" ||
+      event.toolName === "read_files" ||
+      event.toolName === "read_multiple_files") && !event.isError
       ? (event.details as { workspaceEvidence?: unknown } | undefined)?.workspaceEvidence
       : undefined;
     if (wsEvidence) {
