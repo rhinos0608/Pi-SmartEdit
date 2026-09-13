@@ -181,14 +181,16 @@ function globToRegex(pattern: string): RegExp {
 
 /**
  * Check if a file path matches any of the dangerous patterns.
- * Normalizes the path using path.resolve() before matching.
+ * Normalizes the path using path.resolve() before matching, converting
+ * Windows backslash separators to forward slashes so glob patterns match
+ * on all platforms.
  */
 export async function matchesDangerousPath(
   filePath: string,
   patterns: readonly string[] = DANGEROUS_PATH_PATTERNS,
   regexes: readonly RegExp[] = DANGEROUS_PATH_REGEXES,
 ): Promise<string | null> {
-  const normalizedPath = resolve(filePath);
+  const normalizedPath = resolve(filePath).split("\\").join("/");
   const effectiveRegexes = patterns === DANGEROUS_PATH_PATTERNS ? regexes : patterns.map(globToRegex);
   for (let i = 0; i < effectiveRegexes.length; i++) {
     if (effectiveRegexes[i].test(normalizedPath)) {
