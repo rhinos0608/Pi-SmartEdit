@@ -232,8 +232,8 @@ export class LSPConnection {
       });
       this.write({ jsonrpc: "2.0", id, method, params });
 
-      // Don't let this timer prevent Node from exiting
-      timer.unref();
+      // Keep the request timeout ref'd so callers don't get cancelled-by-parent
+      // while awaiting server responses in Node's test runner.
     });
   }
 
