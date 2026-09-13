@@ -18,7 +18,7 @@ import {
   formatHashLine,
   initHashline,
   buildHashlineAnchors,
-} from "../src/core/hashline.js";
+} from "../src/hashline/hashline.js";
 
 // Initialize hashline before running tests
 let initialized = false;

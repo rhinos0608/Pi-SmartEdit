@@ -24,8 +24,8 @@ import {
     type PatchToolDeps,
     type VerificationCheck,
 } from "../src/patch.js";
-import { createPriorAuthorityStore } from "../src/evidence-authority.js";
-import { computeLineHashSync, initHashline } from "../src/core/hashline.js";
+import { createPriorAuthorityStore } from "../src/context/evidence-authority.js";
+import { computeLineHashSync, initHashline } from "../src/hashline/hashline.js";
 import { getUndoHistory } from "../src/undo/edit-history.js";
 
 function sha256(s: string): string {

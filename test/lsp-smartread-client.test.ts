@@ -290,7 +290,7 @@ describe("refactor RPC clients", () => {
         return { ok: true, workspaceEdit: { fileEdits: [{ filePath: "/a.ts", edits: [] }] } };
       },
     });
-    const { requestOrganizeImports } = await import("../src/lsp-smartread-client.js");
+    const { requestOrganizeImports } = await import("../src/lsp/lsp-smartread-client.js");
     const resp = await requestOrganizeImports(bus as never, { filePath: "/a.ts" });
     assert.equal(seenRpc, LANGUAGE_INTELLIGENCE_RPC_METHODS.organizeImports);
     assert.deepEqual(seenPayload, { filePath: "/a.ts" });
@@ -310,7 +310,7 @@ describe("refactor RPC clients", () => {
         return { ok: true, workspaceEdit: { fileEdits: [{ filePath: "/a.ts", edits: [] }] } };
       },
     });
-    const { requestFormatting } = await import("../src/lsp-smartread-client.js");
+    const { requestFormatting } = await import("../src/lsp/lsp-smartread-client.js");
     const resp = await requestFormatting(bus as never, { filePath: "/a.ts", tabSize: 4, insertSpaces: true });
     assert.equal(seenRpc, LANGUAGE_INTELLIGENCE_RPC_METHODS.formatting);
     assert.deepEqual(seenPayload, { filePath: "/a.ts", tabSize: 4, insertSpaces: true });
@@ -330,7 +330,7 @@ describe("refactor RPC clients", () => {
         return { ok: true, actions: [{ title: "fix", workspaceEdit: { fileEdits: [{ filePath: "/a.ts", edits: [] }] } }] };
       },
     });
-    const { requestCodeAction } = await import("../src/lsp-smartread-client.js");
+    const { requestCodeAction } = await import("../src/lsp/lsp-smartread-client.js");
     const resp = await requestCodeAction(bus as never, { filePath: "/a.ts", line: 1, character: 2, only: ["quickfix"] });
     assert.equal(seenRpc, LANGUAGE_INTELLIGENCE_RPC_METHODS.codeAction);
     assert.deepEqual(seenPayload, { filePath: "/a.ts", line: 1, character: 2, only: ["quickfix"] });

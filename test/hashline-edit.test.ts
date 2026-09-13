@@ -35,14 +35,14 @@ import {
   // Types for test data
   type Anchor,
   type HashlineEditOp,
-} from "../src/core/hashline-edit.js";
+} from "../src/hashline/hashline-edit.js";
 
 import {
   computeLineHashSync,
   initHashline,
-} from "../src/core/hashline.js";
+} from "../src/hashline/hashline.js";
 
-import type { ApplyResult } from "../src/core/hashline-edit.js";
+import type { ApplyResult } from "../src/hashline/hashline-edit.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 

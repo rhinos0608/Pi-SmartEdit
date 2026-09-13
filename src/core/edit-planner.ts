@@ -12,9 +12,9 @@
  *   replaceAll, closest-match diagnostics, literal `$` replacement) and reuse
  *   its resolved `MatchSpan[]`.
  * - Symbolic edits (replaceBody/insertBefore/insertAfter) reuse
- *   `applySymbolicEdits` from symbolic-edits.ts.
+ *   `applySymbolicEdits` from ../ast/symbolic-edits.js.
  * - Structural edits (pattern+replacement) reuse ast-grep semantics via
- *   `resolvePatternEdits` from astgrep-anchor.ts.
+ *   `resolvePatternEdits` from ../ast/astgrep-anchor.js.
  *
  * BOM and original line-ending behavior are preserved using the existing
  * normalization/restoration helpers from edit-diff.
@@ -32,17 +32,17 @@ import {
   applyEdits,
   findText,
   detectIndentation,
-} from "./core/edit-diff.js";
-import { applyHashlinePath, type HashlineEditInput } from "./core/hashline-edit.js";
+} from "./edit-diff.js";
+import { applyHashlinePath, type HashlineEditInput } from "../hashline/hashline-edit.js";
 import {
   resolveAnchorToScope,
   lineRangeToScope,
   intersectScopes,
   type AstResolverLike,
   type AnchorResolutionDiagnostics,
-} from "./anchor-resolution.js";
-import { applySymbolicEdits } from "./symbolic-edits.js";
-import { isAstGrepAvailable, resolvePatternEdits } from "./astgrep-anchor.js";
+} from "../anchor/anchor-resolution.js";
+import { applySymbolicEdits } from "../ast/symbolic-edits.js";
+import { isAstGrepAvailable, resolvePatternEdits } from "../ast/astgrep-anchor.js";
 import type {
   EditItem,
   EditAnchor,
@@ -51,7 +51,7 @@ import type {
   SearchScope,
   EditCapability,
   FileSnapshot,
-} from "./core/types.js";
+} from "./types.js";
 
 /** One resolved replacement against the immutable snapshot. */
 export interface ResolvedMutation {

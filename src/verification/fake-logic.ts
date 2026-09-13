@@ -15,7 +15,7 @@
 import { createRequire } from "module";
 import { readFile } from "fs/promises";
 import type Parser from "web-tree-sitter";
-import { parseFile, type ParseResult } from "../core/ast-resolver.js";
+import { parseFile, type ParseResult } from "../ast/ast-resolver.js";
 
 // ─── Public types ────────────────────────────────────────────────────
 

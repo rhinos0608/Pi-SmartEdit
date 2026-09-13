@@ -1,6 +1,6 @@
-import type { EditItem, EditAnchor, SearchScope, LineRange } from "./core/types";
-import type { ParseResult } from "./core/ast-resolver";
-import { lineRangeToByteRange, validateLineRange } from "./core/edit-diff.js";
+import type { EditItem, EditAnchor, SearchScope, LineRange } from "../core/types";
+import type { ParseResult } from "../ast/ast-resolver";
+import { lineRangeToByteRange, validateLineRange } from "../core/edit-diff.js";
 
 /**
  * The shape of the AST resolver object used by anchor resolution.

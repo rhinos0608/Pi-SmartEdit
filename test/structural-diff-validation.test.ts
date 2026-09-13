@@ -18,8 +18,8 @@ import {
   hasStructuralAnomalies,
 } from "../src/verification/structural-diff.js";
 import type { StructuralDiffResult, StructuralEditOp } from "../src/verification/structural-diff.js";
-import { parseFile, disposeParseResult } from "../src/core/ast-resolver.js";
-import { clearGrammarCache, resetParser } from "../src/core/grammar-loader.js";
+import { parseFile, disposeParseResult } from "../src/ast/ast-resolver.js";
+import { clearGrammarCache, resetParser } from "../src/ast/grammar-loader.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────
 

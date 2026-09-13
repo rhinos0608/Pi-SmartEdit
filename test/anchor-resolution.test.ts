@@ -4,8 +4,8 @@ import {
     findTextLineRange,
     getHashlineAnchorLine,
     computeEditContainingRange,
-} from "../src/anchor-resolution.js";
-import { findSymbolNode } from "../src/core/ast-resolver.js";
+} from "../src/anchor/anchor-resolution.js";
+import { findSymbolNode } from "../src/ast/ast-resolver.js";
 
 type FakeNode = {
     type: string;

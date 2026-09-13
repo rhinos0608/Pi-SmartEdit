@@ -1,7 +1,7 @@
 import { describe, it, before } from "node:test";
 import assert from "node:assert";
-import { createAstResolver, clearParseCache } from "../src/core/ast-resolver.js";
-import { applySymbolicEdits, buildSymbolicEditGuidance, resolveSymbolicEditLineRange, isSymbolicEdit } from "../src/symbolic-edits.js";
+import { createAstResolver, clearParseCache } from "../src/ast/ast-resolver.js";
+import { applySymbolicEdits, buildSymbolicEditGuidance, resolveSymbolicEditLineRange, isSymbolicEdit } from "../src/ast/symbolic-edits.js";
 
 describe("symbolic edits", () => {
   before(() => {

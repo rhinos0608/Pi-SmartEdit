@@ -20,8 +20,8 @@
  *     smartread-bridge.ts (which handles breakage/co-change recording).
  */
 
-import type { FileSnapshot } from "./core/types";
-import { buildHashlineAnchors, computeLineHashSync } from "./core/hashline";
+import type { FileSnapshot } from "../core/types";
+import { buildHashlineAnchors, computeLineHashSync } from "../hashline/hashline";
 
 /**
  * Anchor state for a single line — hash, absolute position, content text,

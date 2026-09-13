@@ -15,7 +15,7 @@ import assert from "node:assert";
 import {
   computeLineHashSync,
   initHashline,
-} from "../src/core/hashline.js";
+} from "../src/hashline/hashline.js";
 
 import {
   resolveHashlineEdits,
@@ -30,7 +30,7 @@ import {
   resetHashlineMetrics,
   type HashlineEditInput,
   type FallbackTier,
-} from "../src/core/hashline-edit.js";
+} from "../src/hashline/hashline-edit.js";
 
 import type { EditAnchor } from "../src/core/types.js";
 

@@ -262,7 +262,7 @@ export async function runAutoValidation(
   if (oldTree && oldContent) {
     try {
       // Dynamic import to avoid circular dependency
-      const { validateSyntax } = await import("../core/ast-resolver.js");
+      const { validateSyntax } = await import("../ast/ast-resolver.js");
       const syntaxResult = await validateSyntax(content, filePath, oldTree, oldContent);
       if (!syntaxResult.valid) {
         syntaxError = syntaxResult.error;
@@ -305,7 +305,7 @@ export async function runAutoValidation(
   let structuralDiff: StructuralDiffResult | undefined;
   if (oldTree && oldContent) {
     try {
-      const { parseFile } = await import("../core/ast-resolver.js");
+      const { parseFile } = await import("../ast/ast-resolver.js");
       const parseResult = await parseFile(content, filePath);
       if (parseResult) {
         try {

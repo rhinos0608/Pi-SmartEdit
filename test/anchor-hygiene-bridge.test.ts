@@ -13,13 +13,13 @@
 import { describe, it, before, beforeEach, afterEach } from "node:test";
 import assert from "node:assert";
 
-import { initHashline, buildHashlineAnchors } from "../src/core/hashline.js";
+import { initHashline, buildHashlineAnchors } from "../src/hashline/hashline.js";
 import {
   computeAnchorDelta,
   formatAnchorDeltaForModel,
   ANCHOR_CHURN_THRESHOLD,
-} from "../src/anchor-registry.js";
-import type { AnchorDelta } from "../src/anchor-registry.js";
+} from "../src/anchor/anchor-registry.js";
+import type { AnchorDelta } from "../src/anchor/anchor-registry.js";
 import { fastHash } from "../src/core/types.js";
 import type { FileSnapshot } from "../src/core/types.js";
 

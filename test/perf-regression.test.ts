@@ -10,8 +10,8 @@
 
 import { describe, it, before } from "node:test";
 import assert from "node:assert";
-import { initHashline, buildHashlineAnchors } from "../src/core/hashline.js";
-import { computeAnchorDelta } from "../src/anchor-registry.js";
+import { initHashline, buildHashlineAnchors } from "../src/hashline/hashline.js";
+import { computeAnchorDelta } from "../src/anchor/anchor-registry.js";
 import { checkPatchCorrectness } from "../src/verification/patch-correctness.js";
 import { fastHash } from "../src/core/types.js";
 import type { FileSnapshot } from "../src/core/types.js";

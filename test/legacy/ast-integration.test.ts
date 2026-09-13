@@ -17,7 +17,7 @@ import {
   applyEdits,
   lineRangeToByteRange,
 } from "../../src/core/edit-diff";
-import { validateSyntax } from "../../src/core/ast-resolver";
+import { validateSyntax } from "../../src/ast/ast-resolver";
 
 import type { SearchScope } from "../../src/core/types";
 import type { EditItem } from "../../src/core/types";

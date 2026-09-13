@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { RenamePreviewCache } from "../src/rename-preview-cache.js";
+import { RenamePreviewCache } from "../src/lsp/rename-preview-cache.js";
 
 describe("rename-preview-cache", () => {
   it("store and retrieve", () => {

@@ -24,7 +24,7 @@ import {
     findResourceForCanonicalPath,
     isValidFullFileSha256,
     SHA256_RE,
-} from "../src/patch-authorization.js";
+} from "../src/context/patch-authorization.js";
 
 function sha256(s: string): string {
     return createHash("sha256").update(s, "utf8").digest("hex");

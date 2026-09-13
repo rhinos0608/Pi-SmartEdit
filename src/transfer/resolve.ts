@@ -5,7 +5,7 @@
  * the destination-anchor rebasing previously inlined in `src/patch.ts`
  * (touching-span and duplicate-destination checks). No behavior change.
  */
-import { parseTag, tryRebaseAnchor } from "../core/hashline-edit.js";
+import { parseTag, tryRebaseAnchor } from "../hashline/hashline-edit.js";
 import { normalizeToLF, stripBom } from "../core/edit-diff.js";
 
 export interface ResolvedSourceRange {

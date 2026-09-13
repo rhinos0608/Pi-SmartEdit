@@ -9,15 +9,15 @@
  * Usage: bun run benchmark/hashline-bench.ts
  */
 
-import { initHashline, computeLineHashSync, buildHashlineAnchors } from "../src/core/hashline";
+import { initHashline, computeLineHashSync, buildHashlineAnchors } from "../src/hashline/hashline";
 import {
   validateHashlineEdits,
   tryRebaseAll,
   applyHashlineEdits,
   type HashlineEditOp,
   type Anchor,
-} from "../src/core/hashline-edit";
-import { computeAnchorDelta, ANCHOR_CHURN_THRESHOLD } from "../src/anchor-registry";
+} from "../src/hashline/hashline-edit";
+import { computeAnchorDelta, ANCHOR_CHURN_THRESHOLD } from "../src/anchor/anchor-registry";
 import type { FileSnapshot } from "../src/core/types";
 
 // ─── Types ────────────────────────────────────────────────────────────────────

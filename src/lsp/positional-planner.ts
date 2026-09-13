@@ -1,4 +1,4 @@
-import { generateDiffString } from "./core/edit-diff.js";
+import { generateDiffString } from "../core/edit-diff.js";
 import type { LspWorkspaceEdit } from "@rhinos0608/pi-workspace-protocol";
 
 export interface PositionalEdit {

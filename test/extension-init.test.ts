@@ -19,7 +19,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { visibleWidth } from "@mariozechner/pi-tui";
 import smartEdit from "../src/index.js";
 import { createPatchTool, type PatchToolDeps, type PatchTool } from "../src/patch.js";
-import { claimDiagnosticsOwner, isDiagnosticsClaimed, resetDiagnosticsOwnership } from "../src/mutation-ownership.js";
+import { claimDiagnosticsOwner, isDiagnosticsClaimed, resetDiagnosticsOwnership } from "../src/mutation/mutation-ownership.js";
 import { PROTOCOL_SCHEMA_VERSION, hashSessionFilePath, resourceIdFor, validateInspectionEnvelope, type WorkspaceEvidenceEnvelope, type InspectedResource } from "@rhinos0608/pi-workspace-protocol";
 
 // ── Helpers ─────────────────────────────────────────────────────────

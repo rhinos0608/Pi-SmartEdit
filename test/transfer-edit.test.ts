@@ -12,7 +12,7 @@ import {
     buildTransferInsertEdit,
     buildTransferDeleteEdit,
 } from "../src/transfer-edit.js";
-import { computeLineHashSync, initHashline } from "../src/core/hashline.js";
+import { computeLineHashSync, initHashline } from "../src/hashline/hashline.js";
 
 let hashlineInitialized = false;
 async function ensureHashline(): Promise<void> {

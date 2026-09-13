@@ -52,23 +52,23 @@ import {
     type PostEditEvidence,
     type RpcMethod,
 } from "@rhinos0608/pi-workspace-protocol";
-import { formatBoundedDiagnostics, appendDiagnosticsToContent } from "./post-mutation.js";
+import { formatBoundedDiagnostics, appendDiagnosticsToContent } from "./mutation/post-mutation.js";
 import { generateDiffString, stripBom, normalizeToLF } from "./core/edit-diff.js";
 import { adaptTransferOps } from "./transfer/adapter.js";
 import { resolveSourceRange, resolveDestination } from "./transfer/resolve.js";
 import { planTransfer, bindResolvedTransfer, planTransferMutations, buildTransferDescription, buildTransferInsertEdit, buildTransferDeleteEdit, type TransferPlan } from "./transfer/plan.js";
 import { checkEditSafety } from "./safety/approval-gating.js";
 import { EDIT_PARAMETERS, validateEditRequest, type EditOperation } from "./edit-contract.js";
-import { planPositionalEdits } from "./positional-planner.js";
-import { globalRenamePreviewCache } from "./rename-preview-cache.js";
-import { requestRenamePreview, requestOrganizeImports, requestFormatting, requestCodeAction } from "./lsp-smartread-client.js";
-import { normalizeRawEdit } from "./edit-intents.js";
-import type { PriorAuthorityStore } from "./evidence-authority.js";
-import { planTextEdits, type StructuralResolver } from "./edit-planner.js";
-import { EditTransaction } from "./edit-transaction.js";
+import { planPositionalEdits } from "./lsp/positional-planner.js";
+import { globalRenamePreviewCache } from "./lsp/rename-preview-cache.js";
+import { requestRenamePreview, requestOrganizeImports, requestFormatting, requestCodeAction } from "./lsp/lsp-smartread-client.js";
+import { normalizeRawEdit } from "./formats/edit-intents.js";
+import type { PriorAuthorityStore } from "./context/evidence-authority.js";
+import { planTextEdits, type StructuralResolver } from "./core/edit-planner.js";
+import { EditTransaction } from "./mutation/edit-transaction.js";
 import { saveTransactionUndoRecords } from "./undo/edit-history.js";
 import { MatchError } from "./core/errors.js";
-import type { AstResolverLike } from "./anchor-resolution.js";
+import type { AstResolverLike } from "./anchor/anchor-resolution.js";
 import type { EditItem, EditTarget, FileSnapshot, HashlineEditMetadata } from "./core/types.js";
 import type { RepairLoopResult } from "./verification/repair-loop.js";
 
@@ -203,10 +203,10 @@ async function runVerifierCheck(
     }
 }
 
-// ── Authorization (see ./patch-authorization.ts) ────────────────────
+// ── Authorization (see ./context/patch-authorization.js) ───────────────────
 // Evidence authorization (types, resource selection, coverage validation,
 // SHA-shape validation, requested-resource lookup) lives in
-// patch-authorization.ts. patch.ts keeps evidence RPC, grouping, mutation,
+// context/patch-authorization.js. patch.ts keeps evidence RPC, grouping, mutation,
 // and rollback. Re-exported here so existing importers keep working.
 export {
     resolvePatchAuthorization,
@@ -217,14 +217,14 @@ export {
     isValidFullFileSha256,
     SHA256_RE,
     type AuthorizationResult,
-} from "./patch-authorization.js";
+} from "./context/patch-authorization.js";
 import {
     authorizeResource,
     checkResourceCoverage,
     validateResourceAuthority,
     findResourceForCanonicalPath,
     isValidFullFileSha256,
-} from "./patch-authorization.js";
+} from "./context/patch-authorization.js";
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -644,7 +644,7 @@ async function handleApplyRefactorPreview(deps: PatchToolDeps, toolCallId: strin
     }
     const files = cached.plannedRename.stagedFiles;
     try {
-        const { EditTransaction: ET } = await import("./edit-transaction.js");
+        const { EditTransaction: ET } = await import("./mutation/edit-transaction.js");
         const tx = await ET.begin(files.map((f) => f.filePath));
         try {
             const staleFiles = await findStalePreviewFiles(files);
@@ -1202,7 +1202,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
 
                 // Hashline inserts are idempotent: an insert whose lines already
                 // follow the destination anchor is a silent no-op downstream
-                // (edit-planner skips no-change spans; hashline append_at no-ops
+                // (./core/edit-planner.js skips no-change spans; hashline append_at no-ops
                 // on identical following lines). Reject pre-write with a
                 // transfer-specific conflict instead of silently dropping the
                 // insert — covers same-file and cross-file. Generic hashline

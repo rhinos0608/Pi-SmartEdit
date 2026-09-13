@@ -14,8 +14,8 @@ import {
   HASHLINE_CONTENT_SEPARATOR,
 } from "./hashline";
 
-import type { EditAnchor, FileSnapshot } from "./types";
-import { SmartEditError } from "./errors";
+import type { EditAnchor, FileSnapshot } from "../core/types";
+import { SmartEditError } from "../core/errors";
 
 /**
  * A parsed LINE+ID anchor (e.g., "42ab" → line=42, hash="ab").

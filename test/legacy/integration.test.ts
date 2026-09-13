@@ -16,7 +16,7 @@ import { parseSearchReplace } from "../../src/formats/search-replace";
 import { parseUnifiedDiffToEditItems } from "../../src/formats/unified-diff";
 import { parseOpenAIPatch, openAIPatchToEditItem } from "../../src/formats/openai-patch";
 import { detectInputFormat } from "../../src/formats/format-detector";
-import { validateSyntax } from "../../src/core/ast-resolver";
+import { validateSyntax } from "../../src/ast/ast-resolver";
 
 import type { EditItem, SearchScope } from "../../src/core/types";
 

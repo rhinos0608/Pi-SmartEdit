@@ -15,18 +15,18 @@ import { truncateToWidth, visibleWidth, type Component } from "@mariozechner/pi-
 import { realpathSync, statSync } from "fs";
 import { readFile as fsReadFile } from "fs/promises";
 import { resolve, relative } from "path";
-import { sortHashlineEditsForApplication, formatHashlineBatchSummary } from "./hashline-batching.js";
+import { sortHashlineEditsForApplication, formatHashlineBatchSummary } from "./hashline/hashline-batching.js";
 import {
   prepareArguments,
   validateInput,
   formatEditError,
 } from "./args.js";
 
-import { createAstResolver } from "./core/ast-resolver";
+import { createAstResolver } from "./ast/ast-resolver";
 
-import { recordRead, recordReadSession, getSnapshot } from "./core/read-cache";
+import { recordRead, recordReadSession, getSnapshot } from "./context/read-cache";
 
-import { buildHashlineAnchors } from "./core/hashline";
+import { buildHashlineAnchors } from "./hashline/hashline";
 
 import { LSPManager } from "./lsp/lsp-manager";
 import { checkPostEditDiagnostics } from "./lsp/diagnostics";
@@ -36,17 +36,17 @@ import { detectLanguageFromExtension } from "./lsp/language-id";
 
 
 
-import { getSmartEditRuntimeConfig } from "./edit-mode";
+import { getSmartEditRuntimeConfig } from "./config/edit-mode";
 import { runAutoValidation, formatValidationFeedback, resetRetryCounts } from "./verification/auto-validate";
 import { runRepairLoop } from "./verification/repair-loop";
 import { runPostEditEvidencePipeline } from "./verification/post-edit-evidence";
-import { recordBreakage, recordCoChange } from "./smartread-bridge";
-import { claimDiagnosticsOwner, releaseDiagnosticsOwner } from "./mutation-ownership.js";
-import { appendDiagnosticsToContent } from "./post-mutation.js";
+import { recordBreakage, recordCoChange } from "./context/smartread-bridge";
+import { claimDiagnosticsOwner, releaseDiagnosticsOwner } from "./mutation/mutation-ownership.js";
+import { appendDiagnosticsToContent } from "./mutation/post-mutation.js";
 import { createPatchTool, type PatchToolDeps, type PatchToolDetails } from "./patch.js";
 import { normalizeFlatEditRequest } from "./edit-contract.js";
-import { normalizeRawEdit } from "./edit-intents.js";
-import { createPriorAuthorityStore, type PriorAuthorityStore } from "./evidence-authority.js";
+import { normalizeRawEdit } from "./formats/edit-intents.js";
+import { createPriorAuthorityStore, type PriorAuthorityStore } from "./context/evidence-authority.js";
 import {
   createRpcClient,
   RPC_CHANNELS,
@@ -987,7 +987,7 @@ export default function smartEdit(pi: ExtensionAPI) {
   // ── Claim post-mutation diagnostics ownership for write/edit ──
   // SmartRead's fallback checks isDiagnosticsClaimed() on tool_result and
   // skips its own diagnostics collection when this extension has claimed the
-  // toolCallId, regardless of extension load order (see mutation-ownership.ts).
+  // toolCallId, regardless of extension load order (see ./mutation/mutation-ownership.js).
   pi.on("tool_call", (event) => {
     if (event.toolName === "write" || event.toolName === "edit") {
       claimDiagnosticsOwner(event.toolCallId);

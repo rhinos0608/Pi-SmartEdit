@@ -4,7 +4,7 @@ import {
   MAX_CONTENT_DIAGNOSTICS,
   formatBoundedDiagnostics,
   appendDiagnosticsToContent,
-} from "../src/post-mutation.js";
+} from "../src/mutation/post-mutation.js";
 
 test("formatBoundedDiagnostics: returns empty string for no diagnostics", () => {
   assert.equal(formatBoundedDiagnostics([]), "");

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { planPositionalEdits } from "../src/positional-planner.js";
+import { planPositionalEdits } from "../src/lsp/positional-planner.js";
 
 describe("positional-planner", () => {
   it("single edit", async () => {

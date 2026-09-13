@@ -20,9 +20,9 @@
 import { statSync, readFileSync } from "fs";
 import { readFile } from "fs/promises";
 import { resolve } from "path";
-import type { FileSnapshot } from "./types";
-import { fastHash } from "./types";
-import type { buildHashlineAnchors } from "./hashline";
+import type { FileSnapshot } from "../core/types";
+import { fastHash } from "../core/types";
+import type { buildHashlineAnchors } from "../hashline/hashline";
 
 // ─── Retry configuration ───────────────────────────────────────────
 

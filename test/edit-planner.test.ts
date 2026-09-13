@@ -8,11 +8,11 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { planTextEdits } from "../src/edit-planner.js";
-import { resolvePatternEdits } from "../src/astgrep-anchor.js";
-import { initHashline, formatLineHash } from "../src/core/hashline.js";
+import { planTextEdits } from "../src/core/edit-planner.js";
+import { resolvePatternEdits } from "../src/ast/astgrep-anchor.js";
+import { initHashline, formatLineHash } from "../src/hashline/hashline.js";
 import type { FileSnapshot } from "../src/core/types.js";
-import type { AstResolverLike } from "../src/anchor-resolution.js";
+import type { AstResolverLike } from "../src/anchor/anchor-resolution.js";
 
 type Anchor = { symbolName?: string; symbolNamePath?: string; symbolKind?: string; symbolLine?: number };
 

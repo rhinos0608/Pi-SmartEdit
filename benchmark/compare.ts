@@ -13,13 +13,13 @@ import {
   computeLineHash,
   initHashline,
   computeLineHashSync,
-} from "../src/core/hashline";
+} from "../src/hashline/hashline";
 import {
   resolveHashlineEdits,
   validateHashlineEdits,
   applyHashlineEdits,
   type HashlineEditInput,
-} from "../src/core/hashline-edit";
+} from "../src/hashline/hashline-edit";
 import { findText, detectIndentation } from "../src/core/edit-diff";
 import { mkdirSync, writeFileSync } from "fs";
 import { dirname, join } from "path";

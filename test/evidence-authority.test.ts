@@ -20,7 +20,7 @@ import {
     type InspectedResource,
 } from "@rhinos0608/pi-workspace-protocol";
 
-import { createPriorAuthorityStore } from "../src/evidence-authority.js";
+import { createPriorAuthorityStore } from "../src/context/evidence-authority.js";
 
 function sha256(s: string): string {
     return createHash("sha256").update(s, "utf8").digest("hex");

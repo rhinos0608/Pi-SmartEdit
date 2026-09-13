@@ -5,7 +5,7 @@ import {
   releaseDiagnosticsOwner,
   isDiagnosticsClaimed,
   resetDiagnosticsOwnership,
-} from "../src/mutation-ownership.js";
+} from "../src/mutation/mutation-ownership.js";
 
 test("mutation-ownership: claim marks a toolCallId as claimed", () => {
   resetDiagnosticsOwnership();

@@ -1,4 +1,4 @@
-import { isAstGrepAvailable, findWithPattern, replaceWithPattern, astGrepPatternToTreeSitterQuery, ASTGREP_AVAILABLE } from '../src/astgrep-anchor.ts';
+import { isAstGrepAvailable, findWithPattern, replaceWithPattern, astGrepPatternToTreeSitterQuery, ASTGREP_AVAILABLE } from '../src/ast/astgrep-anchor.ts';
 
 console.log('ASTGREP_AVAILABLE:', ASTGREP_AVAILABLE);
 const avail = await isAstGrepAvailable();

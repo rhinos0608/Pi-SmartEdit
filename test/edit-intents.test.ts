@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { normalizeRawEdit } from "../src/edit-intents.js";
+import { normalizeRawEdit } from "../src/formats/edit-intents.js";
 
 describe("raw edit normalization", () => {
   it("normalizes JSON, forgiving JSON, and search/replace", () => {

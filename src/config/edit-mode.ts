@@ -5,7 +5,7 @@
  * Hashline editing is opt-in and treated as experimental.
  */
 
-import { loadConfig } from "./config/schema.js";
+import { loadConfig } from "./schema.js";
 
 export interface SmartEditRuntimeConfig {
   useHashlineEditing: boolean;

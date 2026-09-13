@@ -1,11 +1,11 @@
-import type { EditOperation } from "./edit-contract.js";
-import { detectInputFormat, type InputFormat } from "./formats/format-detector.js";
-import { parseSearchReplace } from "./formats/search-replace.js";
-import { parseUnifiedDiff } from "./formats/unified-diff.js";
-import { parseOpenAIPatch, openAIPatchToEditItem } from "./formats/openai-patch.js";
-import { parseCodexPatch } from "./formats/codex-patch.js";
-import { parseAtomicPatchEnvelope } from "./formats/atomic-patch.js";
-import { repairJson } from "./formats/forgiving-parser.js";
+import type { EditOperation } from "../edit-contract.js";
+import { detectInputFormat, type InputFormat } from "./format-detector.js";
+import { parseSearchReplace } from "./search-replace.js";
+import { parseUnifiedDiff } from "./unified-diff.js";
+import { parseOpenAIPatch, openAIPatchToEditItem } from "./openai-patch.js";
+import { parseCodexPatch } from "./codex-patch.js";
+import { parseAtomicPatchEnvelope } from "./atomic-patch.js";
+import { repairJson } from "./forgiving-parser.js";
 
 export type EditIntent =
   | { kind: "text"; operation: EditOperation }

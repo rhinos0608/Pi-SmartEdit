@@ -1,9 +1,9 @@
 import { chmod, link, mkdir, open, readFile, rm, stat } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
-import type { TransactionUndoRecord, UndoOperation } from "./undo/edit-history.js";
+import type { TransactionUndoRecord, UndoOperation } from "../undo/edit-history.js";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { atomicCreate, atomicWrite } from "./undo/atomic-write.js";
+import { atomicCreate, atomicWrite } from "../undo/atomic-write.js";
 
 export interface TransactionOutcome {
   attempted: string[];

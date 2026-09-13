@@ -6,7 +6,7 @@ import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { EditTransaction } from "../src/edit-transaction.js";
+import { EditTransaction } from "../src/mutation/edit-transaction.js";
 import { atomicCreate } from "../src/undo/atomic-write.js";
 
 const LOCK_DIR = join(tmpdir(), "pi-smartedit-locks");

@@ -1,11 +1,11 @@
 import { relative, isAbsolute, resolve } from "path";
 import type { EditItem, EditInput } from "./core/types";
-import { isSymbolicEdit } from "./symbolic-edits.js";
-import { HASHLINE_CONTENT_SEPARATOR } from "./core/hashline";
+import { isSymbolicEdit } from "./ast/symbolic-edits.js";
+import { HASHLINE_CONTENT_SEPARATOR } from "./hashline/hashline";
 import { detectInputFormat } from "./formats/format-detector.js";
 import { repairJson } from "./formats/forgiving-parser.js";
 import { normalizeFlatEditRequest } from "./edit-contract.js";
-import { normalizeRawEdit } from "./edit-intents.js";
+import { normalizeRawEdit } from "./formats/edit-intents.js";
 
 // ─── Hashline display prefix stripping ───────────────────────────────
 

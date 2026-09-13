@@ -1,10 +1,10 @@
 import { readFile as fsReadFile } from "fs/promises";
 import { resolve, relative } from "path";
-import { buildHashlineAnchors } from "./core/hashline";
-import { recordRead, recordReadSession, getAllSessionPaths } from "./core/read-cache";
-import { normalizeToLF } from "./core/edit-diff";
-import { findTextLineRange } from "./anchor-resolution.js";
-import type { EditItem } from "./core/types";
+import { buildHashlineAnchors } from "../hashline/hashline";
+import { recordRead, recordReadSession, getAllSessionPaths } from "./read-cache";
+import { normalizeToLF } from "../core/edit-diff";
+import { findTextLineRange } from "../anchor/anchor-resolution.js";
+import type { EditItem } from "../core/types";
 
 /**
  * Read a range of lines from a file and return them as a string.

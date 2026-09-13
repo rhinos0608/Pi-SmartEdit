@@ -67,7 +67,7 @@ export interface EditTarget {
 
 /**
  * Target for symbolic edits only (replaceBody/insertBefore/insertAfter).
- * Kept for internal use by symbolic-edits.ts pipeline.
+ * Kept for internal use by ../ast/symbolic-edits.js pipeline.
  */
 export type SymbolEditTarget =
   | { readonly name: string; namePath?: string; kind?: string; line?: number }

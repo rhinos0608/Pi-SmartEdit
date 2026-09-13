@@ -1,9 +1,9 @@
 import type Parser from "web-tree-sitter";
-import type { EditTarget, MatchSpan, SymbolRef } from "./core/types";
-import type { ParseResult } from "./core/ast-resolver";
-import { MatchTier } from "./core/types";
+import type { EditTarget, MatchSpan, SymbolRef } from "../core/types";
+import type { ParseResult } from "./ast-resolver";
+import { MatchTier } from "../core/types";
 
-export type { SymbolEditTarget } from "./core/types";
+export type { SymbolEditTarget } from "../core/types";
 
 export interface SymbolicEditRequest {
   editIdx: number;

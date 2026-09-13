@@ -22,11 +22,11 @@ import {
 } from "@rhinos0608/pi-workspace-protocol";
 
 import { createPatchTool, type PatchToolDeps } from "../src/patch.js";
-import { createPriorAuthorityStore } from "../src/evidence-authority.js";
-import { initHashline, formatLineHash } from "../src/core/hashline.js";
+import { createPriorAuthorityStore } from "../src/context/evidence-authority.js";
+import { initHashline, formatLineHash } from "../src/hashline/hashline.js";
 import type { FileSnapshot } from "../src/core/types.js";
-import type { AstResolverLike } from "../src/anchor-resolution.js";
-import type { StructuralResolver } from "../src/edit-planner.js";
+import type { AstResolverLike } from "../src/anchor/anchor-resolution.js";
+import type { StructuralResolver } from "../src/core/edit-planner.js";
 
 function sha256(s: string): string {
   return createHash("sha256").update(s, "utf8").digest("hex");

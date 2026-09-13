@@ -19,12 +19,12 @@
 
 import type Parser from "web-tree-sitter";
 import { loadGrammar } from "./grammar-loader";
-import type { EditAnchor, SymbolRef, SearchScope } from "./types";
+import type { EditAnchor, SymbolRef, SearchScope } from "../core/types";
 
 // ─── Re-exported interfaces ─────────────────────────────────────────
 
 export { type default as Parser } from "web-tree-sitter";
-export type { EditAnchor, SymbolRef, SearchScope } from "./types";
+export type { EditAnchor, SymbolRef, SearchScope } from "../core/types";
 
 /** Result of parsing a file with tree-sitter */
 export interface ParseResult {

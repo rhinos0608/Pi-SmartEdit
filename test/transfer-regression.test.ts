@@ -33,8 +33,8 @@ import {
 } from "../src/transfer-edit.js";
 import * as transferEdit from "../src/transfer-edit.js";
 import { validateEditRequest } from "../src/edit-contract.js";
-import { computeLineHashSync, initHashline } from "../src/core/hashline.js";
-import { applyHashlineEdits } from "../src/core/hashline-edit.js";
+import { computeLineHashSync, initHashline } from "../src/hashline/hashline.js";
+import { applyHashlineEdits } from "../src/hashline/hashline-edit.js";
 
 let hashlineInitialized = false;
 async function ensureHashline(): Promise<void> {

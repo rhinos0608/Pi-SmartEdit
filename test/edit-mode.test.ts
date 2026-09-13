@@ -5,7 +5,7 @@ import { resolve } from "node:path";
 import {
   getSmartEditRuntimeConfig,
   parseBooleanEnv,
-} from "../src/edit-mode.js";
+} from "../src/config/edit-mode.js";
 import { resolveEditPath } from "../src/index.js";
 
 describe("edit path resolution", () => {
