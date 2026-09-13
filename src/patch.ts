@@ -34,15 +34,11 @@
  */
 import { readFile as fsReadFile, stat as fsStat, mkdir as fsMkdir } from "node:fs/promises";
 import { resolve as pathResolve, dirname as pathDirname } from "node:path";
-import { realpathSync, existsSync } from "node:fs";
+import { realpathSync } from "node:fs";
 
 import {
-    PROTOCOL_SCHEMA_VERSION,
     hashSessionFilePath,
-    inspectionIdFor,
-    resourceIdFor,
     sha256OfString,
-    type WorkspaceEvidenceEnvelope,
     type InspectedResource,
     type LineRange,
     type PatchDetails,
@@ -50,19 +46,13 @@ import {
     type CheckRecord,
     type ResourceInvalidation,
     type PostEditEvidence,
-    type RpcMethod,
 } from "@rhinos0608/pi-workspace-protocol";
 import { formatBoundedDiagnostics, appendDiagnosticsToContent } from "./mutation/post-mutation.js";
 import { generateDiffString, stripBom, normalizeToLF } from "./core/edit-diff.js";
-import { adaptTransferOps } from "./transfer/adapter.js";
 import { resolveSourceRange, resolveDestination } from "./transfer/resolve.js";
 import { planTransfer, bindResolvedTransfer, planTransferMutations, buildTransferDescription, buildTransferInsertEdit, buildTransferDeleteEdit, type TransferPlan } from "./transfer/plan.js";
 import { checkEditSafety } from "./safety/approval-gating.js";
-import { EDIT_PARAMETERS, validateEditRequest, type EditOperation } from "./edit-contract.js";
-import { planPositionalEdits } from "./lsp/positional-planner.js";
-import { globalRenamePreviewCache } from "./lsp/rename-preview-cache.js";
-import { requestRenamePreview, requestOrganizeImports, requestFormatting, requestCodeAction } from "./lsp/lsp-smartread-client.js";
-import { normalizeRawEdit } from "./formats/edit-intents.js";
+import { EDIT_PARAMETERS, validateEditRequest } from "./edit-contract.js";
 import type { PriorAuthorityStore } from "./context/evidence-authority.js";
 import { planTextEdits, type StructuralResolver } from "./core/edit-planner.js";
 import { EditTransaction } from "./mutation/edit-transaction.js";
@@ -72,136 +62,60 @@ import type { AstResolverLike } from "./anchor/anchor-resolution.js";
 import type { EditItem, EditTarget, FileSnapshot, HashlineEditMetadata } from "./core/types.js";
 import type { RepairLoopResult } from "./verification/repair-loop.js";
 
-// ── Public surface ──────────────────────────────────────────────────
+// ── Public surface (shared kernel: ./patch/types.js) ────────────────
+// Type definitions live in the shared kernel; re-exported here so existing
+// importers keep working untouched. Pure move: zero logic change.
+import type {
+    PatchToolDeps,
+    FinalSuccessFile,
+    VerificationCheck,
+    CheckOutcome,
+    MutableChecks,
+    GroupedEdit,
+    EditGroup,
+    RawTopology,
+    PatchResult,
+    PreparedPatchRequest,
+    ResolvedPatchTransfer,
+    PatchDisplayDiff,
+    PatchToolDetails,
+    PatchTool,
+} from "./patch/types.js";
+import { VERIFIER_TIMEOUT_MS } from "./patch/types.js";
+export type {
+    RpcClientLike,
+    PatchToolDeps,
+    FinalSuccessFile,
+    FinalSuccessInput,
+    FinalSuccessResult,
+    VerificationCheck,
+    CheckOutcome,
+    PatchDisplayDiff,
+    PatchToolDetails,
+    PatchTool,
+} from "./patch/types.js";
 
-export interface RpcClientLike {
-    request(rpc: RpcMethod, payload: unknown, options?: { signal?: AbortSignal }): Promise<{
-        kind: "reply";
-        schemaVersion: number;
-        requestId: string;
-        ok: boolean;
-        payload?: unknown;
-        error?: string;
-    }>;
-    dispose(): void;
-}
+// ── Result builders (shared kernel: ./patch/result-builders.js) ─────
+// Check accumulation, verifier execution, and rejected/failed result
+// construction live in the shared kernel; imported here so the
+// orchestrator keeps working untouched. Pure move: zero logic change.
+import {
+    freshChecks,
+    makeCheck,
+    freezeChecks,
+    runVerifierCheck,
+    failResult,
+    makeRejected,
+    makeFailed,
+    buildRollbackInfo,
+    classifyRpcError,
+} from "./patch/result-builders.js";
 
-export interface PatchToolDeps {
-    readonly getBus?: () => { emit: (c: string, d: unknown) => void; on: (c: string, h: (d: unknown) => void) => () => void };
-    readonly getRpcClient: () => RpcClientLike;
-    readonly getSessionFilePath: () => string | null;
-    readonly getCanonicalWorkspaceRoot: () => string;
-    readonly getVerificationChecks?: () => ReadonlyArray<VerificationCheck>;
-    /** Per-session prior-authority store (tool-owned evidence policy B). When
-     *  present, a strong prior authority for a target path is selected before
-     *  RPC envelope resolution; missing prior authority for existing files is
-     *  rejected with actionable read guidance. */
-    readonly getPriorAuthority?: () => PriorAuthorityStore | null;
-    /** Per-session AST resolver for target/lineRange scoping. null when
-     *  tree-sitter is unavailable. */
-    readonly getAstResolver?: () => AstResolverLike | null;
-    /** Per-session structural (ast-grep) resolver. Defaults to the real
-     *  ast-grep engine when absent. */
-    readonly getStructuralResolver?: () => StructuralResolver | null;
-    /** Per-session snapshot lookup for hashline oldText reconstruction.
-     *  Tool-owned; never exposed in the agent schema. When absent, hashline
-     *  fallback cannot reconstruct oldText and falls through to mismatch
-     *  rejection (fast path and rebase still work). */
-    readonly getSnapshot?: (path: string) => FileSnapshot | null;
-    /** Runs the advisory repair loop against the staged candidate.  It never
-     * writes itself; accepted repaired content is re-authorized below. */
-    readonly runRepair?: (args: { path: string; content: string; cwd: string }) => Promise<RepairLoopResult>;
-    /** Runs advisory, filesystem-dependent lanes only after the transaction is
-     * committed. It is deliberately not invoked on rollback or rejection. */
-    readonly runFinalSuccessLanes?: (args: FinalSuccessInput) => Promise<FinalSuccessResult>;
-}
-
-export interface FinalSuccessFile {
-    readonly path: string;
-    readonly oldContent: string;
-    readonly content: string;
-    readonly changedLineRanges: ReadonlyArray<LineRange>;
-}
-export interface FinalSuccessInput {
-    readonly cwd: string;
-    readonly toolCallId: string;
-    readonly files: ReadonlyArray<FinalSuccessFile>;
-}
-export interface FinalSuccessResult {
-    readonly diagnostics?: ReadonlyArray<string>;
-    readonly checks?: ReadonlyArray<{ id: string; outcome: CheckOutcome["outcome"]; detail?: string }>;
-    readonly evidence?: unknown;
-}
-
-export interface VerificationCheck {
-    readonly id: string;
-    readonly kind: "blocking" | "advisory";
-    /** precommit runs before writes; postwrite runs while transaction locks remain held. */
-    readonly phase?: "precommit" | "postwrite";
-    readonly run: (ctx: { path: string; content: string; toolCallId: string }) => Promise<CheckOutcome>;
-}
-
-export interface CheckOutcome {
-    readonly outcome: "pass" | "fail" | "skipped" | "timeout";
-    readonly detail?: string;
-}
-
-interface MutableChecks {
-    blocking: CheckRecord[];
-    completed: CheckRecord[];
-    advisory: CheckRecord[];
-    skipped: CheckRecord[];
-    timedOut: CheckRecord[];
-}
-
-function freshChecks(): MutableChecks {
-    return { blocking: [], completed: [], advisory: [], skipped: [], timedOut: [] };
-}
-
-function makeCheck(id: string, outcome: "pass" | "fail" | "skipped" | "timeout", detail?: string): CheckRecord {
-    return detail === undefined ? { id, outcome } : { id, outcome, detail };
-}
-
-function freezeChecks(c: MutableChecks): PatchDetails["checks"] {
-    return {
-        blocking: c.blocking.slice(),
-        completed: c.completed.slice(),
-        advisory: c.advisory.slice(),
-        skipped: c.skipped.slice(),
-        timedOut: c.timedOut.slice(),
-    };
-}
-
-/** Shared timeout budget for both the pre-commit and post-write verifier
- *  loops, so a verifier cannot hold the transaction lock (post-write runs
- *  before commit()) or block the write indefinitely (pre-commit). */
-const VERIFIER_TIMEOUT_MS = 5000;
-
-/** Runs one verifier against a race with a timeout so a hung verifier can
- *  never block the caller forever. A thrown error that is not the timeout
- *  itself is classified as "fail" (a verifier crash is a hard fail); the
- *  timeout itself is classified as "timeout" so callers can gate on it. */
-async function runVerifierCheck(
-    v: VerificationCheck,
-    ctx: { path: string; content: string; toolCallId: string },
-): Promise<{ outcome: CheckOutcome["outcome"]; detail?: string }> {
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    try {
-        const result = await Promise.race([
-            v.run(ctx),
-            new Promise<never>((_r, rej) => {
-                timer = setTimeout(() => { rej(new Error("timeout")); }, VERIFIER_TIMEOUT_MS);
-            }),
-        ]);
-        return result.detail === undefined ? { outcome: result.outcome } : { outcome: result.outcome, detail: result.detail };
-    } catch (err) {
-        const outcome = err instanceof Error && err.message === "timeout" ? "timeout" : "fail";
-        const detail = err instanceof Error ? err.message : String(err);
-        return { outcome, detail };
-    } finally {
-        if (timer) clearTimeout(timer);
-    }
-}
+// ── Repair spans (shared kernel: ./patch/repair-spans.js) ────────────
+// Staged-to-preimage mapping and textual delta coverage live in the shared
+// kernel; imported here so the orchestrator keeps working untouched.
+// Pure move: zero logic change.
+import { mapRepairSpanToPreimage, changedLineRanges } from "./patch/repair-spans.js";
 
 // ── Authorization (see ./context/patch-authorization.js) ───────────────────
 // Evidence authorization (types, resource selection, coverage validation,
@@ -226,720 +140,34 @@ import {
     isValidFullFileSha256,
 } from "./context/patch-authorization.js";
 
-// ── Helpers ─────────────────────────────────────────────────────────
+// ── Request preparation (shared kernel: ./patch/request-prep.js) ───
+// Grouping, auto-inspect envelope synthesis, preparation, transfer
+// resolution, and envelope acquisition live in the shared kernel;
+// imported here so the orchestrator keeps working untouched.
+// Pure move: zero logic change.
+import {
+    safeReadUtf8,
+    preparePatchRequest,
+    resolvePatchTransfers,
+    acquirePatchEnvelope,
+} from "./patch/request-prep.js";
 
-function safeReadUtf8(path: string): Promise<string> {
-    return fsReadFile(path).then((b) => b.toString("utf8"));
-}
-
-// ── Per-edit grouping ───────────────────────────────────────────────
-
-interface GroupedEdit {
-    readonly oldText?: string;
-    readonly newText?: string;
-    readonly description?: string;
-    readonly replaceAll?: boolean;
-    readonly target?: EditTarget;
-    readonly lineRange?: LineRange;
-    readonly hashline?: HashlineEditMetadata;
-}
-
-interface EditGroup {
-    /** Resolved absolute path (cwd-relative input has been resolved). */
-    readonly absolutePath: string;
-    /** Original input path string (used for diagnostics). */
-    readonly rawPath: string;
-    readonly edits: ReadonlyArray<GroupedEdit>;
-    readonly topology?: RawTopology;
-}
-
-type RawTopology =
-    | { kind: "add"; path: string; content: string }
-    | { kind: "delete"; path: string }
-    | { kind: "rename"; oldPath: string; newPath: string };
-
-function groupEditsByPath(
-    cwd: string,
-    topLevelPath: string,
-    edits: ReadonlyArray<GroupedEdit & { path?: string }>,
-): { ok: true; groups: EditGroup[] } | { ok: false; error: string } {
-    const buckets = new Map<string, EditGroup>();
-    for (let i = 0; i < edits.length; i++) {
-        const e = edits[i];
-        const rawPath = typeof e.path === "string" && e.path.length > 0 ? e.path : topLevelPath;
-        if (typeof rawPath !== "string" || rawPath.length === 0) {
-            return { ok: false, error: `edits[${i}]: no path (top-level path missing and per-edit path missing)` };
-        }
-        const absolutePath = pathResolve(cwd, rawPath);
-        const existing = buckets.get(absolutePath);
-        const groupEdit: GroupedEdit = {
-            oldText: e.oldText,
-            newText: e.newText,
-            description: e.description,
-            replaceAll: e.replaceAll,
-            target: e.target,
-            lineRange: e.lineRange,
-            hashline: e.hashline,
-        };
-        if (existing) {
-            // Replace the entry in the map with an extended group.
-            buckets.set(absolutePath, {
-                absolutePath: existing.absolutePath,
-                rawPath: existing.rawPath,
-                edits: [...existing.edits, groupEdit],
-            });
-        } else {
-            buckets.set(absolutePath, { absolutePath, rawPath, edits: [groupEdit] });
-        }
-    }
-    return { ok: true, groups: [...buckets.values()] };
-}
-
-// ── Auto-inspect envelope construction ──────────────────────────────
-
-async function buildAutoInspectEnvelope(args: {
-    sessionFilePath: string;
-    canonicalRoot: string;
-    groups: ReadonlyArray<EditGroup>;
-    newFileAllowed?: ReadonlySet<string>;
-}): Promise<{
-    ok: true;
-    envelope: WorkspaceEvidenceEnvelope;
-    canonicalByGroup: string[];
-    newFileCanonicals: ReadonlySet<string>;
-} | { ok: false; error: string }> {
-    const sessionId = hashSessionFilePath(args.sessionFilePath);
-    const resources: InspectedResource[] = [];
-    const canonicalByGroup: string[] = [];
-    const newFileCanonicals = new Set<string>();
-    const resourceKeyItems: Array<{ canonicalPath: string; range?: { startLine: number; endLine: number } }> = [];
-
-    for (const g of args.groups) {
-        const fileExists = existsSync(g.absolutePath);
-        if (!fileExists) {
-            // New-file creation is only valid when every edit has empty oldText,
-            // or the group is a transfer-op destination explicitly allowed to
-            // create a new file (its synthesized edit uses the EOF append
-            // branch, not oldText, so it wouldn't satisfy the .every() below).
-            const allEmpty = (args.newFileAllowed?.has(g.absolutePath) ?? false) || g.edits.every(
-                (e) => typeof e.oldText === "string" && e.oldText.length === 0,
-            );
-            if (!allEmpty) {
-                return {
-                    ok: false,
-                    error:
-                        `auto-inspect: file not found: ${g.absolutePath}. ` +
-                        `Patch can only create new files when every edit has empty oldText ` +
-                        `(use oldText: "" with newText containing the new file contents). ` +
-                        `For arbitrary new files, use the write tool instead.`,
-                };
-            }
-            // Synthesize an empty-file full-file resource so the rest of the
-            // pipeline can run unchanged. Mark this path as a synthesized new
-            // file so the per-group executor skips the realpath / SHA / range
-            // checks that only make sense for existing content.
-            const emptySha = sha256OfString("");
-            const resource: InspectedResource = {
-                resourceId: resourceIdFor({ canonicalPath: g.absolutePath, kind: "full" }),
-                canonicalPath: g.absolutePath,
-                kind: "full",
-                coverage: "full-file",
-                allowedRanges: [{ startLine: 1, endLine: 1 }],
-                fullFileSha256: emptySha,
-                fresh: true,
-                byteLength: 0,
-                lineCount: 0,
-            };
-            resources.push(resource);
-            resourceKeyItems.push({ canonicalPath: g.absolutePath });
-            canonicalByGroup.push(g.absolutePath);
-            newFileCanonicals.add(g.absolutePath);
-            continue;
-        }
-        let canonical: string;
-        try {
-            canonical = realpathSync(g.absolutePath);
-        } catch (err) {
-            return { ok: false, error: `auto-inspect: file not found: ${g.absolutePath} (${err instanceof Error ? err.message : String(err)})` };
-        }
-        let content: string;
-        try {
-            content = await safeReadUtf8(canonical);
-        } catch (err) {
-            return { ok: false, error: `auto-inspect: read failed for ${canonical} (${err instanceof Error ? err.message : String(err)})` };
-        }
-        const sha = sha256OfString(content);
-        const lineCount = content.split("\n").length;
-        const resource: InspectedResource = {
-            resourceId: resourceIdFor({ canonicalPath: canonical, kind: "full" }),
-            canonicalPath: canonical,
-            kind: "full",
-            coverage: "full-file",
-            allowedRanges: [{ startLine: 1, endLine: lineCount }],
-            fullFileSha256: sha,
-            fresh: true,
-            byteLength: Buffer.byteLength(content, "utf8"),
-            lineCount,
-        };
-        resources.push(resource);
-        resourceKeyItems.push({ canonicalPath: canonical });
-        canonicalByGroup.push(canonical);
-    }
-
-    const inspectionId = inspectionIdFor({
-        sessionId,
-        workspaceRoot: args.canonicalRoot,
-        resources: resourceKeyItems,
-    });
-    const envelope: WorkspaceEvidenceEnvelope = {
-        schemaVersion: PROTOCOL_SCHEMA_VERSION,
-        inspectionId,
-        sessionId,
-        workspaceRoot: args.canonicalRoot,
-        canonicalWorkspaceRoot: args.canonicalRoot,
-        createdAt: new Date().toISOString(),
-        resources,
-        mode: "path",
-    };
-    return { ok: true, envelope, canonicalByGroup, newFileCanonicals };
-}
-
-// ── Extract-only helpers (Lane A): file-local, behavior-preserving ──
-// These helpers exist only to split createPatchTool.execute's Brain Method
-// without changing patch semantics. Transaction begin/commit/finalize stay
-// in the orchestrator; materialization + group pipeline stay in try/finally.
-
-interface RefactorRequestFields {
-    readonly kind: string;
-    readonly path?: string;
-    readonly line?: number;
-    readonly character?: number;
-    readonly newName?: string;
-    readonly previewId?: string;
-    readonly tabSize?: number;
-    readonly insertSpaces?: boolean;
-    readonly endLine?: number;
-    readonly endCharacter?: number;
-    readonly diagnostics?: unknown;
-    readonly only?: unknown;
-}
-
-type PatchResult = { content: Array<{ type: "text"; text: string }>; details: PatchToolDetails };
-
-function failResult(toolCallId: string, text: string, message: string, reasons: string[], phase: "stage" | "write" = "stage"): PatchResult {
-    return {
-        content: [{ type: "text" as const, text }],
-        details: makeFailed(toolCallId, phase, message, { inspectionId: "", resourceIds: [] }, freshChecks(), reasons),
-    };
-}
-
-function isMissingRenamePreviewFields(path: string | undefined, line: number | undefined, character: number | undefined, newName: string | undefined): boolean {
-    return path === undefined || line === undefined || character === undefined || newName === undefined;
-}
-
-function isMissingCodeActionFields(path: string | undefined, line: number | undefined, character: number | undefined): boolean {
-    return path === undefined || line === undefined || character === undefined;
-}
-
-function moveSpansOverlap(seen: { canonicalFrom: string; startLine: number; endLine: number }, canonicalFrom: string, startLine: number, endLine: number): boolean {
-    return seen.canonicalFrom === canonicalFrom && startLine <= seen.endLine && seen.startLine <= endLine;
-}
-
-function isSameFileMoveCandidate(op: string, canonicalFrom: string, canonicalTo: string, after: string | undefined): boolean {
-    return op === "move" && canonicalFrom === canonicalTo && after !== undefined && after !== "start";
-}
-
-function isAfterLineInsideSourceSpan(afterLine: number | null, startLine: number, endLine: number): boolean {
-    return afterLine !== null && afterLine >= startLine - 1 && afterLine <= endLine;
-}
-
-function isBlockingPostwriteFailure(kind: string, outcome: string): boolean {
-    return kind === "blocking" && (outcome === "fail" || outcome === "timeout");
-}
-
-async function storeRefactorPreview(args: {
-    deps: PatchToolDeps;
-    toolCallId: string;
-    workspaceEdit: unknown;
-    planned: { stagedFiles: Array<{ filePath: string; newContent: string }>; diffString: string };
-    meta: { filePath: string; line: number; character: number; newName: string; serverDescriptorId: unknown };
-}): Promise<PatchResult | null> {
-    const { deps, toolCallId, workspaceEdit, planned, meta } = args;
-    const sessionFilePath = deps.getSessionFilePath();
-    if (!sessionFilePath) {
-        return failResult(toolCallId, "failed: refactor preview requires an active session (no session file path available)", "no session file path", ["no session file path"]);
-    }
-    const root = deps.getCanonicalWorkspaceRoot();
-    const sid = hashSessionFilePath(sessionFilePath);
-    const previewId = globalRenamePreviewCache.store(workspaceEdit as never, planned as never, { ...meta, serverDescriptorId: meta.serverDescriptorId as never, sessionId: sid, sessionRoot: root });
-    return {
-        content: [{ type: "text" as const, text: `preview ${previewId}: ${planned.stagedFiles.length} file(s)\n${planned.diffString.slice(0, 4000)}` }],
-        details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: planned.diffString, diffs: planned.stagedFiles.map((sf) => ({ path: sf.filePath, diff: sf.newContent })), previewId, stagedFiles: planned.stagedFiles.length } as unknown as PatchToolDetails,
-    };
-}
-
-interface BusPreviewResponse {
-    readonly ok: boolean;
-    readonly workspaceEdit?: unknown;
-    readonly serverDescriptorId?: unknown;
-    readonly error?: string;
-}
-
-async function planAndStorePreview(
-    deps: PatchToolDeps,
-    toolCallId: string,
-    workspaceEdit: unknown,
-    meta: { filePath: string; line: number; character: number; newName: string; serverDescriptorId: unknown },
-): Promise<PatchResult> {
-    const planned = await planPositionalEdits(workspaceEdit as never, async (p) => (await fsReadFile(p)).toString("utf8"));
-    const stored = await storeRefactorPreview({ deps, toolCallId, workspaceEdit, planned, meta });
-    if (stored) return stored;
-    return failResult(toolCallId, "failed: refactor preview requires an active session (no session file path available)", "no session file path", ["no session file path"]);
-}
-
-async function runBusPreview(args: {
-    deps: PatchToolDeps;
-    toolCallId: string;
-    label: string;
-    request: (bus: NonNullable<ReturnType<NonNullable<PatchToolDeps["getBus"]>>>) => Promise<BusPreviewResponse>;
-    meta: { filePath: string; line: number; character: number; newName: string };
-}): Promise<PatchResult> {
-    const { deps, toolCallId, label, request, meta } = args;
-    const bus = deps.getBus?.() ?? null;
-    if (!bus) return failResult(toolCallId, `failed: ${label} requires bus`, "bus unavailable", ["bus unavailable"]);
-    try {
-        const resp = await request(bus);
-        if (!resp.ok || !resp.workspaceEdit) {
-            return failResult(toolCallId, `failed: ${label}: ${resp.error ?? "no edit"}`, resp.error ?? "no workspaceEdit", [resp.error ?? "no workspaceEdit"]);
-        }
-        return await planAndStorePreview(deps, toolCallId, resp.workspaceEdit, { ...meta, serverDescriptorId: resp.serverDescriptorId });
-    } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        return failResult(toolCallId, `failed: ${label} ${msg}`, msg, [msg]);
-    }
-}
-
-function selectCodeActionWorkspaceEdit(actions: ReadonlyArray<{ readonly workspaceEdit?: unknown; readonly isPreferred?: boolean }>): { ok: true; workspaceEdit: unknown } | { ok: false; reason: string } {
-    if (actions.length === 0) return { ok: false, reason: "no code actions available" };
-    const withEdit = actions.filter((a) => !!a.workspaceEdit);
-    if (withEdit.length === 0) return { ok: false, reason: "no applicable code action" };
-    const selected = withEdit.length === 1 ? withEdit[0] : (withEdit.find((a) => a.isPreferred) ?? withEdit[0]);
-    if (!selected?.workspaceEdit) return { ok: false, reason: "no applicable code action" };
-    return { ok: true, workspaceEdit: selected.workspaceEdit };
-}
-
-async function handleRenamePreview(deps: PatchToolDeps, toolCallId: string, refactor: RefactorRequestFields): Promise<PatchResult> {
-    if (!deps.getBus?.()) return failResult(toolCallId, "failed: rename-preview requires bus", "bus unavailable", ["bus unavailable"]);
-    if (isMissingRenamePreviewFields(refactor.path, refactor.line, refactor.character, refactor.newName)) {
-        return failResult(toolCallId, "failed: rename-preview requires path, line, character, newName", "missing rename-preview fields", ["missing rename-preview fields"]);
-    }
-    const path = refactor.path as string;
-    const line = refactor.line as number;
-    const character = refactor.character as number;
-    const newName = refactor.newName as string;
-    return runBusPreview({ deps, toolCallId, label: "rename-preview",
-        request: (bus) => requestRenamePreview(bus, { filePath: path, line, character, newName }),
-        meta: { filePath: path, line, character, newName } });
-}
-
-async function handleOrganizeImportsPreview(deps: PatchToolDeps, toolCallId: string, refactor: RefactorRequestFields): Promise<PatchResult> {
-    if (!deps.getBus?.()) return failResult(toolCallId, "failed: organize-imports-preview requires bus", "bus unavailable", ["bus unavailable"]);
-    if (refactor.path === undefined) {
-        return failResult(toolCallId, "failed: organize-imports-preview requires path", "missing organize-imports-preview path", ["missing organize-imports-preview path"]);
-    }
-    const path = refactor.path;
-    return runBusPreview({ deps, toolCallId, label: "organize-imports-preview",
-        request: (bus) => requestOrganizeImports(bus, { filePath: path }),
-        meta: { filePath: path, line: 0, character: 0, newName: "" } });
-}
-
-async function handleFormattingPreview(deps: PatchToolDeps, toolCallId: string, refactor: RefactorRequestFields): Promise<PatchResult> {
-    if (!deps.getBus?.()) return failResult(toolCallId, "failed: formatting-preview requires bus", "bus unavailable", ["bus unavailable"]);
-    if (refactor.path === undefined) {
-        return failResult(toolCallId, "failed: formatting-preview requires path", "missing formatting-preview path", ["missing formatting-preview path"]);
-    }
-    const path = refactor.path;
-    const { tabSize, insertSpaces } = refactor;
-    return runBusPreview({ deps, toolCallId, label: "formatting-preview",
-        request: (bus) => requestFormatting(bus, { filePath: path, tabSize, insertSpaces }),
-        meta: { filePath: path, line: 0, character: 0, newName: "" } });
-}
-
-async function handleCodeActionPreview(deps: PatchToolDeps, toolCallId: string, refactor: RefactorRequestFields): Promise<PatchResult> {
-    const bus = deps.getBus?.() ?? null;
-    if (!bus) return failResult(toolCallId, "failed: code-action-preview requires bus", "bus unavailable", ["bus unavailable"]);
-    try {
-        if (isMissingCodeActionFields(refactor.path, refactor.line, refactor.character)) {
-            return failResult(toolCallId, "failed: code-action-preview requires path, line, character", "missing code-action-preview fields", ["missing code-action-preview fields"]);
-        }
-        const resp = await requestCodeAction(bus, { filePath: refactor.path as string, line: refactor.line as number, character: refactor.character as number, endLine: refactor.endLine, endCharacter: refactor.endCharacter, diagnostics: refactor.diagnostics as never, only: refactor.only as never });
-        if (!resp.ok) {
-            return failResult(toolCallId, `failed: code-action-preview: ${resp.error ?? "no actions"}`, resp.error ?? "code action failed", [resp.error ?? "code action failed"]);
-        }
-        const selected = selectCodeActionWorkspaceEdit(resp.actions ?? []);
-        if (!selected.ok) return failResult(toolCallId, `failed: ${selected.reason}`, selected.reason, [selected.reason]);
-        return await planAndStorePreview(deps, toolCallId, selected.workspaceEdit, { filePath: refactor.path as string, line: refactor.line as number, character: refactor.character as number, newName: "", serverDescriptorId: resp.serverDescriptorId });
-    } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        return failResult(toolCallId, `failed: code-action-preview ${msg}`, msg, [msg]);
-    }
-}
-
-type StagedPreviewFile = { filePath: string; originalContent: string; newContent: string; edits: Array<{ range: { start: { line: number }; end: { line: number } } }> };
-
-async function findStalePreviewFiles(files: StagedPreviewFile[]): Promise<string[]> {
-    const staleFiles: string[] = [];
-    for (const sf of files) {
-        try {
-            const current = (await fsReadFile(sf.filePath)).toString("utf8");
-            if (current !== sf.originalContent) staleFiles.push(sf.filePath);
-        } catch {
-            staleFiles.push(sf.filePath);
-        }
-    }
-    return staleFiles;
-}
-
-function findPreviewUnauthorizedFiles(deps: PatchToolDeps, files: StagedPreviewFile[]): string[] {
-    const priorStore = deps.getPriorAuthority?.() ?? null;
-    const unauthorized: string[] = [];
-    for (const sf of files) {
-        let canonical: string;
-        try { canonical = realpathSync(sf.filePath); } catch { canonical = sf.filePath; }
-        let res = priorStore ? priorStore.select(canonical) : null;
-        if (!res) res = priorStore ? priorStore.select(sf.filePath) : null;
-        if (!res) { unauthorized.push(`${sf.filePath} (no prior read authority)`); continue; }
-        const preimageSha = sha256OfString(sf.originalContent);
-        if (res.fullFileSha256 !== preimageSha) { unauthorized.push(`${sf.filePath} (SHA mismatch: authority ${String(res.fullFileSha256).slice(0, 8)} != preimage ${preimageSha.slice(0, 8)})`); continue; }
-        const touched: Array<{ startLine: number; endLine: number }> = sf.edits.length === 0 ? [] : sf.edits.map((e) => ({ startLine: e.range.start.line + 1, endLine: e.range.end.line + 1 }));
-        if (touched.length === 0) continue;
-        const covErr = checkResourceCoverage(res, touched);
-        if (covErr) unauthorized.push(`${sf.filePath} (${covErr})`);
-    }
-    return unauthorized;
-}
-
-function mapApplyPreviewError(toolCallId: string, err: unknown): PatchResult {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes("rejected:")) {
-        return { content: [{ type: "text" as const, text: msg }], details: makeRejected(toolCallId, "coverage", [msg], { inspectionId: "", resourceIds: [] }, freshChecks()) };
-    }
-    return failResult(toolCallId, `failed: apply refactor ${msg}`, msg, [msg], "write");
-}
-
-async function handleApplyRefactorPreview(deps: PatchToolDeps, toolCallId: string, refactor: RefactorRequestFields): Promise<PatchResult> {
-    const sessionFilePath = deps.getSessionFilePath();
-    if (!sessionFilePath) {
-        return failResult(toolCallId, "failed: refactor preview requires an active session (no session file path available)", "no session file path", ["no session file path"]);
-    }
-    const root = deps.getCanonicalWorkspaceRoot();
-    const sid = hashSessionFilePath(sessionFilePath);
-    const applyPreviewId = refactor.previewId;
-    if (applyPreviewId === undefined) {
-        return failResult(toolCallId, "failed: apply-refactor-preview requires previewId", "missing previewId", ["missing previewId"]);
-    }
-    const cached = globalRenamePreviewCache.get(applyPreviewId, { sessionId: sid, sessionRoot: root });
-    if (!cached) {
-        return { content: [{ type: "text" as const, text: "rejected: preview not found or expired" }], details: makeRejected(toolCallId, "coverage", ["preview not found or expired"], { inspectionId: "", resourceIds: [] }, freshChecks()) };
-    }
-    const files = cached.plannedRename.stagedFiles;
-    try {
-        const { EditTransaction: ET } = await import("./mutation/edit-transaction.js");
-        const tx = await ET.begin(files.map((f) => f.filePath));
-        try {
-            const staleFiles = await findStalePreviewFiles(files);
-            if (staleFiles.length > 0) {
-                await tx.rollback();
-                return { content: [{ type: "text", text: `rejected: files changed since preview: ${staleFiles.join(", ")}` }], details: makeRejected(toolCallId, "stale", [`files changed since preview: ${staleFiles.join(", ")}`], { inspectionId: "", resourceIds: [] }, freshChecks()) };
-            }
-            const unauthorized = findPreviewUnauthorizedFiles(deps, files);
-            if (unauthorized.length > 0) {
-                await tx.rollback();
-                return { content: [{ type: "text", text: `rejected: missing read authority for: ${unauthorized.join(", ")} — read the file first, then retry` }], details: makeRejected(toolCallId, "coverage", [`missing read authority for: ${unauthorized.join(", ")}`], { inspectionId: "", resourceIds: [] }, freshChecks()) };
-            }
-            for (const sf of files) await tx.write(sf.filePath, sf.newContent);
-            await tx.commit();
-        } catch (e) {
-            try { await tx.rollback(); } catch {}
-            throw e;
-        }
-        globalRenamePreviewCache.delete(applyPreviewId);
-        return { content: [{ type: "text" as const, text: `applied refactor ${applyPreviewId}: ${files.length} file(s)` }], details: { tool: "patch", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: cached.plannedRename.diffString } as unknown as PatchToolDetails };
-    } catch (err) {
-        return mapApplyPreviewError(toolCallId, err);
-    }
-}
-
-async function handleRefactorRequest(deps: PatchToolDeps, toolCallId: string, refactor: RefactorRequestFields | undefined): Promise<PatchResult | null> {
-    if (!refactor) return null;
-    if (refactor.kind === "rename-preview") return handleRenamePreview(deps, toolCallId, refactor);
-    if (refactor.kind === "organize-imports-preview") return handleOrganizeImportsPreview(deps, toolCallId, refactor);
-    if (refactor.kind === "formatting-preview") return handleFormattingPreview(deps, toolCallId, refactor);
-    if (refactor.kind === "code-action-preview") return handleCodeActionPreview(deps, toolCallId, refactor);
-    return handleApplyRefactorPreview(deps, toolCallId, refactor);
-}
-
-interface PreparedPatchRequest {
-    requestEvidenceRef: EvidenceRef | undefined;
-    sessionFilePath: string;
-    canonicalRoot: string;
-    textOps: EditOperation[];
-    adaptedTransfers: { ok: true; value: Array<{ op: "copy" | "move"; from: string; to: string; range: { pos: string; end: string }; after: string | undefined; description: string | undefined }> };
-    groups: EditGroup[];
-    checks: MutableChecks;
-    diagnostics: string[];
-}
-
-function preparePatchRequest(args: {
-    validated: { ok: true; value: { evidenceRef?: EvidenceRef; edits?: EditOperation[]; raw?: unknown; path?: string } };
-    deps: PatchToolDeps;
-    ctx: { cwd: string };
-    toolCallId: string;
-}): { ok: true; prepared: PreparedPatchRequest } | { ok: false; result: PatchResult } {
-    const { validated, deps, ctx, toolCallId } = args;
-    const requestEvidenceRef = validated.value.evidenceRef;
-    const sessionFilePath = deps.getSessionFilePath();
-    if (typeof sessionFilePath !== "string" || sessionFilePath.length === 0) {
-        return { ok: false, result: { content: [{ type: "text" as const, text: "rejected: ephemeral session identity" }], details: makeRejected(toolCallId, "session", ["no real session file path"], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks()) } };
-    }
-    const canonicalRoot = deps.getCanonicalWorkspaceRoot();
-    if (typeof canonicalRoot !== "string" || canonicalRoot.length === 0) {
-        return { ok: false, result: { content: [{ type: "text" as const, text: "rejected: missing canonical workspace root" }], details: makeRejected(toolCallId, "session", ["no canonical workspace root"], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks()) } };
-    }
-    let requestEdits: ReadonlyArray<EditOperation> = validated.value.edits ?? [];
-    let rawTopology: RawTopology[] = [];
-    const rawWarnings: string[] = [];
-    if (validated.value.raw !== undefined) {
-        const normalized = normalizeRawEdit(validated.value.raw as never, validated.value.path);
-        rawWarnings.push(...normalized.warnings);
-        if (normalized.diagnostics.length > 0 || normalized.intents.length === 0) {
-            const diagnostics = [...rawWarnings, ...normalized.diagnostics, "Raw patch parsed into no executable update operations."];
-            return { ok: false, result: { content: [{ type: "text" as const, text: "failed: raw patch parsing" }], details: makeFailed(toolCallId, "stage", "raw patch normalization failed", { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks(), diagnostics) } };
-        }
-        rawTopology = normalized.intents.flatMap((intent): RawTopology[] => {
-            if (intent.kind === "text") return [];
-            return intent.kind === "rename" ? [{ kind: "rename", oldPath: intent.oldPath, newPath: intent.newPath }] : [intent];
-        });
-        requestEdits = normalized.intents.flatMap((intent) => intent.kind === "text" ? [intent.operation] : []);
-    }
-    const transferOps = requestEdits.filter((e) => (e as { op?: unknown }).op !== undefined);
-    const textOps = requestEdits.filter((e) => (e as { op?: unknown }).op === undefined);
-    const adaptedTransfers = adaptTransferOps(transferOps, validated.value.path);
-    if (!adaptedTransfers.ok) {
-        return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${adaptedTransfers.error}` }], details: makeRejected(toolCallId, "session", [adaptedTransfers.error], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks()) } };
-    }
-    const grouping = groupEditsByPath(ctx.cwd, validated.value.path ?? "", textOps);
-    if (!grouping.ok) {
-        return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${grouping.error}` }], details: makeRejected(toolCallId, "session", [grouping.error], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks()) } };
-    }
-    const groups = grouping.groups;
-    const topologyConflicts: Array<{ path: string; existingKind: string; newKind: string }> = [];
-    for (const op of rawTopology) {
-        const entries = op.kind === "rename" ? [[op.oldPath, op], [op.newPath, undefined]] : [[op.path, op]];
-        for (const [rawPath, topology] of entries as Array<[string, RawTopology | undefined]>) {
-            const absolutePath = pathResolve(ctx.cwd, rawPath);
-            const existingIdx = groups.findIndex((g) => g.absolutePath === absolutePath);
-            if (existingIdx >= 0) {
-                const existingTopology = groups[existingIdx].topology;
-                if (topology) {
-                    if (existingTopology) topologyConflicts.push({ path: rawPath, existingKind: existingTopology.kind, newKind: topology.kind });
-                    else groups[existingIdx] = { ...groups[existingIdx], topology };
-                } else if (existingTopology && op.kind === "rename") {
-                    topologyConflicts.push({ path: rawPath, existingKind: existingTopology.kind, newKind: op.kind });
-                }
-            } else groups.push({ absolutePath, rawPath, edits: [], ...(topology ? { topology } : {}) });
-        }
-    }
-    if (topologyConflicts.length > 0) {
-        const message = topologyConflicts.map((c) => `conflicting topology operations for path '${c.path}': ${c.existingKind} vs ${c.newKind}`).join("; ");
-        return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${message}` }], details: makeRejected(toolCallId, "conflict", [message], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks()) } };
-    }
-    const checks: MutableChecks = freshChecks();
-    const diagnostics: string[] = [...rawWarnings];
-    return { ok: true, prepared: { requestEvidenceRef, sessionFilePath, canonicalRoot, textOps, adaptedTransfers: adaptedTransfers as PreparedPatchRequest["adaptedTransfers"], groups, checks, diagnostics } };
-}
-
-interface ResolvedPatchTransfer {
-    op: "copy" | "move";
-    canonicalFrom: string;
-    canonicalTo: string;
-    range: { pos: string; end: string };
-    after: string | undefined;
-    rawFrom: string;
-    rawTo: string;
-    toIsNewFile: boolean;
-    description: string | undefined;
-}
-
-function resolvePatchTransfers(args: {
-    adaptedTransfers: PreparedPatchRequest["adaptedTransfers"];
-    groups: EditGroup[];
-    ctx: { cwd: string };
-    toolCallId: string;
-    requestEvidenceRef: EvidenceRef | undefined;
-    checks: MutableChecks;
-}): { ok: true; resolvedTransfers: ResolvedPatchTransfer[]; transferNewFileCanonicals: Set<string>; copySourceOnlyPaths: Set<string> } | { ok: false; result: PatchResult } {
-    const { adaptedTransfers, groups, ctx, toolCallId, requestEvidenceRef, checks } = args;
-    const resolvedTransfers: ResolvedPatchTransfer[] = [];
-    const transferNewFileCanonicals = new Set<string>();
-    const copySourceOnlyPaths = new Set<string>();
-    for (const transferReq of adaptedTransfers.value) {
-        const op = transferReq.op;
-        const rawFrom = transferReq.from;
-        const rawTo = transferReq.to;
-        const range = transferReq.range;
-        const after = transferReq.after;
-        let canonicalFrom: string;
-        try {
-            canonicalFrom = realpathSync(pathResolve(ctx.cwd, rawFrom));
-        } catch (err) {
-            const message = `transfer source not found: ${rawFrom} (${err instanceof Error ? err.message : String(err)})`;
-            return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${message}` }], details: makeRejected(toolCallId, "coverage", [message], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, checks) } };
-        }
-        let canonicalTo: string;
-        let toIsNewFile = false;
-        try {
-            canonicalTo = realpathSync(pathResolve(ctx.cwd, rawTo));
-        } catch (err) {
-            if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-                canonicalTo = pathResolve(ctx.cwd, rawTo);
-                toIsNewFile = true;
-            } else {
-                const message = `transfer destination not found: ${rawTo} (${err instanceof Error ? err.message : String(err)})`;
-                return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${message}` }], details: makeRejected(toolCallId, "coverage", [message], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, checks) } };
-            }
-        }
-        if (toIsNewFile) transferNewFileCanonicals.add(canonicalTo);
-        const description = transferReq.description;
-        resolvedTransfers.push({ op, canonicalFrom, canonicalTo, range, after, rawFrom, rawTo, toIsNewFile, description });
-        const buckets: Array<[string, string]> = op === "move" ? [[canonicalTo, rawTo], [canonicalFrom, rawFrom]] : [[canonicalTo, rawTo]];
-        for (const [absolutePath, rawPath] of buckets) {
-            if (!groups.some((g) => g.absolutePath === absolutePath)) groups.push({ absolutePath, rawPath, edits: [] });
-        }
-        if (op === "copy") copySourceOnlyPaths.add(canonicalFrom);
-    }
-    return { ok: true, resolvedTransfers, transferNewFileCanonicals, copySourceOnlyPaths };
-}
-
-async function acquirePatchEnvelope(args: {
-    deps: PatchToolDeps;
-    groups: EditGroup[];
-    groupsNeedingEnvelopeHint?: undefined;
-    sessionFilePath: string;
-    canonicalRoot: string;
-    requestEvidenceRef: EvidenceRef | undefined;
-    transferNewFileCanonicals: ReadonlySet<string>;
-    toolCallId: string;
-    checks: MutableChecks;
-    diagnostics: string[];
-    usedEvidence: string[];
-    signal: AbortSignal | undefined;
-}): Promise<{ ok: true; envelope: WorkspaceEvidenceEnvelope | null; autoInspected: boolean; evidenceRefForDetails: EvidenceRef; newFileCanonicals: ReadonlySet<string> } | { ok: false; result: PatchResult }> {
-    const { deps, groups, sessionFilePath, canonicalRoot, requestEvidenceRef, transferNewFileCanonicals, toolCallId, checks, diagnostics, usedEvidence, signal } = args;
-    const priorStore = deps.getPriorAuthority?.() ?? null;
-    const groupsNeedingEnvelope: EditGroup[] = [];
-    for (const g of groups) {
-        let prior: InspectedResource | null = null;
-        if (priorStore) {
-            try {
-                const canonical = realpathSync(g.absolutePath);
-                prior = priorStore.select(canonical);
-            } catch {
-                // file does not exist — no prior authority possible
-            }
-        }
-        if (!prior) groupsNeedingEnvelope.push(g);
-    }
-    let envelope: WorkspaceEvidenceEnvelope | null = null;
-    let autoInspected = false;
-    let evidenceRefForDetails: EvidenceRef;
-    let newFileCanonicals: ReadonlySet<string> = new Set();
-    if (groupsNeedingEnvelope.length === 0) {
-        evidenceRefForDetails = { inspectionId: "", resourceIds: [] };
-        return { ok: true, envelope, autoInspected, evidenceRefForDetails, newFileCanonicals };
-    }
-    if (!requestEvidenceRef) {
-        const existingWithoutPrior = groupsNeedingEnvelope.filter((g) => existsSync(g.absolutePath));
-        if (existingWithoutPrior.length > 0) {
-            const message = `no prior strong read authority for ${existingWithoutPrior.map((g) => g.rawPath).join(", ")}; read the file first (full file or target range), then retry`;
-            diagnostics.push(message);
-            return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: coverage (${message})` }], details: makeRejected(toolCallId, "coverage", diagnostics, { inspectionId: "", resourceIds: [] }, checks) } };
-        }
-        const built = await buildAutoInspectEnvelope({ sessionFilePath, canonicalRoot, groups: groupsNeedingEnvelope, newFileAllowed: transferNewFileCanonicals });
-        if (!built.ok) {
-            diagnostics.push(built.error);
-            checks.completed.push(makeCheck("auto-inspect", "fail", built.error));
-            return { ok: false, result: { content: [{ type: "text" as const, text: `failed: ${built.error}` }], details: makeFailed(toolCallId, "stage", built.error, { inspectionId: "", resourceIds: [] }, checks, diagnostics) } };
-        }
-        envelope = built.envelope;
-        autoInspected = true;
-        newFileCanonicals = built.newFileCanonicals;
-        evidenceRefForDetails = { inspectionId: envelope.inspectionId, resourceIds: envelope.resources.map((r) => r.resourceId) };
-        checks.completed.push(makeCheck("auto-inspect", "pass", `synthesized envelope for ${envelope.resources.length} file(s)`));
-        return { ok: true, envelope, autoInspected, evidenceRefForDetails, newFileCanonicals };
-    }
-    evidenceRefForDetails = { inspectionId: requestEvidenceRef.inspectionId, resourceIds: [...requestEvidenceRef.resourceIds] };
-    const rpc = deps.getRpcClient();
-    try {
-        const reply = await rpc.request("resolve_evidence" as RpcMethod, { inspectionId: requestEvidenceRef.inspectionId, sessionFilePath, workspaceRoot: canonicalRoot }, { signal });
-        if (!reply.ok || !reply.payload) {
-            checks.completed.push(makeCheck("evidence-pipeline", "fail", reply.error ?? "rpc returned no payload"));
-            return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${reply.error ?? "unknown rpc error"}` }], details: makeRejected(toolCallId, classifyRpcError(reply.error), [reply.error ?? "rpc failure"], evidenceRefForDetails, checks) } };
-        }
-        envelope = reply.payload as WorkspaceEvidenceEnvelope;
-        checks.completed.push(makeCheck("evidence-pipeline", "pass", "rpc resolve_evidence succeeded"));
-    } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        diagnostics.push(msg);
-        checks.completed.push(makeCheck("evidence-pipeline", "timeout", msg));
-        return { ok: false, result: { content: [{ type: "text" as const, text: `failed: ${msg}` }], details: makeFailed(toolCallId, "stage", msg, evidenceRefForDetails, checks, diagnostics) } };
-    } finally {
-        rpc.dispose();
-    }
-    if (envelope) {
-        const expectedSessionId = hashSessionFilePath(sessionFilePath);
-        if (envelope.sessionId !== expectedSessionId) {
-            diagnostics.push("envelope session identity mismatch");
-            return { ok: false, result: { content: [{ type: "text" as const, text: "rejected: session identity mismatch" }], details: makeRejected(toolCallId, "session", diagnostics, evidenceRefForDetails, checks, usedEvidence) } };
-        }
-        if (envelope.canonicalWorkspaceRoot !== canonicalRoot) {
-            diagnostics.push("envelope workspace root mismatch");
-            return { ok: false, result: { content: [{ type: "text" as const, text: "rejected: workspace mismatch" }], details: makeRejected(toolCallId, "session", diagnostics, evidenceRefForDetails, checks, usedEvidence) } };
-        }
-    }
-    return { ok: true, envelope, autoInspected, evidenceRefForDetails, newFileCanonicals };
-}
+// ── Refactor preview (shared kernel: ./patch/refactor-preview.js) ──
+// Rename / organize-imports / formatting / code-action preview planning
+// plus apply-preview live in the shared kernel; imported here so the
+// orchestrator keeps working untouched. Pure move: zero logic change.
+// handleRefactorRequest returns PatchResult|null (null = not refactor →
+// orchestrator continues). isBlockingPostwriteFailure is shared with the
+// orchestrator postwrite loop (imported, not duplicated).
+import {
+    moveSpansOverlap,
+    isSameFileMoveCandidate,
+    isAfterLineInsideSourceSpan,
+    isBlockingPostwriteFailure,
+    handleRefactorRequest,
+} from "./patch/refactor-preview.js";
 
 // ── Patch tool factory ──────────────────────────────────────────────
-
-export interface PatchDisplayDiff {
-    readonly path: string;
-    readonly diff: string;
-}
-
-export type PatchToolDetails = PatchDetails & {
-    /** Exact classic-text match failure; used only for bounded retry guidance. */
-    readonly matchFailure?: "NOT_FOUND" | "AMBIGUOUS";
-    readonly diff?: string;
-    readonly diffs?: ReadonlyArray<PatchDisplayDiff>;
-    /** Advisory repair results for staged candidates, keyed by canonical path. */
-    readonly repairs?: Readonly<Record<string, RepairLoopResult>>;
-    readonly finalization?: unknown;
-};
-
-export interface PatchTool {
-    readonly name: "patch";
-    readonly label: "patch";
-    readonly description: string;
-    readonly parameters: Record<string, unknown>;
-    execute(
-        toolCallId: string,
-        params: Record<string, unknown>,
-        signal: AbortSignal | undefined,
-        onUpdate: ((u: { content: Array<{ type: "text"; text: string }> }) => void) | undefined,
-        ctx: { cwd: string; hasUI?: boolean; ui?: unknown; [k: string]: unknown },
-    ): Promise<{ content: Array<{ type: "text"; text: string }>; details: PatchToolDetails }>;
-}
 
 export function createPatchTool(deps: PatchToolDeps): PatchTool {
     return {
@@ -1985,118 +1213,8 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
     };
 }
 
-/**
- * Conservative line coverage for an arbitrary repaired candidate.  We use
- * the smallest contiguous preimage range containing the textual delta; this
- * can reject a repair that a finer diff could allow, but can never widen a
- * line-range grant.
- */
-/**
- * Map a line span from staged (post-edit) coordinates back to the original
- * file's coordinates using the planner's preimage/postimage ranges. Lines
- * outside edited regions map 1:1 with the accumulated line-count delta;
- * lines inside an edited region map to that region's preimage start. Returns
- * null when the mapping cannot be established (no or mismatched planner
- * ranges) so the caller skips the repair rather than mis-authorizing it.
- */
-function mapRepairSpanToPreimage(
-    span: LineRange,
-    preimage: ReadonlyArray<LineRange>,
-    postimage: ReadonlyArray<LineRange>,
-): LineRange | null {
-    if (preimage.length === 0 || preimage.length !== postimage.length) return null;
-    const mapLine = (line: number): number => {
-        let shift = 0;
-        for (let i = 0; i < postimage.length; i++) {
-            const post = postimage[i];
-            const pre = preimage[i];
-            if (line >= post.startLine && line <= post.endLine) return pre.startLine;
-            if (line > post.endLine) shift += (pre.endLine - pre.startLine) - (post.endLine - post.startLine);
-        }
-        return line + shift;
-    };
-    return { startLine: mapLine(span.startLine), endLine: mapLine(span.endLine) };
-}
+// Repair-span helpers (mapRepairSpanToPreimage, changedLineRanges) live in
+// the shared kernel (./patch/repair-spans.js); imported above.
 
-function changedLineRanges(before: string, after: string): ReadonlyArray<LineRange> {
-    if (before === after) return [];
-    let prefix = 0;
-    const shared = Math.min(before.length, after.length);
-    while (prefix < shared && before[prefix] === after[prefix]) prefix++;
-    let beforeEnd = before.length;
-    let afterEnd = after.length;
-    while (beforeEnd > prefix && afterEnd > prefix && before[beforeEnd - 1] === after[afterEnd - 1]) {
-        beforeEnd--;
-        afterEnd--;
-    }
-    const startLine = before.slice(0, prefix).split("\n").length;
-    const endLine = Math.max(startLine, before.slice(0, beforeEnd).split("\n").length);
-    return [{ startLine, endLine }];
-}
-
-// ── helpers ──
-
-function buildRollbackInfo(transactionId: string, outcome: { attempted: string[]; ok: string[]; restored: string[]; failed: string[] }): { ok: boolean; reason?: string } {
-    const success = outcome.failed.length === 0;
-    if (success) {
-        const reason = `transaction ${transactionId}: restored ${outcome.restored.length}/${outcome.attempted.length} path(s)`;
-        return { ok: true, reason };
-    } else {
-        const reason = `transaction ${transactionId}: rollback failed for ${outcome.failed.join(", ")}`;
-        return { ok: false, reason };
-    }
-}
-
-function makeRejected(
-    toolCallId: string,
-    reason: "stale" | "coverage" | "conflict" | "approval" | "session",
-    diagnostics: string[],
-    evidenceRef: EvidenceRef,
-    checks: MutableChecks,
-    usedEvidence: ReadonlyArray<string> = [],
-    changedResources: ReadonlyArray<ResourceInvalidation> = [],
-): PatchDetails {
-    return {
-        tool: "patch",
-        status: { kind: "rejected", reason },
-        toolCallId,
-        evidenceRef,
-        usedEvidence,
-        changedResources,
-        checks: freezeChecks(checks),
-        diagnostics,
-    };
-}
-
-function makeFailed(
-    toolCallId: string,
-    phase: "stage" | "write" | "verify",
-    message: string,
-    evidenceRef: EvidenceRef,
-    checks: MutableChecks,
-    diagnostics: string[],
-    usedEvidence: ReadonlyArray<string> = [],
-    changedResources: ReadonlyArray<ResourceInvalidation> = [],
-    rollback?: { ok: boolean; reason?: string },
-): PatchDetails {
-    return {
-        tool: "patch",
-        status: { kind: "failed", phase },
-        toolCallId,
-        evidenceRef,
-        usedEvidence,
-        changedResources,
-        checks: freezeChecks(checks),
-        diagnostics,
-        error: message,
-        ...(rollback ? { rollback } : {}),
-    };
-}
-
-function classifyRpcError(msg: string | undefined): "stale" | "coverage" | "conflict" | "approval" | "session" {
-    if (!msg) return "session";
-    if (/coverage/i.test(msg)) return "coverage";
-    if (/stale/i.test(msg)) return "stale";
-    if (/conflict|duplicate/i.test(msg)) return "conflict";
-    return "session";
-}
+// buildRollbackInfo, makeRejected, makeFailed, classifyRpcError live in
+// ./patch/result-builders.js (imported above).
