@@ -34,7 +34,6 @@
  */
 import { readFile as fsReadFile, stat as fsStat, mkdir as fsMkdir } from "node:fs/promises";
 import { resolve as pathResolve, dirname as pathDirname } from "node:path";
-import { realpathSync } from "node:fs";
 
 import {
     hashSessionFilePath,
@@ -48,12 +47,9 @@ import {
     type PostEditEvidence,
 } from "@rhinos0608/pi-workspace-protocol";
 import { generateDiffString } from "./core/edit-diff.js";
-import { materializeTransfers } from "./patch/transfer-staging.js";
 import { checkEditSafety } from "./safety/approval-gating.js";
 import { EDIT_PARAMETERS, validateEditRequest, type RefactorRequest } from "./edit-contract.js";
 import type { PriorAuthorityStore } from "./context/evidence-authority.js";
-import { EditTransaction } from "./mutation/edit-transaction.js";
-import { saveTransactionUndoRecords } from "./undo/edit-history.js";
 import type { EditItem, EditTarget, FileSnapshot, HashlineEditMetadata } from "./core/types.js";
 import type { RepairLoopResult } from "./verification/repair-loop.js";
 
@@ -71,6 +67,7 @@ import type {
     RawTopology,
     PatchResult,
     PreparedPatchRequest,
+    PatchExecutionState,
     ResolvedPatchTransfer,
     PatchDisplayDiff,
     PatchTool,
@@ -99,18 +96,23 @@ import {
     runVerifierCheck,
     failResult,
     makeRejected,
-    makeFailed,
-    buildRollbackInfo,
     classifyRpcError,
 } from "./patch/result-builders.js";
 import { finalizeAppliedPatch } from "./patch/final-result.js";
+
+// ── Transaction runner (shared kernel: ./patch/transaction-runner.js) ──
+// EditTransaction begin/commit/rollback orchestration lives in the shared
+// kernel; imported here so the orchestrator keeps working untouched.
+// Pure move: zero logic change. The runner owns the try/finally, so
+// terminal returns inside its try still trigger its own
+// rollback-on-not-committed finally.
+import { runPatchTransaction } from "./patch/transaction-runner.js";
 
 // ── Group planning (shared kernel: ./patch/group-planning.js) ──────────
 // Per-group preimage authorization, candidate mutation planning, and
 // advisory repair integration live in the shared kernel; imported here so
 // the orchestrator keeps working untouched. Pure move: zero logic change.
 import { resolveAuthorizedGroupPreimage, planGroupMutation, applyAuthorizedRepair } from "./patch/group-planning.js";
-import { executeEditGroup } from "./patch/group-application.js";
 
 // ── Authorization (see ./context/patch-authorization.js) ───────────────────
 // Evidence authorization (types, resource selection, coverage validation,
@@ -196,7 +198,6 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             const checks: MutableChecks = prepared.prepared.checks;
             const diagnostics: string[] = prepared.prepared.diagnostics;
             const usedEvidence: string[] = [];
-
             const totalEdits = groups.reduce((sum, g) => sum + g.edits.length, 0);
             const fileWord = groups.length === 1 ? "file" : "files";
             const editWord = totalEdits === 1 ? "edit" : "edits";
@@ -216,10 +217,13 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             const evidenceRefForDetails = acquired.evidenceRefForDetails;
             const newFileCanonicals = acquired.newFileCanonicals;
 
-            // ── Per-group application ────────────────────────────────
+            // ── Transaction lifecycle ──────────────────────────────────
+            // Begin/commit/rollback orchestration lives in
+            // ./patch/transaction-runner.js (pure move, zero logic change).
+            // The runner owns the try/finally: terminal returns inside its
+            // try still trigger its own rollback-on-not-committed finally.
             // We validate and apply each file's edits in order. On the
             // first failure, abort the whole batch and report.
-
             const invalidations: ResourceInvalidation[] = [];
             const postEditEvidenceByPath = new Map<string, PostEditEvidence>();
             const repairsByPath = new Map<string, RepairLoopResult>();
@@ -228,132 +232,42 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
             const appliedCanonical: string[] = [];
             const appliedSummaries: string[] = [];
             const displayDiffs: PatchDisplayDiff[] = [];
-            // One canonicalization for transaction planning and every mutation:
-            // new files keep their raw resolved path (no on-disk file to
-            // realpath), existing files resolve symlinks — so every path passed
-            // to EditTransaction.before() was included during begin().
-            const canonicalTxPath = (absolutePath: string): string => {
-                if (newFileCanonicals.has(absolutePath)) return absolutePath;
-                try {
-                    return realpathSync(absolutePath);
-                } catch {
-                    return absolutePath;
-                }
-            };
-            const transactionPaths = [...new Set([
-                ...groups.map((group) => canonicalTxPath(group.absolutePath)),
-                ...copySourceOnlyPaths,
-            ])];
-            let transaction: EditTransaction;
-            try {
-                transaction = await EditTransaction.begin(transactionPaths);
-            } catch (err) {
-                // begin() can throw (lock-timeout, or a snapshot failure while
-                // reading a target path). It runs before any per-group work, so
-                // there is nothing to roll back yet — just report a typed
-                // failure rather than letting the rejection propagate past the
-                // tool boundary as an uncaught promise rejection.
-                const msg = err instanceof Error ? err.message : String(err);
-                diagnostics.push(`failed to begin transaction: ${msg}`);
-                return {
-                    content: [{ type: "text" as const, text: `failed: begin transaction (${msg})` }],
-                    details: makeFailed(toolCallId, "stage", `failed to begin transaction: ${msg}`, {
-                        inspectionId: evidenceRefForDetails.inspectionId,
-                        resourceIds: [],
-                    }, checks, diagnostics, usedEvidence, invalidations),
-                };
-            }
-            let committed = false;
-            let rollbackInfo: { ok: boolean; reason?: string } | undefined;
-
-            try {
-            // ── Resolve transfer (copy/move) ops against the pre-transaction
-            // snapshot, then fill in the reserved groups' edits with the
-            // synthesized hashline EditItems. Runs before the main per-group
-            // loop (which then treats these exactly like any other hashline
-            // group) and inside this try so an early rejection here still
-            // triggers the finally-block rollback below. Staging lives in
-            // ./patch/transfer-staging.js (pure move, zero logic change).
-            const staged = materializeTransfers({
-                resolvedTransfers,
-                transaction,
-                groups,
-                priorStore,
-                envelope,
-                evidenceRefForDetails,
-                toolCallId,
+            const state: PatchExecutionState = {
                 checks,
                 diagnostics,
                 usedEvidence,
                 invalidations,
+                postEditEvidenceByPath,
+                repairsByPath,
+                finalizedFiles,
+                appliedFiles,
+                appliedCanonical,
+                appliedSummaries,
+                displayDiffs,
+            };
+            const txResult = await runPatchTransaction({
+                deps,
+                ctx,
+                toolCallId,
+                evidenceRefForDetails,
+                canonicalRoot,
+                envelope,
+                priorStore,
+                groups,
+                resolvedTransfers,
+                copySourceOnlyPaths,
+                newFileCanonicals,
+                state,
+                stream,
             });
-            if (!staged.ok) return staged.result;
-
-            const groupAppContext = { deps, ctx, toolCallId, evidenceRefForDetails, canonicalRoot, envelope, priorStore, newFileCanonicals, transaction, canonicalTxPath, stream };
-            const groupAppState = { checks, diagnostics, usedEvidence, invalidations, postEditEvidenceByPath, repairsByPath, finalizedFiles, appliedFiles, appliedCanonical, appliedSummaries, displayDiffs };
-            for (const group of groups) {
-                // Write-failure outbox: executeEditGroup marks outcome.committed
-                // ONLY on the write-failure path (immediate rollback already
-                // done inside); every other terminal leaves committed=false so
-                // the outer finally still rolls back. Never normalize these.
-                const groupOutcome: { committed: boolean; rollbackInfo?: { ok: boolean; reason?: string } } = { committed };
-                if (rollbackInfo !== undefined) groupOutcome.rollbackInfo = rollbackInfo;
-                const groupResult = await executeEditGroup({ context: groupAppContext, state: groupAppState, group, outcome: groupOutcome });
-                committed = groupOutcome.committed;
-                if (groupOutcome.rollbackInfo !== undefined) rollbackInfo = groupOutcome.rollbackInfo;
-                if (groupResult.status === "terminal") return groupResult.result;
-            }
-
-            // Capture undo records (which snapshot post-write disk content for
-            // afterSha) BEFORE commit() releases the lock. commit()'s only
-            // side effect is releasing the lock — every write already landed
-            // on disk atomically earlier in this loop — so reading undo state
-            // while the lock is still held closes the window where a second,
-            // concurrent SmartEdit transaction could mutate the file between
-            // release and a fresh post-commit disk read, which would corrupt
-            // afterSha with someone else's write.
-            const undoRecords = await transaction.getUndoRecords().catch(() => []);
-            await transaction.commit();
-            committed = true;
-            try {
-                await saveTransactionUndoRecords(ctx.cwd, undoRecords);
-            } catch (err) {
-                // Undo persistence is best-effort and must never turn a durable
-                // applied result into a failure.
-                diagnostics.push(`undo persistence failed after commit: ${err instanceof Error ? err.message : String(err)}`);
-            }
-            } finally {
-                if (!committed) {
-                    const rollback = await transaction.rollback();
-                    rollbackInfo = buildRollbackInfo(transaction.transactionId, rollback);
-                    const failedRollbackPaths = new Set(rollback.failed);
-                    invalidations.splice(
-                        0,
-                        invalidations.length,
-                        ...invalidations.filter((invalidation) => failedRollbackPaths.has(invalidation.canonicalPath)),
-                    );
-                    diagnostics.push(`rollback: restored ${rollback.restored.length} path(s)`);
-                    if (rollback.failed.length > 0) diagnostics.push(`rollback failed: ${rollback.failed.join(", ")}`);
-                }
-            }
+            if (!txResult.ok) return txResult.result;
+            const rollbackInfo = txResult.rollbackInfo;
 
             return finalizeAppliedPatch({
                 deps,
                 ctx,
                 toolCallId,
-                state: {
-                    checks,
-                    diagnostics,
-                    usedEvidence,
-                    invalidations,
-                    postEditEvidenceByPath,
-                    repairsByPath,
-                    finalizedFiles,
-                    appliedFiles,
-                    appliedCanonical,
-                    appliedSummaries,
-                    displayDiffs,
-                },
+                state,
                 autoInspected,
                 evidenceRefForDetails,
                 rollbackInfo,
