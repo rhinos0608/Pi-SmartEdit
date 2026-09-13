@@ -251,7 +251,11 @@ describe("eslint-runner", () => {
       const dir = makeTempDir("smart-edit-eslint-metachar-");
       tempDirs.push(dir);
       writeEslintConfig(dir);
-      const filePath = join(dir, "we&ird|na(me)%!^.ts");
+      // '|' is a reserved filename character on Windows (ENOENT on write),
+      // so omit it there; the rest still exercises cmd metachars (&()%!^).
+      const weirdBase =
+        process.platform === "win32" ? "we&ird(na)me%!^.ts" : "we&ird|na(me)%!^.ts";
+      const filePath = join(dir, weirdBase);
       writeFileSync(filePath, "const x = 1\n", "utf-8");
       installFakeEslint(
         dir,
