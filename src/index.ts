@@ -77,6 +77,7 @@ import {
   handleWriteResult,
   handleEditRetryResult,
   handleEditSuccessResult,
+  type NarrowHintsByPath,
 } from "./extension/post-lanes.js";
 
 import {
@@ -91,8 +92,11 @@ export default function smartEdit(pi: ExtensionAPI) {
   /** Per-extension, per-session state (singletons consolidated in ./extension/session.js). */
   const session = createSessionState();
 
-  const buildMutationEvidence = (paths: string[]): Promise<WorkspaceEvidenceEnvelope | undefined> =>
-    buildSessionMutationEvidence(session, paths);
+  const buildMutationEvidence = (
+    paths: string[],
+    narrowHints?: NarrowHintsByPath,
+  ): Promise<WorkspaceEvidenceEnvelope | undefined> =>
+    buildSessionMutationEvidence(session, paths, narrowHints);
 
   const buildRetryEvidence = (
     event: RetryEvidenceEvent,

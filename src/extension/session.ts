@@ -9,6 +9,7 @@ import { LSPManager } from "../lsp/lsp-manager";
 import { createSmartReadDiagnosticsClient } from "../lsp/smartread-diagnostics-client.js";
 import { resetRetryCounts } from "../verification/auto-validate";
 import { createPriorAuthorityStore, type PriorAuthorityStore } from "../context/evidence-authority.js";
+import { narrowPostEditRanges, type NarrowHintsByPath } from "./post-lanes.js";
 import {
   PROTOCOL_SCHEMA_VERSION,
   hashSessionFilePath,
@@ -98,6 +99,7 @@ export async function shutdownSessionState(state: SessionState): Promise<void> {
 export async function buildMutationEvidence(
   state: SessionState,
   paths: string[],
+  narrowHints?: NarrowHintsByPath,
 ): Promise<WorkspaceEvidenceEnvelope | undefined> {
   if (!state.currentSessionFilePath || !state.currentCanonicalWorkspaceRoot) return undefined;
   const resources: Array<WorkspaceEvidenceEnvelope["resources"][number]> = [];
@@ -114,15 +116,44 @@ export async function buildMutationEvidence(
       if (!statSync(canonicalPath).isFile()) continue;
       const content = (await fsReadFile(canonicalPath)).toString("utf8");
       const lineCount = content.split("\n").length;
+      const sha = sha256OfString(content);
+      const byteLength = Buffer.byteLength(content, "utf8");
+      // Narrow post-edit mint: a line-range prior survives the stale-SHA guard
+      // with its ranges transformed through the edit mapping plus the
+      // model-visible postimage changed ranges — never widened to full-file.
+      // Prior full-file, missing prior, and hint-less (write path) mints keep
+      // the legacy full-file grant so edit→edit / write→edit flows survive.
+      const hint = narrowHints?.get(path);
+      const prior = hint ? state.priorAuthorityStore?.select(canonicalPath) ?? null : null;
+      if (hint && prior && prior.coverage === "line-range") {
+        const narrowed = narrowPostEditRanges(prior.allowedRanges, hint, lineCount);
+        const first = narrowed[0];
+        if (first) {
+          resources.push({
+            resourceId: resourceIdFor({ canonicalPath, kind: "range", range: first }),
+            canonicalPath,
+            kind: "range",
+            coverage: "line-range",
+            allowedRanges: narrowed,
+            fullFileSha256: sha,
+            fresh: true,
+            byteLength,
+            lineCount,
+          });
+        }
+        // Empty narrowing mints nothing: the stale prior rejects and the model
+        // re-reads, instead of authorizing lines it never observed.
+        continue;
+      }
       resources.push({
         resourceId: resourceIdFor({ canonicalPath, kind: "full" }),
         canonicalPath,
         kind: "full",
         coverage: "full-file",
         allowedRanges: [{ startLine: 1, endLine: lineCount }],
-        fullFileSha256: sha256OfString(content),
+        fullFileSha256: sha,
         fresh: true,
-        byteLength: Buffer.byteLength(content, "utf8"),
+        byteLength,
         lineCount,
       });
     } catch {

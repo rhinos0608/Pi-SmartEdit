@@ -2,7 +2,7 @@ import { readFile as fsReadFile } from "fs/promises";
 import { resolve } from "path";
 
 import type { ToolResultEvent } from "@mariozechner/pi-coding-agent";
-import type { WorkspaceEvidenceEnvelope } from "@rhinos0608/pi-workspace-protocol";
+import type { LineRange, WorkspaceEvidenceEnvelope } from "@rhinos0608/pi-workspace-protocol";
 
 import { recordRead, recordReadSession } from "../context/read-cache";
 import type { PriorAuthorityStore } from "../context/evidence-authority.js";
@@ -60,11 +60,157 @@ export async function refreshReadCacheAfterEdit(filePath: string, cwd: string): 
   recordReadSession(filePath, cwd, 1, -1, lines.length, "edit");
 }
 
+/** One contiguous changed hunk in pre-edit (old) and post-edit (new) line coordinates. */
+export interface PostEditLineBlock {
+  oldStartLine: number;
+  oldLineCount: number;
+  newStartLine: number;
+  newLineCount: number;
+}
+
+/**
+ * Narrow-mint hint for one edited file: the model-visible postimage changed
+ * ranges (diff hunks surfaced to the model) plus the old→new line mapping
+ * blocks needed to transform prior authority through the edit.
+ */
+export interface PostEditNarrowHint {
+  changedRanges: LineRange[];
+  blocks: PostEditLineBlock[];
+}
+
+/** Per-display-path narrow hints, keyed by the same path strings used for minting. */
+export type NarrowHintsByPath = ReadonlyMap<string, PostEditNarrowHint>;
+
+/** Mutation-evidence minter with optional post-edit narrowing hints (edit path). */
+export type BuildMutationEvidence = (
+  paths: string[],
+  narrowHints?: NarrowHintsByPath,
+) => Promise<WorkspaceEvidenceEnvelope | undefined>;
+
+/**
+ * Parse an edit display diff (generateDiffString format: `+NNN`/`-NNN`/` NNN`
+ * lines with `...` elisions) into model-visible postimage changed ranges and
+ * old→new line mapping blocks. Unknown lines break sync conservatively.
+ */
+export function parsePostEditDiff(diff: string): PostEditNarrowHint {
+  const changedRanges: LineRange[] = [];
+  const blocks: PostEditLineBlock[] = [];
+  let delta = 0;
+  let oldPtr: number | null = null;
+  let block: { oldStart: number; oldLen: number; newLen: number } | null = null;
+  const finishBlock = (): void => {
+    if (!block) return;
+    const newStart = block.oldStart + delta;
+    if (block.newLen > 0) changedRanges.push({ startLine: newStart, endLine: newStart + block.newLen - 1 });
+    blocks.push({
+      oldStartLine: block.oldStart,
+      oldLineCount: block.oldLen,
+      newStartLine: newStart,
+      newLineCount: block.newLen,
+    });
+    delta += block.newLen - block.oldLen;
+    block = null;
+  };
+  for (const line of diff.split("\n")) {
+    if (/^ +\.\.\.$/.test(line)) {
+      finishBlock();
+      oldPtr = null;
+      continue;
+    }
+    const m = /^([+\- ]) *(\d+)(?: (.*))?$/.exec(line);
+    if (!m) {
+      finishBlock();
+      oldPtr = null;
+      continue;
+    }
+    const sign = m[1];
+    const n = Number.parseInt(m[2] ?? "0", 10);
+    if (!Number.isInteger(n) || n < 1) {
+      finishBlock();
+      oldPtr = null;
+      continue;
+    }
+    if (sign === " ") {
+      finishBlock();
+      oldPtr = n + 1;
+    } else if (sign === "-") {
+      if (!block) block = { oldStart: n, oldLen: 0, newLen: 0 };
+      block.oldLen++;
+      oldPtr = n + 1;
+    } else {
+      if (!block) block = { oldStart: oldPtr ?? n - delta, oldLen: 0, newLen: 0 };
+      block.newLen++;
+    }
+  }
+  finishBlock();
+  return { changedRanges, blocks };
+}
+
+/** Merge overlapping/adjacent 1-based line ranges into minimal disjoint form. */
+function mergeDisjointRanges(ranges: ReadonlyArray<LineRange>): LineRange[] {
+  if (ranges.length <= 1) return ranges.map((r) => ({ ...r }));
+  const sorted = [...ranges].sort((a, b) => a.startLine - b.startLine);
+  const out: Array<{ startLine: number; endLine: number }> = [];
+  for (const r of sorted) {
+    const last = out[out.length - 1];
+    if (last && r.startLine <= last.endLine + 1) {
+      last.endLine = Math.max(last.endLine, r.endLine);
+    } else {
+      out.push({ startLine: r.startLine, endLine: r.endLine });
+    }
+  }
+  return out;
+}
+
+/**
+ * Transform prior (pre-edit) authority ranges through the edit mapping and
+ * union the model-visible postimage changed ranges, clamped to the post-edit
+ * line count. Ranges over entirely deleted lines collapse and are dropped —
+ * the model must re-read to gain authority there.
+ */
+export function narrowPostEditRanges(
+  prior: ReadonlyArray<LineRange>,
+  hint: PostEditNarrowHint,
+  lineCount: number,
+): LineRange[] {
+  const blocks = [...hint.blocks].sort((a, b) => a.oldStartLine - b.oldStartLine);
+  const mapPoint = (x: number, isEnd: boolean): number => {
+    let shift = 0;
+    for (const b of blocks) {
+      if (b.oldLineCount > 0) {
+        const oldEnd = b.oldStartLine + b.oldLineCount - 1;
+        if (x < b.oldStartLine) return x + shift;
+        if (x > oldEnd) {
+          shift += b.newLineCount - b.oldLineCount;
+          continue;
+        }
+        if (b.newLineCount === 0) return isEnd ? b.newStartLine - 1 : b.newStartLine;
+        return isEnd ? b.newStartLine + b.newLineCount - 1 : b.newStartLine;
+      }
+      if (x < b.oldStartLine) return x + shift;
+      shift += b.newLineCount;
+    }
+    return x + shift;
+  };
+  const out: LineRange[] = [];
+  for (const r of prior) {
+    const s = mapPoint(r.startLine, false);
+    const e = mapPoint(r.endLine, true);
+    if (s <= e) out.push({ startLine: s, endLine: e });
+  }
+  for (const r of hint.changedRanges) out.push({ ...r });
+  return mergeDisjointRanges(
+    out
+      .filter((r) => r.startLine <= r.endLine && r.endLine >= 1 && r.startLine <= lineCount)
+      .map((r) => ({ startLine: Math.max(1, r.startLine), endLine: Math.min(lineCount, r.endLine) })),
+  );
+}
+
 /** tool_result seam: write diagnostics lane (awaited + returned, not fire-and-forget). */
 export async function handleWriteResult(
   event: { toolName?: string; isError?: boolean; input?: unknown; content?: unknown; details?: unknown },
   toolCwd: string,
-  buildMutationEvidence: (paths: string[]) => Promise<WorkspaceEvidenceEnvelope | undefined>,
+  buildMutationEvidence: BuildMutationEvidence,
   store: PriorAuthorityStore | null,
 ): Promise<{ content: ToolResultEvent["content"]; details: unknown } | undefined> {
   const writePath = (event.input as { path?: string } | undefined)?.path;
@@ -129,7 +275,7 @@ export async function handleEditRetryResult(
 export async function handleEditSuccessResult(
   event: { toolName?: string; isError?: boolean; content?: unknown; details?: unknown },
   toolCwd: string,
-  buildMutationEvidence: (paths: string[]) => Promise<WorkspaceEvidenceEnvelope | undefined>,
+  buildMutationEvidence: BuildMutationEvidence,
   store: PriorAuthorityStore | null,
 ): Promise<{ content: ToolResultEvent["content"]; details: unknown } | undefined> {
   if (
@@ -159,7 +305,23 @@ export async function handleEditSuccessResult(
         // File might not exist yet or can't be read — skip silently
       });
     }
-    const workspaceEvidence = await buildMutationEvidence(uniquePaths);
+    // Narrow-mint hints: the diff hunks surfaced to the model carry the
+    // postimage changed ranges plus the old→new line mapping, so the mint can
+    // advance the SHA past the stale guard without broadening coverage.
+    const narrowHints = new Map<string, PostEditNarrowHint>();
+    for (const d of details.diffs) {
+      const entry = d as { path?: unknown; diff?: unknown };
+      if (typeof entry.path !== "string" || typeof entry.diff !== "string" || entry.diff.length === 0) continue;
+      const parsed = parsePostEditDiff(entry.diff);
+      const existing = narrowHints.get(entry.path);
+      if (existing) {
+        existing.changedRanges.push(...parsed.changedRanges);
+        existing.blocks.push(...parsed.blocks);
+      } else {
+        narrowHints.set(entry.path, parsed);
+      }
+    }
+    const workspaceEvidence = await buildMutationEvidence(uniquePaths, narrowHints);
     if (workspaceEvidence) {
       store?.record(workspaceEvidence);
       return {
