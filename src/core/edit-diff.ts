@@ -13,6 +13,7 @@ import * as Diff from "diff";
 import type {
   EditItem,
   IndentationStyle,
+  MatchResult,
   MatchSpan,
   ClosestMatchDiagnostic,
   SearchScope,
@@ -459,6 +460,32 @@ function adaptReplacementText(
 }
 
 /** Seam: replace-all spans. */
+/** Build one MatchSpan for a replaceAll hit, adapting indentation/quote style. */
+function buildReplaceAllSpan(m: MatchResult, edit: NormalizedEdit, index: number, ctx: MatchBuildContext): MatchSpan {
+  let newText = edit.newText;
+  if (m.tier !== MatchTier.EXACT) {
+    newText = adaptReplacementText(newText, edit, ctx, m.matchedText, m.index, m.matchLength);
+  } else {
+    newText = preserveQuoteStyle(
+      newText,
+      ctx.normalizedContent,
+      m.index,
+      m.matchLength,
+      ctx.path,
+    );
+  }
+  return {
+    editIndex: index,
+    matchIndex: m.index,
+    matchLength: m.matchLength,
+    newText,
+    tier: m.tier,
+    matchNote: m.matchNote,
+    replaceAll: true,
+    description: edit.description,
+  };
+}
+
 function buildReplaceAllSpans(
   edit: NormalizedEdit,
   index: number,
@@ -497,28 +524,7 @@ function buildReplaceAllSpans(
   }
   const spans: MatchSpan[] = [];
   for (const m of allMatches) {
-    let newText = edit.newText;
-    if (m.tier !== MatchTier.EXACT) {
-      newText = adaptReplacementText(newText, edit, ctx, m.matchedText, m.index, m.matchLength);
-    } else {
-      newText = preserveQuoteStyle(
-        newText,
-        ctx.normalizedContent,
-        m.index,
-        m.matchLength,
-        ctx.path,
-      );
-    }
-    spans.push({
-      editIndex: index,
-      matchIndex: m.index,
-      matchLength: m.matchLength,
-      newText,
-      tier: m.tier,
-      matchNote: m.matchNote,
-      replaceAll: true,
-      description: edit.description,
-    });
+    spans.push(buildReplaceAllSpan(m, edit, index, ctx));
   }
   pushTierNote(match.matchNote, match.tier, index, matchNotes);
   return spans;
@@ -768,6 +774,89 @@ export async function applyEdits(
 
 // ─── Diff generation ────────────────────────────────────────────────
 
+/** Mutable cursor + buffers threaded through generateDiffString helpers. */
+interface DiffRenderState {
+  output: string[];
+  oldLineNum: number;
+  newLineNum: number;
+  lastWasChange: boolean;
+  firstChangedLine: number | undefined;
+  lineNumWidth: number;
+  contextLines: number;
+}
+
+/** Split a diff part value into lines, dropping the trailing empty split. */
+function splitDiffPartLines(value: string): string[] {
+  const raw = value.split("\n");
+  if (raw[raw.length - 1] === "") raw.pop();
+  return raw;
+}
+
+/** Append added (+) or removed (-) lines; advances the matching line counter. */
+function appendChangedLines(raw: string[], added: boolean, state: DiffRenderState): void {
+  if (state.firstChangedLine === undefined) state.firstChangedLine = state.newLineNum;
+  for (const line of raw) {
+    if (added) {
+      const lineNum = String(state.newLineNum).padStart(state.lineNumWidth, " ");
+      state.output.push(`+${lineNum} ${line}`);
+      state.newLineNum++;
+    } else {
+      const lineNum = String(state.oldLineNum).padStart(state.lineNumWidth, " ");
+      state.output.push(`-${lineNum} ${line}`);
+      state.oldLineNum++;
+    }
+  }
+  state.lastWasChange = true;
+}
+
+/** Trailing context after a change: show the first N unchanged lines, then .... */
+function appendLeadingOnlyContext(raw: string[], state: DiffRenderState): void {
+  const shown = raw.slice(0, state.contextLines);
+  const skipped = raw.length - shown.length;
+  for (const line of shown) {
+    const ln = String(state.oldLineNum++).padStart(state.lineNumWidth, " ");
+    state.output.push(` ${ln} ${line}`);
+    state.newLineNum++;
+  }
+  if (skipped > 0) {
+    state.output.push(` ${"".padStart(state.lineNumWidth, " ")} ...`);
+    state.oldLineNum += skipped;
+    state.newLineNum += skipped;
+  }
+}
+
+/** Leading context before a change: ..., then show the last N unchanged lines. */
+function appendTrailingOnlyContext(raw: string[], state: DiffRenderState): void {
+  const skipped = Math.max(0, raw.length - state.contextLines);
+  if (skipped > 0) {
+    state.output.push(` ${"".padStart(state.lineNumWidth, " ")} ...`);
+    state.oldLineNum += skipped;
+    state.newLineNum += skipped;
+  }
+  for (const line of raw.slice(skipped)) {
+    const ln = String(state.oldLineNum++).padStart(state.lineNumWidth, " ");
+    state.output.push(` ${ln} ${line}`);
+    state.newLineNum++;
+  }
+}
+
+/** Dispatch one unchanged block based on neighboring changes. */
+function appendUnchangedBlock(raw: string[], hasLeadingChange: boolean, hasTrailingChange: boolean, state: DiffRenderState): void {
+  if (hasLeadingChange && hasTrailingChange) {
+    renderContext(raw, state.output, state.oldLineNum, state.newLineNum, state.lineNumWidth, state.contextLines);
+    state.oldLineNum += raw.length;
+    state.newLineNum += raw.length;
+  } else if (hasLeadingChange) {
+    appendLeadingOnlyContext(raw, state);
+  } else if (hasTrailingChange) {
+    appendTrailingOnlyContext(raw, state);
+  } else {
+    state.oldLineNum += raw.length;
+    state.newLineNum += raw.length;
+  }
+  state.lastWasChange = false;
+}
+
 /**
  * Generate a unified diff string with line numbers and context.
  */
@@ -783,76 +872,31 @@ export function generateDiffString(
   const maxLineNum = Math.max(oldLines.length, newLines.length);
   const lineNumWidth = String(maxLineNum).length;
 
-  let oldLineNum = 1;
-  let newLineNum = 1;
-  let lastWasChange = false;
-  let firstChangedLine: number | undefined;
+  const state: DiffRenderState = {
+    output,
+    oldLineNum: 1,
+    newLineNum: 1,
+    lastWasChange: false,
+    firstChangedLine: undefined,
+    lineNumWidth,
+    contextLines,
+  };
 
   for (let i = 0; i < parts.length; i++) {
     const part = parts[i];
-    const raw = part.value.split("\n");
-    if (raw[raw.length - 1] === "") raw.pop();
+    const raw = splitDiffPartLines(part.value);
 
     if (part.added || part.removed) {
-      if (firstChangedLine === undefined) firstChangedLine = newLineNum;
-
-      for (const line of raw) {
-        if (part.added) {
-          const lineNum = String(newLineNum).padStart(lineNumWidth, " ");
-          output.push(`+${lineNum} ${line}`);
-          newLineNum++;
-        } else {
-          const lineNum = String(oldLineNum).padStart(lineNumWidth, " ");
-          output.push(`-${lineNum} ${line}`);
-          oldLineNum++;
-        }
-      }
-      lastWasChange = true;
+      appendChangedLines(raw, part.added === true, state);
     } else {
-      const nextPartIsChange =
+      const hasTrailingChange =
         i < parts.length - 1 &&
         (parts[i + 1].added || parts[i + 1].removed);
-      const hasLeadingChange = lastWasChange;
-      const hasTrailingChange = nextPartIsChange;
-
-      if (hasLeadingChange && hasTrailingChange) {
-        renderContext(raw, output, oldLineNum, newLineNum, lineNumWidth, contextLines);
-        oldLineNum += raw.length;
-        newLineNum += raw.length;
-      } else if (hasLeadingChange) {
-        const shown = raw.slice(0, contextLines);
-        const skipped = raw.length - shown.length;
-        for (const line of shown) {
-          const ln = String(oldLineNum++).padStart(lineNumWidth, " ");
-          output.push(` ${ln} ${line}`);
-          newLineNum++;
-        }
-        if (skipped > 0) {
-          output.push(` ${"".padStart(lineNumWidth, " ")} ...`);
-          oldLineNum += skipped;
-          newLineNum += skipped;
-        }
-      } else if (hasTrailingChange) {
-        const skipped = Math.max(0, raw.length - contextLines);
-        if (skipped > 0) {
-          output.push(` ${"".padStart(lineNumWidth, " ")} ...`);
-          oldLineNum += skipped;
-          newLineNum += skipped;
-        }
-        for (const line of raw.slice(skipped)) {
-          const ln = String(oldLineNum++).padStart(lineNumWidth, " ");
-          output.push(` ${ln} ${line}`);
-          newLineNum++;
-        }
-      } else {
-        oldLineNum += raw.length;
-        newLineNum += raw.length;
-      }
-      lastWasChange = false;
+      appendUnchangedBlock(raw, state.lastWasChange, hasTrailingChange, state);
     }
   }
 
-  return { diff: output.join("\n"), firstChangedLine };
+  return { diff: state.output.join("\n"), firstChangedLine: state.firstChangedLine };
 }
 
 function renderContext(
