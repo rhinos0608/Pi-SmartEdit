@@ -8,7 +8,7 @@
  * transfer groups) — preserved as-is.
  */
 import { readFile as fsReadFile } from "node:fs/promises";
-import { resolve as pathResolve } from "node:path";
+import { resolve as pathResolve, dirname, basename, join as pathJoin } from "node:path";
 import { realpathSync, existsSync } from "node:fs";
 import {
     PROTOCOL_SCHEMA_VERSION,
@@ -16,6 +16,7 @@ import {
     inspectionIdFor,
     resourceIdFor,
     sha256OfString,
+    validateInspectionEnvelope,
     type WorkspaceEvidenceEnvelope,
     type InspectedResource,
     type EvidenceRef,
@@ -125,9 +126,19 @@ export async function buildAutoInspectEnvelope(args: {
             // file so the per-group executor skips the realpath / SHA / range
             // checks that only make sense for existing content.
             const emptySha = sha256OfString("");
+            // The file does not exist yet, so realpathSync on the full path is
+            // impossible (ENOENT). Resolve the parent dir (which must exist for
+            // a creatable file) and join the basename: symlink-aware and stable,
+            // matching the canonical path used once the file exists.
+            let newCanonical: string;
+            try {
+                newCanonical = pathJoin(realpathSync(dirname(g.absolutePath)), basename(g.absolutePath));
+            } catch {
+                newCanonical = g.absolutePath;
+            }
             const resource: InspectedResource = {
-                resourceId: resourceIdFor({ canonicalPath: g.absolutePath, kind: "full" }),
-                canonicalPath: g.absolutePath,
+                resourceId: resourceIdFor({ canonicalPath: newCanonical, kind: "full" }),
+                canonicalPath: newCanonical,
                 kind: "full",
                 coverage: "full-file",
                 allowedRanges: [{ startLine: 1, endLine: 1 }],
@@ -137,9 +148,9 @@ export async function buildAutoInspectEnvelope(args: {
                 lineCount: 0,
             };
             resources.push(resource);
-            resourceKeyItems.push({ canonicalPath: g.absolutePath });
-            canonicalByGroup.push(g.absolutePath);
-            newFileCanonicals.add(g.absolutePath);
+            resourceKeyItems.push({ canonicalPath: newCanonical });
+            canonicalByGroup.push(newCanonical);
+            newFileCanonicals.add(newCanonical);
             continue;
         }
         let canonical: string;
@@ -373,7 +384,20 @@ export async function acquirePatchEnvelope(args: {
             checks.completed.push(makeCheck("evidence-pipeline", "fail", reply.error ?? "rpc returned no payload"));
             return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${reply.error ?? "unknown rpc error"}` }], details: makeRejected(toolCallId, classifyRpcError(reply.error), [reply.error ?? "rpc failure"], evidenceRefForDetails, checks) } };
         }
-        envelope = reply.payload as WorkspaceEvidenceEnvelope;
+        if (reply.schemaVersion !== PROTOCOL_SCHEMA_VERSION) {
+            const message = `invalid evidence envelope: schemaVersion must be ${PROTOCOL_SCHEMA_VERSION}`;
+            diagnostics.push(message);
+            checks.completed.push(makeCheck("evidence-pipeline", "fail", message));
+            return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${message}` }], details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks) } };
+        }
+        const validated = validateInspectionEnvelope(reply.payload);
+        if (!validated.ok) {
+            const message = `invalid evidence envelope: ${validated.error}`;
+            diagnostics.push(message);
+            checks.completed.push(makeCheck("evidence-pipeline", "fail", message));
+            return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${message}` }], details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks) } };
+        }
+        envelope = validated.value;
         checks.completed.push(makeCheck("evidence-pipeline", "pass", "rpc resolve_evidence succeeded"));
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);

@@ -4,7 +4,7 @@ Pi-SmartEdit is the Pi coding agent's `edit`/`write` extension. It relies on two
 
 ## `/Users/rhinesharar/Pi-Workspace-Protocol`
 
-- **Package:** `@rhinos0608/pi-workspace-protocol` (pinned in `package.json` as `github:rhinos0608/Pi-Workspace-Protocol#v0.3.0`).
+- **Package:** `@rhinos0608/pi-workspace-protocol` (pinned in `package.json` as `github:rhinos0608/Pi-Workspace-Protocol#v0.4.0`).
 - **Purpose:** Versioned TypeScript contracts, SHA-256/id helpers, runtime validators, and an event-bus RPC layer for the SmartRead/SmartEdit inspect+patch protocol.
 - **What Pi-SmartEdit consumes:**
   - `src/index.ts` imports `createRpcClient` and `RPC_CHANNELS`.

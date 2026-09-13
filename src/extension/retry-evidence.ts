@@ -146,7 +146,7 @@ export async function mintRetryEvidenceFromSelection(
   const sessionId = hashSessionFilePath(sessionFilePath);
   const envelope: WorkspaceEvidenceEnvelope = {
     schemaVersion: PROTOCOL_SCHEMA_VERSION,
-    inspectionId: inspectionIdFor({ sessionId, workspaceRoot, resources: resources.map((r) => ({ canonicalPath: r.canonicalPath, allowedRanges: r.allowedRanges })) }),
+    inspectionId: inspectionIdFor({ sessionId, workspaceRoot, resources: resources.flatMap((r) => r.allowedRanges.map((range) => ({ canonicalPath: r.canonicalPath, range }))) }),
     sessionId, workspaceRoot, canonicalWorkspaceRoot: workspaceRoot,
     createdAt: new Date().toISOString(), resources, mode: "path",
   };
