@@ -1,5 +1,6 @@
 import assert from "assert";
 import { describe, it } from "node:test";
+import { resolve } from "node:path";
 
 import {
   getSmartEditRuntimeConfig,
@@ -11,7 +12,7 @@ describe("edit path resolution", () => {
   it("resolves parent-directory paths instead of rejecting them", () => {
     assert.strictEqual(
       resolveEditPath("/repo/workspace", "../outside.txt"),
-      "/repo/outside.txt",
+      resolve("/repo/workspace", "../outside.txt"),
     );
   });
 });
