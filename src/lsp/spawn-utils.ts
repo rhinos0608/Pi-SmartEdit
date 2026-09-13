@@ -1,6 +1,7 @@
 import { spawn } from "child_process";
+import { existsSync } from "fs";
 import { access } from "fs/promises";
-import { dirname, resolve } from "path";
+import { delimiter, dirname, join, resolve } from "path";
 
 export interface SpawnOptions {
   cwd?: string;
@@ -48,6 +49,8 @@ export interface SpawnTarget {
   command: string;
   args: string[];
   windowsVerbatimArguments?: boolean;
+  /** Original batch-shim name when gated through cmd.exe (win32 only). */
+  batchFile?: string;
 }
 
 /**
@@ -70,6 +73,7 @@ export function buildSpawnTarget(
       command: "cmd.exe",
       args: ["/d", "/s", "/c", `"${shellCommand}"`],
       windowsVerbatimArguments: true,
+      batchFile: command,
     };
   }
   return { command, args };
@@ -175,6 +179,21 @@ export function safeSpawnAsync(
     const attempt = (): void => {
       const id = ++attemptId;
       const target = targets[index];
+      // Missing shims must never reach cmd.exe: on current Windows Server
+      // images `cmd /c "missing.cmd"` exits 1 with a localized
+      // "not recognized" message, not 9009 with empty output — so exit-code
+      // sniffing alone misreports them as real failures. Skip ungated when
+      // the batch file is not resolvable; the close handler re-checks as a
+      // backstop for files deleted between this check and exit.
+      if (target.batchFile && !isBatchFileResolvable(target.batchFile, options.cwd)) {
+        if (!timedOut && index + 1 < targets.length) {
+          index++;
+          attempt();
+          return;
+        }
+        finish(-1);
+        return;
+      }
       const child = spawn(target.command, target.args, {
         cwd: options.cwd,
         stdio: ["ignore", "pipe", "pipe"],
@@ -191,19 +210,21 @@ export function safeSpawnAsync(
 
       child.on("close", (code: number | null) => {
         if (settled || id !== attemptId) return;
-        // cmd.exe reports an unresolvable command as exit 9009 via `close`,
-        // not `error` — without this the `.bat` fallback would be dead when
-        // only a later suffix exists. 9009 is cmd-specific (POSIX exit codes
-        // are 8-bit); message-matching would break on non-English Windows.
-        // A tool that ran and diagnosed something wrote output, so empty
-        // stdout AND stderr separates lookup failure from a genuine 9009 exit
-        // — without this, a real 9009 (none of our callers produce one) with
-        // kept diagnostics could be discarded by the fallback. Never start new
-        // work after the deadline either. A terminal lookup failure (all
-        // suffixes exhausted) normalizes to -1, the missing-command status
-        // on every OS — callers treat it as "tool absent", not as a
-        // diagnostic exit code.
-        const lookupFailure = code === 9009 && stdout === "" && stderr === "";
+        // cmd.exe reports an unresolvable command via `close`, not `error` —
+        // without this the `.bat` fallback would be dead when only a later
+        // suffix exists. The classic signal is exit 9009 with empty output
+        // (9009 is cmd-specific; POSIX exit codes are 8-bit). Current
+        // Windows Server images instead exit 1 with a localized
+        // "not recognized" message, so message/exit-code sniffing alone
+        // misreports. Backstop: a non-zero exit from a cmd-gated target
+        // whose batch file does not resolve on disk is a lookup failure
+        // regardless of code or text — a tool that really ran either exited
+        // 0 or left its shim resolvable. Never start new work after the
+        // deadline. A terminal lookup failure (all suffixes exhausted)
+        // normalizes to -1, the missing-command status on every OS.
+        const gatedMiss = target.batchFile !== undefined && code !== 0 &&
+          !isBatchFileResolvable(target.batchFile, options.cwd);
+        const lookupFailure = (code === 9009 && stdout === "" && stderr === "") || gatedMiss;
         if (!timedOut && lookupFailure && index + 1 < targets.length) {
           index++;
           attempt();
@@ -235,8 +256,37 @@ export function safeSpawnAsync(
 }
 
 /**
- * Append `chunk` to `current` while capping total length at `maxChars`.
+ * Check whether a cmd-gated batch shim resolves without spawning.
+ *
+ * Locale-independent by design: cmd.exe's "not recognized" text is
+ * localized and its exit code varies (9009 vs 1) across images, so
+ * existence on disk decides. Path-like names resolve against `cwd`;
+ * bare names search `cwd` then each `PATH` entry (quotes stripped).
+ * Sync and failure-path-only (at most 2 checks per missing command).
  */
+export function isBatchFileResolvable(batchFile: string, cwd?: string): boolean {
+  const base = cwd ?? process.cwd();
+  try {
+    if (/[/\\]/.test(batchFile)) {
+      return existsSync(resolve(base, batchFile));
+    }
+    if (existsSync(join(base, batchFile))) return true;
+    const pathEnv = process.env.PATH ?? "";
+    for (const entry of pathEnv.split(delimiter)) {
+      const dir = entry.replace(/^"+|"+$/g, "").trim();
+      if (!dir) continue;
+      try {
+        if (existsSync(join(dir, batchFile))) return true;
+      } catch {
+        continue;
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 export function appendBounded(
   current: string,
   chunk: string,

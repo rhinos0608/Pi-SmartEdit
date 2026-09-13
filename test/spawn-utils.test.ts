@@ -1,6 +1,9 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import { buildSpawnTarget, buildSpawnTargets, safeSpawnAsync } from "../src/lsp/spawn-utils.js";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { buildSpawnTarget, buildSpawnTargets, isBatchFileResolvable, safeSpawnAsync } from "../src/lsp/spawn-utils.js";
 
 describe("buildSpawnTarget", () => {
   it("routes .cmd through cmd.exe on win32 with one verbatim /c string", () => {
@@ -8,6 +11,7 @@ describe("buildSpawnTarget", () => {
       command: "cmd.exe",
       args: ["/d", "/s", "/c", '"npx.cmd ^"--no-install^" ^"eslint^""'],
       windowsVerbatimArguments: true,
+      batchFile: "npx.cmd",
     });
   });
 
@@ -119,6 +123,20 @@ describe("safeSpawnAsync", () => {
       { cwd: process.cwd(), timeout: 500 },
     );
     assert.strictEqual(result.status, -1);
+  });
+
+  it("tags gated targets with their batch file for resolvability checks", () => {
+    assert.strictEqual(buildSpawnTarget("TOOL.BAT", [], "win32").batchFile, "TOOL.BAT");
+    assert.strictEqual(buildSpawnTarget("npx", [], "win32").batchFile, undefined);
+    assert.strictEqual(buildSpawnTarget("npx.cmd", ["a"], "darwin").batchFile, undefined);
+  });
+
+  it("isBatchFileResolvable finds shims by cwd and rejects missing names", () => {
+    assert.strictEqual(isBatchFileResolvable("definitely-missing-shim-xyz-123.cmd"), false);
+    const dir = mkdtempSync(join(tmpdir(), "shim-"));
+    writeFileSync(join(dir, "tool.cmd"), "@echo off\n");
+    assert.strictEqual(isBatchFileResolvable("tool.cmd", dir), true);
+    assert.strictEqual(isBatchFileResolvable("other.cmd", dir), false);
   });
 
   it("leaves .cmd alone off win32", () => {
