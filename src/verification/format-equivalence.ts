@@ -12,7 +12,7 @@ import { existsSync, readFileSync, writeFileSync, unlinkSync } from "fs";
 import { spawn } from "child_process";
 import { randomUUID } from "crypto";
 import { tmpdir } from "os";
-import { diffLines } from "diff";
+import { diffLines, type Change } from "diff";
 
 export interface FormatEquivalenceResult {
   equivalent: boolean; // true if formatted matches original (ignoring whitespace-only diffs)
@@ -22,43 +22,119 @@ export interface FormatEquivalenceResult {
   formatted?: string; // auto-formatted content for comparison
 }
 
-/**
- * Detect available formatter by checking for config files in cwd.
- * Returns the formatter command string or null if none found.
- */
-export function detectFormatter(cwd: string, filePath: string): string | null {
-  // Walk ancestor directories from the file directory up through cwd,
-  // so a config in cwd applies to nested files.
+const PRETTIER_CONFIGS = [
+  '.prettierrc',
+  '.prettierrc.json',
+  '.prettierrc.js',
+  '.prettierrc.yaml',
+  '.prettierrc.toml',
+  'prettier.config.js',
+  'prettier.config.mjs',
+  'prettier.config.cjs',
+];
+
+type FormatterKind = 'biome' | 'prettier';
+
+/** Private discovery result: kind + invocation inputs. Exported for regression tests. */
+export interface FormatterDiscovery {
+  kind: FormatterKind;
+  command: string;
+  /** Nearest Prettier config path (prettier kind only, null when default). */
+  configPath: string | null;
+}
+
+/** Shared ancestor walk: file dir up through cwd root, inclusive. */
+function ancestorDirs(cwd: string, filePath: string): string[] {
   const root = resolve(cwd);
   let dir = dirname(resolve(cwd, filePath));
-
-  const prettierConfigs = [
-    '.prettierrc',
-    '.prettierrc.json',
-    '.prettierrc.js',
-    '.prettierrc.yaml',
-    '.prettierrc.toml',
-    'prettier.config.js',
-    'prettier.config.mjs',
-    'prettier.config.cjs',
-  ];
-
+  const dirs: string[] = [];
   for (;;) {
-    if (existsSync(resolve(dir, 'biome.json'))) {
-      return 'bunx biome format';
-    }
-    for (const config of prettierConfigs) {
-      if (existsSync(resolve(dir, config))) {
-        return 'npx prettier --write';
-      }
-    }
+    dirs.push(dir);
     if (dir === root || !dir.startsWith(root)) break;
     const parent = dirname(dir);
     if (parent === dir) break;
     dir = parent;
   }
+  return dirs;
+}
 
+/** Nearest Prettier config over shared walk, or null. */
+function findNearestPrettierConfig(dirs: string[]): string | null {
+  for (const dir of dirs) {
+    for (const config of PRETTIER_CONFIGS) {
+      const candidate = resolve(dir, config);
+      if (existsSync(candidate)) return candidate;
+    }
+  }
   return null;
+}
+
+/** Private discovery seam: single walk, Biome-over-Prettier per directory. */
+function discoverFormatter(cwd: string, filePath: string): FormatterDiscovery | null {
+  const dirs = ancestorDirs(cwd, filePath);
+  for (const dir of dirs) {
+    if (existsSync(resolve(dir, 'biome.json'))) {
+      return { kind: 'biome', command: 'bunx biome format', configPath: null };
+    }
+    for (const config of PRETTIER_CONFIGS) {
+      if (existsSync(resolve(dir, config))) {
+        return {
+          kind: 'prettier',
+          command: 'npx prettier --write',
+          configPath: findNearestPrettierConfig([dir]),
+        };
+      }
+    }
+  }
+  return null;
+}
+
+/** Build formatter argv for a temp file (config forwarding for Prettier). Exported for regression tests. */
+export function buildFormatterArgs(discovery: FormatterDiscovery, tmpPath: string): string[] {
+  if (discovery.kind === 'biome') return ['bunx', 'biome', 'format', '--write', tmpPath];
+  return discovery.configPath
+    ? ['npx', 'prettier', '--write', '--config', discovery.configPath, tmpPath]
+    : ['npx', 'prettier', '--write', tmpPath];
+}
+
+/** Execute formatter binary against temp file. Fail-open payload on error. */
+async function executeFormatterOnTempFile(
+  discovery: FormatterDiscovery,
+  tmpPath: string,
+  cwd: string,
+): Promise<{ formatted?: string; error?: string }> {
+  const result = await runFormatterCommand(buildFormatterArgs(discovery, tmpPath), cwd);
+  if (result.error) return { error: result.error };
+  try {
+    return { formatted: readFileSync(tmpPath, 'utf-8') };
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    return { error };
+  }
+}
+
+/** Compare original vs formatted: indent score + equivalence + diff. */
+function compareFormatResults(
+  original: string,
+  formatted: string,
+): { equivalent: boolean; indentScore: number; diff?: string } {
+  const indentScore = computeIndentScore(original, formatted);
+  const diff = generateEquivalenceDiff(original, formatted);
+  const equivalent = diff.trim() === '' || !hasNonWhitespaceChanges(original, formatted);
+  return { equivalent, indentScore, diff: equivalent ? undefined : diff };
+}
+
+function tempFilePath(filePath: string): string {
+  const ext = filePath.slice(filePath.lastIndexOf('.')) || '.ts';
+  return resolve(tmpdir(), `.smart-edit-tmp-${randomUUID()}${ext}`);
+}
+
+/**
+ * Detect available formatter by checking for config files in cwd.
+ * Returns the formatter command string or null if none found.
+ */
+export function detectFormatter(cwd: string, filePath: string): string | null {
+  return discoverFormatter(cwd, filePath)?.command ?? null;
 }
 
 /**
@@ -68,34 +144,7 @@ export function detectFormatter(cwd: string, filePath: string): string | null {
  * walk in detectFormatter so the retained path matches the detection.
  */
 export function findPrettierConfigPath(cwd: string, filePath: string): string | null {
-  const root = resolve(cwd);
-  let dir = dirname(resolve(cwd, filePath));
-
-  const prettierConfigs = [
-    '.prettierrc',
-    '.prettierrc.json',
-    '.prettierrc.js',
-    '.prettierrc.yaml',
-    '.prettierrc.toml',
-    'prettier.config.js',
-    'prettier.config.mjs',
-    'prettier.config.cjs',
-  ];
-
-  for (;;) {
-    for (const config of prettierConfigs) {
-      const candidate = resolve(dir, config);
-      if (existsSync(candidate)) {
-        return candidate;
-      }
-    }
-    if (dir === root || !dir.startsWith(root)) break;
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-
-  return null;
+  return findNearestPrettierConfig(ancestorDirs(cwd, filePath));
 }
 
 /**
@@ -126,14 +175,9 @@ export function computeIndentScore(original: string, formatted: string): number 
   return differingIndentCount / maxLines;
 }
 
-/**
- * Generate a compact diff showing only changed regions.
- * Uses 3 lines of context around changes.
- */
-export function generateEquivalenceDiff(original: string, formatted: string): string {
-  const changes = diffLines(original, formatted);
+/** Collect +/- changed lines from diff parts, skipping blanks. */
+function collectChangedLines(changes: Change[]): string[] {
   const lines: string[] = [];
-
   for (const part of changes) {
     if (part.added) {
       for (const line of part.value.split('\n')) {
@@ -149,14 +193,27 @@ export function generateEquivalenceDiff(original: string, formatted: string): st
       }
     }
   }
+  return lines;
+}
 
-  // Limit output to first 50 changed lines to avoid bloat
+/** Cap changed lines at 50 with overflow marker. */
+function truncateChangedLines(lines: string[]): string[] {
   const output = lines.slice(0, 50);
   if (lines.length > 50) {
     output.push(`... [${lines.length - 50} more changes]`);
   }
+  return output;
+}
 
-  return output.join('\n');
+/**
+ * Generate a compact diff showing only changed regions.
+ * Uses 3 lines of context around changes.
+ */
+export function generateEquivalenceDiff(original: string, formatted: string): string {
+  const changes = diffLines(original, formatted);
+  const lines = collectChangedLines(changes);
+  // Limit output to first 50 changed lines to avoid bloat
+  return truncateChangedLines(lines).join('\n');
 }
 
 /**
@@ -168,58 +225,30 @@ export async function runFormatEquivalenceCheck(
   filePath: string,
   cwd: string,
 ): Promise<FormatEquivalenceResult> {
-  const formatter = detectFormatter(cwd, filePath);
+  const discovery = discoverFormatter(cwd, filePath);
 
-  if (!formatter) {
+  if (!discovery) {
     return { equivalent: true, indentScore: 0 };
   }
 
   // Create a temporary file for formatting (preserve extension for formatter detection)
-  const ext = filePath.slice(filePath.lastIndexOf('.')) || '.ts';
-  const tmpPath = resolve(tmpdir(), `.smart-edit-tmp-${randomUUID()}${ext}`);
+  const tmpPath = tempFilePath(filePath);
 
   try {
     // Write content to temp file
     writeFileSync(tmpPath, content, 'utf-8');
 
-    // Run formatter based on detected type
-    let formattedContent: string;
-
-    if (formatter === 'bunx biome format') {
-      const result = await runFormatterCommand(['bunx', 'biome', 'format', tmpPath], cwd);
-      if (result.error) {
-        return { equivalent: true, indentScore: 0, error: result.error };
-      }
-      // Read the formatted file
-      formattedContent = readFileSync(tmpPath, 'utf-8');
-    } else {
-      // Prettier — retain the detected config path via --config so project
-      // rules apply to tmpPath (tmp file lives outside the project, so a
-      // bare --write would fall back to defaults).
-      const configPath = findPrettierConfigPath(cwd, filePath);
-      const prettierArgs = configPath
-        ? ['npx', 'prettier', '--write', '--config', configPath, tmpPath]
-        : ['npx', 'prettier', '--write', tmpPath];
-      const result = await runFormatterCommand(prettierArgs, cwd);
-      if (result.error) {
-        return { equivalent: true, indentScore: 0, error: result.error };
-      }
-      // Read the formatted file
-      formattedContent = readFileSync(tmpPath, 'utf-8');
+    const outcome = await executeFormatterOnTempFile(discovery, tmpPath, cwd);
+    if (outcome.error || outcome.formatted === undefined) {
+      return { equivalent: true, indentScore: 0, error: outcome.error };
     }
 
-    // Compute indent score
-    const indentScore = computeIndentScore(content, formattedContent);
-
-    // Check if they're equivalent (only whitespace differences)
-    const diff = generateEquivalenceDiff(content, formattedContent);
-    const equivalent = diff.trim() === '' || !hasNonWhitespaceChanges(content, formattedContent);
-
+    const comparison = compareFormatResults(content, outcome.formatted);
     return {
-      equivalent,
-      indentScore,
-      diff: equivalent ? undefined : diff,
-      formatted: formattedContent,
+      equivalent: comparison.equivalent,
+      indentScore: comparison.indentScore,
+      diff: comparison.diff,
+      formatted: outcome.formatted,
     };
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err);

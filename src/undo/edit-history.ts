@@ -101,6 +101,10 @@ export interface DecodedUndoEntry extends Omit<UndoEntry, "originalContent"> {
 
 const sha256 = (value: string): string => createHash("sha256").update(value, "utf8").digest("hex");
 
+/** Byte-exact SHA-256 over raw file bytes. Matches save-side hashing in
+ *  src/mutation/edit-transaction.ts (sha over Buffer, no UTF-8 round-trip). */
+const shaBuffer = (value: Buffer): string => createHash("sha256").update(value).digest("hex");
+
 /** Persist successful transaction records. Save failures are advisory and never throw. */
 export async function saveTransactionUndoRecords(cwd: string, records: readonly TransactionUndoRecord[]): Promise<void> {
   try {
@@ -195,6 +199,120 @@ export async function saveUndoState(
  * @param options - Optional atomic write options (e.g. mode preservation)
  * @returns `true` if the file was restored, `false` if no undo entry exists
  */
+interface MatchedUndoEntry {
+  entry: UndoEntry;
+  filename: string;
+}
+
+interface CurrentFileState {
+  exists: boolean;
+  buffer?: Buffer;
+  content: string;
+  mode?: number;
+}
+
+async function listUndoFiles(undoDir: string): Promise<string[] | null> {
+  try {
+    return await fsReaddir(undoDir);
+  } catch {
+    // Directory doesn't exist — no undo data
+    return null;
+  }
+}
+
+async function loadMatchingUndoEntries(
+  undoDir: string,
+  files: readonly string[],
+  filePath: string,
+): Promise<MatchedUndoEntry[]> {
+  const matching: MatchedUndoEntry[] = [];
+  const resolvedFilePath = pathResolve(filePath);
+  for (const filename of files) {
+    if (!filename.endsWith(".json")) continue;
+    try {
+      const raw = await fsReadFile(join(undoDir, filename), "utf-8");
+      const entry = JSON.parse(raw) as UndoEntry;
+      if (pathResolve(entry.path) === resolvedFilePath) {
+        matching.push({ entry, filename });
+      }
+    } catch {
+      // Skip unparseable files
+    }
+  }
+  return matching;
+}
+
+function selectLatestUndoEntry(matching: MatchedUndoEntry[]): MatchedUndoEntry {
+  // Sort by timestamp descending — most recent first
+  matching.sort(
+    (a, b) =>
+      new Date(b.entry.timestamp).getTime() -
+      new Date(a.entry.timestamp).getTime(),
+  );
+  return matching[0]!;
+}
+
+async function readCurrentFileState(targetPath: string): Promise<CurrentFileState | null> {
+  let mode: number | undefined;
+  try {
+    mode = (await fsStat(targetPath)).mode & 0o7777;
+  } catch {
+    return { exists: false, content: "" };
+  }
+  try {
+    const buffer = await fsReadFile(targetPath);
+    return { exists: true, buffer, content: buffer.toString("utf-8"), mode };
+  } catch {
+    return null;
+  }
+}
+
+function validateSingleUndoGuard(entry: UndoEntry, current: CurrentFileState): boolean {
+  // Legacy entries intentionally retain old pre-edit hash behavior.
+  if (entry.version === 2) {
+    if ((entry.afterExists ?? true) !== current.exists) return false;
+    if (current.exists && current.buffer && createHash("sha256").update(current.buffer).digest("hex") !== entry.afterSha) return false;
+    if (current.exists && entry.afterMode !== undefined && current.mode !== undefined && current.mode !== entry.afterMode) return false;
+    return true;
+  }
+  return current.exists && fastHash(current.content) === entry.snapshotHash;
+}
+
+async function applySingleUndoOp(
+  entry: UndoEntry,
+  filePath: string,
+  targetPath: string,
+  storedOriginalContent: Buffer,
+  options?: AtomicWriteOptions,
+): Promise<boolean> {
+  const isVersioned = entry.version === 2;
+  const operation = entry.operation ?? "text";
+  if (isVersioned && operation === "add") {
+    await fsRm(targetPath);
+  } else if (isVersioned && operation === "rename") {
+    const oldPath = pathResolve(entry.oldPath ?? filePath);
+    if (await fsStat(oldPath).then(() => true).catch(() => false)) return false;
+    // Hard-link first so content survives the source removal below.
+    await fsLink(targetPath, oldPath);
+    await fsRm(targetPath);
+    if (entry.beforeMode !== undefined) await fsChmod(oldPath, entry.beforeMode);
+  } else if (isVersioned && operation === "delete") {
+    await atomicCreate(targetPath, storedOriginalContent, entry.beforeMode === undefined ? undefined : { mode: entry.beforeMode });
+  } else {
+    await atomicWrite(targetPath, storedOriginalContent, { ...options, mode: entry.beforeMode ?? options?.mode });
+    if (entry.beforeMode !== undefined) await fsChmod(targetPath, entry.beforeMode);
+  }
+  return true;
+}
+
+async function cleanupUndoFile(undoDir: string, filename: string): Promise<void> {
+  try {
+    await fsUnlink(join(undoDir, filename));
+  } catch {
+    // Cleanup failure is non-fatal
+  }
+}
+
 export async function restoreUndoState(
   cwd: string,
   filePath: string,
@@ -202,105 +320,44 @@ export async function restoreUndoState(
 ): Promise<boolean> {
   try {
     const undoDir = getUndoDir(cwd);
-
-    let files: string[];
-    try {
-      files = await fsReaddir(undoDir);
-    } catch {
-      // Directory doesn't exist — no undo data
-      return false;
-    }
-
-    // Find and parse entries matching this file path
-    const matching: Array<{ entry: UndoEntry; filename: string }> = [];
-    for (const filename of files) {
-      if (!filename.endsWith(".json")) continue;
-      try {
-        const raw = await fsReadFile(join(undoDir, filename), "utf-8");
-        const entry = JSON.parse(raw) as UndoEntry;
-      const resolvedEntryPath = pathResolve(entry.path);
-      const resolvedFilePath = pathResolve(filePath);
-      if (resolvedEntryPath === resolvedFilePath) {
-          matching.push({ entry, filename });
-        }
-      } catch {
-        // Skip unparseable files
-      }
-    }
-
+    const files = await listUndoFiles(undoDir);
+    if (files === null) return false;
+    const matching = await loadMatchingUndoEntries(undoDir, files, filePath);
     if (matching.length === 0) return false;
-
-    // Sort by timestamp descending — most recent first
-    matching.sort(
-      (a, b) =>
-        new Date(b.entry.timestamp).getTime() -
-        new Date(a.entry.timestamp).getTime(),
-    );
-
-    const { entry, filename } = matching[0];
+    const { entry, filename } = selectLatestUndoEntry(matching);
     if (entry.version === 2 && entry.transactionId) {
       return await restoreTransactionUndoState(cwd, entry.transactionId);
     }
-
     // Decode original content, retaining raw bytes: the file may not be
     // valid UTF-8, and a string round-trip would corrupt it. The same buffer
     // feeds the atomic restore below byte-exact.
     const storedOriginalContent = Buffer.from(entry.originalContent, "base64");
-
-    const isVersioned = entry.version === 2;
-    const operation = entry.operation ?? "text";
     const targetPath = pathResolve(entry.newPath ?? filePath);
-    const currentExists = await fsStat(targetPath).then(() => true).catch(() => false);
-    let currentFileContent = "";
-    let currentFileBuffer: Buffer | undefined;
-    if (currentExists) {
-      try {
-        currentFileBuffer = await fsReadFile(targetPath);
-        currentFileContent = currentFileBuffer.toString("utf-8");
-      } catch {
-        return false;
-      }
-    }
-    // Legacy entries intentionally retain old pre-edit hash behavior.
-    if (isVersioned) {
-      if ((entry.afterExists ?? true) !== currentExists) return false;
-      if (currentExists && currentFileBuffer && createHash("sha256").update(currentFileBuffer).digest("hex") !== entry.afterSha) return false;
-    } else if (!currentExists || fastHash(currentFileContent) !== entry.snapshotHash) {
-      return false;
-    }
-    if (isVersioned && operation === "add") {
-      await fsRm(targetPath);
-    } else if (isVersioned && operation === "rename") {
-      const oldPath = pathResolve(entry.oldPath ?? filePath);
-      if (await fsStat(oldPath).then(() => true).catch(() => false)) return false;
-      await fsLink(targetPath, oldPath);
-      await fsRm(targetPath);
-      if (entry.beforeMode !== undefined) await fsChmod(oldPath, entry.beforeMode);
-    } else if (isVersioned && operation === "delete") {
-      await atomicCreate(targetPath, storedOriginalContent, entry.beforeMode === undefined ? undefined : { mode: entry.beforeMode });
-    } else {
-      await atomicWrite(targetPath, storedOriginalContent, { ...options, mode: entry.beforeMode ?? options?.mode });
-      if (entry.beforeMode !== undefined) await fsChmod(targetPath, entry.beforeMode);
-    }
-
-    // Delete the undo file after successful restore
-    try {
-      await fsUnlink(join(undoDir, filename));
-    } catch {
-      // Cleanup failure is non-fatal
-    }
-
+    const current = await readCurrentFileState(targetPath);
+    if (current === null) return false;
+    if (!validateSingleUndoGuard(entry, current)) return false;
+    if (!await applySingleUndoOp(entry, filePath, targetPath, storedOriginalContent, options)) return false;
+    await cleanupUndoFile(undoDir, filename);
     return true;
   } catch {
     return false;
   }
 }
 
-/** Restore every record in transaction atomically from undo's perspective. */
-export async function restoreTransactionUndoState(cwd: string, transactionId: string): Promise<boolean> {
-  const undoDir = getUndoDir(cwd);
+interface TransactionRecordFile {
+  entry: TransactionUndoRecord;
+  filename: string;
+}
+
+interface RollbackFileState {
+  exists: boolean;
+  content?: Buffer;
+  mode?: number;
+}
+
+async function loadTransactionRecords(undoDir: string, transactionId: string): Promise<TransactionRecordFile[]> {
   const files: string[] = await fsReaddir(undoDir).catch(() => []);
-  const records: Array<{ entry: TransactionUndoRecord; filename: string }> = [];
+  const records: TransactionRecordFile[] = [];
   for (const filename of files) {
     if (!filename.endsWith(".json")) continue;
     try {
@@ -308,69 +365,121 @@ export async function restoreTransactionUndoState(cwd: string, transactionId: st
       if (entry.version === 2 && entry.transactionId === transactionId) records.push({ entry, filename });
     } catch { /* ignore corrupt entries */ }
   }
-  if (records.length === 0) return false;
+  return records;
+}
 
+function checkTransactionCompleteness(records: TransactionRecordFile[]): boolean {
   // Incomplete transaction guard: when a count was persisted, restore must
   // observe exactly that many records. Legacy count-less records skip the
   // check and remain restorable.
   const recordCounts = records.map(({ entry }) => entry.recordCount);
   const expectedCount = recordCounts.find((count): count is number => typeof count === "number");
-  if (expectedCount !== undefined) {
-    if (recordCounts.some((count) => count !== expectedCount) || records.length !== expectedCount) return false;
-  }
+  if (expectedCount === undefined) return true;
+  return !recordCounts.some((count) => count !== expectedCount) && records.length === expectedCount;
+}
 
-  const exists = async (path: string) => fsStat(path).then(() => true).catch(() => false);
-  const content = async (path: string) => fsReadFile(path, "utf8");
-  const target = (entry: TransactionUndoRecord) => pathResolve(entry.operation === "rename" ? (entry.newPath ?? entry.path) : entry.path);
+function transactionTarget(entry: TransactionUndoRecord): string {
+  return pathResolve(entry.operation === "rename" ? (entry.newPath ?? entry.path) : entry.path);
+}
+
+function collectTransactionPaths(records: TransactionRecordFile[]): Set<string> {
   const paths = new Set<string>();
   for (const { entry } of records) {
-    paths.add(target(entry));
+    paths.add(transactionTarget(entry));
     if (entry.operation === "rename") paths.add(pathResolve(entry.oldPath ?? entry.path));
   }
-  for (const { entry } of records) {
-    const targetPath = target(entry);
-    const present = await exists(targetPath);
-    if ((entry.afterExists ?? true) !== present) return false;
-    if (present && sha256(await content(targetPath)) !== entry.afterSha) return false;
-    if (entry.operation === "rename" && await exists(pathResolve(entry.oldPath ?? entry.path))) return false;
-  }
+  return paths;
+}
 
-  const beforeUndo = new Map<string, { exists: boolean; content?: string; mode?: number }>();
+async function preflightTransactionRecords(records: TransactionRecordFile[]): Promise<boolean> {
+  for (const { entry } of records) {
+    const targetPath = transactionTarget(entry);
+    let st: { mode: number } | undefined;
+    try {
+      st = await fsStat(targetPath);
+    } catch { st = undefined; }
+    const present = st !== undefined;
+    if ((entry.afterExists ?? true) !== present) return false;
+    // Raw bytes: a UTF-8 string round-trip would corrupt non-UTF8 files and
+    // mismatch the byte hashes stored save-side.
+    if (present && shaBuffer(await fsReadFile(targetPath)) !== entry.afterSha) return false;
+    if (present && entry.afterMode !== undefined && (st!.mode & 0o7777) !== entry.afterMode) return false;
+    if (entry.operation === "rename" && await fsStat(pathResolve(entry.oldPath ?? entry.path)).then(() => true).catch(() => false)) return false;
+  }
+  return true;
+}
+
+async function captureRollbackSnapshot(paths: Set<string>): Promise<Map<string, RollbackFileState>> {
+  const beforeUndo = new Map<string, RollbackFileState>();
   for (const path of paths) {
     try {
       const st = await fsStat(path);
-      beforeUndo.set(path, { exists: true, content: await content(path), mode: st.mode & 0o7777 });
+      beforeUndo.set(path, { exists: true, content: await fsReadFile(path), mode: st.mode & 0o7777 });
     } catch { beforeUndo.set(path, { exists: false }); }
   }
-  const restoreSnapshot = async (path: string, state: { exists: boolean; content?: string; mode?: number }) => {
-    if (state.exists) {
-      await atomicWrite(path, state.content ?? "", { mode: state.mode });
-      if (state.mode !== undefined) await fsChmod(path, state.mode);
-    } else if (await exists(path)) await fsRm(path);
-  };
-  try {
-    for (const { entry } of records) {
-      const targetPath = target(entry);
-      if (entry.operation === "add") await fsRm(targetPath);
-      else if (entry.operation === "rename") {
-        const oldPath = pathResolve(entry.oldPath ?? entry.path);
-        await fsLink(targetPath, oldPath);
-        await fsRm(targetPath);
-        if (entry.beforeMode !== undefined) await fsChmod(oldPath, entry.beforeMode);
-      } else if (entry.operation === "delete") {
-        await atomicCreate(targetPath, Buffer.from(entry.originalContent, "base64"), entry.beforeMode === undefined ? undefined : { mode: entry.beforeMode });
-      } else {
-        await atomicWrite(targetPath, Buffer.from(entry.originalContent, "base64"), { mode: entry.beforeMode });
-        if (entry.beforeMode !== undefined) await fsChmod(targetPath, entry.beforeMode);
-      }
-    }
-  } catch {
-    try { for (const [path, state] of beforeUndo) await restoreSnapshot(path, state); } catch { /* best effort */ }
-    return false;
+  return beforeUndo;
+}
+
+async function restoreRollbackSnapshot(path: string, state: RollbackFileState): Promise<void> {
+  if (state.exists) {
+    await atomicWrite(path, state.content ?? Buffer.alloc(0), { mode: state.mode });
+    if (state.mode !== undefined) await fsChmod(path, state.mode);
+  } else if (await fsStat(path).then(() => true).catch(() => false)) {
+    await fsRm(path);
   }
+}
+
+async function rollbackToSnapshot(beforeUndo: Map<string, RollbackFileState>): Promise<void> {
+  try {
+    for (const [path, state] of beforeUndo) await restoreRollbackSnapshot(path, state);
+  } catch { /* best effort */ }
+}
+
+async function applyOneTransactionOp(entry: TransactionUndoRecord, targetPath: string): Promise<void> {
+  if (entry.operation === "add") {
+    await fsRm(targetPath);
+  } else if (entry.operation === "rename") {
+    const oldPath = pathResolve(entry.oldPath ?? entry.path);
+    // Hard-link first so content survives the source removal below.
+    await fsLink(targetPath, oldPath);
+    await fsRm(targetPath);
+    if (entry.beforeMode !== undefined) await fsChmod(oldPath, entry.beforeMode);
+  } else if (entry.operation === "delete") {
+    await atomicCreate(targetPath, Buffer.from(entry.originalContent, "base64"), entry.beforeMode === undefined ? undefined : { mode: entry.beforeMode });
+  } else {
+    await atomicWrite(targetPath, Buffer.from(entry.originalContent, "base64"), { mode: entry.beforeMode });
+    if (entry.beforeMode !== undefined) await fsChmod(targetPath, entry.beforeMode);
+  }
+}
+
+async function applyTransactionOps(records: TransactionRecordFile[]): Promise<void> {
+  for (const { entry } of records) {
+    await applyOneTransactionOp(entry, transactionTarget(entry));
+  }
+}
+
+async function cleanupTransactionFiles(undoDir: string, records: TransactionRecordFile[]): Promise<void> {
   for (const { filename } of records) {
     try { await fsUnlink(join(undoDir, filename)); } catch { /* advisory cleanup */ }
   }
+}
+
+/** Restore every record in transaction atomically from undo's perspective. */
+export async function restoreTransactionUndoState(cwd: string, transactionId: string): Promise<boolean> {
+  const undoDir = getUndoDir(cwd);
+  const records = await loadTransactionRecords(undoDir, transactionId);
+  if (records.length === 0) return false;
+  if (!checkTransactionCompleteness(records)) return false;
+  if (!await preflightTransactionRecords(records)) return false;
+  const paths = collectTransactionPaths(records);
+  const beforeUndo = await captureRollbackSnapshot(paths);
+  try {
+    await applyTransactionOps(records);
+  } catch {
+    await rollbackToSnapshot(beforeUndo);
+    return false;
+  }
+  await cleanupTransactionFiles(undoDir, records);
   return true;
 }
 

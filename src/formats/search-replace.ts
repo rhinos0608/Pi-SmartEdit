@@ -34,100 +34,116 @@ export interface SearchReplaceBlock {
  * @throws If a block is truncated (missing REPLACE marker) or SEARCH section is empty
  */
 export function parseSearchReplace(input: string, knownPaths?: string[]): SearchReplaceBlock[] {
-  // Normalize CRLF to LF and strip BOM
-  const normalized = input.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/^\uFEFF/, '');
+  const normalized = normalizeSearchReplaceInput(input);
 
   const result: SearchReplaceBlock[] = [];
   let searchPos = 0;
-  
+
   while (searchPos < normalized.length) {
-    // Find next SEARCH marker
     const searchIdx = normalized.indexOf('<<<<<<< SEARCH', searchPos);
     if (searchIdx === -1) break;
-    
-    // Extract potential filename (anything between previous content and SEARCH)
-    const beforeSearch = normalized.slice(searchPos, searchIdx).trimEnd();
-    const beforeLines = beforeSearch.split('\n');
-    const lastBeforeLine = beforeLines.length > 0 ? beforeLines[beforeLines.length - 1].trim() : '';
-    
-    // Find separator — search for ======= that is on its own line (not inside SEARCH content)
-    // The ======= must be preceded by newline to distinguish from ===== in SEARCH content
+
     const afterSearchStart = searchIdx + '<<<<<<< SEARCH'.length;
-    let sepIdx = -1;
-    
-    // Find the next ======= that follows a newline (separator on its own line)
-    let candidateIdx = normalized.indexOf('\n=======', afterSearchStart);
-    while (candidateIdx !== -1) {
-      // Check if it's followed by newline (proper separator line)
-      const afterSepIdx = candidateIdx + '\n======='.length;
-      const nextChar = afterSepIdx < normalized.length ? normalized[afterSepIdx] : '';
-      
-      const trailing = normalized.slice(afterSepIdx).match(/^[^\n]*/)?.[0] ?? '';
-      if (nextChar === '\n' || nextChar === '\r' || /^[ \t\r]*$/.test(trailing)) {
-        sepIdx = candidateIdx + 1; // Skip the leading newline
-        break;
-      }
-      
-      // Not a proper separator — look for the next one
-      candidateIdx = normalized.indexOf('\n=======', candidateIdx + 1);
-      
-      // Keep scanning; separator must be a standalone marker line.
-    }
-    
-    // Fallback: check if the first ======= in the block is on its own line
-    if (sepIdx === -1) {
-      const firstSepCandidate = normalized.indexOf('=======', afterSearchStart);
-      if (firstSepCandidate !== -1) {
-        // Check if it's preceded by newline (start of line)
-        const beforeFirst = firstSepCandidate > 0 ? normalized[firstSepCandidate - 1] : '\n';
-        const afterFirstIdx = firstSepCandidate + '======='.length;
-        const afterFirst = afterFirstIdx < normalized.length ? normalized[afterFirstIdx] : '';
-        const trailing = normalized.slice(afterFirstIdx).match(/^[^\n]*/)?.[0] ?? '';
-        if ((beforeFirst === '\n' || beforeFirst === '\r') && (afterFirst === '\n' || afterFirst === '\r' || /^[ \t\r]*$/.test(trailing))) {
-          sepIdx = firstSepCandidate;
-        }
-      }
-    }
-    
-    if (sepIdx === -1) {
-      throw new ParseError(`Unclosed SEARCH block at position ${searchIdx}: missing ======= separator`, 'SEARCH_REPLACE_PARSE', searchIdx);
-    }
-    
-    // Find REPLACE marker
-    const replaceIdx = normalized.indexOf('>>>>>>> REPLACE', sepIdx + '======='.length);
-    if (replaceIdx === -1) {
-      throw new ParseError(`Unclosed SEARCH block at position ${searchIdx}: missing >>>>>>> REPLACE marker`, 'SEARCH_REPLACE_PARSE', searchIdx);
-    }
-    
-    // Extract old and new text
-    const oldTextRaw = normalized.slice(afterSearchStart, sepIdx);
-    const newTextRaw = normalized.slice(sepIdx + '======='.length, replaceIdx);
-    
-    const oldText = normalizeContent(oldTextRaw);
-    const newText = normalizeContent(newTextRaw);
-    
-    // Check for empty oldText
-    if (oldText.trim().length === 0) {
-      throw new ParseError(`SEARCH block at position ${searchIdx} has no oldText`, 'SEARCH_REPLACE_PARSE', searchIdx);
-    }
-    
-    // Determine path from line before SEARCH marker
-    let path: string | undefined;
-    if (lastBeforeLine.length > 0 && 
-        !lastBeforeLine.includes('<<<<<<') && 
-        !lastBeforeLine.includes('>>>>>>') &&
-        !lastBeforeLine.includes('=======')) {
-      const stripped = stripFilename(lastBeforeLine);
-      if (stripped && (stripped.includes('.') || stripped.includes('/'))) {
-        path = knownPaths ? matchKnownPath(stripped, knownPaths) : stripped;
-      }
-    }
-    
-    result.push({ path, oldText, newText });
-    searchPos = replaceIdx + '>>>>>>> REPLACE'.length;
+    const hint = extractFilenameHint(normalized, searchPos, searchIdx);
+    const sepIdx = findStandaloneSeparator(normalized, afterSearchStart, searchIdx);
+    const block = extractOneBlock(normalized, searchIdx, sepIdx, afterSearchStart);
+    const path = hint === undefined ? undefined : resolveKnownPath(hint, knownPaths);
+
+    result.push({ path, oldText: block.oldText, newText: block.newText });
+    searchPos = block.endPos;
   }
 
   return result;
+}
+
+/** Normalize CRLF/CR to LF and strip leading BOM. */
+function normalizeSearchReplaceInput(input: string): string {
+  return input.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/^\uFEFF/, '');
+}
+
+/**
+ * Find the standalone ======= separator line following a SEARCH marker.
+ * Only a separator on its own line splits top-level blocks; nested markers
+ * inside SEARCH content are skipped. Throws on missing separator.
+ */
+function findStandaloneSeparator(normalized: string, afterSearchStart: number, searchIdx: number): number {
+  let candidateIdx = normalized.indexOf('\n=======', afterSearchStart);
+  while (candidateIdx !== -1) {
+    const afterSepIdx = candidateIdx + '\n======='.length;
+    const nextChar = afterSepIdx < normalized.length ? normalized[afterSepIdx] : '';
+
+    const trailing = normalized.slice(afterSepIdx).match(/^[^\n]*/)?.[0] ?? '';
+    if (nextChar === '\n' || nextChar === '\r' || /^[ \t\r]*$/.test(trailing)) {
+      return candidateIdx + 1; // Skip the leading newline
+    }
+
+    // Not a proper separator — look for the next one
+    candidateIdx = normalized.indexOf('\n=======', candidateIdx + 1);
+
+    // Keep scanning; separator must be a standalone marker line.
+  }
+
+  // Fallback: check if the first ======= in the block is on its own line
+  const firstSepCandidate = normalized.indexOf('=======', afterSearchStart);
+  if (firstSepCandidate !== -1) {
+    const beforeFirst = firstSepCandidate > 0 ? normalized[firstSepCandidate - 1] : '\n';
+    const afterFirstIdx = firstSepCandidate + '======='.length;
+    const afterFirst = afterFirstIdx < normalized.length ? normalized[afterFirstIdx] : '';
+    const trailing = normalized.slice(afterFirstIdx).match(/^[^\n]*/)?.[0] ?? '';
+    if ((beforeFirst === '\n' || beforeFirst === '\r') && (afterFirst === '\n' || afterFirst === '\r' || /^[ \t\r]*$/.test(trailing))) {
+      return firstSepCandidate;
+    }
+  }
+
+  throw new ParseError(`Unclosed SEARCH block at position ${searchIdx}: missing ======= separator`, 'SEARCH_REPLACE_PARSE', searchIdx);
+}
+
+/** Extract one block's old/new text and end position. Throws on missing REPLACE or empty SEARCH. */
+function extractOneBlock(normalized: string, searchIdx: number, sepIdx: number, afterSearchStart: number): { oldText: string; newText: string; endPos: number } {
+  const replaceIdx = normalized.indexOf('>>>>>>> REPLACE', sepIdx + '======='.length);
+  if (replaceIdx === -1) {
+    throw new ParseError(`Unclosed SEARCH block at position ${searchIdx}: missing >>>>>>> REPLACE marker`, 'SEARCH_REPLACE_PARSE', searchIdx);
+  }
+
+  const oldTextRaw = normalized.slice(afterSearchStart, sepIdx);
+  const newTextRaw = normalized.slice(sepIdx + '======='.length, replaceIdx);
+
+  const oldText = normalizeContent(oldTextRaw);
+  const newText = normalizeContent(newTextRaw);
+
+  if (oldText.trim().length === 0) {
+    throw new ParseError(`SEARCH block at position ${searchIdx} has no oldText`, 'SEARCH_REPLACE_PARSE', searchIdx);
+  }
+
+  return { oldText, newText, endPos: replaceIdx + '>>>>>>> REPLACE'.length };
+}
+
+/**
+ * Extract the filename hint from the line before a SEARCH marker.
+ * Returns undefined when no plausible filename is present.
+ */
+function extractFilenameHint(normalized: string, searchPos: number, searchIdx: number): string | undefined {
+  const beforeSearch = normalized.slice(searchPos, searchIdx).trimEnd();
+  const beforeLines = beforeSearch.split('\n');
+  const lastBeforeLine = beforeLines.length > 0 ? beforeLines[beforeLines.length - 1].trim() : '';
+
+  if (lastBeforeLine.length === 0 ||
+      lastBeforeLine.includes('<<<<<<') ||
+      lastBeforeLine.includes('>>>>>>') ||
+      lastBeforeLine.includes('=======')) {
+    return undefined;
+  }
+  const stripped = stripFilename(lastBeforeLine);
+  if (!stripped || (!stripped.includes('.') && !stripped.includes('/'))) {
+    return undefined;
+  }
+  return stripped;
+}
+
+/** Resolve a filename hint against known paths (or return it unchanged). */
+function resolveKnownPath(stripped: string, knownPaths?: string[]): string {
+  if (!knownPaths) return stripped;
+  return matchKnownPath(stripped, knownPaths);
 }
 
 /**
@@ -162,17 +178,30 @@ function stripFilename(line: string): string {
 function matchKnownPath(candidate: string, knownPaths: string[]): string {
   if (knownPaths.length === 0) return candidate;
 
-  // 1. Exact match
+  // 1. Exact match.
   if (knownPaths.includes(candidate)) return candidate;
 
-  // 2. Basename match
+  // 2. Basename match.
   const candidateBase = candidate.split('/').pop() ?? candidate;
   for (const kp of knownPaths) {
     const kpBase = kp.split('/').pop() ?? kp;
     if (kpBase === candidateBase) return kp;
   }
 
-  // 3. Fuzzy: find path with lowest normalized edit distance (cutoff 0.8)
+  // 3. Fuzzy: path with lowest normalized edit distance (cutoff 0.8).
+  const fuzzy = matchFuzzyPath(candidate, knownPaths);
+  if (fuzzy !== undefined) return fuzzy;
+
+  // 4. Any known path ending with the candidate (partial path).
+  for (const kp of knownPaths) {
+    if (kp.endsWith('/' + candidate)) return kp;
+  }
+
+  return candidate;
+}
+
+/** 3. Fuzzy: path with lowest normalized edit distance (cutoff 0.8). */
+function matchFuzzyPath(candidate: string, knownPaths: string[]): string | undefined {
   let bestPath = candidate;
   let bestScore = 0;
   for (const kp of knownPaths) {
@@ -180,13 +209,7 @@ function matchKnownPath(candidate: string, knownPaths: string[]): string {
     if (score > bestScore) { bestScore = score; bestPath = kp; }
   }
   if (bestScore >= 0.8) return bestPath;
-
-  // 4. Any known path that ends with the candidate (partial path)
-  for (const kp of knownPaths) {
-    if (kp.endsWith('/' + candidate)) return kp;
-  }
-
-  return candidate;
+  return undefined;
 }
 
 /** Normalized Levenshtein similarity (0–1) for filename matching */

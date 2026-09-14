@@ -18,6 +18,7 @@ import {
   generateEquivalenceDiff,
   runFormatEquivalenceCheck,
 } from "../src/verification/auto-validate";
+import { findPrettierConfigPath, buildFormatterArgs } from "../src/verification/format-equivalence";
 import type { FakeLogicResult } from "../src/verification/fake-logic";
 import type { Diagnostic } from "../src/lsp/diagnostic-dispatcher";
 
@@ -614,6 +615,22 @@ describe("format-equivalence", () => {
     }
   });
 
+  test("findPrettierConfigPath returns null when no config present", () => {
+    mkdirSync(tmpDir, { recursive: true });
+    assert.strictEqual(findPrettierConfigPath(tmpDir, "plain.ts"), null);
+  });
+
+  test("findPrettierConfigPath finds cwd config for a nested file", () => {
+    mkdirSync(resolve(tmpDir, "nested"), { recursive: true });
+    const cfg = resolve(tmpDir, ".prettierrc.json");
+    writeFileSync(cfg, "{}");
+    try {
+      assert.strictEqual(findPrettierConfigPath(tmpDir, "nested/plain.ts"), cfg);
+    } finally {
+      unlinkSync(cfg);
+    }
+  });
+
   test("runFormatEquivalenceCheck is fail-open without formatter", async () => {
     mkdirSync(tmpDir, { recursive: true });
     const result = await runFormatEquivalenceCheck(
@@ -623,5 +640,46 @@ describe("format-equivalence", () => {
     );
     assert.strictEqual(result.equivalent, true);
     assert.strictEqual(result.indentScore, 0);
+  });
+
+  test("regression: biome argv includes --write so the temp file is formatted", () => {
+    // Without --write Biome prints to stdout and the temp file never changes,
+    // so executeFormatterOnTempFile would always compare unformatted content.
+    const argv = buildFormatterArgs(
+      { kind: "biome", command: "bunx biome format", configPath: null },
+      "/tmp/file.ts",
+    );
+    assert.deepStrictEqual(argv, ["bunx", "biome", "format", "--write", "/tmp/file.ts"]);
+  });
+
+  test("prettier argv keeps --write and --config forwarding", () => {
+    assert.deepStrictEqual(
+      buildFormatterArgs(
+        { kind: "prettier", command: "npx prettier --write", configPath: "/cfg/.prettierrc.json" },
+        "/tmp/file.ts",
+      ),
+      ["npx", "prettier", "--write", "--config", "/cfg/.prettierrc.json", "/tmp/file.ts"],
+    );
+    assert.deepStrictEqual(
+      buildFormatterArgs(
+        { kind: "prettier", command: "npx prettier --write", configPath: null },
+        "/tmp/file.ts",
+      ),
+      ["npx", "prettier", "--write", "/tmp/file.ts"],
+    );
+  });
+
+  test("biome takes priority over prettier when both configs present", () => {
+    mkdirSync(tmpDir, { recursive: true });
+    const biomeCfg = resolve(tmpDir, "biome.json");
+    const prettierCfg = resolve(tmpDir, ".prettierrc.json");
+    writeFileSync(biomeCfg, "{}");
+    writeFileSync(prettierCfg, "{}");
+    try {
+      assert.strictEqual(detectFormatter(tmpDir, "plain.ts"), "bunx biome format");
+    } finally {
+      unlinkSync(biomeCfg);
+      unlinkSync(prettierCfg);
+    }
   });
 });

@@ -15,6 +15,7 @@ import {
   rmdir as fsRmdir,
   stat as fsStat,
   rm as fsRm,
+  chmod as fsChmod,
 } from "fs/promises";
 import { resolve, join, dirname } from "path";
 import { randomBytes, createHash } from "crypto";
@@ -434,5 +435,70 @@ describe("edit-history", () => {
     await fsWriteFile(join(undoDir, "legacy.json"), JSON.stringify(entry), "utf8");
     assert.equal(await restoreTransactionUndoState(cwd, id), true);
     assert.equal(await fsReadFile(a, "utf8"), "A", "legacy count-less records should still restore");
+  });
+
+  it("transaction preflight/restore round-trips non-UTF8 bytes byte-exact", async () => {
+    const { cwd, undoDir } = freshCwd();
+    // Invalid UTF-8: a string round-trip (fsReadFile utf8 + string hash) corrupts
+    // these bytes and mismatches the byte hashes stored save-side.
+    const before = Buffer.from([0xff, 0xfe, 0x00, 0x41, 0x80, 0xc3, 0x28]);
+    const after = Buffer.from([0xfe, 0xff, 0x01, 0x42, 0x81]);
+    const target = resolve(cwd, "binary.bin");
+    await fsMkdir(dirname(target), { recursive: true });
+    await fsWriteFile(target, after);
+    const hash = (b: Buffer) => createHash("sha256").update(b).digest("hex");
+    const mode = (await fsStat(target)).mode & 0o7777;
+    const id = "tx-binary";
+    await saveTransactionUndoRecords(cwd, [{
+      path: target,
+      originalContent: before.toString("base64"),
+      timestamp: new Date().toISOString(),
+      editCount: 1,
+      snapshotHash: hash(before).slice(0, 16),
+      changedSymbols: [],
+      version: 2 as const,
+      beforeSha: hash(before),
+      afterSha: hash(after),
+      beforeMode: mode,
+      afterMode: mode,
+      existed: true,
+      afterExists: true,
+      operation: "text" as const,
+      transactionId: id,
+    }]);
+    assert.equal(await restoreTransactionUndoState(cwd, id), true);
+    assert.deepEqual(await fsReadFile(target), before, "restored bytes must match pre-edit bytes exactly");
+    assert.equal(await undoFileCount(undoDir), 0);
+  });
+
+  it("transaction preflight rejects chmod drift (afterMode mismatch)", async () => {
+    // Mode bits are POSIX-only; Windows honors just the read-only bit.
+    if (process.platform === "win32") return;
+    const { cwd, undoDir } = freshCwd();
+    const target = await writeTestFile(cwd, "modedrift.txt", "after");
+    await fsChmod(target, 0o644);
+    const hash = (s: string) => createHash("sha256").update(s).digest("hex");
+    const id = "tx-modedrift";
+    await saveTransactionUndoRecords(cwd, [{
+      path: target,
+      originalContent: Buffer.from("before").toString("base64"),
+      timestamp: new Date().toISOString(),
+      editCount: 1,
+      snapshotHash: hash("before").slice(0, 16),
+      changedSymbols: [],
+      version: 2 as const,
+      beforeSha: hash("before"),
+      afterSha: hash("after"),
+      beforeMode: 0o644,
+      afterMode: 0o644,
+      existed: true,
+      afterExists: true,
+      operation: "text" as const,
+      transactionId: id,
+    }]);
+    await fsChmod(target, 0o600);
+    assert.equal(await restoreTransactionUndoState(cwd, id), false, "chmod drift must fail preflight");
+    assert.equal(await fsReadFile(target, "utf8"), "after", "drifted file must be left untouched");
+    assert.equal(await undoFileCount(undoDir), 1, "records must survive a rejected preflight");
   });
 });
