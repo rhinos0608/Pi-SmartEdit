@@ -887,7 +887,7 @@ export function generateDiffString(
     const raw = splitDiffPartLines(part.value);
 
     if (part.added || part.removed) {
-      appendChangedLines(raw, part.added === true, state);
+      appendChangedLines(raw, part.added, state);
     } else {
       const hasTrailingChange =
         i < parts.length - 1 &&

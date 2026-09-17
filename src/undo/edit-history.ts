@@ -249,7 +249,10 @@ function selectLatestUndoEntry(matching: MatchedUndoEntry[]): MatchedUndoEntry {
       new Date(b.entry.timestamp).getTime() -
       new Date(a.entry.timestamp).getTime(),
   );
-  return matching[0]!;
+  // Caller guarantees matching is non-empty (guard in findMatchingUndoEntry)
+  const first = matching[0];
+  if (!first) throw new Error("selectLatestUndoEntry: empty matching array");
+  return first;
 }
 
 async function readCurrentFileState(targetPath: string): Promise<CurrentFileState | null> {
@@ -403,7 +406,7 @@ async function preflightTransactionRecords(records: TransactionRecordFile[]): Pr
     // Raw bytes: a UTF-8 string round-trip would corrupt non-UTF8 files and
     // mismatch the byte hashes stored save-side.
     if (present && shaBuffer(await fsReadFile(targetPath)) !== entry.afterSha) return false;
-    if (present && entry.afterMode !== undefined && (st!.mode & 0o7777) !== entry.afterMode) return false;
+    if (present && entry.afterMode !== undefined && st !== undefined && (st.mode & 0o7777) !== entry.afterMode) return false;
     if (entry.operation === "rename" && await fsStat(pathResolve(entry.oldPath ?? entry.path)).then(() => true).catch(() => false)) return false;
   }
   return true;

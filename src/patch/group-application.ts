@@ -37,7 +37,9 @@ import {
     type EvidenceRef,
     type InspectedResource,
     type LineRange,
+    type PostEditEvidence,
     type ResourceInvalidation,
+    type WorkspaceEvidenceEnvelope,
 } from "@rhinos0608/pi-workspace-protocol";
 import { generateDiffString } from "../core/edit-diff.js";
 import { checkEditSafety } from "../safety/approval-gating.js";
@@ -76,7 +78,7 @@ export interface GroupApplicationState {
     readonly diagnostics: string[];
     readonly usedEvidence: string[];
     readonly invalidations: ResourceInvalidation[];
-    readonly postEditEvidenceByPath: Map<string, import("@rhinos0608/pi-workspace-protocol").PostEditEvidence>;
+    readonly postEditEvidenceByPath: Map<string, PostEditEvidence>;
     readonly repairsByPath: Map<string, RepairLoopResult>;
     readonly finalizedFiles: FinalSuccessFile[];
     readonly appliedFiles: string[];
@@ -91,7 +93,7 @@ export interface GroupApplicationContext {
     readonly toolCallId: string;
     readonly evidenceRefForDetails: EvidenceRef;
     readonly canonicalRoot: string;
-    readonly envelope: import("@rhinos0608/pi-workspace-protocol").WorkspaceEvidenceEnvelope | null;
+    readonly envelope: WorkspaceEvidenceEnvelope | null;
     readonly priorStore: PriorAuthorityStore | null;
     readonly newFileCanonicals: ReadonlySet<string>;
     readonly transaction: EditTransaction;
