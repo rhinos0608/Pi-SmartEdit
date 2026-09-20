@@ -16,7 +16,8 @@ import {
     sha256OfString,
 } from "@rhinos0608/pi-workspace-protocol";
 import { mintRetryEvidenceFromSelection } from "../src/extension/retry-evidence.js";
-import { acquirePatchEnvelope, buildAutoInspectEnvelope, resolvePatchTransfers } from "../src/patch/request-prep.js";
+import { acquirePatchEnvelope, buildAutoInspectEnvelope } from "../src/patch/request-prep.js";
+import { resolveTransferBatch } from "../src/transfer/resolve-batch.js";
 import { freshChecks } from "../src/patch/result-builders.js";
 
 test("retry envelope inspectionId differs per range and matches provider recompute", async () => {
@@ -83,8 +84,8 @@ test("resolve_evidence path rejects malformed envelope payload", async () => {
         sessionFilePath: "/sessions/proto.jsonl",
         canonicalRoot: workdir,
         requestEvidenceRef: { inspectionId: "a".repeat(64), resourceIds: ["r1"] },
-        transferNewFileCanonicals: new Set(),
         toolCallId: "tc-malformed",
+        tool: "edit",
         checks: freshChecks(),
         diagnostics: [],
         usedEvidence: [],
@@ -160,8 +161,8 @@ test("mismatched-id envelope rejects (resolver-spoof guard)", async () => {
         sessionFilePath: "/sessions/proto-spoof.jsonl",
         canonicalRoot: workdir,
         requestEvidenceRef: { inspectionId: requestedId, resourceIds: ["r1"] },
-        transferNewFileCanonicals: new Set(),
         toolCallId: "tc-spoof",
+        tool: "edit",
         checks: freshChecks(),
         diagnostics: [],
         usedEvidence: [],
@@ -176,21 +177,18 @@ test("transfer ENOENT dest resolves parent realpath under symlinked parent", () 
     symlinkSync(realDir, linkDir);
     const srcFile = join(realDir, "src.ts");
     writeFileSync(srcFile, "hello\n", "utf8");
-    const groups: Parameters<typeof resolvePatchTransfers>[0]["groups"] = [];
-    const res = resolvePatchTransfers({
-        adaptedTransfers: {
-            ok: true as const,
-            value: [
-                {
-                    op: "copy",
-                    from: srcFile,
-                    to: join(linkDir, "new.ts"),
-                    range: { pos: "1aa", end: "1ab" },
-                    after: undefined,
-                    description: undefined,
-                },
-            ],
-        },
+    const groups: Parameters<typeof resolveTransferBatch>[0]["groups"] = [];
+    const res = resolveTransferBatch({
+        transfers: [
+            {
+                op: "copy",
+                from: srcFile,
+                to: join(linkDir, "new.ts"),
+                range: { pos: "1aa", end: "1ab" },
+                after: undefined,
+                description: undefined,
+            },
+        ],
         groups,
         ctx: { cwd: "/" },
         toolCallId: "tc-xfer",
@@ -201,5 +199,5 @@ test("transfer ENOENT dest resolves parent realpath under symlinked parent", () 
     if (!res.ok) return;
     const expected = join(realpathSync(realDir), basename(join(linkDir, "new.ts")));
     assert.equal(res.resolvedTransfers[0]?.canonicalTo, expected);
-    assert.ok(res.transferNewFileCanonicals.has(expected));
+    assert.equal(res.resolvedTransfers[0]?.toIsNewFile, true);
 });

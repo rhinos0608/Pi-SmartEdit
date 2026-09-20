@@ -15,7 +15,7 @@ import {
     resourceIdFor,
     type WorkspaceEvidenceEnvelope,
     type InspectedResource,
-    type PatchDetails,
+    type MutationDetails,
 } from "@rhinos0608/pi-workspace-protocol";
 
 import {
@@ -24,6 +24,7 @@ import {
     type PatchToolDeps,
     type VerificationCheck,
 } from "../src/patch.js";
+import { createTransferTool } from "../src/transfer/tool.js";
 import { createPriorAuthorityStore } from "../src/context/evidence-authority.js";
 import { computeLineHashSync, initHashline } from "../src/hashline/hashline.js";
 import { getUndoHistory } from "../src/undo/edit-history.js";
@@ -602,7 +603,7 @@ test("end-to-end: successful multi-file patch returns renderable diffs for every
         makeCtx(workdir),
     );
 
-    const details = res.details as PatchDetails & {
+    const details = res.details as MutationDetails & {
         diff?: string;
         diffs?: Array<{ path: string; diff: string }>;
     };
@@ -1718,6 +1719,16 @@ test("Bug 4b regression: a hung post-write verifier times out and is treated as 
 
 /** Execute an edit request via auto-inspect (no evidenceRef); full-file authority
  *  is synthesized live from each touched file's current on-disk content. */
+/** A transfer-shaped edit entry (copy/move op) — routed to the first-class
+ *  transfer tool. Stage 4 hard-cut: `edit` no longer accepts these. */
+function isTransferShapedEdit(edit: unknown): boolean {
+    return !!edit && typeof edit === "object" && "op" in (edit as Record<string, unknown>);
+}
+
+function toTransferParams(body: { path?: string; edits: unknown[] }): { transfers: unknown[] } {
+    return { transfers: body.edits };
+}
+
 async function execAutoInspect(
     workdir: string,
     body: { path?: string; edits: unknown[] },
@@ -1749,6 +1760,11 @@ async function execAutoInspect(
         getPriorAuthority: () => store,
         ...(checks ? { getVerificationChecks: () => checks } : {}),
     };
+    const useTransfer = body.edits.length > 0 && body.edits.every(isTransferShapedEdit);
+    if (useTransfer) {
+        const tool = createTransferTool(deps);
+        return tool.execute("tc1", toTransferParams(body) as Record<string, unknown>, undefined, undefined, makeCtx(workdir));
+    }
     const tool = createPatchTool(deps);
     return tool.execute("tc1", { ...body, toolCallId: "tc1" }, undefined, undefined, makeCtx(workdir));
 }
@@ -1777,6 +1793,14 @@ async function execWithEnvelope(
         getSessionFilePath: () => sessionFilePath,
         getCanonicalWorkspaceRoot: () => workdir,
     };
+    const useTransfer = body.edits.length > 0 && body.edits.every(isTransferShapedEdit);
+    if (useTransfer) {
+        const tool = createTransferTool(deps);
+        return tool.execute("tc1", {
+            ...toTransferParams(body),
+            evidenceRef: { inspectionId: envelope.inspectionId, resourceIds: envelope.resources.map((r) => r.resourceId) },
+        } as Record<string, unknown>, undefined, undefined, makeCtx(workdir));
+    }
     const tool = createPatchTool(deps);
     return tool.execute(
         "tc1",
@@ -1867,6 +1891,8 @@ test("transfer: cross-file copy leaves the source file unchanged and adds the te
     });
     const d = res.details as any;
     assert.equal(d.status.kind, "applied", `expected applied, got ${JSON.stringify(d.status)}`);
+    const detailResourceIds = (d as { evidenceRef?: { resourceIds?: string[] } }).evidenceRef?.resourceIds ?? [];
+    assert.ok(detailResourceIds.includes(envelope.resources[0]!.resourceId), "successful copy details must retain source evidence");
     assert.equal(readFileSync(srcFile, "utf8"), srcContent, "copy source must be unchanged");
     assert.equal(readFileSync(dstFile, "utf8"), "uno\ndos\ntwo\n");
 });
@@ -1895,6 +1921,40 @@ test("transfer: cross-file move removes the range from the source and adds it to
     assert.equal(d.status.kind, "applied", `expected applied, got ${JSON.stringify(d.status)}`);
     assert.equal(readFileSync(srcFile, "utf8"), "one\nthree\n");
     assert.equal(readFileSync(dstFile, "utf8"), "uno\ndos\ntwo\n");
+});
+
+test("transfer: missing strong source authority rejects copy and move without writes", async () => {
+    for (const op of ["copy", "move"] as const) {
+        const workdir = realpathSync(mkdtempSync(join(tmpdir(), `patch-xfer-missing-source-${op}-`)));
+        const srcContent = "one\ntwo\nthree\n";
+        const dstContent = "uno\ndos\n";
+        const srcFile = join(workdir, "a.ts");
+        const dstFile = join(workdir, "b.ts");
+        writeFileSync(srcFile, srcContent, "utf8");
+        writeFileSync(dstFile, dstContent, "utf8");
+        const srcLines = srcContent.split("\n");
+        const dstLines = dstContent.split("\n");
+        const sessionFilePath = "/sessions/transfer-missing-source.jsonl";
+        const envelope = makeEnvelope({
+            sessionFilePath,
+            canonicalRoot: workdir,
+            // Destination is strongly authorized; source is intentionally absent.
+            resources: [makeResource({ canonicalPath: realpathSync(dstFile), full: true, content: dstContent })],
+        });
+
+        const res = await execWithEnvelope(workdir, envelope, {
+            path: "a.ts",
+            edits: [{
+                op, from: "a.ts",
+                range: { pos: anchorFor(2, srcLines[1]!), end: anchorFor(2, srcLines[1]!) },
+                to: "b.ts", after: anchorFor(2, dstLines[1]!),
+            }],
+        });
+        const d = res.details as any;
+        assert.equal(d.status.kind, "rejected", `expected rejected for ${op}, got ${JSON.stringify(d.status)}`);
+        assert.equal(readFileSync(srcFile, "utf8"), srcContent, "source must be unchanged");
+        assert.equal(readFileSync(dstFile, "utf8"), dstContent, "destination must be unchanged");
+    }
 });
 
 test("transfer: rejects when the copy source is stale (on-disk content diverged from the attested resource)", async () => {
@@ -1979,6 +2039,40 @@ test("transfer: rejects when the destination file is stale (on-disk content dive
     assert.equal(d.status.kind, "rejected");
     assert.equal(d.status.reason, "stale");
     assert.equal(readFileSync(srcFile, "utf8"), srcContent, "source must be unmodified");
+});
+
+test("transfer: missing strong authority for populated destination rejects copy and move without writes", async () => {
+    for (const op of ["copy", "move"] as const) {
+        const workdir = realpathSync(mkdtempSync(join(tmpdir(), `patch-xfer-missing-destination-${op}-`)));
+        const srcContent = "one\ntwo\nthree\n";
+        const dstContent = "uno\ndos\n";
+        const srcFile = join(workdir, "a.ts");
+        const dstFile = join(workdir, "b.ts");
+        writeFileSync(srcFile, srcContent, "utf8");
+        writeFileSync(dstFile, dstContent, "utf8");
+        const srcLines = srcContent.split("\n");
+        const dstLines = dstContent.split("\n");
+        const sessionFilePath = "/sessions/transfer-missing-destination.jsonl";
+        const envelope = makeEnvelope({
+            sessionFilePath,
+            canonicalRoot: workdir,
+            // Source is strongly authorized; populated destination is intentionally absent.
+            resources: [makeResource({ canonicalPath: realpathSync(srcFile), full: true, content: srcContent })],
+        });
+
+        const res = await execWithEnvelope(workdir, envelope, {
+            path: "a.ts",
+            edits: [{
+                op, from: "a.ts",
+                range: { pos: anchorFor(2, srcLines[1]!), end: anchorFor(2, srcLines[1]!) },
+                to: "b.ts", after: anchorFor(2, dstLines[1]!),
+            }],
+        });
+        const d = res.details as any;
+        assert.equal(d.status.kind, "rejected", `expected rejected for ${op}, got ${JSON.stringify(d.status)}`);
+        assert.equal(readFileSync(srcFile, "utf8"), srcContent, "source must be unchanged");
+        assert.equal(readFileSync(dstFile, "utf8"), dstContent, "destination must be unchanged");
+    }
 });
 
 test("transfer: rejects a copy whose resolved source range is outside a line-range resource's coverage", async () => {
@@ -2066,17 +2160,15 @@ test("transfer: rejects a copy whose source is a prior line-range authority miss
         getCanonicalWorkspaceRoot: () => workdir,
         getPriorAuthority: () => store,
     };
-    const tool = createPatchTool(deps);
+    const tool = createTransferTool(deps);
     const res = await tool.execute(
         "tc-prior-copy",
         {
-            path: "a.ts",
-            edits: [{
+            transfers: [{
                 op: "copy", from: "a.ts",
                 range: { pos: anchorFor(2, srcLines[1]!), end: anchorFor(2, srcLines[1]!) },
                 to: "b.ts", after: anchorFor(2, dstLines[1]!),
             }],
-            toolCallId: "tc-prior-copy",
         },
         undefined,
         undefined,
@@ -2149,6 +2241,37 @@ test("transfer: rejects an ambiguous source anchor (duplicate hash within the re
     assert.equal(readFileSync(file, "utf8"), content, "file must be unchanged");
 });
 
+test("transfer: overlapping move source spans reject before any writes", async () => {
+    const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-xfer-overlap-")));
+    const content = "alpha\nbeta\ngamma\ndelta\n";
+    const file = join(workdir, "a.ts");
+    const firstDestination = join(workdir, "b.ts");
+    const secondDestination = join(workdir, "c.ts");
+    writeFileSync(file, content, "utf8");
+    const lines = content.split("\n");
+
+    const res = await execAutoInspect(workdir, {
+        path: "a.ts",
+        edits: [
+            {
+                op: "move", from: "a.ts",
+                range: { pos: anchorFor(1, lines[0]!), end: anchorFor(2, lines[1]!) },
+                to: "b.ts",
+            },
+            {
+                op: "move", from: "a.ts",
+                range: { pos: anchorFor(2, lines[1]!), end: anchorFor(3, lines[2]!) },
+                to: "c.ts",
+            },
+        ],
+    });
+    const d = res.details as any;
+    assert.equal(d.status.kind, "rejected", `expected rejected, got ${JSON.stringify(d.status)}`);
+    assert.equal(readFileSync(file, "utf8"), content, "source must be unchanged");
+    assert.equal(existsSync(firstDestination), false, "first destination must not be created");
+    assert.equal(existsSync(secondDestination), false, "second destination must not be created");
+});
+
 test("transfer: rejects a same-file move whose `after` anchor lands inside the source range being deleted", async () => {
     const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-xfer-")));
     mkdirSync(workdir, { recursive: true });
@@ -2174,6 +2297,29 @@ test("transfer: rejects a same-file move whose `after` anchor lands inside the s
         `diagnostics should reflect the transfer-specific same-file conflict (got: ${JSON.stringify(d.diagnostics)})`,
     );
     assert.equal(readFileSync(file, "utf8"), content, "file must be unchanged");
+});
+
+test("transfer: same-file move rejects destination touching either source boundary", async () => {
+    for (const boundary of ["start", "end"] as const) {
+        const workdir = realpathSync(mkdtempSync(join(tmpdir(), `patch-xfer-boundary-${boundary}-`)));
+        const content = "alpha\nbeta\ngamma\ndelta\n";
+        const file = join(workdir, "a.ts");
+        writeFileSync(file, content, "utf8");
+        const lines = content.split("\n");
+        const afterLine = boundary === "start" ? 1 : 3;
+
+        const res = await execAutoInspect(workdir, {
+            path: "a.ts",
+            edits: [{
+                op: "move", from: "a.ts",
+                range: { pos: anchorFor(2, lines[1]!), end: anchorFor(3, lines[2]!) },
+                to: "a.ts", after: anchorFor(afterLine, lines[afterLine - 1]!),
+            }],
+        });
+        const d = res.details as any;
+        assert.equal(d.status.kind, "rejected", `expected ${boundary}-boundary rejection, got ${JSON.stringify(d.status)}`);
+        assert.equal(readFileSync(file, "utf8"), content, "file must be unchanged");
+    }
 });
 
 test("transfer: rejects a same-file move whose destination already contains the moved text (duplicate-dest)", async () => {
@@ -2205,34 +2351,37 @@ test("transfer: rejects a same-file move whose destination already contains the 
     assert.equal(readFileSync(file, "utf8"), content, "file must be unchanged");
 });
 
-test("transfer: rejects a copy whose destination `after` anchor lands inside a separate text edit's replaced span in the same batch", async () => {
+test("transfer: rejects a copy whose destination anchor was invalidated by a prior edit (stale anchor)", async () => {
     const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-xfer-")));
     mkdirSync(workdir, { recursive: true });
     const content = "alpha\nbeta\ngamma\ndelta\n";
     const file = join(workdir, "a.ts");
     writeFileSync(file, content, "utf8");
     const lines = content.split("\n");
+    // Mixed edit+transfer batches are separate transactions now: the text
+    // edit applies first, invalidating the transfer's destination anchor.
+    const edited = await execAutoInspect(workdir, {
+        path: "a.ts",
+        edits: [{ oldText: "beta\ngamma", newText: "BETA\nGAMMA" }],
+    });
+    assert.equal((edited.details as any).status.kind, "applied");
+    const staleAfter = anchorFor(2, lines[1]!);
 
     const res = await execAutoInspect(workdir, {
         path: "a.ts",
-        edits: [
-            // Independent text edit replacing lines 2-3 ("beta", "gamma").
-            { oldText: "beta\ngamma", newText: "BETA\nGAMMA" },
-            // Copy whose destination `after` anchor lands inside that replaced span.
-            {
-                op: "copy", from: "a.ts",
-                range: { pos: anchorFor(4, lines[3]!), end: anchorFor(4, lines[3]!) },
-                to: "a.ts", after: anchorFor(2, lines[1]!),
-            },
-        ],
+        edits: [{
+            op: "copy", from: "a.ts",
+            range: { pos: anchorFor(4, lines[3]!), end: anchorFor(4, lines[3]!) },
+            to: "a.ts", after: staleAfter,
+        }],
     });
     const d = res.details as any;
     assert.equal(d.status.kind, "failed", `expected failed, got ${JSON.stringify(d.status)}`);
     assert.ok(
-        String(d.diagnostics ?? "").match(/ambiguous/i),
-        `diagnostics should reflect the ambiguous-insert-boundary check (got: ${JSON.stringify(d.diagnostics)})`,
+        String(d.diagnostics ?? "").match(/since the last read|corrected anchors|not found|failed/i),
+        `diagnostics should reflect the stale destination anchor (got: ${JSON.stringify(d.diagnostics)})`,
     );
-    assert.equal(readFileSync(file, "utf8"), content, "file must be unchanged");
+    assert.equal(readFileSync(file, "utf8"), "alpha\nBETA\nGAMMA\ndelta\n", "only the prior text edit must have applied");
 });
 
 test("transfer: cross-file move rolls back BOTH files when a blocking verifier fails for the source path", async () => {
@@ -2330,7 +2479,7 @@ test("transfer: cross-file move from a CRLF source into an LF destination adopts
     assert.ok(!dstFinal.includes("\r"), "transferred text must not carry the source's CR byte into an LF destination");
 });
 
-test("transfer: a transfer op and a normal oldText/newText edit to a third file apply together in one call", async () => {
+test("transfer: a transfer op mixed with a text edit in one edit call is rejected (separate transactions)", async () => {
     const workdir = realpathSync(mkdtempSync(join(tmpdir(), "patch-xfer-")));
     mkdirSync(workdir, { recursive: true });
     const srcContent = "one\ntwo\nthree\n";
@@ -2357,10 +2506,11 @@ test("transfer: a transfer op and a normal oldText/newText edit to a third file 
         ],
     });
     const d = res.details as any;
-    assert.equal(d.status.kind, "applied", `expected applied, got ${JSON.stringify(d.status)}`);
-    assert.equal(readFileSync(srcFile, "utf8"), "one\nthree\n");
-    assert.equal(readFileSync(dstFile, "utf8"), "uno\ndos\ntwo\n");
-    assert.equal(readFileSync(thirdFile, "utf8"), "foo\nBAR\n");
+    assert.equal(d.status.kind, "rejected", `expected rejected, got ${JSON.stringify(d.status)}`);
+    assert.match(res.content[0]!.text, /transfer tool/);
+    assert.equal(readFileSync(srcFile, "utf8"), srcContent, "source must be unchanged");
+    assert.equal(readFileSync(dstFile, "utf8"), dstContent, "destination must be unchanged");
+    assert.equal(readFileSync(thirdFile, "utf8"), thirdContent, "third file must be unchanged");
 });
 
 test("transfer: cross-file copy into a brand-new destination file creates it with exactly the transferred content", async () => {
@@ -2389,14 +2539,12 @@ test("transfer: cross-file copy into a brand-new destination file creates it wit
         getCanonicalWorkspaceRoot: () => workdir,
         getPriorAuthority: () => store,
     };
-    const res = await createPatchTool(deps).execute("tc1", {
-        path: "a.ts",
-        edits: [{
+    const res = await createTransferTool(deps).execute("tc1", {
+        transfers: [{
             op: "copy", from: "a.ts",
             range: { pos: anchorFor(2, srcLines[1]!), end: anchorFor(2, srcLines[1]!) },
             to: "new.ts",
         }],
-        toolCallId: "tc1",
     }, undefined, undefined, makeCtx(workdir));
     const d = res.details as any;
     assert.equal(d.status.kind, "applied", `expected applied, got ${JSON.stringify(d.status)}`);
@@ -2487,14 +2635,12 @@ test("transfer: a supplied `after` anchor is rejected when `to` is a brand-new f
         getCanonicalWorkspaceRoot: () => workdir,
         getPriorAuthority: () => store,
     };
-    const res = await createPatchTool(deps).execute("tc1", {
-        path: "a.ts",
-        edits: [{
+    const res = await createTransferTool(deps).execute("tc1", {
+        transfers: [{
             op: "copy", from: "a.ts",
             range: { pos: anchorFor(2, srcLines[1]!), end: anchorFor(2, srcLines[1]!) },
             to: "new.ts", after: anchorFor(2, srcLines[1]!),
         }],
-        toolCallId: "tc1",
     }, undefined, undefined, makeCtx(workdir));
     const d = res.details as any;
     assert.equal(d.status.kind, "rejected", `expected rejected, got ${JSON.stringify(d.status)}`);
