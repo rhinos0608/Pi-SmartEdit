@@ -181,9 +181,9 @@ Pi loads the extension automatically when it starts.
 
 ## Usage
 
-Use the same interface as the built-in `edit` tool.
+Smart Edit provides two tools. `edit` transforms or generates content; `transfer` moves, copies, or reuses text/code that already exists in an observed source. When existing content should be preserved and relocated/reused — especially during refactors or when implementing from a reference — prefer `transfer`: it preserves source content directly instead of regenerating it.
 
-By default, Smart Edit stays on the `oldText`/`newText` fuzzy-matching path and keeps the current AST/LSP helpers in play. To try the hashline path, set `SMART_EDIT_USE_HASHLINE_EDITING=1` before starting Pi.
+By default, Smart Edit stays on the `oldText`/`newText` fuzzy-matching path and keeps the current AST/LSP helpers in play. Hashline is opt-in; see Configuration.
 
 ### Atomic patch (multi-file)
 
@@ -294,7 +294,7 @@ The `target` and `lineRange` helpers still work on the default text path.
 }
 ```
 
-Only use this after enabling `SMART_EDIT_USE_HASHLINE_EDITING=1`.
+Hashline is opt-in; see Configuration.
 
 ### Replace all matches
 
@@ -311,16 +311,15 @@ Only use this after enabling `SMART_EDIT_USE_HASHLINE_EDITING=1`.
 }
 ```
 
-### Transfer edit (copy/move)
+### Transfer (copy/move)
 
-Relocate existing observed text by reference instead of reproducing it in `newText`. `copy` leaves the source intact; `move` deletes it after transfer. `from`/`range` are pre-edit anchors from the last read of `from`; `to`/`after` is the pre-edit destination anchor to insert immediately after.
+Move, copy, or reuse text/code already available in an observed source. `copy` leaves the source intact; `move` deletes it after transfer. `from`/`range` are pre-edit source anchors from the last read of `from`; `to`/`after` is the pre-edit destination anchor to insert immediately after. All transfers in one call resolve against the same pre-transaction state and commit atomically.
 
 Same-file copy:
 
 ```json
 {
-  "path": "src/foo.ts",
-  "edits": [
+  "transfers": [
     {
       "op": "copy",
       "from": "src/foo.ts",
@@ -336,7 +335,7 @@ Cross-file move:
 
 ```json
 {
-  "edits": [
+  "transfers": [
     {
       "op": "move",
       "from": "src/parser.ts",
@@ -352,7 +351,7 @@ New-file destination: omit `after` when `to` does not exist yet — the transfer
 
 ```json
 {
-  "edits": [
+  "transfers": [
     {
       "op": "copy",
       "from": "src/parser.ts",
@@ -363,11 +362,16 @@ New-file destination: omit `after` when `to` does not exist yet — the transfer
 }
 ```
 
-Transfer text comes from retained observed content, never model regeneration; the source range and destination must have prior read authority. An edit in the same call cannot target text a transfer just created — use a follow-up edit to modify transferred content. Stale or ambiguous anchors fail closed with a corrective re-read message.
+`after: "start"` prepends to the destination file; omit `after` only for a new-file destination. A supplied `after` on a new-file destination is rejected, as are non-public sentinels (`end`, `EOF`, `BOF`, `before`) and `:after`/`:before` suffix tricks — supply a destination anchor or `start`.
 
-`after: "start"` prepends to the destination file; omit `after` only for a new-file destination (content is appended to the created file). A supplied `after` on a new-file destination is rejected, as are non-public sentinels (`end`, `EOF`, `BOF`, `before`) and `:after`/`:before` suffix tricks — supply a destination anchor or `start`.
+#### Transfer authority (runtime semantics)
 
-Transfer rejections (pre-write): same-file `move` whose destination lands inside or touching the source span; any transfer whose source lines already follow the destination anchor (the insert layer would otherwise silently drop it — pick a different anchor); overlapping `move` source spans in one call — each transfer-specific `conflict`. `copy`/`move` combined with `replaceAll` is a `session` shape rejection (mutually exclusive fields).
+- Source (`copy` and `move`): strong read authority covering the resolved source span plus a valid full-file SHA for freshness — enforced even though `copy` leaves the source untouched.
+- Existing destination: prior strong read authority plus freshness validation required.
+- New destination (exception): no prior read needed — no preimage exists to observe. Still participates safely in the same atomic transaction.
+- Missing authority, freshness, or coverage fails at runtime with a corrective re-read message. No setup needed; read, then retry.
+
+Transfer rejections (pre-write `conflict`): same-file `move` landing inside or touching the source span; source lines already following the destination anchor (the insert layer would otherwise silently drop them — pick a different anchor); duplicate destination content; overlapping `move` source spans in one call. Transferred content cannot be edited in the same call — use a follow-up `edit` to modify it. Stale or ambiguous anchors fail closed with a re-read message.
 
 ## Architecture
 
