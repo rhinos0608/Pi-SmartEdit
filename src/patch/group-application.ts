@@ -44,6 +44,7 @@ import {
 import { generateDiffString } from "../core/edit-diff.js";
 import { checkEditSafety } from "../safety/approval-gating.js";
 import type { PriorAuthorityStore } from "../context/evidence-authority.js";
+import type { MutationToolIdentity } from "../mutation/types.js";
 import type { EditTransaction } from "../mutation/edit-transaction.js";
 import type { RepairLoopResult } from "../verification/repair-loop.js";
 import { safeReadUtf8 } from "./request-prep.js";
@@ -91,11 +92,13 @@ export interface GroupApplicationContext {
     readonly deps: PatchToolDeps;
     readonly ctx: { cwd: string; hasUI?: boolean; ui?: unknown; [k: string]: unknown };
     readonly toolCallId: string;
+    readonly tool: MutationToolIdentity;
     readonly evidenceRefForDetails: EvidenceRef;
     readonly canonicalRoot: string;
     readonly envelope: WorkspaceEvidenceEnvelope | null;
     readonly priorStore: PriorAuthorityStore | null;
-    readonly newFileCanonicals: ReadonlySet<string>;
+    /** Canonical paths planned as `create-new` (owned by resource intents). */
+    readonly createdPaths: ReadonlySet<string>;
     readonly transaction: EditTransaction;
     readonly canonicalTxPath: (absolutePath: string) => string;
     readonly stream: (text: string) => void;
@@ -125,6 +128,7 @@ interface PrewriteVerifierArgs {
     readonly canonicalTarget: string;
     readonly newContent: string;
     readonly toolCallId: string;
+    readonly tool: MutationToolIdentity;
     readonly evidenceRefForDetails: EvidenceRef;
     readonly resource: InspectedResource;
     readonly state: GroupApplicationState;
@@ -134,7 +138,7 @@ interface PrewriteVerifierArgs {
  *  non-postwrite filter; each verifier run with timeout stored in BOTH
  *  timedOut and blocking-when-blocking; cumulative checks.blocking gate. */
 export async function runPrewriteVerifiers(args: PrewriteVerifierArgs): Promise<PatchResult | null> {
-    const { verifiers, group, canonicalTarget, newContent, toolCallId, evidenceRefForDetails, resource, state } = args;
+    const { verifiers, group, canonicalTarget, newContent, toolCallId, tool, evidenceRefForDetails, resource, state } = args;
     const { checks, diagnostics, usedEvidence, invalidations } = state;
     // Run allowlisted checks (per file). Postwrite-phase checks run
     // only after the write (below); running them here would observe
@@ -171,7 +175,7 @@ export async function runPrewriteVerifiers(args: PrewriteVerifierArgs): Promise<
             details: makeRejected(toolCallId, "approval", diagnostics, {
                 inspectionId: evidenceRefForDetails.inspectionId,
                 resourceIds: [resource.resourceId],
-            }, checks, usedEvidence, invalidations),
+            }, checks, usedEvidence, invalidations, tool),
         };
     }
     return null;
@@ -183,6 +187,7 @@ interface FreshnessRecheckArgs {
     readonly currentSha: string;
     readonly isNewFileGroup: boolean;
     readonly toolCallId: string;
+    readonly tool: MutationToolIdentity;
     readonly evidenceRefForDetails: EvidenceRef;
     readonly resource: InspectedResource;
     readonly state: GroupApplicationState;
@@ -192,7 +197,7 @@ interface FreshnessRecheckArgs {
  *  guard) against the resource's attested fullFileSha256; no-op for new
  *  files. */
 export async function recheckPrewriteFreshness(args: FreshnessRecheckArgs): Promise<PatchResult | null> {
-    const { group, canonicalTarget, currentSha, isNewFileGroup, toolCallId, evidenceRefForDetails, resource, state } = args;
+    const { group, canonicalTarget, currentSha, isNewFileGroup, toolCallId, tool, evidenceRefForDetails, resource, state } = args;
     const { checks, diagnostics, usedEvidence, invalidations } = state;
     // Fix #6: re-read and re-hash immediately before writing so a
     // concurrent writer between the initial SHA check and the actual
@@ -210,7 +215,7 @@ export async function recheckPrewriteFreshness(args: FreshnessRecheckArgs): Prom
                 details: makeRejected(toolCallId, "stale", diagnostics, {
                     inspectionId: evidenceRefForDetails.inspectionId,
                     resourceIds: [resource.resourceId],
-                }, checks, usedEvidence, invalidations),
+                }, checks, usedEvidence, invalidations, tool),
             };
         }
         if (sha256OfString(preWriteContent) !== currentSha) {
@@ -220,7 +225,7 @@ export async function recheckPrewriteFreshness(args: FreshnessRecheckArgs): Prom
                 details: makeRejected(toolCallId, "stale", diagnostics, {
                     inspectionId: evidenceRefForDetails.inspectionId,
                     resourceIds: [resource.resourceId],
-                }, checks, usedEvidence, invalidations),
+                }, checks, usedEvidence, invalidations, tool),
             };
         }
     }
@@ -260,6 +265,7 @@ interface PersistContentArgs {
     readonly newContent: string;
     readonly isNewFileGroup: boolean;
     readonly toolCallId: string;
+    readonly tool: MutationToolIdentity;
     readonly evidenceRefForDetails: EvidenceRef;
     readonly resource: InspectedResource;
     readonly transaction: EditTransaction;
@@ -277,7 +283,7 @@ export type PersistContentResult =
  *  committed=true — distinct from every other failure path, which leaves the
  *  transaction open for the outer finally. */
 export async function persistContentGroup(args: PersistContentArgs): Promise<PersistContentResult> {
-    const { group, canonicalTarget, currentContent, newContent, isNewFileGroup, toolCallId, evidenceRefForDetails, resource, transaction, state } = args;
+    const { group, canonicalTarget, currentContent, newContent, isNewFileGroup, toolCallId, tool, evidenceRefForDetails, resource, transaction, state } = args;
     const { checks, diagnostics, usedEvidence, invalidations } = state;
     // Atomic write. Skipped when content is unchanged (a
     // topology-only rename with no text edits) — there is nothing
@@ -301,7 +307,7 @@ export async function persistContentGroup(args: PersistContentArgs): Promise<Per
                 details: makeFailed(toolCallId, "write", `write failed: ${group.rawPath}`, {
                     inspectionId: evidenceRefForDetails.inspectionId,
                     resourceIds: [resource.resourceId],
-                }, checks, diagnostics, usedEvidence, invalidations, rollbackInfo),
+                }, checks, diagnostics, usedEvidence, invalidations, rollbackInfo, tool),
             },
             rollbackInfo,
         };
@@ -345,6 +351,7 @@ interface VerifyPersistedArgs {
     readonly canonicalTarget: string;
     readonly newContent: string;
     readonly toolCallId: string;
+    readonly tool: MutationToolIdentity;
     readonly evidenceRefForDetails: EvidenceRef;
     readonly resource: InspectedResource;
     readonly verifiers: ReadonlyArray<VerificationCheck>;
@@ -358,7 +365,7 @@ export type VerifyPersistedResult =
 /** Postwrite verification: stat, read, in-memory-vs-on-disk SHA equality
  *  check, postwrite verifier loop with blocking-postwrite-failure mapping. */
 export async function verifyPersistedGroup(args: VerifyPersistedArgs): Promise<VerifyPersistedResult> {
-    const { group, canonicalTarget, newContent, toolCallId, evidenceRefForDetails, resource, verifiers, state } = args;
+    const { group, canonicalTarget, newContent, toolCallId, tool, evidenceRefForDetails, resource, verifiers, state } = args;
     const { checks, diagnostics, usedEvidence, invalidations } = state;
     // Post-write verify.
     let postContent: string;
@@ -375,7 +382,7 @@ export async function verifyPersistedGroup(args: VerifyPersistedArgs): Promise<V
                 details: makeFailed(toolCallId, "verify", `post-write read failed: ${group.rawPath}`, {
                     inspectionId: evidenceRefForDetails.inspectionId,
                     resourceIds: [resource.resourceId],
-                }, checks, diagnostics, usedEvidence, invalidations),
+                }, checks, diagnostics, usedEvidence, invalidations, undefined, tool),
             },
         };
     }
@@ -390,7 +397,7 @@ export async function verifyPersistedGroup(args: VerifyPersistedArgs): Promise<V
                 details: makeFailed(toolCallId, "verify", `post-write hash mismatch: ${group.rawPath}`, {
                     inspectionId: evidenceRefForDetails.inspectionId,
                     resourceIds: [resource.resourceId],
-                }, checks, diagnostics, usedEvidence, invalidations),
+                }, checks, diagnostics, usedEvidence, invalidations, undefined, tool),
             },
         };
     }
@@ -415,7 +422,7 @@ export async function verifyPersistedGroup(args: VerifyPersistedArgs): Promise<V
                     details: makeFailed(toolCallId, "verify", `blocking post-write check failed: ${group.rawPath}`, {
                         inspectionId: evidenceRefForDetails.inspectionId,
                         resourceIds: [resource.resourceId],
-                    }, checks, diagnostics, usedEvidence, invalidations),
+                    }, checks, diagnostics, usedEvidence, invalidations, undefined, tool),
                 },
             };
         }
@@ -434,6 +441,7 @@ interface FinalizeGroupArgs {
     readonly postSha: string;
     readonly postimageLineRanges: ReadonlyArray<LineRange>;
     readonly toolCallId: string;
+    readonly tool: MutationToolIdentity;
     readonly evidenceRefForDetails: EvidenceRef;
     readonly resource: InspectedResource;
     readonly cwd: string;
@@ -452,7 +460,7 @@ export type FinalizeGroupResult =
  *  file input construction, diff, applied path/canonical/summary
  *  bookkeeping, success progress event. */
 export async function finalizeGroupSuccess(args: FinalizeGroupArgs): Promise<FinalizeGroupResult> {
-    const { group, canonicalTarget: incomingCanonical, displayPath: incomingDisplay, hasTextEdits, currentContent, postContent, postSha, postimageLineRanges, toolCallId, evidenceRefForDetails, resource, cwd, transaction, canonicalTxPath, state, stream } = args;
+    const { group, canonicalTarget: incomingCanonical, displayPath: incomingDisplay, hasTextEdits, currentContent, postContent, postSha, postimageLineRanges, toolCallId, tool, evidenceRefForDetails, resource, cwd, transaction, canonicalTxPath, state, stream } = args;
     const { diagnostics, usedEvidence, invalidations, postEditEvidenceByPath, finalizedFiles, appliedFiles, appliedCanonical, appliedSummaries, displayDiffs } = state;
     const { checks } = state;
     let canonicalTarget = incomingCanonical;
@@ -472,7 +480,7 @@ export async function finalizeGroupSuccess(args: FinalizeGroupArgs): Promise<Fin
                     details: makeFailed(toolCallId, "write", `rename failed: ${group.rawPath}`, {
                         inspectionId: evidenceRefForDetails.inspectionId,
                         resourceIds: [resource.resourceId],
-                    }, checks, diagnostics, usedEvidence, invalidations),
+                    }, checks, diagnostics, usedEvidence, invalidations, undefined, tool),
                 },
             };
         }
@@ -536,7 +544,7 @@ export async function finalizeGroupSuccess(args: FinalizeGroupArgs): Promise<Fin
  *  return early here — the delete lane is owned by group-planning.js. */
 export async function executeEditGroup(args: ExecuteEditGroupArgs): Promise<ExecuteEditGroupResult> {
     const { context, state, group, outcome } = args;
-    const { deps, ctx, toolCallId, evidenceRefForDetails, canonicalRoot, envelope, priorStore, newFileCanonicals, transaction, canonicalTxPath, stream } = context;
+    const { deps, ctx, toolCallId, tool, evidenceRefForDetails, canonicalRoot, envelope, priorStore, createdPaths, transaction, canonicalTxPath, stream } = context;
     const { checks, diagnostics, usedEvidence, invalidations } = state;
     // Skip bookkeeping placeholders (e.g. rename destination paths) that have
     // no text edits and no topology — nothing to apply.
@@ -546,7 +554,8 @@ export async function executeEditGroup(args: ExecuteEditGroupArgs): Promise<Exec
 
     const preimage = await resolveAuthorizedGroupPreimage({
         group,
-        newFileCanonicals,
+        createdPaths,
+        tool,
         priorStore,
         envelope,
         evidenceRefForDetails,
@@ -571,6 +580,7 @@ export async function executeEditGroup(args: ExecuteEditGroupArgs): Promise<Exec
     const displayPath: string = group.rawPath;
 
     const planned = await planGroupMutation({
+        tool,
         group,
         canonicalTarget,
         resource,
@@ -627,6 +637,7 @@ export async function executeEditGroup(args: ExecuteEditGroupArgs): Promise<Exec
         canonicalTarget,
         newContent,
         toolCallId,
+        tool,
         evidenceRefForDetails,
         resource,
         state,
@@ -639,6 +650,7 @@ export async function executeEditGroup(args: ExecuteEditGroupArgs): Promise<Exec
         currentSha,
         isNewFileGroup,
         toolCallId,
+        tool,
         evidenceRefForDetails,
         resource,
         state,
@@ -654,6 +666,7 @@ export async function executeEditGroup(args: ExecuteEditGroupArgs): Promise<Exec
         newContent,
         isNewFileGroup,
         toolCallId,
+        tool,
         evidenceRefForDetails,
         resource,
         transaction,
@@ -674,6 +687,7 @@ export async function executeEditGroup(args: ExecuteEditGroupArgs): Promise<Exec
         canonicalTarget,
         newContent,
         toolCallId,
+        tool,
         evidenceRefForDetails,
         resource,
         verifiers,
@@ -692,6 +706,7 @@ export async function executeEditGroup(args: ExecuteEditGroupArgs): Promise<Exec
         postSha: verified.postSha,
         postimageLineRanges,
         toolCallId,
+        tool,
         evidenceRefForDetails,
         resource,
         cwd: ctx.cwd,

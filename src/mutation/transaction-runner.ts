@@ -1,5 +1,5 @@
 /**
- * Patch transaction runner — EditTransaction begin/commit/rollback orchestration.
+ * Mutation transaction runner — EditTransaction begin/commit/rollback orchestration.
  * Pure move: verbatim from src/patch.ts (stage 5 of patch.ts split),
  * no logic change. The orchestrator keeps preparation, transfer resolution,
  * envelope acquisition, and finalization; this module owns everything from
@@ -7,7 +7,7 @@
  *
  * Covers, in exact pipeline order:
  *   canonicalTxPath + transaction lock-path set → EditTransaction.begin()
- *   (begin-failure maps to a terminal result) → try { materializeTransfers
+ *   (begin-failure maps to a terminal result) → try { mutation operations
  *   → per-group executeEditGroup loop with the write-failure committed/
  *   rollbackInfo outbox → undo-record capture BEFORE commit → commit() →
  *   best-effort undo persistence AFTER commit } finally { rollback if not
@@ -35,18 +35,19 @@ import type {
     WorkspaceEvidenceEnvelope,
 } from "@rhinos0608/pi-workspace-protocol";
 import type { PriorAuthorityStore } from "../context/evidence-authority.js";
-import { EditTransaction } from "../mutation/edit-transaction.js";
+import { EditTransaction } from "./edit-transaction.js";
 import { saveTransactionUndoRecords } from "../undo/edit-history.js";
-import { materializeTransfers } from "./transfer-staging.js";
-import { executeEditGroup } from "./group-application.js";
-import { buildRollbackInfo, makeFailed } from "./result-builders.js";
+import { executeEditGroup } from "../patch/group-application.js";
+import { buildRollbackInfo, makeFailed, makeRejected } from "../patch/result-builders.js";
+import type { MutationResourceIntent } from "./resource-intent.js";
+import type { PatchToolDeps, PatchResult } from "../patch/types.js";
 import type {
-    EditGroup,
-    PatchExecutionState,
-    PatchResult,
-    PatchToolDeps,
-    ResolvedPatchTransfer,
+    MutationGroup,
+    MutationOperation,
+    MutationState,
+    MutationToolIdentity,
 } from "./types.js";
+export type { MutationOperationContext } from "./types.js";
 
 export interface RunPatchTransactionArgs {
     readonly deps: PatchToolDeps;
@@ -56,15 +57,14 @@ export interface RunPatchTransactionArgs {
     readonly canonicalRoot: string;
     readonly envelope: WorkspaceEvidenceEnvelope | null;
     readonly priorStore: PriorAuthorityStore | null;
-    /** Live groups array — materializeTransfers appends synthesized transfer
-     *  edits to its entries in place. Never a copy. */
-    readonly groups: EditGroup[];
-    readonly resolvedTransfers: ReadonlyArray<ResolvedPatchTransfer>;
-    readonly copySourceOnlyPaths: ReadonlySet<string>;
-    readonly newFileCanonicals: ReadonlySet<string>;
+    readonly tool: MutationToolIdentity;
+    /** Live groups array; mutation operations may add planned edits in place. */
+    readonly groups: MutationGroup[];
+    readonly resourceIntents: ReadonlyArray<MutationResourceIntent>;
+    readonly operations: ReadonlyArray<MutationOperation>;
     /** Live accumulator bag — the SAME array/map instances the caller
      *  finalizes with afterward. Never cloned. */
-    readonly state: PatchExecutionState;
+    readonly state: MutationState;
     readonly stream: (text: string) => void;
 }
 
@@ -73,7 +73,9 @@ export type RunPatchTransactionResult =
     | { ok: false; result: PatchResult };
 
 export async function runPatchTransaction(args: RunPatchTransactionArgs): Promise<RunPatchTransactionResult> {
-    const { deps, ctx, toolCallId, evidenceRefForDetails, canonicalRoot, envelope, priorStore, groups, resolvedTransfers, copySourceOnlyPaths, newFileCanonicals, state, stream } = args;
+    const { deps, ctx, toolCallId, tool, evidenceRefForDetails, canonicalRoot, envelope, priorStore, groups, resourceIntents, operations, state, stream } = args;
+    const createdPaths = new Set(resourceIntents.filter((intent) => intent.kind === "create-new").map((intent) => intent.canonicalPath));
+    const observationPaths = resourceIntents.filter((intent) => intent.kind === "observe-source").map((intent) => intent.canonicalPath);
     const { checks, diagnostics, usedEvidence, invalidations } = state;
 
     // One canonicalization for transaction planning and every mutation:
@@ -81,7 +83,7 @@ export async function runPatchTransaction(args: RunPatchTransactionArgs): Promis
     // realpath), existing files resolve symlinks — so every path passed
     // to EditTransaction.before() was included during begin().
     const canonicalTxPath = (absolutePath: string): string => {
-        if (newFileCanonicals.has(absolutePath)) return absolutePath;
+        if (createdPaths.has(absolutePath)) return absolutePath;
         try {
             return realpathSync(absolutePath);
         } catch {
@@ -90,7 +92,7 @@ export async function runPatchTransaction(args: RunPatchTransactionArgs): Promis
     };
     const transactionPaths = [...new Set([
         ...groups.map((group) => canonicalTxPath(group.absolutePath)),
-        ...copySourceOnlyPaths,
+        ...observationPaths,
     ])];
     let transaction: EditTransaction;
     try {
@@ -110,7 +112,7 @@ export async function runPatchTransaction(args: RunPatchTransactionArgs): Promis
                 details: makeFailed(toolCallId, "stage", `failed to begin transaction: ${msg}`, {
                     inspectionId: evidenceRefForDetails.inspectionId,
                     resourceIds: [],
-                }, checks, diagnostics, usedEvidence, invalidations),
+                }, checks, diagnostics, usedEvidence, invalidations, undefined, tool),
             },
         };
     }
@@ -118,30 +120,32 @@ export async function runPatchTransaction(args: RunPatchTransactionArgs): Promis
     let rollbackInfo: { ok: boolean; reason?: string } | undefined;
 
     try {
-        // ── Resolve transfer (copy/move) ops against the pre-transaction
-        // snapshot, then fill in the reserved groups' edits with the
-        // synthesized hashline EditItems. Runs before the main per-group
-        // loop (which then treats these exactly like any other hashline
-        // group) and inside this try so an early rejection here still
-        // triggers the finally-block rollback below. Staging lives in
-        // ./patch/transfer-staging.js (pure move, zero logic change).
-        const staged = materializeTransfers({
-            resolvedTransfers,
-            transaction,
-            groups,
-            priorStore,
-            envelope,
-            evidenceRefForDetails,
-            toolCallId,
-            checks,
-            diagnostics,
-            usedEvidence,
-            invalidations,
-        });
-        if (!staged.ok) return { ok: false, result: staged.result };
+        // Create-new race guard: a path planned as `create-new` must still
+        // be absent in the begin snapshot. If it exists now, another writer
+        // won the race between planning and begin — reject as a conflict
+        // before any write lands. Runs inside the try so the outer finally
+        // still rolls back (a no-op when nothing was written yet).
+        for (const created of createdPaths) {
+            if (transaction.getSnapshot(created)?.exists) {
+                const message = `create-new conflict: ${created} already exists; read the file and retry against the existing destination`;
+                diagnostics.push(message);
+                return {
+                    ok: false,
+                    result: {
+                        content: [{ type: "text" as const, text: `rejected: ${message}` }],
+                        details: makeRejected(toolCallId, "conflict", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations, tool),
+                    },
+                };
+            }
+        }
 
-        const groupAppContext = { deps, ctx, toolCallId, evidenceRefForDetails, canonicalRoot, envelope, priorStore, newFileCanonicals, transaction, canonicalTxPath, stream };
-        // PatchExecutionState is structurally identical to GroupApplicationState
+        for (const operation of operations) {
+            const applied = operation({ transaction, groups, priorStore, envelope, evidenceRefForDetails, toolCallId, tool, checks, diagnostics, usedEvidence, invalidations });
+            if (!applied.ok) return { ok: false, result: applied.result };
+        }
+
+        const groupAppContext = { deps, ctx, toolCallId, tool, evidenceRefForDetails, canonicalRoot, envelope, priorStore, createdPaths, transaction, canonicalTxPath, stream };
+        // MutationState is structurally identical to GroupApplicationState
         // (same eleven live array/map references) — pass it straight through,
         // never a copy.
         const groupAppState = state;

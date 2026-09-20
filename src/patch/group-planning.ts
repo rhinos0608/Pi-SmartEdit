@@ -32,6 +32,7 @@ import {
     isValidFullFileSha256,
 } from "../context/patch-authorization.js";
 import type { PriorAuthorityStore } from "../context/evidence-authority.js";
+import type { MutationToolIdentity } from "../mutation/types.js";
 import type { EditTransaction } from "../mutation/edit-transaction.js";
 import { safeReadUtf8 } from "./request-prep.js";
 import { makeCheck, makeFailed, makeRejected } from "./result-builders.js";
@@ -46,7 +47,8 @@ import type {
 
 export interface ResolveAuthorizedGroupPreimageArgs {
     readonly group: EditGroup;
-    readonly newFileCanonicals: ReadonlySet<string>;
+    readonly createdPaths: ReadonlySet<string>;
+    readonly tool: MutationToolIdentity;
     readonly priorStore: PriorAuthorityStore | null;
     readonly envelope: WorkspaceEvidenceEnvelope | null;
     readonly evidenceRefForDetails: EvidenceRef;
@@ -85,10 +87,11 @@ function failedResult(
     usedEvidence: string[],
     invalidations: ReadonlyArray<ResourceInvalidation>,
     text: string,
+    tool: MutationToolIdentity = "edit",
 ): PatchResult {
     return {
         content: [{ type: "text" as const, text }],
-        details: makeFailed(toolCallId, stage, message, evidenceRef, checks, diagnostics, usedEvidence, invalidations),
+        details: makeFailed(toolCallId, stage, message, evidenceRef, checks, diagnostics, usedEvidence, invalidations, undefined, tool),
     };
 }
 
@@ -101,19 +104,20 @@ function rejectedResult(
     usedEvidence: string[],
     invalidations: ReadonlyArray<ResourceInvalidation>,
     text: string,
+    tool: MutationToolIdentity = "edit",
 ): PatchResult {
     return {
         content: [{ type: "text" as const, text }],
-        details: makeRejected(toolCallId, reason, diagnostics, evidenceRef, checks, usedEvidence, invalidations),
+        details: makeRejected(toolCallId, reason, diagnostics, evidenceRef, checks, usedEvidence, invalidations, tool),
     };
 }
 
 /** Canonicalize the group target. Synthesized new-files skip realpath. */
 function canonicalizeGroupTarget(
     group: EditGroup,
-    newFileCanonicals: ReadonlySet<string>,
+    createdPaths: ReadonlySet<string>,
 ): { ok: true; value: CanonicalizedTarget } | { ok: false; message: string } {
-    if (newFileCanonicals.has(group.absolutePath)) {
+    if (createdPaths.has(group.absolutePath)) {
         return { ok: true, value: { canonicalTarget: group.absolutePath, isNewFileGroup: true } };
     }
     try {
@@ -229,9 +233,9 @@ function validatePreimageFreshness(
 export async function resolveAuthorizedGroupPreimage(
     args: ResolveAuthorizedGroupPreimageArgs,
 ): Promise<AuthorizedGroupPreimage> {
-    const { group, newFileCanonicals, priorStore, envelope, evidenceRefForDetails, canonicalRoot, toolCallId, checks, diagnostics, usedEvidence, invalidations } = args;
+    const { group, createdPaths, tool, priorStore, envelope, evidenceRefForDetails, canonicalRoot, toolCallId, checks, diagnostics, usedEvidence, invalidations } = args;
     // Resolve canonical path for this group.
-    const canonicalized = canonicalizeGroupTarget(group, newFileCanonicals);
+    const canonicalized = canonicalizeGroupTarget(group, createdPaths);
     if (!canonicalized.ok) {
         diagnostics.push(canonicalized.message);
         return {
@@ -239,7 +243,7 @@ export async function resolveAuthorizedGroupPreimage(
             result: failedResult(toolCallId, "stage", `file not found: ${group.rawPath}`, {
                 ...evidenceRefForDetails,
                 resourceIds: [""],
-            }, checks, diagnostics, usedEvidence, invalidations, `failed: file not found: ${group.rawPath}`),
+            }, checks, diagnostics, usedEvidence, invalidations, `failed: file not found: ${group.rawPath}`, tool),
         };
     }
     const { canonicalTarget, isNewFileGroup } = canonicalized.value;
@@ -256,13 +260,13 @@ export async function resolveAuthorizedGroupPreimage(
 
     const authorization = authorizeGroupResource(group, resource, canonicalTarget, canonicalRoot);
     if (!authorization.ok) {
-        diagnostics.push(`${authorization.reason} for ${canonicalTarget} (path-mode inspect this file first)`);
+        diagnostics.push(`${authorization.reason} for ${canonicalTarget} (path-mode inspect this file first)`, tool);
         return {
             ok: false,
             result: rejectedResult(toolCallId, "coverage", {
                 inspectionId: evidenceRefForDetails.inspectionId,
                 resourceIds: [resource.resourceId],
-            }, checks, diagnostics, usedEvidence, invalidations, `rejected: coverage (weak evidence for ${group.rawPath})`),
+            }, checks, diagnostics, usedEvidence, invalidations, `rejected: coverage (weak evidence for ${group.rawPath})`, tool),
         };
     }
     usedEvidence.push(resource.resourceId);
@@ -276,7 +280,7 @@ export async function resolveAuthorizedGroupPreimage(
             result: failedResult(toolCallId, "stage", `read failed: ${group.rawPath}`, {
                 inspectionId: evidenceRefForDetails.inspectionId,
                 resourceIds: [resource.resourceId],
-            }, checks, diagnostics, usedEvidence, invalidations, `failed: read ${group.rawPath}`),
+            }, checks, diagnostics, usedEvidence, invalidations, `failed: read ${group.rawPath}`, tool),
         };
     }
     const { content: currentContent, sha: currentSha } = preimage;
@@ -290,7 +294,7 @@ export async function resolveAuthorizedGroupPreimage(
                 result: rejectedResult(toolCallId, "coverage", {
                     inspectionId: evidenceRefForDetails.inspectionId,
                     resourceIds: [resource.resourceId],
-                }, checks, diagnostics, usedEvidence, invalidations, `rejected: coverage (missing valid snapshot SHA for ${group.rawPath})`),
+                }, checks, diagnostics, usedEvidence, invalidations, `rejected: coverage (missing valid snapshot SHA for ${group.rawPath})`, tool),
             };
         }
         return {
@@ -298,7 +302,7 @@ export async function resolveAuthorizedGroupPreimage(
             result: rejectedResult(toolCallId, "stale", {
                 inspectionId: evidenceRefForDetails.inspectionId,
                 resourceIds: [resource.resourceId],
-            }, checks, diagnostics, usedEvidence, invalidations, `rejected: stale (${group.rawPath})`),
+            }, checks, diagnostics, usedEvidence, invalidations, `rejected: stale (${group.rawPath})`, tool),
         };
     }
 
@@ -306,6 +310,7 @@ export async function resolveAuthorizedGroupPreimage(
 }
 
 export interface PlanGroupMutationArgs {
+    readonly tool: MutationToolIdentity;
     readonly group: EditGroup;
     readonly canonicalTarget: string;
     readonly resource: InspectedResource;
@@ -343,6 +348,7 @@ export type PlannedGroupMutation =
 
 interface PlanContext {
     readonly toolCallId: string;
+    readonly tool: MutationToolIdentity;
     readonly group: EditGroup;
     readonly resource: InspectedResource;
     readonly evidenceRefForDetails: EvidenceRef;
@@ -360,7 +366,7 @@ function rejectConflictingOperations(ctx: PlanContext): PlannedGroupMutation {
         result: rejectedResult(ctx.toolCallId, "conflict", {
             inspectionId: ctx.evidenceRefForDetails.inspectionId,
             resourceIds: [ctx.resource.resourceId],
-        }, ctx.checks, ctx.diagnostics, ctx.usedEvidence, ctx.invalidations, `rejected: conflicting operations (${ctx.group.rawPath})`),
+        }, ctx.checks, ctx.diagnostics, ctx.usedEvidence, ctx.invalidations, `rejected: conflicting operations (${ctx.group.rawPath})`, ctx.tool),
     };
 }
 
@@ -407,7 +413,7 @@ async function runTopologyOnlyDelete(
             result: failedResult(ctx.toolCallId, "write", `delete failed: ${ctx.group.rawPath}`, {
                 inspectionId: ctx.evidenceRefForDetails.inspectionId,
                 resourceIds: [ctx.resource.resourceId],
-            }, ctx.checks, ctx.diagnostics, ctx.usedEvidence, ctx.invalidations, `failed: delete ${ctx.group.rawPath}`),
+            }, ctx.checks, ctx.diagnostics, ctx.usedEvidence, ctx.invalidations, `failed: delete ${ctx.group.rawPath}`, ctx.tool),
         };
     }
     ctx.invalidations.push({
@@ -457,7 +463,7 @@ function composeNewFileClassic(ctx: PlanContext, currentContent: string): Classi
                 result: failedResult(ctx.toolCallId, "stage", `edit missing oldText/newText: ${ctx.group.rawPath}`, {
                     inspectionId: ctx.evidenceRefForDetails.inspectionId,
                     resourceIds: [ctx.resource.resourceId],
-                }, ctx.checks, ctx.diagnostics, ctx.usedEvidence, ctx.invalidations, `failed: edit (missing fields) in ${ctx.group.rawPath}`),
+                }, ctx.checks, ctx.diagnostics, ctx.usedEvidence, ctx.invalidations, `failed: edit (missing fields) in ${ctx.group.rawPath}`, ctx.tool),
             };
         }
         if (!newContent.includes(edit.oldText)) {
@@ -467,7 +473,7 @@ function composeNewFileClassic(ctx: PlanContext, currentContent: string): Classi
                 result: failedResult(ctx.toolCallId, "stage", `oldText not found: ${ctx.group.rawPath}`, {
                     inspectionId: ctx.evidenceRefForDetails.inspectionId,
                     resourceIds: [ctx.resource.resourceId],
-                }, ctx.checks, ctx.diagnostics, ctx.usedEvidence, ctx.invalidations, `failed: edit (oldText not found) in ${ctx.group.rawPath}`),
+                }, ctx.checks, ctx.diagnostics, ctx.usedEvidence, ctx.invalidations, `failed: edit (oldText not found) in ${ctx.group.rawPath}`, ctx.tool),
             };
         }
         if (edit.replaceAll) {
@@ -532,7 +538,7 @@ async function planNormalTextEdits(
                     ...makeFailed(ctx.toolCallId, "stage", `edit planning failed: ${ctx.group.rawPath}`, {
                         inspectionId: ctx.evidenceRefForDetails.inspectionId,
                         resourceIds: [ctx.resource.resourceId],
-                    }, ctx.checks, ctx.diagnostics, ctx.usedEvidence, ctx.invalidations),
+                    }, ctx.checks, ctx.diagnostics, ctx.usedEvidence, ctx.invalidations, undefined, ctx.tool),
                     ...(matchCode === "NOT_FOUND" || matchCode === "AMBIGUOUS" ? { matchFailure: matchCode } : {}),
                 },
             },
@@ -563,7 +569,7 @@ function rejectUncoveredSpans(
         result: rejectedResult(ctx.toolCallId, "coverage", {
             inspectionId: ctx.evidenceRefForDetails.inspectionId,
             resourceIds: [ctx.resource.resourceId],
-        }, ctx.checks, ctx.diagnostics, ctx.usedEvidence, ctx.invalidations, `rejected: coverage (${ctx.group.rawPath})`),
+        }, ctx.checks, ctx.diagnostics, ctx.usedEvidence, ctx.invalidations, `rejected: coverage (${ctx.group.rawPath})`, ctx.tool),
     };
 }
 
@@ -575,9 +581,9 @@ function rejectUncoveredSpans(
  *  span coverage against the authorized preimage. Returns terminal
  *  PatchResult on failure. */
 export async function planGroupMutation(args: PlanGroupMutationArgs): Promise<PlannedGroupMutation> {
-    const { group, canonicalTarget, resource, currentContent, currentSha, isNewFileGroup, usedPriorAuthority, deps, evidenceRefForDetails, toolCallId, checks, diagnostics, usedEvidence, invalidations, transaction, canonicalTxPath, displayPath, appliedFiles, appliedCanonical, appliedSummaries, displayDiffs, stream } = args;
+    const { tool, group, canonicalTarget, resource, currentContent, currentSha, isNewFileGroup, usedPriorAuthority, deps, evidenceRefForDetails, toolCallId, checks, diagnostics, usedEvidence, invalidations, transaction, canonicalTxPath, displayPath, appliedFiles, appliedCanonical, appliedSummaries, displayDiffs, stream } = args;
     const hasTextEdits = group.edits.length > 0;
-    const ctx: PlanContext = { toolCallId, group, resource, evidenceRefForDetails, checks, diagnostics, usedEvidence, invalidations };
+    const ctx: PlanContext = { toolCallId, tool, group, resource, evidenceRefForDetails, checks, diagnostics, usedEvidence, invalidations };
 
     // Reject patches combining text edits with delete topology.
     if (hasTextEdits && group.topology?.kind === "delete") {

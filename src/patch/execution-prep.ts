@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 // ── Execution preparation (shared kernel: ./patch/execution-prep.js) ──
 // Preparation / transfer resolution / envelope acquisition plus the
 // PatchExecutionState accumulator construction. Pure move: verbatim from
@@ -14,11 +15,12 @@ import type {
     WorkspaceEvidenceEnvelope,
 } from "@rhinos0608/pi-workspace-protocol";
 import type { PriorAuthorityStore } from "../context/evidence-authority.js";
+import type { MutationResourceIntent } from "../mutation/resource-intent.js";
+import type { MutationOperation, MutationPreparation } from "../mutation/types.js";
 import type { RepairLoopResult } from "../verification/repair-loop.js";
 import type { EditRequest } from "../edit-contract.js";
 import {
     preparePatchRequest,
-    resolvePatchTransfers,
     acquirePatchEnvelope,
 } from "./request-prep.js";
 import type {
@@ -29,7 +31,6 @@ import type {
     PatchExecutionState,
     PatchResult,
     PatchToolDeps,
-    ResolvedPatchTransfer,
 } from "./types.js";
 
 export interface PreparePatchExecutionArgs {
@@ -42,19 +43,7 @@ export interface PreparePatchExecutionArgs {
 }
 
 export type PreparePatchExecutionResult =
-    | {
-        ok: true;
-        groups: EditGroup[];
-        resolvedTransfers: ResolvedPatchTransfer[];
-        copySourceOnlyPaths: Set<string>;
-        newFileCanonicals: ReadonlySet<string>;
-        envelope: WorkspaceEvidenceEnvelope | null;
-        priorStore: PriorAuthorityStore | null;
-        evidenceRefForDetails: EvidenceRef;
-        canonicalRoot: string;
-        autoInspected: boolean;
-        state: PatchExecutionState;
-    }
+    | ({ ok: true } & MutationPreparation)
     | { ok: false; result: PatchResult };
 
 export async function preparePatchExecution(args: PreparePatchExecutionArgs): Promise<PreparePatchExecutionResult> {
@@ -62,7 +51,7 @@ export async function preparePatchExecution(args: PreparePatchExecutionArgs): Pr
     // Preparation / transfer resolution / envelope acquisition live in
     // file-local helpers (Lane A extract-only); orchestrator keeps the
     // transaction begin/commit/finalize phases.
-    const prepared = preparePatchRequest({ validated, deps, ctx, toolCallId });
+    const prepared = preparePatchRequest({ validated, deps, ctx, toolCallId, tool: "edit" });
     if (!prepared.ok) return { ok: false as const, result: prepared.result };
     const requestEvidenceRef = prepared.prepared.requestEvidenceRef;
     const sessionFilePath = prepared.prepared.sessionFilePath;
@@ -76,19 +65,20 @@ export async function preparePatchExecution(args: PreparePatchExecutionArgs): Pr
     const editWord = totalEdits === 1 ? "edit" : "edits";
     stream(`patch — ${totalEdits} ${editWord} across ${groups.length} ${fileWord}`);
 
-    const transfers = resolvePatchTransfers({ adaptedTransfers: prepared.prepared.adaptedTransfers, groups, ctx, toolCallId, requestEvidenceRef, checks });
-    if (!transfers.ok) return { ok: false as const, result: transfers.result };
-    const resolvedTransfers = transfers.resolvedTransfers;
-    const transferNewFileCanonicals = transfers.transferNewFileCanonicals;
-    const copySourceOnlyPaths = transfers.copySourceOnlyPaths;
+    // Edit is text-only: transfer fields were hard-cut from the contract, so
+    // the edit path plans no transfer operations. Create-new is owned by the
+    // intents below (a path absent at planning time needs no prior authority).
+    const resourceIntents: MutationResourceIntent[] = groups.map((group) => ({
+        canonicalPath: group.absolutePath,
+        kind: !existsSync(group.absolutePath) ? "create-new" : "mutate-existing",
+    }));
 
     const priorStore = deps.getPriorAuthority?.() ?? null;
-    const acquired = await acquirePatchEnvelope({ deps, groups, sessionFilePath, canonicalRoot, requestEvidenceRef, transferNewFileCanonicals, toolCallId, checks, diagnostics, usedEvidence, signal });
+    const acquired = await acquirePatchEnvelope({ deps, groups, resourceIntents, sessionFilePath, canonicalRoot, requestEvidenceRef, toolCallId, tool: "edit", checks, diagnostics, usedEvidence, signal });
     if (!acquired.ok) return { ok: false as const, result: acquired.result };
     const envelope = acquired.envelope;
     const autoInspected = acquired.autoInspected;
     const evidenceRefForDetails = acquired.evidenceRefForDetails;
-    const newFileCanonicals = acquired.newFileCanonicals;
 
     // ── Transaction lifecycle ──────────────────────────────────
     // Begin/commit/rollback orchestration lives in
@@ -118,12 +108,12 @@ export async function preparePatchExecution(args: PreparePatchExecutionArgs): Pr
         appliedSummaries,
         displayDiffs,
     };
+    const operations: MutationOperation[] = [];
     return {
         ok: true,
         groups,
-        resolvedTransfers,
-        copySourceOnlyPaths,
-        newFileCanonicals,
+        resourceIntents,
+        operations,
         envelope,
         priorStore,
         evidenceRefForDetails,
