@@ -8,7 +8,7 @@
  */
 import type {
     RpcMethod,
-    PatchDetails,
+    MutationDetails,
     EvidenceRef,
     LineRange,
     CheckRecord,
@@ -16,6 +16,18 @@ import type {
     PostEditEvidence,
 } from "@rhinos0608/pi-workspace-protocol";
 import type { PriorAuthorityStore } from "../context/evidence-authority.js";
+import type {
+    FinalSuccessFile as KernelFinalSuccessFile,
+    MutableChecks as KernelMutableChecks,
+    MutationDisplayDiff as KernelMutationDisplayDiff,
+    MutationEdit as KernelMutationEdit,
+    MutationGroup as KernelMutationGroup,
+    MutationTopology as KernelMutationTopology,
+} from "../mutation/types.js";
+export type {
+    FinalSuccessFile as KernelFinalSuccessFile,
+    MutableChecks as KernelMutableChecks,
+} from "../mutation/types.js";
 import type { AstResolverLike } from "../anchor/anchor-resolution.js";
 import type { StructuralResolver } from "../core/edit-planner.js";
 import type { EditTarget, FileSnapshot, HashlineEditMetadata } from "../core/types.js";
@@ -64,12 +76,7 @@ export interface PatchToolDeps {
     readonly runFinalSuccessLanes?: (args: FinalSuccessInput) => Promise<FinalSuccessResult>;
 }
 
-export interface FinalSuccessFile {
-    readonly path: string;
-    readonly oldContent: string;
-    readonly content: string;
-    readonly changedLineRanges: ReadonlyArray<LineRange>;
-}
+export type FinalSuccessFile = KernelFinalSuccessFile;
 export interface FinalSuccessInput {
     readonly cwd: string;
     readonly toolCallId: string;
@@ -94,42 +101,18 @@ export interface CheckOutcome {
     readonly detail?: string;
 }
 
-export interface MutableChecks {
-    blocking: CheckRecord[];
-    completed: CheckRecord[];
-    advisory: CheckRecord[];
-    skipped: CheckRecord[];
-    timedOut: CheckRecord[];
-}
+export type MutableChecks = KernelMutableChecks;
 
 /** Shared timeout budget for both the pre-commit and post-write verifier
  *  loops, so a verifier cannot hold the transaction lock (post-write runs
  *  before commit()) or block the write indefinitely (pre-commit). */
 export const VERIFIER_TIMEOUT_MS = 5000;
 
-export interface GroupedEdit {
-    readonly oldText?: string;
-    readonly newText?: string;
-    readonly description?: string;
-    readonly replaceAll?: boolean;
-    readonly target?: EditTarget;
-    readonly lineRange?: LineRange;
-    readonly hashline?: HashlineEditMetadata;
-}
+export type GroupedEdit = KernelMutationEdit;
 
-export interface EditGroup {
-    /** Resolved absolute path (cwd-relative input has been resolved). */
-    readonly absolutePath: string;
-    /** Original input path string (used for diagnostics). */
-    readonly rawPath: string;
-    readonly edits: ReadonlyArray<GroupedEdit>;
-    readonly topology?: RawTopology;
-}
+export type EditGroup = KernelMutationGroup;
 
-export type RawTopology =
-    | { kind: "add"; path: string; content: string }
-    | { kind: "delete"; path: string }
-    | { kind: "rename"; oldPath: string; newPath: string };
+export type RawTopology = KernelMutationTopology;
 
 export interface RefactorRequestFields {
     readonly kind: string;
@@ -188,30 +171,14 @@ export interface PreparedPatchRequest {
     sessionFilePath: string;
     canonicalRoot: string;
     textOps: EditOperation[];
-    adaptedTransfers: { ok: true; value: Array<{ op: "copy" | "move"; from: string; to: string; range: { pos: string; end: string }; after: string | undefined; description: string | undefined }> };
     groups: EditGroup[];
     checks: MutableChecks;
     diagnostics: string[];
 }
 
-export interface ResolvedPatchTransfer {
-    op: "copy" | "move";
-    canonicalFrom: string;
-    canonicalTo: string;
-    range: { pos: string; end: string };
-    after: string | undefined;
-    rawFrom: string;
-    rawTo: string;
-    toIsNewFile: boolean;
-    description: string | undefined;
-}
+export type PatchDisplayDiff = KernelMutationDisplayDiff;
 
-export interface PatchDisplayDiff {
-    readonly path: string;
-    readonly diff: string;
-}
-
-export type PatchToolDetails = PatchDetails & {
+export type PatchToolDetails = MutationDetails & {
     /** Exact classic-text match failure; used only for bounded retry guidance. */
     readonly matchFailure?: "NOT_FOUND" | "AMBIGUOUS";
     readonly diff?: string;

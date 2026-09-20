@@ -391,161 +391,52 @@ test("validateEditRequest requires oldText and newText together for a text edit"
     assert.ok(symbolic.ok, "symbolic target must be self-actionable");
 });
 
-// ── Transfer (copy/move) ops ─────────────────────────────────────────
+// ── Transfer-shaped payloads belong to the transfer tool ───────────────
+// Stage 4 hard-cut: `edit` rejects every transfer field (op/from/range/to/
+// after) as unsupported input and steers to the first-class transfer tool.
 
-test("validateEditRequest accepts a well-formed transfer op", () => {
+test("validateEditRequest rejects a transfer-shaped edit op", () => {
     const v = validateEditRequest({
         path: "unused.ts",
         edits: [{ op: "copy", from: "a.ts", range: { pos: "5aa", end: "6bb" }, to: "b.ts", after: "18cd" }],
         toolCallId: "t",
     });
-    assert.ok(v.ok, `well-formed transfer op must validate (got: ${v.ok ? "" : v.error})`);
+    assert.ok(!v.ok, "transfer-shaped edit must be rejected");
+    assert.match(v.error, /transfer tool/);
 });
 
-test("validateEditRequest rejects transfer op with invalid op value", () => {
+test("validateEditRequest rejects each transfer field without op", () => {
+    for (const field of ["from", "range", "to", "after"] as const) {
+        const edit: Record<string, unknown> = field === "range"
+            ? { [field]: { pos: "5aa", end: "6bb" } }
+            : { [field]: "x" };
+        const v = validateEditRequest({ path: "unused.ts", edits: [edit], toolCallId: "t" });
+        assert.ok(!v.ok, `transfer field ${field} without op must be rejected`);
+        assert.match(v.error, /transfer tool/);
+    }
+});
+
+test("validateEditRequest rejects an invalid op value as unsupported input", () => {
     const v = validateEditRequest({
         path: "unused.ts",
         edits: [{ op: "duplicate", from: "a.ts", range: { pos: "5aa", end: "6bb" }, to: "b.ts", after: "18cd" }],
         toolCallId: "t",
     });
     assert.ok(!v.ok, "invalid op value must be rejected");
-    assert.match(v.error, /op must be "copy" or "move"/);
+    assert.match(v.error, /transfer tool/);
 });
 
-test("validateEditRequest rejects transfer op missing from/to/range", () => {
-    const base = { op: "copy" as const, from: "a.ts", range: { pos: "5aa", end: "6bb" }, to: "b.ts", after: "18cd" };
-    for (const omit of ["from", "to", "range"] as const) {
-        const edit: Record<string, unknown> = { ...base };
-        delete edit[omit];
-        const v = validateEditRequest({ path: "unused.ts", edits: [edit], toolCallId: "t" });
-        assert.ok(!v.ok, `transfer op missing ${omit} must be rejected`);
-    }
-});
-
-test("validateEditRequest accepts a transfer op with `to`/`from`/`range`/`op` but no `after` (new-file destination)", () => {
-    const v = validateEditRequest({
-        path: "unused.ts",
-        edits: [{ op: "copy", from: "a.ts", range: { pos: "5aa", end: "6bb" }, to: "new.ts" }],
-        toolCallId: "t",
-    });
-    assert.ok(v.ok, `transfer op without \`after\` must validate (got: ${v.ok ? "" : v.error})`);
-});
-
-test("validateEditRequest rejects transfer op combined with oldText/newText/target/lineRange/hashline", () => {
-    const base = { op: "copy" as const, from: "a.ts", range: { pos: "5aa", end: "6bb" }, to: "b.ts", after: "18cd" };
-    const conflictingFields: Array<Record<string, unknown>> = [
-        { oldText: "x", newText: "y" },
-        { path: "a.ts" },
-        { target: { name: "foo" } },
-        { lineRange: { startLine: 1, endLine: 2 } },
-        { hashline: { range: { pos: "1ab", end: "1ab" } } },
-    ];
-    for (const extra of conflictingFields) {
-        const v = validateEditRequest({ path: "unused.ts", edits: [{ ...base, ...extra }], toolCallId: "t" });
-        assert.ok(!v.ok, `transfer op combined with ${JSON.stringify(extra)} must be rejected`);
-        assert.match(v.error, /op is mutually exclusive with/);
-    }
-});
-
-test("validateEditRequest rejects transfer op combined with replaceAll (even false)", () => {
-    const base = { op: "copy" as const, from: "a.ts", range: { pos: "5aa", end: "6bb" }, to: "b.ts", after: "18cd" };
-    for (const replaceAll of [true, false]) {
-        const v = validateEditRequest({ path: "unused.ts", edits: [{ ...base, replaceAll }], toolCallId: "t" });
-        assert.ok(!v.ok, `transfer op combined with replaceAll:${replaceAll} must be rejected`);
-        assert.match(v.error, /transfer|replaceAll|mutually exclusive/i);
-    }
-});
-
-test("validateEditRequest rejects transfer-only fields without op", () => {
-    const v = validateEditRequest({
-        path: "unused.ts",
-        edits: [{ from: "a.ts", range: { pos: "5aa", end: "6bb" }, to: "b.ts", after: "18cd" }],
-        toolCallId: "t",
-    });
-    assert.ok(!v.ok, "transfer fields without op must be rejected");
-    assert.match(v.error, /transfer.*op|require op/i);
-});
-
-test("validateEditRequest accepts pathless transfer (top-level path accepted-but-ignored)", () => {
-    const edits = [{ op: "copy" as const, from: "a.ts", range: { pos: "5aa", end: "6bb" }, to: "new.ts" }];
-    const pathless = validateEditRequest({ edits, toolCallId: "t" });
-    assert.ok(pathless.ok, `pathless transfer must validate (got: ${pathless.ok ? "" : pathless.error})`);
-    const withPath = validateEditRequest({ path: "unused.ts", edits, toolCallId: "t" });
-    assert.ok(withPath.ok, "top-level path alongside transfers must validate");
-});
-
-test("validateEditRequest accepts after=start but rejects EOF/end/before/suffix tricks", () => {
-    const base = { op: "copy" as const, from: "a.ts", range: { pos: "5aa", end: "6bb" }, to: "b.ts" };
-    const start = validateEditRequest({ path: "unused.ts", edits: [{ ...base, after: "start" }], toolCallId: "t" });
-    assert.ok(start.ok, `after=start must validate (got: ${start.ok ? "" : start.error})`);
-    for (const after of ["EOF", "end", "before", "18cd:after", "18cd:before"]) {
-        const v = validateEditRequest({ path: "unused.ts", edits: [{ ...base, after }], toolCallId: "t" });
-        assert.ok(!v.ok, `transfer after "${after}" must be rejected`);
-        assert.match(v.error, /transfer.*after/i);
-    }
-});
-
-test("validateEditRequest rejects malformed transfer range", () => {
-    const cases: Array<{ range: unknown; match: RegExp }> = [
-        { range: undefined, match: /range must be an object/ },
-        { range: {}, match: /range\.pos must be a non-empty string/ },
-        { range: { pos: "5aa" }, match: /range\.end must be a non-empty string/ },
-        { range: { pos: "", end: "6bb" }, match: /range\.pos must be a non-empty string/ },
-    ];
-    for (const c of cases) {
-        const edit: Record<string, unknown> = { op: "copy", from: "a.ts", to: "b.ts", after: "18cd" };
-        if (c.range !== undefined) edit.range = c.range;
-        const v = validateEditRequest({ path: "unused.ts", edits: [edit], toolCallId: "t" });
-        assert.ok(!v.ok, `transfer range ${JSON.stringify(c.range)} must be rejected`);
-        assert.match(v.error, c.match);
-    }
-});
-
-test("registered edit schema advertises target.pattern/replacement together (both-or-neither) via anyOf", () => {
-    const params = registeredEditParams();
-    const props = params.properties as Record<string, unknown>;
-    const editsItem = props.edits as { items?: { properties?: Record<string, unknown>; anyOf?: Array<{ required?: string[]; properties?: Record<string, unknown> }> } };
-    const target = editsItem.items?.properties?.target as { properties?: Record<string, unknown> };
-    assert.ok(target, "target must be advertised");
-    const editsAnyOf = editsItem.items?.anyOf ?? [];
-    const structuralBranch = editsAnyOf.find((b) => {
-        const t = (b.properties as Record<string, unknown> | undefined)?.target as { anyOf?: Array<{ required?: string[] }> } | undefined;
-        return !!t?.anyOf?.some((inner) => inner.required?.includes("pattern") && inner.required?.includes("replacement"));
-    });
-    assert.ok(structuralBranch, "schema anyOf must include a target branch requiring both pattern and replacement together");
-    const onlyPattern = validateEditRequest({ path: "a.ts", edits: [{ target: { pattern: "console.log($ARG)" } }] });
-    assert.ok(!onlyPattern.ok, "pattern without replacement must be rejected");
-    assert.match(onlyPattern.error, /pattern and replacement must be provided together/);
-    const onlyReplacement = validateEditRequest({ path: "a.ts", edits: [{ target: { replacement: "logger.info($ARG)" } }] });
-    assert.ok(!onlyReplacement.ok, "replacement without pattern must be rejected");
-    assert.match(onlyReplacement.error, /pattern and replacement must be provided together/);
-    const both = validateEditRequest({ path: "a.ts", edits: [{ target: { pattern: "console.log($ARG)", replacement: "logger.info($ARG)" } }] });
-    assert.ok(both.ok, `paired pattern+replacement must be accepted`);
-});
-
-test("registered edit schema advertises op/from/range/to/after and a copy/move enum", () => {
+test("registered edit schema hides op/from/range/to/after and has no transfer anyOf branch", () => {
     const params = registeredEditParams();
     const properties = params.properties as Record<string, unknown>;
     const edits = properties.edits as { items?: { properties?: Record<string, unknown>; anyOf?: Array<{ required?: string[] }> } };
     const editProps = edits.items?.properties ?? {};
 
-    const op = editProps.op as { type?: string; enum?: string[] };
-    assert.ok(op, "edit items must advertise `op`");
-    assert.deepEqual(op.enum, ["copy", "move"]);
-    assert.equal(op.type, "string");
-
-    assert.ok(editProps.from, "edit items must advertise `from`");
-    assert.ok(editProps.to, "edit items must advertise `to`");
-    assert.ok(editProps.after, "edit items must advertise `after`");
-
-    const range = editProps.range as { properties?: Record<string, unknown>; required?: string[] };
-    assert.ok(range, "edit items must advertise `range`");
-    assert.ok(range.properties?.pos, "transfer range must advertise pos");
-    assert.ok(range.properties?.end, "transfer range must advertise end");
-
+    for (const key of ["op", "from", "range", "to", "after"]) {
+        assert.ok(!(key in editProps), `edit items must not advertise \`${key}\``);
+    }
     const anyOf = edits.items?.anyOf ?? [];
     const transferBranch = anyOf.find((branch) =>
         branch.required && ["op", "from", "range", "to"].every((k) => branch.required!.includes(k)));
-    assert.ok(transferBranch, "schema must include an anyOf branch requiring op/from/range/to");
-    assert.ok(!transferBranch!.required!.includes("after"), "`after` must not be in the required tuple (optional for new-file destinations)");
+    assert.ok(!transferBranch, "schema must not include a transfer anyOf branch");
 });

@@ -18,6 +18,7 @@ import {
   formatEditError,
 } from "./args.js";
 import { claimDiagnosticsOwner } from "./mutation/mutation-ownership.js";
+import { isMutationTool } from "./mutation/types.js";
 import type { WorkspaceEvidenceEnvelope } from "@rhinos0608/pi-workspace-protocol";
 
 // ─── Schema ───────────────────────────────────────────────────────
@@ -80,6 +81,7 @@ import {
   type NarrowHintsByPath,
 } from "./extension/post-lanes.js";
 
+import { registerTransferTool } from "./extension/register-transfer.js";
 import {
   registerEditTool,
   buildRetryEvidenceForSession,
@@ -109,7 +111,7 @@ export default function smartEdit(pi: ExtensionAPI) {
   // skips its own diagnostics collection when this extension has claimed the
   // toolCallId, regardless of extension load order (see ./mutation/mutation-ownership.js).
   pi.on("tool_call", (event) => {
-    if (event.toolName === "write" || event.toolName === "edit") {
+    if (isMutationTool(event.toolName)) {
       claimDiagnosticsOwner(event.toolCallId);
     }
     return undefined;
@@ -205,6 +207,7 @@ export default function smartEdit(pi: ExtensionAPI) {
   // Registration + patch wiring live in ./extension/register-edit.js;
   // event wiring above stays here and calls into session/lane fns.
   registerEditTool(pi, session);
+  registerTransferTool(pi, session);
 }
 
 // ── Exports for testing ─────────────────────────────────────────────

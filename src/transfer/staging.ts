@@ -1,7 +1,7 @@
 /**
- * Patch transfer staging — copy/move materialization against the active
- * transaction snapshot. Pure move: verbatim from src/patch.ts (transfer
- * block inside createPatchTool.execute), no logic change. Resolves each
+ * Transfer staging — copy/move materialization against the active
+ * transaction snapshot. Owned by the transfer domain; the shared kernel
+ * owns evidence, transaction, verification, rollback, and finalization. Resolves each
  * transfer's source range against the pre-transaction snapshot (never a
  * fresh disk read), authorizes copy sources, rejects conflicting transfers,
  * and appends the synthesized insert/delete edits into the reserved groups
@@ -16,7 +16,7 @@ import {
     type WorkspaceEvidenceEnvelope,
 } from "@rhinos0608/pi-workspace-protocol";
 import { stripBom, normalizeToLF } from "../core/edit-diff.js";
-import { resolveSourceRange, resolveDestination, type ResolvedSourceRange } from "../transfer/resolve.js";
+import { resolveSourceRange, resolveDestination, type ResolvedSourceRange } from "./resolve.js";
 import {
     planTransfer,
     bindResolvedTransfer,
@@ -25,7 +25,7 @@ import {
     buildTransferInsertEdit,
     buildTransferDeleteEdit,
     type TransferPlan,
-} from "../transfer/plan.js";
+} from "./plan.js";
 import {
     validateResourceAuthority,
     findResourceForCanonicalPath,
@@ -33,19 +33,17 @@ import {
 } from "../context/patch-authorization.js";
 import type { PriorAuthorityStore } from "../context/evidence-authority.js";
 import type { EditTransaction } from "../mutation/edit-transaction.js";
-import { makeFailed, makeRejected } from "./result-builders.js";
-import { moveSpansOverlap, isSameFileMoveCandidate, isAfterLineInsideSourceSpan } from "./refactor-preview.js";
-import type {
-    EditGroup,
-    MutableChecks,
-    PatchResult,
-    ResolvedPatchTransfer,
-} from "./types.js";
+import { makeFailed, makeRejected } from "../patch/result-builders.js";
+import { moveSpansOverlap, isSameFileMoveCandidate, isAfterLineInsideSourceSpan } from "../patch/refactor-preview.js";
+import type { MutableChecks, MutationResult } from "../mutation/types.js";
+import type { ResolvedTransferBatch } from "./resolve-batch.js";
+import type { MutationGroup, MutationToolIdentity } from "../mutation/types.js";
 
 export interface MaterializeTransfersArgs {
-    readonly resolvedTransfers: ReadonlyArray<ResolvedPatchTransfer>;
+    readonly tool: MutationToolIdentity;
+    readonly resolvedTransfers: ReadonlyArray<ResolvedTransferBatch>;
     readonly transaction: EditTransaction;
-    readonly groups: EditGroup[];
+    readonly groups: MutationGroup[];
     readonly priorStore: PriorAuthorityStore | null;
     readonly envelope: WorkspaceEvidenceEnvelope | null;
     readonly evidenceRefForDetails: EvidenceRef;
@@ -66,15 +64,16 @@ interface MoveSourceSpan {
  *  from the active transaction's snapshot, never fresh disk. */
 function readTransferSourcePreimage(args: {
     transaction: EditTransaction;
-    rt: ResolvedPatchTransfer;
+    rt: ResolvedTransferBatch;
     toolCallId: string;
+    tool: MutationToolIdentity;
     checks: MutableChecks;
     diagnostics: string[];
     usedEvidence: string[];
     invalidations: ReadonlyArray<ResourceInvalidation>;
     evidenceRefForDetails: EvidenceRef;
-}): { ok: true; rawSourceContent: string; sourceLogicalLines: string[] } | { ok: false; result: PatchResult } {
-    const { transaction, rt, toolCallId, checks, diagnostics, usedEvidence, invalidations, evidenceRefForDetails } = args;
+}): { ok: true; rawSourceContent: string; sourceLogicalLines: string[] } | { ok: false; result: MutationResult } {
+    const { transaction, rt, toolCallId, tool, checks, diagnostics, usedEvidence, invalidations, evidenceRefForDetails } = args;
     const snapshot = transaction.getSnapshot(rt.canonicalFrom);
     if (!snapshot || !snapshot.exists) {
         diagnostics.push(`transfer source does not exist: ${rt.rawFrom}`);
@@ -82,7 +81,7 @@ function readTransferSourcePreimage(args: {
             ok: false,
             result: {
                 content: [{ type: "text" as const, text: `failed: transfer source does not exist: ${rt.rawFrom}` }],
-                details: makeFailed(toolCallId, "stage", `transfer source does not exist: ${rt.rawFrom}`, evidenceRefForDetails, checks, diagnostics, usedEvidence, invalidations),
+                details: makeFailed(toolCallId, "stage", `transfer source does not exist: ${rt.rawFrom}`, evidenceRefForDetails, checks, diagnostics, usedEvidence, invalidations, undefined, tool),
             },
         };
     }
@@ -102,15 +101,16 @@ function authorizeCopySource(args: {
     envelope: WorkspaceEvidenceEnvelope | null;
     evidenceRefForDetails: EvidenceRef;
     toolCallId: string;
+    tool: MutationToolIdentity;
     checks: MutableChecks;
     diagnostics: string[];
     usedEvidence: string[];
     invalidations: ReadonlyArray<ResourceInvalidation>;
-    rt: ResolvedPatchTransfer;
+    rt: ResolvedTransferBatch;
     resolved: ResolvedSourceRange;
     rawSourceContent: string;
-}): PatchResult | null {
-    const { priorStore, envelope, evidenceRefForDetails, toolCallId, checks, diagnostics, usedEvidence, invalidations, rt, resolved, rawSourceContent } = args;
+}): MutationResult | null {
+    const { priorStore, envelope, evidenceRefForDetails, toolCallId, tool, checks, diagnostics, usedEvidence, invalidations, rt, resolved, rawSourceContent } = args;
     let sourceResource: InspectedResource | null = null;
     let usedPriorSourceAuthority = false;
     if (priorStore) {
@@ -124,7 +124,7 @@ function authorizeCopySource(args: {
         diagnostics.push(`coverage: no authority for copy source ${rt.rawFrom}`);
         return {
             content: [{ type: "text" as const, text: `rejected: coverage (copy source ${rt.rawFrom})` }],
-            details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
+            details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations, tool),
         };
     }
     const coverageError = validateResourceAuthority(sourceResource, [{ startLine: resolved.startLine, endLine: resolved.endLine }], false);
@@ -135,7 +135,7 @@ function authorizeCopySource(args: {
             details: makeRejected(toolCallId, "coverage", diagnostics, {
                 inspectionId: evidenceRefForDetails.inspectionId,
                 resourceIds: [sourceResource.resourceId],
-            }, checks, usedEvidence, invalidations),
+            }, checks, usedEvidence, invalidations, tool),
         };
     }
     if (!isValidFullFileSha256(sourceResource.fullFileSha256)) {
@@ -145,7 +145,7 @@ function authorizeCopySource(args: {
             details: makeRejected(toolCallId, "coverage", diagnostics, {
                 inspectionId: evidenceRefForDetails.inspectionId,
                 resourceIds: [sourceResource.resourceId],
-            }, checks, usedEvidence, invalidations),
+            }, checks, usedEvidence, invalidations, tool),
         };
     }
     // Freshness hashes the raw snapshot preimage (BOM/CRLF
@@ -158,9 +158,10 @@ function authorizeCopySource(args: {
             details: makeRejected(toolCallId, "stale", diagnostics, {
                 inspectionId: evidenceRefForDetails.inspectionId,
                 resourceIds: [sourceResource.resourceId],
-            }, checks, usedEvidence, invalidations),
+            }, checks, usedEvidence, invalidations, tool),
         };
     }
+    if (!usedEvidence.includes(sourceResource.resourceId)) usedEvidence.push(sourceResource.resourceId);
     return null;
 }
 
@@ -169,7 +170,7 @@ function authorizeCopySource(args: {
  *  Returns the rejection message, or null when clear. */
 function findOverlappingMoveSpan(
     moveSourceSpans: ReadonlyArray<MoveSourceSpan>,
-    rt: ResolvedPatchTransfer,
+    rt: ResolvedTransferBatch,
     resolved: ResolvedSourceRange,
 ): string | null {
     for (const seen of moveSourceSpans) {
@@ -184,7 +185,7 @@ function findOverlappingMoveSpan(
  *  point between lines [startLine-1, endLine]) has no well-defined
  *  pre/post-delete meaning. Returns the rejection message, or null. */
 function checkSameFileDestination(
-    rt: ResolvedPatchTransfer,
+    rt: ResolvedTransferBatch,
     sourceLogicalLines: string[],
     resolved: ResolvedSourceRange,
 ): string | null {
@@ -205,7 +206,7 @@ function checkSameFileDestination(
  *  Returns the rejection message, or null. */
 function findDuplicateDestination(args: {
     transaction: EditTransaction;
-    rt: ResolvedPatchTransfer;
+    rt: ResolvedTransferBatch;
     sourceLines: string[];
     sourceLogicalLines: string[];
 }): string | null {
@@ -241,8 +242,8 @@ function findDuplicateDestination(args: {
  *  plain data, converted to hashline EditItems appended to the reserved
  *  groups in place (matching entries replaced, never reordered). */
 function appendTransferMutations(args: {
-    groups: EditGroup[];
-    rt: ResolvedPatchTransfer;
+    groups: MutationGroup[];
+    rt: ResolvedTransferBatch;
     transferPlan: TransferPlan;
     resolved: ResolvedSourceRange;
 }): void {
@@ -266,13 +267,13 @@ function appendTransferMutations(args: {
 
 /** Resolve transfer (copy/move) ops against the pre-transaction snapshot,
  *  then fill in the reserved groups' edits with the synthesized hashline
- *  EditItems. Returns success, or a terminal PatchResult the caller must
+ *  EditItems. Returns success, or a terminal MutationResult the caller must
  *  return (call inside try so the finally-block rollback still triggers). */
-export function materializeTransfers(args: MaterializeTransfersArgs): { ok: true } | { ok: false; result: PatchResult } {
-    const { resolvedTransfers, transaction, groups, priorStore, envelope, evidenceRefForDetails, toolCallId, checks, diagnostics, usedEvidence, invalidations } = args;
+export function materializeTransfers(args: MaterializeTransfersArgs): { ok: true } | { ok: false; result: MutationResult } {
+    const { tool, resolvedTransfers, transaction, groups, priorStore, envelope, evidenceRefForDetails, toolCallId, checks, diagnostics, usedEvidence, invalidations } = args;
     const moveSourceSpans: Array<{ canonicalFrom: string; startLine: number; endLine: number }> = [];
     for (const rt of resolvedTransfers) {
-        const preimage = readTransferSourcePreimage({ transaction, rt, toolCallId, checks, diagnostics, usedEvidence, invalidations, evidenceRefForDetails });
+        const preimage = readTransferSourcePreimage({ transaction, rt, toolCallId, tool, checks, diagnostics, usedEvidence, invalidations, evidenceRefForDetails });
         if (!preimage.ok) return preimage;
         const rawSourceContent = preimage.rawSourceContent;
         const sourceLogicalLines = preimage.sourceLogicalLines;
@@ -291,7 +292,7 @@ export function materializeTransfers(args: MaterializeTransfersArgs): { ok: true
                 ok: false,
                 result: {
                     content: [{ type: "text" as const, text: `rejected: ${message}` }],
-                    details: makeRejected(toolCallId, "conflict", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
+                    details: makeRejected(toolCallId, "conflict", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations, tool),
                 },
             };
         }
@@ -303,13 +304,13 @@ export function materializeTransfers(args: MaterializeTransfersArgs): { ok: true
                 ok: false,
                 result: {
                     content: [{ type: "text" as const, text: `failed: transfer range resolution (${rt.rawFrom})` }],
-                    details: makeFailed(toolCallId, "stage", `${resolved.error} (${rt.rawFrom})`, evidenceRefForDetails, checks, diagnostics, usedEvidence, invalidations),
+                    details: makeFailed(toolCallId, "stage", `${resolved.error} (${rt.rawFrom})`, evidenceRefForDetails, checks, diagnostics, usedEvidence, invalidations, undefined, tool),
                 },
             };
         }
 
         if (rt.op === "copy") {
-            const authFailure = authorizeCopySource({ priorStore, envelope, evidenceRefForDetails, toolCallId, checks, diagnostics, usedEvidence, invalidations, rt, resolved: resolved.value, rawSourceContent });
+            const authFailure = authorizeCopySource({ priorStore, envelope, evidenceRefForDetails, toolCallId, tool, checks, diagnostics, usedEvidence, invalidations, rt, resolved: resolved.value, rawSourceContent });
             if (authFailure) return { ok: false, result: authFailure };
         }
 
@@ -320,7 +321,7 @@ export function materializeTransfers(args: MaterializeTransfersArgs): { ok: true
                 ok: false,
                 result: {
                     content: [{ type: "text" as const, text: `rejected: ${message}` }],
-                    details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
+                    details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations, tool),
                 },
             };
         }
@@ -337,7 +338,7 @@ export function materializeTransfers(args: MaterializeTransfersArgs): { ok: true
                     ok: false,
                     result: {
                         content: [{ type: "text" as const, text: `rejected: ${overlapMessage}` }],
-                        details: makeRejected(toolCallId, "conflict", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
+                        details: makeRejected(toolCallId, "conflict", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations, tool),
                     },
                 };
             }
@@ -354,7 +355,7 @@ export function materializeTransfers(args: MaterializeTransfersArgs): { ok: true
                 ok: false,
                 result: {
                     content: [{ type: "text" as const, text: `rejected: ${sameFileMessage}` }],
-                    details: makeRejected(toolCallId, "conflict", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
+                    details: makeRejected(toolCallId, "conflict", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations, tool),
                 },
             };
         }
@@ -374,7 +375,7 @@ export function materializeTransfers(args: MaterializeTransfersArgs): { ok: true
                 ok: false,
                 result: {
                     content: [{ type: "text" as const, text: `rejected: ${duplicateMessage}` }],
-                    details: makeRejected(toolCallId, "conflict", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations),
+                    details: makeRejected(toolCallId, "conflict", diagnostics, evidenceRefForDetails, checks, usedEvidence, invalidations, tool),
                 },
             };
         }

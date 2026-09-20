@@ -13,7 +13,7 @@
  * advertised contract.
  */
 import { validateEvidenceRef } from "@rhinos0608/pi-workspace-protocol";
-import type { EditTarget, HashlineEditMetadata, LineRange, TransferRange } from "./core/types.js";
+import type { EditTarget, HashlineEditMetadata, LineRange } from "./core/types.js";
 
 /** One targeted edit operation. */
 export interface EditOperation {
@@ -34,16 +34,9 @@ export interface EditOperation {
     target?: EditTarget;
     /** 1-based line-range scope for this edit. */
     lineRange?: LineRange;
-    /** Experimental hashline edit metadata. Enable with
-     *  `SMART_EDIT_USE_HASHLINE_EDITING` or its experimental alias. */
+    /** Hashline-anchored edit metadata. Addresses source lines by stable
+     *  anchor, with optional symbol scope for fallback. */
     hashline?: HashlineEditMetadata;
-    /** Transfer (copy/move) operation: relocate an existing observed range by
-     *  reference. Mutually exclusive with every other edit field. */
-    op?: "copy" | "move";
-    from?: string;
-    range?: TransferRange;
-    to?: string;
-    after?: string;
 }
 
 /** Rename preview: all fields required. */
@@ -475,92 +468,6 @@ function checkAnchoredEditFields(e: Record<string, unknown>, i: number): string 
         ?? checkHashlineField(e, i);
 }
 
-function isTransferSentinel(after: string): boolean {
-    return after === "EOF" || after === "end" || after === "BOF" || after === "before";
-}
-
-function hasAnchorSeparator(after: string): boolean {
-    return after.includes(":");
-}
-
-function isAcceptedTransferAfter(after: string): boolean {
-    if (isTransferSentinel(after)) return false;
-    return !hasAnchorSeparator(after);
-}
-
-function checkTransferAfter(after: unknown, i: number): string | null {
-    if (after === undefined) return null;
-    if (typeof after !== "string" || after.length === 0)
-        return `edit.edits[${i}].after must be a non-empty string if present`;
-    // Public destinations are an `after` anchor or `start` (prepend)
-    // only: EOF/end/before sentinels and `:after`/`:before` suffix
-    // tricks belong to the internal dest union, not the wire contract.
-    if (!isAcceptedTransferAfter(after))
-        return `edit.edits[${i}].transfer after "${after}" is not accepted: supply a destination anchor or \`start\``;
-    return null;
-}
-
-function checkTransferOpKind(op: unknown, i: number): string | null {
-    if (op !== "copy" && op !== "move")
-        return `edit.edits[${i}].op must be "copy" or "move"`;
-    return null;
-}
-
-function hasTransferExclusiveConflict(e: Record<string, unknown>): boolean {
-    return e.path !== undefined
-        || e.oldText !== undefined
-        || e.newText !== undefined
-        || e.target !== undefined
-        || e.lineRange !== undefined
-        || e.hashline !== undefined
-        || e.replaceAll !== undefined;
-}
-
-function checkTransferExclusivity(e: Record<string, unknown>, i: number): string | null {
-    if (hasTransferExclusiveConflict(e))
-        return `edit.edits[${i}]: op is mutually exclusive with path, oldText, newText, replaceAll, target, lineRange, and hashline`;
-    return null;
-}
-
-function checkTransferFrom(e: Record<string, unknown>, i: number): string | null {
-    if (isMissingNonEmptyString(e.from))
-        return `edit.edits[${i}].from must be a non-empty string`;
-    return null;
-}
-
-function checkTransferTo(e: Record<string, unknown>, i: number): string | null {
-    if (isMissingNonEmptyString(e.to))
-        return `edit.edits[${i}].to must be a non-empty string`;
-    return null;
-}
-
-function checkTransferRange(e: Record<string, unknown>, i: number): string | null {
-    const { range } = e;
-    if (!isPlainObject(range))
-        return `edit.edits[${i}].range must be an object`;
-    return validatePosEndRange(range, i, "range");
-}
-
-function checkTransferOp(e: Record<string, unknown>, i: number): string | null {
-    return checkTransferOpKind(e.op, i)
-        ?? checkTransferExclusivity(e, i)
-        ?? checkTransferFrom(e, i)
-        ?? checkTransferTo(e, i)
-        ?? checkTransferAfter(e.after, i)
-        ?? checkTransferRange(e, i);
-}
-
-function targetHasSymbolicOp(targetObj: Record<string, unknown>): boolean {
-    return targetObj.replaceBody !== undefined
-        || targetObj.insertBefore !== undefined
-        || targetObj.insertAfter !== undefined;
-}
-
-function targetHasStructuralOp(targetObj: Record<string, unknown>): boolean {
-    return typeof targetObj.pattern === "string"
-        && typeof targetObj.replacement === "string";
-}
-
 function hasTextPair(oldText: unknown, newText: unknown): boolean {
     return typeof oldText === "string" && typeof newText === "string";
 }
@@ -595,41 +502,20 @@ function checkActionableBoundary(e: Record<string, unknown>, i: number): string 
         ?? `edit.edits[${i}] requires an actionable operation: provide both oldText and newText, or a symbolic/structural target or hashline`;
 }
 
-function hasAnyTransferField(e: Record<string, unknown>): boolean {
-    return e.from !== undefined || e.range !== undefined || e.to !== undefined || e.after !== undefined;
-}
-
-function checkTransferFieldsWithoutOp(e: Record<string, unknown>, i: number): string | null {
-    if (hasAnyTransferField(e))
-        return `edit.edits[${i}]: transfer fields (from, range, to, after) require op "copy" or "move"`;
-    return null;
-}
-
 function validateEditOperation(e: Record<string, unknown>, i: number): string | null {
     const unknown = firstUnknownKey(e, new Set([
         "path", "oldText", "newText", "description", "replaceAll", "target",
-        "lineRange", "hashline", "op", "from", "range", "to", "after",
+        "lineRange", "hashline",
     ]));
-    if (unknown) return `edit.edits[${i}].${unknown} is not supported`;
-    const { op } = e;
+    if (unknown) {
+        if (TRANSFER_KEYS.has(unknown))
+            return `edit.edits[${i}].${unknown} is not supported: transfer operations (copy/move) belong to the transfer tool, not edit`;
+        return `edit.edits[${i}].${unknown} is not supported`;
+    }
     const scalarErr = checkEditScalarFields(e, i);
     if (scalarErr) return scalarErr;
     const anchoredErr = checkAnchoredEditFields(e, i);
     if (anchoredErr) return anchoredErr;
-
-    // Transfer (copy/move) op: self-contained and mutually exclusive with
-    // every other edit shape. A valid transfer op is unconditionally
-    // actionable, so it returns early rather than falling into the
-    // oldText/newText/symbolic/structural/hashline actionable-boundary check.
-    // Only op/from/range/to/after/description may be present: path, replaceAll
-    // (even false), oldText, newText, target, lineRange, and hashline all reject.
-    if (op !== undefined) return checkTransferOp(e, i);
-
-    // Transfer-only fields without `op` are a malformed transfer, not a
-    // text edit: reject transfer-specifically instead of falling through to
-    // the generic actionable-operation boundary below.
-    const transferFieldsErr = checkTransferFieldsWithoutOp(e, i);
-    if (transferFieldsErr) return transferFieldsErr;
 
     // Actionable-operation boundary: a text edit needs both oldText and newText;
     // otherwise the item must be self-actionable via a symbolic/structural target
@@ -656,9 +542,19 @@ function checkRequestVariantExclusivity(hasEdits: boolean, hasRaw: boolean, hasR
     return null;
 }
 
-function isTransferEdit(e: Record<string, unknown>): boolean {
-    return e.op === "copy" || e.op === "move";
+function targetHasSymbolicOp(targetObj: Record<string, unknown>): boolean {
+    return targetObj.replaceBody !== undefined
+        || targetObj.insertBefore !== undefined
+        || targetObj.insertAfter !== undefined;
 }
+
+function targetHasStructuralOp(targetObj: Record<string, unknown>): boolean {
+    return typeof targetObj.pattern === "string"
+        && typeof targetObj.replacement === "string";
+}
+
+/** Transfer-shaped keys belong to the transfer tool; edit rejects them. */
+const TRANSFER_KEYS: ReadonlySet<string> = new Set(["op", "from", "range", "to", "after"]);
 
 function checkSingleEditItem(editList: unknown[], i: number): string | null {
     const e = editList[i];
@@ -675,10 +571,7 @@ function validateEditItems(editList: unknown[]): string | null {
 }
 
 function editsNeedTopLevelPath(editList: unknown[]): boolean {
-    return editList.some((item) => {
-        const e = item as Record<string, unknown>;
-        return !isTransferEdit(e) && e.path === undefined;
-    });
+    return editList.some((item) => (item as Record<string, unknown>).path === undefined);
 }
 
 function checkEditsList(edits: unknown, path: unknown): string | null {
@@ -816,7 +709,7 @@ export const EDIT_PARAMETERS = {
         path: { type: "string", description: "Default target file path. May be omitted when every edit provides its own path." },
         edits: {
             type: "array",
-            description: "One or more targeted edits. Mutually exclusive with `raw`.",
+            description: "One or more targeted edits that transform or generate content. Mutually exclusive with `raw`. When existing content should be preserved and relocated/reused, prefer transfer.",
             items: {
                 type: "object",
                 additionalProperties: false,
@@ -856,7 +749,7 @@ export const EDIT_PARAMETERS = {
                     hashline: {
                         type: "object",
                         additionalProperties: false,
-                        description: "Experimental hashline edit metadata. Enable SMART_EDIT_USE_HASHLINE_EDITING or its experimental alias.",
+                        description: "Hashline-anchored edit metadata. Addresses source lines by stable anchor, with optional symbol scope for fallback.",
                         properties: {
                             range: {
                                 type: "object",
@@ -889,25 +782,6 @@ export const EDIT_PARAMETERS = {
                         },
                         required: ["range"],
                     },
-                    op: {
-                        type: "string",
-                        enum: ["copy", "move"],
-                        description:
-                            "Relocate existing observed text by reference instead of reproducing it in newText: `copy` leaves the source intact, `move` deletes it after transfer. `to` is always required; `after` is required when `to` is an existing file (omit it when creating a new file; `start` prepends). Example: {\"op\":\"copy\",\"from\":\"a.ts\",\"range\":{\"pos\":\"10ab\",\"end\":\"12cd\"},\"to\":\"a.ts\",\"after\":\"40ef\"}",
-                    },
-                    from: { type: "string", description: "Source file path for a transfer op." },
-                    range: {
-                        type: "object",
-                        additionalProperties: false,
-                        description: "Transfer op source anchor range in `from`, pre-edit coordinates from the last read.",
-                        properties: {
-                            pos: { type: "string", minLength: 1, description: "Start hashline anchor of the source span." },
-                            end: { type: "string", minLength: 1, description: "End hashline anchor of the source span." },
-                        },
-                        required: ["pos", "end"],
-                    },
-                    to: { type: "string", description: "Destination file path for a transfer op." },
-                    after: { type: "string", minLength: 1, description: "Destination hashline anchor to insert after, or `start` to prepend. Omit when `to` is a new file." },
                 },
                 // An edit item must be actionable: a text pair (oldText+newText) or
                 // a self-actionable target (symbolic op or structural pattern+replacement)
@@ -929,7 +803,6 @@ export const EDIT_PARAMETERS = {
                         },
                     },
                     { required: ["hashline"] },
-                    { required: ["op", "from", "range", "to"] },
                 ],
             },
         },
