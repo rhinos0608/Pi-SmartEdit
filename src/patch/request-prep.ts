@@ -1,11 +1,10 @@
 /**
  * Patch request preparation — grouping, auto-inspect envelope synthesis,
- * preparation, transfer resolution, and envelope acquisition.
+ * preparation, and envelope acquisition. Transfer batch resolution lives in
+ * the transfer domain (`src/transfer/resolve-batch.ts`).
  * Pure move: verbatim from src/patch.ts (MS4 of patch.ts split), no logic
  * change. Owns node fs/path reads plus the getRpcClient resolve_evidence
  * call (rpc.dispose() in finally). Must NOT import tx, planner, verifiers.
- * resolvePatchTransfers mutates the groups array in place (reserved
- * transfer groups) — preserved as-is.
  */
 import { readFile as fsReadFile } from "node:fs/promises";
 import { resolve as pathResolve, dirname, basename, join as pathJoin } from "node:path";
@@ -22,6 +21,8 @@ import {
     type EvidenceRef,
     type RpcMethod,
 } from "@rhinos0608/pi-workspace-protocol";
+import type { MutationResourceIntent } from "../mutation/resource-intent.js";
+import type { MutationToolIdentity } from "../mutation/types.js";
 import type {
     PatchToolDeps,
     GroupedEdit,
@@ -30,7 +31,6 @@ import type {
     MutableChecks,
     PatchResult,
     PreparedPatchRequest,
-    ResolvedPatchTransfer,
 } from "./types.js";
 import {
     freshChecks,
@@ -39,7 +39,6 @@ import {
     makeFailed,
     classifyRpcError,
 } from "./result-builders.js";
-import { adaptTransferOps } from "../transfer/adapter.js";
 import { normalizeRawEdit } from "../formats/edit-intents.js";
 import type { EditOperation } from "../edit-contract.js";
 
@@ -88,7 +87,6 @@ export async function buildAutoInspectEnvelope(args: {
     sessionFilePath: string;
     canonicalRoot: string;
     groups: ReadonlyArray<EditGroup>;
-    newFileAllowed?: ReadonlySet<string>;
 }): Promise<{
     ok: true;
     envelope: WorkspaceEvidenceEnvelope;
@@ -104,11 +102,12 @@ export async function buildAutoInspectEnvelope(args: {
     for (const g of args.groups) {
         const fileExists = existsSync(g.absolutePath);
         if (!fileExists) {
-            // New-file creation is only valid when every edit has empty oldText,
-            // or the group is a transfer-op destination explicitly allowed to
-            // create a new file (its synthesized edit uses the EOF append
-            // branch, not oldText, so it wouldn't satisfy the .every() below).
-            const allEmpty = (args.newFileAllowed?.has(g.absolutePath) ?? false) || g.edits.every(
+            // New-file creation is only valid when every edit has empty
+            // oldText. A transfer destination group carries no text edits at
+            // all, so `[].every()` is trivially true and it is allowed here;
+            // the kernel's `create-new` intent (plus the create-new race
+            // guard in the transaction runner) owns the rest.
+            const allEmpty = g.edits.every(
                 (e) => typeof e.oldText === "string" && e.oldText.length === 0,
             );
             if (!allEmpty) {
@@ -206,16 +205,17 @@ export function preparePatchRequest(args: {
     deps: PatchToolDeps;
     ctx: { cwd: string };
     toolCallId: string;
+    tool: MutationToolIdentity;
 }): { ok: true; prepared: PreparedPatchRequest } | { ok: false; result: PatchResult } {
-    const { validated, deps, ctx, toolCallId } = args;
+    const { validated, deps, ctx, toolCallId, tool } = args;
     const requestEvidenceRef = validated.value.evidenceRef;
     const sessionFilePath = deps.getSessionFilePath();
     if (typeof sessionFilePath !== "string" || sessionFilePath.length === 0) {
-        return { ok: false, result: { content: [{ type: "text" as const, text: "rejected: ephemeral session identity" }], details: makeRejected(toolCallId, "session", ["no real session file path"], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks()) } };
+        return { ok: false, result: { content: [{ type: "text" as const, text: "rejected: ephemeral session identity" }], details: makeRejected(toolCallId, "session", ["no real session file path"], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks(), [], [], tool) } };
     }
     const canonicalRoot = deps.getCanonicalWorkspaceRoot();
     if (typeof canonicalRoot !== "string" || canonicalRoot.length === 0) {
-        return { ok: false, result: { content: [{ type: "text" as const, text: "rejected: missing canonical workspace root" }], details: makeRejected(toolCallId, "session", ["no canonical workspace root"], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks()) } };
+        return { ok: false, result: { content: [{ type: "text" as const, text: "rejected: missing canonical workspace root" }], details: makeRejected(toolCallId, "session", ["no canonical workspace root"], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks(), [], [], tool) } };
     }
     let requestEdits: ReadonlyArray<EditOperation> = validated.value.edits ?? [];
     let rawTopology: RawTopology[] = [];
@@ -225,7 +225,7 @@ export function preparePatchRequest(args: {
         rawWarnings.push(...normalized.warnings);
         if (normalized.diagnostics.length > 0 || normalized.intents.length === 0) {
             const diagnostics = [...rawWarnings, ...normalized.diagnostics, "Raw patch parsed into no executable update operations."];
-            return { ok: false, result: { content: [{ type: "text" as const, text: "failed: raw patch parsing" }], details: makeFailed(toolCallId, "stage", "raw patch normalization failed", { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks(), diagnostics) } };
+            return { ok: false, result: { content: [{ type: "text" as const, text: "failed: raw patch parsing" }], details: makeFailed(toolCallId, "stage", "raw patch normalization failed", { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks(), diagnostics, [], [], undefined, tool) } };
         }
         rawTopology = normalized.intents.flatMap((intent): RawTopology[] => {
             if (intent.kind === "text") return [];
@@ -233,15 +233,9 @@ export function preparePatchRequest(args: {
         });
         requestEdits = normalized.intents.flatMap((intent) => intent.kind === "text" ? [intent.operation] : []);
     }
-    const transferOps = requestEdits.filter((e) => (e as { op?: unknown }).op !== undefined);
-    const textOps = requestEdits.filter((e) => (e as { op?: unknown }).op === undefined);
-    const adaptedTransfers = adaptTransferOps(transferOps, validated.value.path);
-    if (!adaptedTransfers.ok) {
-        return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${adaptedTransfers.error}` }], details: makeRejected(toolCallId, "session", [adaptedTransfers.error], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks()) } };
-    }
-    const grouping = groupEditsByPath(ctx.cwd, validated.value.path ?? "", textOps);
+    const grouping = groupEditsByPath(ctx.cwd, validated.value.path ?? "", requestEdits);
     if (!grouping.ok) {
-        return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${grouping.error}` }], details: makeRejected(toolCallId, "session", [grouping.error], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks()) } };
+        return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${grouping.error}` }], details: makeRejected(toolCallId, "session", [grouping.error], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks(), [], [], tool) } };
     }
     const groups = grouping.groups;
     const topologyConflicts: Array<{ path: string; existingKind: string; newKind: string }> = [];
@@ -263,82 +257,28 @@ export function preparePatchRequest(args: {
     }
     if (topologyConflicts.length > 0) {
         const message = topologyConflicts.map((c) => `conflicting topology operations for path '${c.path}': ${c.existingKind} vs ${c.newKind}`).join("; ");
-        return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${message}` }], details: makeRejected(toolCallId, "conflict", [message], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks()) } };
+        return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${message}` }], details: makeRejected(toolCallId, "conflict", [message], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, freshChecks(), [], [], tool) } };
     }
     const checks: MutableChecks = freshChecks();
     const diagnostics: string[] = [...rawWarnings];
-    return { ok: true, prepared: { requestEvidenceRef, sessionFilePath, canonicalRoot, textOps, adaptedTransfers: adaptedTransfers as PreparedPatchRequest["adaptedTransfers"], groups, checks, diagnostics } };
-}
-
-export function resolvePatchTransfers(args: {
-    adaptedTransfers: PreparedPatchRequest["adaptedTransfers"];
-    groups: EditGroup[];
-    ctx: { cwd: string };
-    toolCallId: string;
-    requestEvidenceRef: EvidenceRef | undefined;
-    checks: MutableChecks;
-}): { ok: true; resolvedTransfers: ResolvedPatchTransfer[]; transferNewFileCanonicals: Set<string>; copySourceOnlyPaths: Set<string> } | { ok: false; result: PatchResult } {
-    const { adaptedTransfers, groups, ctx, toolCallId, requestEvidenceRef, checks } = args;
-    const resolvedTransfers: ResolvedPatchTransfer[] = [];
-    const transferNewFileCanonicals = new Set<string>();
-    const copySourceOnlyPaths = new Set<string>();
-    for (const transferReq of adaptedTransfers.value) {
-        const op = transferReq.op;
-        const rawFrom = transferReq.from;
-        const rawTo = transferReq.to;
-        const range = transferReq.range;
-        const after = transferReq.after;
-        let canonicalFrom: string;
-        try {
-            canonicalFrom = realpathSync(pathResolve(ctx.cwd, rawFrom));
-        } catch (err) {
-            const message = `transfer source not found: ${rawFrom} (${err instanceof Error ? err.message : String(err)})`;
-            return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${message}` }], details: makeRejected(toolCallId, "coverage", [message], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, checks) } };
-        }
-        let canonicalTo: string;
-        let toIsNewFile = false;
-        try {
-            canonicalTo = realpathSync(pathResolve(ctx.cwd, rawTo));
-        } catch (err) {
-            if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-                const absTo = pathResolve(ctx.cwd, rawTo);
-                try {
-                    canonicalTo = pathJoin(realpathSync(dirname(absTo)), basename(absTo));
-                } catch {
-                    canonicalTo = absTo;
-                }
-                toIsNewFile = true;
-            } else {
-                const message = `transfer destination not found: ${rawTo} (${err instanceof Error ? err.message : String(err)})`;
-                return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${message}` }], details: makeRejected(toolCallId, "coverage", [message], { inspectionId: requestEvidenceRef?.inspectionId ?? "", resourceIds: requestEvidenceRef ? [...requestEvidenceRef.resourceIds] : [] }, checks) } };
-            }
-        }
-        if (toIsNewFile) transferNewFileCanonicals.add(canonicalTo);
-        const description = transferReq.description;
-        resolvedTransfers.push({ op, canonicalFrom, canonicalTo, range, after, rawFrom, rawTo, toIsNewFile, description });
-        const buckets: Array<[string, string]> = op === "move" ? [[canonicalTo, rawTo], [canonicalFrom, rawFrom]] : [[canonicalTo, rawTo]];
-        for (const [absolutePath, rawPath] of buckets) {
-            if (!groups.some((g) => g.absolutePath === absolutePath)) groups.push({ absolutePath, rawPath, edits: [] });
-        }
-        if (op === "copy") copySourceOnlyPaths.add(canonicalFrom);
-    }
-    return { ok: true, resolvedTransfers, transferNewFileCanonicals, copySourceOnlyPaths };
+    return { ok: true, prepared: { requestEvidenceRef, sessionFilePath, canonicalRoot, textOps: [...requestEdits], groups, checks, diagnostics } };
 }
 
 export async function acquirePatchEnvelope(args: {
     deps: PatchToolDeps;
     groups: EditGroup[];
+    resourceIntents?: ReadonlyArray<MutationResourceIntent>;
     sessionFilePath: string;
     canonicalRoot: string;
     requestEvidenceRef: EvidenceRef | undefined;
-    transferNewFileCanonicals: ReadonlySet<string>;
     toolCallId: string;
+    tool: MutationToolIdentity;
     checks: MutableChecks;
     diagnostics: string[];
     usedEvidence: string[];
     signal: AbortSignal | undefined;
 }): Promise<{ ok: true; envelope: WorkspaceEvidenceEnvelope | null; autoInspected: boolean; evidenceRefForDetails: EvidenceRef; newFileCanonicals: ReadonlySet<string> } | { ok: false; result: PatchResult }> {
-    const { deps, groups, sessionFilePath, canonicalRoot, requestEvidenceRef, transferNewFileCanonicals, toolCallId, checks, diagnostics, usedEvidence, signal } = args;
+    const { deps, groups, resourceIntents = [], sessionFilePath, canonicalRoot, requestEvidenceRef, toolCallId, tool, checks, diagnostics, usedEvidence, signal } = args;
     const priorStore = deps.getPriorAuthority?.() ?? null;
     const groupsNeedingEnvelope: EditGroup[] = [];
     for (const g of groups) {
@@ -353,6 +293,21 @@ export async function acquirePatchEnvelope(args: {
         }
         if (!prior) groupsNeedingEnvelope.push(g);
     }
+    // Create-new destinations need no prior authority: the kernel synthesizes
+    // an empty preimage for them (owned by the `create-new` resource intents).
+    // Observation-only transfer sources are evidence resources even when they
+    // are not mutation groups. Copy requires full-file authority and freshness.
+    for (const intent of resourceIntents) {
+        if (intent.kind !== "observe-source") continue;
+        const prior = priorStore?.select(intent.canonicalPath) ?? null;
+        if (prior?.coverage === "full-file") continue;
+        // Existing partial authority is intentionally left for transfer staging
+        // to reject when its required full-file SHA is absent.
+        if (prior && !requestEvidenceRef) continue;
+        if (!groupsNeedingEnvelope.some((g) => g.absolutePath === intent.canonicalPath)) {
+            groupsNeedingEnvelope.push({ absolutePath: intent.canonicalPath, rawPath: intent.canonicalPath, edits: [] });
+        }
+    }
     let envelope: WorkspaceEvidenceEnvelope | null = null;
     let autoInspected = false;
     let evidenceRefForDetails: EvidenceRef;
@@ -366,13 +321,13 @@ export async function acquirePatchEnvelope(args: {
         if (existingWithoutPrior.length > 0) {
             const message = `no prior strong read authority for ${existingWithoutPrior.map((g) => g.rawPath).join(", ")}; read the file first (full file or target range), then retry`;
             diagnostics.push(message);
-            return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: coverage (${message})` }], details: makeRejected(toolCallId, "coverage", diagnostics, { inspectionId: "", resourceIds: [] }, checks) } };
+            return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: coverage (${message})` }], details: makeRejected(toolCallId, "coverage", diagnostics, { inspectionId: "", resourceIds: [] }, checks, [], [], tool) } };
         }
-        const built = await buildAutoInspectEnvelope({ sessionFilePath, canonicalRoot, groups: groupsNeedingEnvelope, newFileAllowed: transferNewFileCanonicals });
+        const built = await buildAutoInspectEnvelope({ sessionFilePath, canonicalRoot, groups: groupsNeedingEnvelope });
         if (!built.ok) {
             diagnostics.push(built.error);
             checks.completed.push(makeCheck("auto-inspect", "fail", built.error));
-            return { ok: false, result: { content: [{ type: "text" as const, text: `failed: ${built.error}` }], details: makeFailed(toolCallId, "stage", built.error, { inspectionId: "", resourceIds: [] }, checks, diagnostics) } };
+            return { ok: false, result: { content: [{ type: "text" as const, text: `failed: ${built.error}` }], details: makeFailed(toolCallId, "stage", built.error, { inspectionId: "", resourceIds: [] }, checks, diagnostics, [], [], undefined, tool) } };
         }
         envelope = built.envelope;
         autoInspected = true;
@@ -387,34 +342,34 @@ export async function acquirePatchEnvelope(args: {
         const reply = await rpc.request("resolve_evidence" as RpcMethod, { inspectionId: requestEvidenceRef.inspectionId, sessionFilePath, workspaceRoot: canonicalRoot }, { signal });
         if (!reply.ok || !reply.payload) {
             checks.completed.push(makeCheck("evidence-pipeline", "fail", reply.error ?? "rpc returned no payload"));
-            return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${reply.error ?? "unknown rpc error"}` }], details: makeRejected(toolCallId, classifyRpcError(reply.error), [reply.error ?? "rpc failure"], evidenceRefForDetails, checks) } };
+            return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${reply.error ?? "unknown rpc error"}` }], details: makeRejected(toolCallId, classifyRpcError(reply.error), [reply.error ?? "rpc failure"], evidenceRefForDetails, checks, [], [], tool) } };
         }
         if (reply.schemaVersion !== PROTOCOL_SCHEMA_VERSION) {
             const message = `invalid evidence envelope: schemaVersion must be ${PROTOCOL_SCHEMA_VERSION}`;
             diagnostics.push(message);
             checks.completed.push(makeCheck("evidence-pipeline", "fail", message));
-            return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${message}` }], details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks) } };
+            return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${message}` }], details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, [], [], tool) } };
         }
         const validated = validateInspectionEnvelope(reply.payload);
         if (!validated.ok) {
             const message = `invalid evidence envelope: ${validated.error}`;
             diagnostics.push(message);
             checks.completed.push(makeCheck("evidence-pipeline", "fail", message));
-            return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${message}` }], details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks) } };
+            return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${message}` }], details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, [], [], tool) } };
         }
         envelope = validated.value;
         if (requestEvidenceRef && envelope.inspectionId !== requestEvidenceRef.inspectionId) {
             const message = "envelope inspectionId mismatch (possible resolver spoof)";
             diagnostics.push(message);
             checks.completed.push(makeCheck("evidence-pipeline", "fail", message));
-            return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${message}` }], details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks) } };
+            return { ok: false, result: { content: [{ type: "text" as const, text: `rejected: ${message}` }], details: makeRejected(toolCallId, "coverage", diagnostics, evidenceRefForDetails, checks, [], [], tool) } };
         }
         checks.completed.push(makeCheck("evidence-pipeline", "pass", "rpc resolve_evidence succeeded"));
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         diagnostics.push(msg);
         checks.completed.push(makeCheck("evidence-pipeline", "timeout", msg));
-        return { ok: false, result: { content: [{ type: "text" as const, text: `failed: ${msg}` }], details: makeFailed(toolCallId, "stage", msg, evidenceRefForDetails, checks, diagnostics) } };
+        return { ok: false, result: { content: [{ type: "text" as const, text: `failed: ${msg}` }], details: makeFailed(toolCallId, "stage", msg, evidenceRefForDetails, checks, diagnostics, [], [], undefined, tool) } };
     } finally {
         rpc.dispose();
     }
@@ -422,11 +377,11 @@ export async function acquirePatchEnvelope(args: {
         const expectedSessionId = hashSessionFilePath(sessionFilePath);
         if (envelope.sessionId !== expectedSessionId) {
             diagnostics.push("envelope session identity mismatch");
-            return { ok: false, result: { content: [{ type: "text" as const, text: "rejected: session identity mismatch" }], details: makeRejected(toolCallId, "session", diagnostics, evidenceRefForDetails, checks, usedEvidence) } };
+            return { ok: false, result: { content: [{ type: "text" as const, text: "rejected: session identity mismatch" }], details: makeRejected(toolCallId, "session", diagnostics, evidenceRefForDetails, checks, usedEvidence, [], tool) } };
         }
         if (envelope.canonicalWorkspaceRoot !== canonicalRoot) {
             diagnostics.push("envelope workspace root mismatch");
-            return { ok: false, result: { content: [{ type: "text" as const, text: "rejected: workspace mismatch" }], details: makeRejected(toolCallId, "session", diagnostics, evidenceRefForDetails, checks, usedEvidence) } };
+            return { ok: false, result: { content: [{ type: "text" as const, text: "rejected: workspace mismatch" }], details: makeRejected(toolCallId, "session", diagnostics, evidenceRefForDetails, checks, usedEvidence, [], tool) } };
         }
     }
     return { ok: true, envelope, autoInspected, evidenceRefForDetails, newFileCanonicals };

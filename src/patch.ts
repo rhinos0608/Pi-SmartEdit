@@ -40,7 +40,7 @@ import {
     sha256OfString,
     type InspectedResource,
     type LineRange,
-    type PatchDetails,
+    type MutationDetails,
     type EvidenceRef,
     type CheckRecord,
     type ResourceInvalidation,
@@ -58,18 +58,7 @@ import type { RepairLoopResult } from "./verification/repair-loop.js";
 // importers keep working untouched. Pure move: zero logic change.
 import type {
     PatchToolDeps,
-    FinalSuccessFile,
-    VerificationCheck,
-    CheckOutcome,
-    MutableChecks,
-    GroupedEdit,
-    EditGroup,
-    RawTopology,
     PatchResult,
-    PreparedPatchRequest,
-    PatchExecutionState,
-    ResolvedPatchTransfer,
-    PatchDisplayDiff,
     PatchTool,
 } from "./patch/types.js";
 import { VERIFIER_TIMEOUT_MS } from "./patch/types.js";
@@ -98,7 +87,7 @@ import {
     makeRejected,
     classifyRpcError,
 } from "./patch/result-builders.js";
-import { finalizeAppliedPatch } from "./patch/final-result.js";
+import { finalizeAppliedPatch } from "./mutation/final-result.js";
 
 // ── Transaction runner (shared kernel: ./patch/transaction-runner.js) ──
 // EditTransaction begin/commit/rollback orchestration lives in the shared
@@ -106,13 +95,11 @@ import { finalizeAppliedPatch } from "./patch/final-result.js";
 // Pure move: zero logic change. The runner owns the try/finally, so
 // terminal returns inside its try still trigger its own
 // rollback-on-not-committed finally.
-import { runPatchTransaction } from "./patch/transaction-runner.js";
 
 // ── Group planning (shared kernel: ./patch/group-planning.js) ──────────
 // Per-group preimage authorization, candidate mutation planning, and
 // advisory repair integration live in the shared kernel; imported here so
 // the orchestrator keeps working untouched. Pure move: zero logic change.
-import { resolveAuthorizedGroupPreimage, planGroupMutation, applyAuthorizedRepair } from "./patch/group-planning.js";
 
 // ── Authorization (see ./context/patch-authorization.js) ───────────────────
 // Evidence authorization (types, resource selection, coverage validation,
@@ -135,12 +122,6 @@ export {
 // resolution, and envelope acquisition live in the shared kernel;
 // imported here so the orchestrator keeps working untouched.
 // Pure move: zero logic change.
-import {
-    safeReadUtf8,
-    preparePatchRequest,
-    resolvePatchTransfers,
-    acquirePatchEnvelope,
-} from "./patch/request-prep.js";
 
 // ── Refactor preview (shared kernel: ./patch/refactor-preview.js) ──
 // Rename / organize-imports / formatting / code-action preview planning
@@ -149,10 +130,6 @@ import {
 // handleRefactorRequest returns PatchResult|null (null = not refactor →
 // orchestrator continues). isBlockingPostwriteFailure is shared with the
 // orchestrator postwrite loop (imported, not duplicated).
-import {
-    isBlockingPostwriteFailure,
-    handleRefactorRequest,
-} from "./patch/refactor-preview.js";
 
 // ── Execute orchestrator (shared kernel: ./patch/execute.js) ───────
 // dispatchValidatedRequest + preparePatchExecution + executePatch own the
@@ -167,7 +144,7 @@ export function createPatchTool(deps: PatchToolDeps): PatchTool {
         name: "patch",
         label: "patch",
         description:
-            "Apply edits to files gated by workspace evidence. Existing files require prior strong read authority; new files may use empty-file semantics. Provide a `path` and a list of `edits`, or a `raw` patch string (mutually exclusive); each edit may carry its own `path`. Freshness and coverage are validated automatically; returns a discriminated lifecycle result (applied | rejected | failed).",
+            "Apply edits to files gated by workspace evidence. Existing files require prior strong read authority; new files may use empty-file semantics. Provide a `path` and a list of `edits`, or a `raw` patch string (mutually exclusive); each edit may carry its own `path`. Freshness and coverage are validated automatically; returns a discriminated lifecycle result (applied | rejected | failed). Use patch to transform or generate content; when existing content should be preserved and relocated/reused, prefer transfer.",
         parameters: EDIT_PARAMETERS as unknown as Record<string, unknown>,
 
         async execute(toolCallId, params, signal, onUpdate, ctx) {

@@ -6,6 +6,7 @@ import { recordRead, recordReadSession, getSnapshot } from "../context/read-cach
 import { buildHashlineAnchors } from "../hashline/hashline";
 import { getSmartEditRuntimeConfig } from "../config/edit-mode";
 import { releaseDiagnosticsOwner } from "../mutation/mutation-ownership.js";
+import { isMutationTool } from "../mutation/types.js";
 import type { PriorAuthorityStore } from "../context/evidence-authority.js";
 
 const smartEditRuntimeConfig = getSmartEditRuntimeConfig();
@@ -25,10 +26,7 @@ export function coerceText(value: unknown): string {
 
 /** tool_result seam: release diagnostics claim on failed mutation. */
 export function releaseClaimOnFailedMutation(event: { toolName?: string; isError?: boolean; toolCallId: string }): void {
-  if (
-    (event.toolName === "write" || event.toolName === "edit") &&
-    event.isError
-  ) {
+  if (isMutationTool(event.toolName) && event.isError) {
     releaseDiagnosticsOwner(event.toolCallId);
   }
 }

@@ -4,11 +4,12 @@
  * transaction. Moved verbatim from src/patch.ts (MS2 of patch.ts split).
  */
 import type {
-    PatchDetails,
+    MutationDetails,
     EvidenceRef,
     CheckRecord,
     ResourceInvalidation,
 } from "@rhinos0608/pi-workspace-protocol";
+import type { MutationToolIdentity } from "../mutation/types.js";
 import type {
     MutableChecks,
     VerificationCheck,
@@ -25,7 +26,7 @@ export function makeCheck(id: string, outcome: "pass" | "fail" | "skipped" | "ti
     return detail === undefined ? { id, outcome } : { id, outcome, detail };
 }
 
-export function freezeChecks(c: MutableChecks): PatchDetails["checks"] {
+export function freezeChecks(c: MutableChecks): MutationDetails["checks"] {
     return {
         blocking: c.blocking.slice(),
         completed: c.completed.slice(),
@@ -87,9 +88,10 @@ export function makeRejected(
     checks: MutableChecks,
     usedEvidence: ReadonlyArray<string> = [],
     changedResources: ReadonlyArray<ResourceInvalidation> = [],
-): PatchDetails {
+    tool: MutationToolIdentity = "edit",
+): MutationDetails {
     return {
-        tool: "patch",
+        tool,
         status: { kind: "rejected", reason },
         toolCallId,
         evidenceRef,
@@ -110,9 +112,10 @@ export function makeFailed(
     usedEvidence: ReadonlyArray<string> = [],
     changedResources: ReadonlyArray<ResourceInvalidation> = [],
     rollback?: { ok: boolean; reason?: string },
-): PatchDetails {
+    tool: MutationToolIdentity = "edit",
+): MutationDetails {
     return {
-        tool: "patch",
+        tool,
         status: { kind: "failed", phase },
         toolCallId,
         evidenceRef,

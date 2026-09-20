@@ -1,7 +1,11 @@
 /**
  * Transfer-edit facade: re-exports the frozen transfer semantics now owned
- * by `src/transfer/` (contract, resolve, plan, adapter) so existing imports
- * (`src/patch.ts`, tests) keep working unchanged.
+ * by `src/transfer/` (contract, resolve, plan) so existing imports
+ * (tests) keep working unchanged.
+ *
+ * Stage 4 hard-cut: the transfer-in-`edit` adapter is deleted. Copy/move is
+ * only available through the first-class `transfer` tool
+ * (`src/transfer/tool.ts`); `edit` rejects transfer-shaped payloads.
  */
 export {
   type TransferRequest,
@@ -28,7 +32,3 @@ export {
   buildTransferInsertEdit,
   buildTransferDeleteEdit,
 } from "./transfer/plan.js";
-export {
-  adaptTransferOp,
-  adaptTransferOps,
-} from "./transfer/adapter.js";

@@ -6,6 +6,7 @@ import type { LineRange, WorkspaceEvidenceEnvelope } from "@rhinos0608/pi-worksp
 
 import { recordRead, recordReadSession } from "../context/read-cache";
 import type { PriorAuthorityStore } from "../context/evidence-authority.js";
+import { isMutationTool } from "../mutation/types.js";
 import { runAutoValidation, formatValidationFeedback } from "../verification/auto-validate";
 import { appendDiagnosticsToContent } from "../mutation/post-mutation.js";
 import type { PatchToolDetails } from "../patch.js";
@@ -278,10 +279,7 @@ export async function handleEditSuccessResult(
   buildMutationEvidence: BuildMutationEvidence,
   store: PriorAuthorityStore | null,
 ): Promise<{ content: ToolResultEvent["content"]; details: unknown } | undefined> {
-  if (
-    event.toolName !== "edit" ||
-    event.isError
-  ) {
+  if (!isMutationTool(event.toolName) || event.isError) {
     return undefined;
   }
   try {
