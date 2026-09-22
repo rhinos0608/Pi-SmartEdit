@@ -16,7 +16,7 @@ Smart Edit replaces Pi's built-in `edit` tool with safer matching, richer diagno
 - **Stale-file guard**: blocks edits when the file changed since read
 - **Range coverage guard**: blocks edits outside the lines you actually read
 - **Failure-atomic transactions**: multi-file, raw, and topology edits share one transaction with rollback for handled failures
-- **Outside-workspace targets**: SmartEdit canonicalizes target paths but does not enforce workspace containment for mutations — only evidence minting is containment-gated
+- **Outside-workspace targets**: SmartEdit canonicalizes target paths but does not confine mutations to the workspace — cwd is session/evidence identity, not filesystem confinement. An out-of-workspace path with valid evidence CAN authorize; the real filesystem perimeter is the Pi runtime/container
 - **Atomic writes**: temp-file write + rename, with mode preservation (undo-safe)
 - **Edit history / undo**: captures pre-edit state to `.smart-edit-undo/` for rollback
 - **Context markers**: XML-style tags around injected semantic context for attribution/filtering
@@ -112,7 +112,7 @@ Previews expire after 5 minutes, max 16 cached (oldest evicted first). Apply ver
 
 ### Security model
 
-All LSP output is treated as untrusted. Every `WorkspaceEdit` is validated: file URIs must resolve to canonical realpaths inside allowed roots, UTF-16 ranges must be in-bounds and non-overlapping, and counts are bounded. Each touched file requires prior strong read authority with matching SHA-256 — no evidence, no write. Apply uses a failure-atomic `EditTransaction` so partial writes roll back.
+All LSP output is treated as untrusted. Every `WorkspaceEdit` is validated at the provider boundary: file URIs must resolve to canonical realpaths (symlinks resolved via `realpathSync`), UTF-16 ranges must be in-bounds and non-overlapping, and counts are bounded. Path validation is provider/runtime hygiene, not workspace containment — an out-of-workspace path with valid evidence CAN authorize (see outside-workspace policy below). Each touched file requires prior strong read authority with matching SHA-256 — no evidence, no write. Apply uses a failure-atomic `EditTransaction` so partial writes roll back.
 
 ## SmartRead Integration
 
@@ -449,7 +449,7 @@ npx tsx --test test/<file>  # e.g., test/symbolic-edits.test.ts
 - Fuzzy matches are safe: replacements are always applied to the original file text.
 - Undo data is stored in `.smart-edit-undo/` per project; persistence happens **after commit** and is **best-effort** (never blocks the edit).
 - Verification pipeline is advisory: warnings are matchNotes, never hard errors by default.
-- **Outside-workspace policy**: SmartEdit canonicalizes targets but does not enforce workspace containment for mutations. Only evidence minting is containment-gated; filesystem confinement is the container/runtime's responsibility.
+- **Outside-workspace policy**: SmartEdit canonicalizes targets but does not confine mutations to the workspace. cwd names the session/evidence identity, not a filesystem boundary: an out-of-workspace path with valid evidence CAN authorize. The real filesystem perimeter is the Pi runtime/container.
 - **Failure-atomicity guarantee**: Multi-file, raw, and topology edits share one failure-atomic transaction. Handled write/verify failures roll back all prior changes in the transaction and report exact rollback outcome. This does **not** cover power-loss, OS crash, or instantaneous cross-file filesystem atomicity — only handled process failures with explicit rollback.
 - **Evidence Policy B**: The agent-visible schema omits `evidenceRef`. The latest strong prior authority for a canonical path is reused; prior line-range authority is never widened by omission. Full-file auto-inspection occurs only when no strong prior authority exists.
 - **Default verifier**: no production blocking verifier is configured. The extension has no safe staged-workspace command contract, so it does not run arbitrary configured commands as a blocking gate. Verification lanes are advisory only.

@@ -3,7 +3,17 @@ import type { EvidenceRef } from "@rhinos0608/pi-workspace-protocol";
 import { formatBoundedDiagnostics, appendDiagnosticsToContent } from "./post-mutation.js";
 import { makeCheck, freezeChecks } from "../patch/result-builders.js";
 import type { PatchResult, PatchToolDeps, PatchToolDetails } from "../patch/types.js";
-import type { MutationState, MutationToolIdentity } from "./types.js";
+import type { MutationState, MutationToolIdentity, MutationDisplayDiff } from "./types.js";
+
+/** Global diff byte cap on result details: diffs over this are truncated with a hint. */
+export const MAX_RESULT_DIFF_BYTES = 256 * 1024;
+
+export function truncateDiffText(diff: string): string {
+    const n = Buffer.byteLength(diff, "utf8");
+    if (n <= MAX_RESULT_DIFF_BYTES) return diff;
+    const buf = Buffer.from(diff, "utf8").subarray(0, MAX_RESULT_DIFF_BYTES).toString("utf8");
+    return `${buf}\n... [diff truncated: showing first ${MAX_RESULT_DIFF_BYTES} of ${n} bytes; inspect the files on disk for the full change]`;
+}
 
 
 export interface FinalizeAppliedPatchArgs {
@@ -31,8 +41,10 @@ export async function finalizeAppliedPatch({ deps, ctx, toolCallId, state, autoI
     const lastCanonical = state.appliedCanonical.at(-1) ?? "";
     const lastPost = lastCanonical ? state.postEditEvidenceByPath.get(lastCanonical) : undefined;
     const singleDiff = state.displayDiffs.length === 1 ? state.displayDiffs[0] : undefined;
-    const combinedDiff = singleDiff ? singleDiff.diff : state.displayDiffs.map((entry) => `${entry.path}\n${entry.diff}`).join("\n\n");
-    const details: PatchToolDetails = { tool, status: { kind: "applied" }, toolCallId, evidenceRef: evidenceRefForDetails, usedEvidence: [...new Set(state.usedEvidence)], changedResources: state.invalidations, postEditEvidence: lastPost, checks: freezeChecks(state.checks), diagnostics: state.diagnostics, diff: combinedDiff, diffs: state.displayDiffs, repairs: Object.fromEntries(state.repairsByPath), finalization, rollback: rollbackInfo };
+    const rawCombined = singleDiff ? singleDiff.diff : state.displayDiffs.map((entry) => `${entry.path}\n${entry.diff}`).join("\n\n");
+    const combinedDiff = truncateDiffText(rawCombined);
+    const displayDiffs: MutationDisplayDiff[] = state.displayDiffs.map((entry) => ({ ...entry, diff: truncateDiffText(entry.diff) }));
+    const details: PatchToolDetails = { tool, status: { kind: "applied" }, toolCallId, evidenceRef: evidenceRefForDetails, usedEvidence: [...new Set(state.usedEvidence)], changedResources: state.invalidations, postEditEvidence: lastPost, checks: freezeChecks(state.checks), diagnostics: state.diagnostics, diff: combinedDiff, diffs: displayDiffs, repairs: Object.fromEntries(state.repairsByPath), finalization, rollback: rollbackInfo };
     const summary = state.appliedSummaries.length === 1 ? `applied ${state.appliedSummaries[0]}` : `applied: ${state.appliedSummaries.join("; ")}`;
     return { content: appendDiagnosticsToContent([{ type: "text" as const, text: summary }], formatBoundedDiagnostics(state.diagnostics)) as { type: "text"; text: string }[], details };
 }

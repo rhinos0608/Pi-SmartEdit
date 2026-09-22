@@ -50,7 +50,8 @@ export const TRANSFER_TOOL_PARAMETERS = {
         transfers: {
             type: "array",
             minItems: 1,
-            description: "One or more copy/move transfers. All transfers resolve against the same pre-transaction state and commit atomically.",
+            maxItems: 100,
+            description: "One or more copy/move transfers (max 100; max 50 distinct files). All transfers resolve against the same pre-transaction state and commit atomically.",
             items: TRANSFER_PARAMETERS,
         },
     },
@@ -60,6 +61,14 @@ export const TRANSFER_TOOL_PARAMETERS = {
 function isPlainObject(v: unknown): v is Record<string, unknown> {
     return typeof v === "object" && v !== null && !Array.isArray(v);
 }
+
+/** Admission caps: enforced at the top of validateTransferBatch, before resolution/locks. */
+export const MAX_TRANSFER_ITEMS = 100;
+export const MAX_TRANSFER_FILES = 50;
+/** Max bytes for any single transfer string field. */
+export const MAX_TRANSFER_STRING_BYTES = 1 * 1024 * 1024;
+/** Max bytes of transfer body text (sum of all string fields). */
+export const MAX_TRANSFER_TEXT_BYTES = 4 * 1024 * 1024;
 
 export function validateTransferBatch(
     input: unknown,
@@ -72,12 +81,43 @@ export function validateTransferBatch(
     if (!Array.isArray(transfers) || transfers.length === 0) {
         return { ok: false, error: "transfer.transfers must be a non-empty array" };
     }
+    if (transfers.length > MAX_TRANSFER_ITEMS)
+        return { ok: false, error: `transfer.transfers has ${transfers.length} items (max ${MAX_TRANSFER_ITEMS}): split the request into smaller batches and retry` };
     const out: TransferRequest[] = [];
+    const files = new Set<string>();
+    let totalBytes = 0;
+    const account = (field: string, value: string): string | null => {
+        const n = Buffer.byteLength(value, "utf8");
+        if (n > MAX_TRANSFER_STRING_BYTES)
+            return `${field} is ${n} bytes (max ${MAX_TRANSFER_STRING_BYTES}): split the request into smaller batches and retry`;
+        totalBytes += n;
+        if (totalBytes > MAX_TRANSFER_TEXT_BYTES)
+            return `transfer request text is over ${MAX_TRANSFER_TEXT_BYTES} bytes total: split the request into smaller batches and retry`;
+        return null;
+    };
     for (let i = 0; i < transfers.length; i++) {
         const validated = validateTransferRequest(transfers[i]);
         if (!validated.ok) return { ok: false, error: `transfer.transfers[${i}]: ${validated.error}` };
         out.push(validated.value);
+        files.add(validated.value.from);
+        files.add(validated.value.to);
+        const v = validated.value;
+        const fields: Array<[string, string | undefined]> = [
+            [`transfer.transfers[${i}].from`, v.from],
+            [`transfer.transfers[${i}].to`, v.to],
+            [`transfer.transfers[${i}].after`, v.after],
+            [`transfer.transfers[${i}].description`, v.description],
+            [`transfer.transfers[${i}].range.pos`, v.range.pos],
+            [`transfer.transfers[${i}].range.end`, v.range.end],
+        ];
+        for (const [field, value] of fields) {
+            if (value === undefined) continue;
+            const err = account(field, value);
+            if (err) return { ok: false, error: err };
+        }
     }
+    if (files.size > MAX_TRANSFER_FILES)
+        return { ok: false, error: `transfer touches ${files.size} files (max ${MAX_TRANSFER_FILES}): split the request into smaller batches and retry` };
     // evidenceRef is optional stored-call compat (tool-owned authority, never
     // advertised). Validated when present, never required.
     if (evidenceRef !== undefined) {

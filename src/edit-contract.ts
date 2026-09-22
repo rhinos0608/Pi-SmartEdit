@@ -14,6 +14,7 @@
  */
 import { validateEvidenceRef } from "@rhinos0608/pi-workspace-protocol";
 import type { EditTarget, HashlineEditMetadata, LineRange } from "./core/types.js";
+import { normalizeRawEdit } from "./formats/edit-intents.js";
 
 /** One targeted edit operation. */
 export interface EditOperation {
@@ -601,6 +602,17 @@ function checkTopLevelToolCallId(toolCallId: unknown): { ok: false; error: strin
     return null;
 }
 
+/** Admission caps: enforced early in the validator, before locks/snapshots/hashing.
+ *  Counts mirror LSP WorkspaceEdit limits (50 files / 5000 edits); the
+ *  per-request 100-item cap is stricter and governs. */
+export const MAX_EDIT_ITEMS = 100;
+export const MAX_FILES_TOUCHED = 50;
+export const MAX_TOTAL_EDITS = 5000;
+/** Max bytes of request body text (sum of oldText+newText+replaceBody+pattern+replacement+raw). */
+export const MAX_REQUEST_TEXT_BYTES = 4 * 1024 * 1024;
+/** Max bytes for any single request string field. */
+export const MAX_REQUEST_STRING_BYTES = 1 * 1024 * 1024;
+
 function checkRawField(raw: unknown): { ok: false; error: string } | null {
     if (isMissingNonEmptyString(raw))
         return fail("edit.raw must be a non-empty string");
@@ -616,6 +628,159 @@ function checkEditsVariant(hasEdits: boolean, edits: unknown, path: unknown): { 
     if (!hasEdits) return null;
     const editsErr = checkEditsList(edits, path);
     if (editsErr) return fail(editsErr);
+    return null;
+}
+
+function accountCappedString(field: string, value: string, total: { bytes: number }): string | null {
+    const n = Buffer.byteLength(value, "utf8");
+    if (n > MAX_REQUEST_STRING_BYTES)
+        return `${field} is ${n} bytes (max ${MAX_REQUEST_STRING_BYTES}): split the edit into smaller items and retry`;
+    total.bytes += n;
+    if (total.bytes > MAX_REQUEST_TEXT_BYTES)
+        return `edit request text is over ${MAX_REQUEST_TEXT_BYTES} bytes total: split the request into smaller batches and retry`;
+    return null;
+}
+
+/** All accepted string fields of one edit item, for byte accounting. */
+function editItemStrings(e: Record<string, unknown>, i: number): Array<[string, unknown]> {
+    const t = (e.target ?? {}) as Record<string, unknown>;
+    const h = (e.hashline ?? {}) as Record<string, unknown>;
+    const hr = (h.range ?? {}) as Record<string, unknown>;
+    const hs = (h.symbol ?? {}) as Record<string, unknown>;
+    return [
+        [`edit.edits[${i}].path`, e.path],
+        [`edit.edits[${i}].oldText`, e.oldText],
+        [`edit.edits[${i}].newText`, e.newText],
+        [`edit.edits[${i}].description`, e.description],
+        [`edit.edits[${i}].target.name`, t.name],
+        [`edit.edits[${i}].target.namePath`, t.namePath],
+        [`edit.edits[${i}].target.kind`, t.kind],
+        [`edit.edits[${i}].target.replaceBody`, t.replaceBody],
+        [`edit.edits[${i}].target.insertBefore`, t.insertBefore],
+        [`edit.edits[${i}].target.insertAfter`, t.insertAfter],
+        [`edit.edits[${i}].target.description`, t.description],
+        [`edit.edits[${i}].target.pattern`, t.pattern],
+        [`edit.edits[${i}].target.replacement`, t.replacement],
+        [`edit.edits[${i}].hashline.range.pos`, hr.pos],
+        [`edit.edits[${i}].hashline.range.end`, hr.end],
+        [`edit.edits[${i}].hashline.symbol.name`, hs.name],
+        [`edit.edits[${i}].hashline.symbol.kind`, hs.kind],
+    ];
+}
+
+function checkRefactorAdmissionCaps(refactor: unknown): string | null {
+    if (!isPlainObject(refactor)) return null;
+    const total = { bytes: 0 };
+    const strings: Array<[string, unknown]> = [
+        ["edit.refactor.path", (refactor as Record<string, unknown>).path],
+        ["edit.refactor.newName", (refactor as Record<string, unknown>).newName],
+        ["edit.refactor.previewId", (refactor as Record<string, unknown>).previewId],
+    ];
+    for (const [field, value] of strings) {
+        if (typeof value !== "string") continue;
+        const err = accountCappedString(field, value, total);
+        if (err) return err;
+    }
+    // diagnostics is an array of unknown-shaped objects; account serialized bytes.
+    const diagnostics = (refactor as Record<string, unknown>).diagnostics;
+    if (diagnostics !== undefined) {
+        let serialized: string;
+        try { serialized = JSON.stringify(diagnostics) ?? ""; }
+        catch { serialized = String(diagnostics); }
+        const err = accountCappedString("edit.refactor.diagnostics", serialized, total);
+        if (err) return err;
+    }
+    // only is a string array; account each element.
+    for (const key of ["only"] as const) {
+        const arr = (refactor as Record<string, unknown>)[key];
+        if (!Array.isArray(arr)) continue;
+        for (let j = 0; j < arr.length; j++) {
+            if (typeof arr[j] !== "string") continue;
+            const err = accountCappedString(`edit.refactor.${key}[${j}]`, arr[j] as string, total);
+            if (err) return err;
+        }
+    }
+    return null;
+}
+
+/** Raw fan-out count via a single normalization pass.
+ *  Counts every supported raw format (JSON, search/replace, unified diff,
+ *  Codex/OpenAI patch, atomic envelope); unparseable raw throws so the
+ *  caller falls through to per-format validation downstream. */
+function countRawIntents(raw: string, defaultPath?: string): { intents: number; files: number } {
+    const normalized = normalizeRawEdit(raw, defaultPath);
+    if (normalized.intents.length === 0) throw new Error(normalized.diagnostics[0] ?? "raw parsed into zero operations");
+    const files = new Set<string>();
+    for (const intent of normalized.intents) {
+        if (intent.kind === "text") { if (intent.operation.path) files.add(intent.operation.path); }
+        else if (intent.kind === "rename") { files.add(intent.oldPath); files.add(intent.newPath); }
+        else files.add(intent.path);
+    }
+    return { intents: normalized.intents.length, files: files.size };
+}
+
+function checkAdmissionCaps(normalized: Record<string, unknown>): string | null {
+    // Early admission gate: counts + body-text bytes, before per-item
+    // validation (and far before locks/snapshots/hashing). Counts mirror LSP
+    // WorkspaceEdit limits (50 files / 5000 edits); the 100-item cap governs.
+    const { edits, raw, path, refactor } = normalized;
+    if (typeof raw === "string") {
+        const rawBytes = Buffer.byteLength(raw, "utf8");
+        if (rawBytes > MAX_REQUEST_STRING_BYTES)
+            return `edit.raw is ${rawBytes} bytes (max ${MAX_REQUEST_STRING_BYTES}): split the patch into smaller raw requests and retry`;
+        if (rawBytes > MAX_REQUEST_TEXT_BYTES)
+            return `edit request text is over ${MAX_REQUEST_TEXT_BYTES} bytes total: split the request into smaller batches and retry`;
+        // Fan-out guard: a compact raw string can expand into many files/ops
+        // during normalization. Count intents best-effort; unparseable raw
+        // falls through to per-format validation downstream.
+        try {
+            const { intents, files } = countRawIntents(raw, typeof path === "string" ? path : undefined);
+            if (intents > MAX_EDIT_ITEMS)
+                return `edit.raw expands to ${intents} operations (max ${MAX_EDIT_ITEMS}): split the patch into smaller raw requests and retry`;
+            if (intents > MAX_TOTAL_EDITS)
+                return `edit.raw expands to ${intents} operations (max ${MAX_TOTAL_EDITS} total): split the patch into smaller raw requests and retry`;
+            if (files > MAX_FILES_TOUCHED)
+                return `edit.raw touches ${files} files (max ${MAX_FILES_TOUCHED}): split the patch into smaller raw requests and retry`;
+        } catch { /* fall through to format validation */ }
+        return null;
+    }
+    const refactorErr = checkRefactorAdmissionCaps(refactor);
+    if (refactorErr) return refactorErr;
+    if (!Array.isArray(edits)) return null;
+    if (edits.length > MAX_EDIT_ITEMS)
+        return `edit.edits has ${edits.length} items (max ${MAX_EDIT_ITEMS}): split the request into smaller batches and retry`;
+    if (edits.length > MAX_TOTAL_EDITS)
+        return `edit.edits has ${edits.length} items (max ${MAX_TOTAL_EDITS} total): split the request into smaller batches and retry`;
+    const files = new Set<string>();
+    const topPath = typeof path === "string" ? path : null;
+    if (typeof path === "string") {
+        const n = Buffer.byteLength(path, "utf8");
+        if (n > MAX_REQUEST_STRING_BYTES)
+            return `edit.path is ${n} bytes (max ${MAX_REQUEST_STRING_BYTES}): split the request into smaller batches and retry`;
+    }
+    const total = { bytes: typeof path === "string" ? Buffer.byteLength(path, "utf8") : 0 };
+    for (let i = 0; i < edits.length; i++) {
+        const e = edits[i] as Record<string, unknown>;
+        if (!e || typeof e !== "object") continue;
+        const p = typeof e.path === "string" ? e.path : topPath;
+        if (p) files.add(p);
+        for (const [field, value] of editItemStrings(e, i)) {
+            if (typeof value !== "string") continue;
+            const err = accountCappedString(field, value, total);
+            if (err) return err;
+        }
+        // hashline.content may be a string or array of strings.
+        const h = (e.hashline ?? {}) as Record<string, unknown>;
+        const content = (h as Record<string, unknown>).content;
+        const contents = typeof content === "string" ? [content] : Array.isArray(content) ? content : [];
+        for (let j = 0; j < contents.length; j++) {
+            if (typeof contents[j] !== "string") continue;
+            const err = accountCappedString(`edit.edits[${i}].hashline.content${Array.isArray(content) ? `[${j}]` : ""}`, contents[j] as string, total);
+            if (err) return err;
+        }
+    }
+    if (files.size > MAX_FILES_TOUCHED)
+        return `edit touches ${files.size} files (max ${MAX_FILES_TOUCHED}): split the request into smaller batches and retry`;
     return null;
 }
 
@@ -652,6 +817,8 @@ export function validateEditRequest(
     const top = checkRequestTopLevel(input);
     if (!("normalized" in top)) return top;
     const { normalized } = top;
+    const capsErr = checkAdmissionCaps(normalized);
+    if (capsErr) return fail(capsErr);
     const { path, edits, raw, toolCallId, evidenceRef, refactor } = normalized;
 
     const scalarsErr = checkTopLevelScalars(path, toolCallId);
@@ -709,6 +876,8 @@ export const EDIT_PARAMETERS = {
         path: { type: "string", description: "Default target file path. May be omitted when every edit provides its own path." },
         edits: {
             type: "array",
+            minItems: 1,
+            maxItems: 100,
             description: "One or more targeted edits that transform or generate content. Mutually exclusive with `raw`. When existing content should be preserved and relocated/reused, prefer transfer.",
             items: {
                 type: "object",

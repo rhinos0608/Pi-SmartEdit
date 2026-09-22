@@ -92,6 +92,22 @@ export async function storeRefactorPreview(args: {
     };
 }
 
+/** Admission caps for LSP-planned refactor output, enforced before caching/apply. Mirrors edit caps. */
+export const MAX_PREVIEW_FILES = 50;
+export const MAX_PREVIEW_TEXT_BYTES = 4 * 1024 * 1024;
+
+export function checkPlannedPreviewCaps(planned: { stagedFiles: Array<{ filePath: string; newContent: string }>; diffString: string }): string | null {
+    if (planned.stagedFiles.length > MAX_PREVIEW_FILES)
+        return `refactor preview touches ${planned.stagedFiles.length} files (max ${MAX_PREVIEW_FILES}): narrow the refactor scope and retry`;
+    let total = Buffer.byteLength(planned.diffString, "utf8");
+    for (const sf of planned.stagedFiles) {
+        total += Buffer.byteLength(sf.newContent, "utf8");
+        if (total > MAX_PREVIEW_TEXT_BYTES)
+            return `refactor preview text is over ${MAX_PREVIEW_TEXT_BYTES} bytes total: narrow the refactor scope and retry`;
+    }
+    return null;
+}
+
 export async function planAndStorePreview(
     deps: PatchToolDeps,
     toolCallId: string,
@@ -99,6 +115,8 @@ export async function planAndStorePreview(
     meta: { filePath: string; line: number; character: number; newName: string; serverDescriptorId: unknown },
 ): Promise<PatchResult> {
     const planned = await planPositionalEdits(workspaceEdit as never, async (p) => (await fsReadFile(p)).toString("utf8"));
+    const capsErr = checkPlannedPreviewCaps(planned);
+    if (capsErr) return failResult(toolCallId, `rejected: ${capsErr}`, capsErr, [capsErr]);
     const stored = await storeRefactorPreview({ deps, toolCallId, workspaceEdit, planned, meta });
     if (stored) return stored;
     return failResult(toolCallId, "failed: refactor preview requires an active session (no session file path available)", "no session file path", ["no session file path"]);
