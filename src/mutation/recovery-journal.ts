@@ -91,7 +91,11 @@ async function durableWriteJson(path: string, value: unknown): Promise<void> {
     const handle = await open(tmp, "w");
     try {
         await handle.writeFile(JSON.stringify(value));
-        await handle.sync();
+        // Best-effort: file fsync is unreliable on some Windows setups
+        // (EPERM from filter drivers), and a sync-only failure must not fail
+        // the edit — content is written regardless. Genuine write errors
+        // (open/write/rename) still throw. Dir fsync below is likewise lax.
+        await handle.sync().catch(() => {});
     } finally {
         await handle.close().catch(() => {});
     }
