@@ -29,7 +29,7 @@ Smart Edit replaces Pi's built-in `edit` tool with safer matching, richer diagno
 - **Post-edit diagnostics**: LSP + compiler fallback, scoped to changed targets
 - **Verification pipeline**: concurrency detection, traceability analysis, git history context, repair loop
 - **Refactor preview**: LSP-powered rename, organize imports, formatting, and code actions with unified diff preview and evidence-gated atomic apply
-- **SmartRead bridge**: RPC consumer for rename/format/code-action/organize-imports via Pi-SmartRead; lazy 250 ms capability probe, sticky remote-vs-standalone mode per session, 15 s client / 10 s provider timeout alignment; also records breakage and co-change events
+- **SmartRead bridge**: RPC consumer for rename/format/code-action/organize-imports via Pi-SmartRead; lazy 250 ms capability probe, sticky remote-vs-standalone mode per session, per-call `timeoutMs` (15 s transport / 10 s provider service budget for refactor RPCs; 4 s service + 5 s transport for post-edit diagnostics, protocol v0.6.0 envelope); also records breakage and co-change events
 
 ## Refactor Preview
 
@@ -102,7 +102,7 @@ Automatically selects the preferred action or the first action with an edit. Opt
 }
 ```
 
-Previews expire after 5 minutes, max 16 cached (oldest evicted first). Apply verifies:
+Previews expire after 5 minutes, max 16 cached (oldest evicted first). `previewId` is SmartEdit-owned (UUID); there is no cross-repo lease. The cache is generalized across all four refactor kinds via kind discriminants — no rename-only naming, no sentinel values. Apply verifies:
 
 - **Session identity binding** — preview bound to originating session; cross-session use rejected
 - **File freshness** — content unchanged since preview (re-read and compared)
@@ -112,13 +112,13 @@ Previews expire after 5 minutes, max 16 cached (oldest evicted first). Apply ver
 
 ### Security model
 
-All LSP output is treated as untrusted. Every `WorkspaceEdit` is validated at the provider boundary: file URIs must resolve to canonical realpaths (symlinks resolved via `realpathSync`), UTF-16 ranges must be in-bounds and non-overlapping, and counts are bounded. Path validation is provider/runtime hygiene, not workspace containment — an out-of-workspace path with valid evidence CAN authorize (see outside-workspace policy below). Each touched file requires prior strong read authority with matching SHA-256 — no evidence, no write. Apply uses a failure-atomic `EditTransaction` so partial writes roll back.
+All LSP output is treated as untrusted. Every `WorkspaceEdit` is validated at the provider boundary: file URIs must resolve to canonical realpaths (symlinks resolved via `realpathSync`), UTF-16 ranges are validated pre-stage (in-bounds, non-overlapping, bounded counts) before any content is staged. Path validation is provider/runtime hygiene, not workspace containment — an out-of-workspace path with valid evidence CAN authorize (see outside-workspace policy below). Each touched file requires prior strong read authority with matching SHA-256 — no evidence, no write. Apply uses a failure-atomic `EditTransaction` so partial writes roll back.
 
 ## SmartRead Integration
 
 SmartEdit delegates language intelligence to Pi-SmartRead over the `languageIntelligence` RPC channel (`@rhinos0608/pi-workspace-protocol`).
 
-- **Operations**: `renamePreview`, `organizeImports`, `formatting`, `codeAction` — each with a dedicated `request*` function in `src/lsp-smartread-client.ts`.
+- **Operations**: `renamePreview`, `organizeImports`, `formatting`, `codeAction` — each with a dedicated `request*` function in `src/lsp/lsp-smartread-client.ts` (per-call `timeoutMs`, default 15 s transport vs 10 s provider service budget).
 - **Lazy capability probe**: first refactor call probes SmartRead with a 250 ms timeout to detect availability; result is cached per session.
 - **Sticky mode selection**: the probe outcome pins the session to `remote` (RPC) or `standalone` mode; no flapping between calls.
 - **Timeout alignment**: client budget 15 s vs provider budget 10 s, so provider timeouts surface as structured errors before the client races.
@@ -387,9 +387,9 @@ Transfer rejections (pre-write `conflict`): same-file `move` landing inside or t
 │   ├── verification/          # Validation, evidence, fake-logic detection, diagnostics, repair loop
 │   ├── edit-mode.ts           # Runtime config (hashline toggle, env vars)
 │   ├── edit-contract.ts       # Edit request validation including refactor variants
-│   ├── positional-planner.ts  # WorkspaceEdit → staged content via exact UTF-16 range edits
-│   ├── rename-preview-cache.ts # Session-scoped UUID-keyed preview storage with TTL
-│   ├── lsp-smartread-client.ts # RPC consumer for SmartRead language intelligence
+│   ├── lsp/positional-planner.ts  # WorkspaceEdit → staged content via exact UTF-16 range edits (pre-stage validated)
+│   ├── lsp/refactor-preview-cache.ts # Generalized preview store: kind discriminants, SmartEdit-owned previewId, no sentinels, no cross-repo lease
+│   ├── lsp/lsp-smartread-client.ts # Per-call-timeout RPC consumer for SmartRead language intelligence
 │   ├── symbolic-edits.ts      # Symbolic edit engine (replaceBody, insertBefore, insertAfter)
 │   └── smartread-bridge.ts    # Breakage/co-change recording to Pi-SmartRead
 ├── test/                      # 45+ automated test suites plus manual scripts
@@ -450,7 +450,7 @@ npx tsx --test test/<file>  # e.g., test/symbolic-edits.test.ts
 - Undo data is stored in `.smart-edit-undo/` per project; persistence happens **after commit** and is **best-effort** (never blocks the edit).
 - Verification pipeline is advisory: warnings are matchNotes, never hard errors by default.
 - **Outside-workspace policy**: SmartEdit canonicalizes targets but does not confine mutations to the workspace. cwd names the session/evidence identity, not a filesystem boundary: an out-of-workspace path with valid evidence CAN authorize. The real filesystem perimeter is the Pi runtime/container.
-- **Failure-atomicity guarantee**: Multi-file, raw, and topology edits share one failure-atomic transaction. Handled write/verify failures roll back all prior changes in the transaction and report exact rollback outcome. This does **not** cover power-loss, OS crash, or instantaneous cross-file filesystem atomicity — only handled process failures with explicit rollback.
+- **Failure-atomicity guarantee**: Multi-file, raw, and topology edits share one failure-atomic transaction. Handled write/verify failures roll back all prior changes in the transaction and report exact rollback outcome. This does **not** cover power-loss, OS crash, or instantaneous cross-file filesystem atomicity — only handled process failures with explicit rollback. Crash recovery (`src/mutation/recovery-journal.ts`, kill-tested) is a separate milestone; `test/recovery-journal.test.ts` is not yet in the `npm test` chain — owner follow-up.
 - **Evidence Policy B**: The agent-visible schema omits `evidenceRef`. The latest strong prior authority for a canonical path is reused; prior line-range authority is never widened by omission. Full-file auto-inspection occurs only when no strong prior authority exists.
 - **Default verifier**: no production blocking verifier is configured. The extension has no safe staged-workspace command contract, so it does not run arbitrary configured commands as a blocking gate. Verification lanes are advisory only.
 - Repair loop is on by default (opt out with `SMART_EDIT_REPAIR_ENABLED=0` or `false`): repair failures produce notes but never block the pipeline.

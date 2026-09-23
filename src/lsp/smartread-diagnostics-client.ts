@@ -20,6 +20,11 @@ type BusLike = {
 
 type Mode = "remote" | "standalone";
 
+/** Service-side budget sent inside the post-edit diagnostics request (protocol v0.6.0 timeoutMs envelope). */
+export const POST_EDIT_DIAGNOSTICS_SERVICE_TIMEOUT_MS = 4_000;
+/** Transport timeout = service budget + slack. */
+export const POST_EDIT_DIAGNOSTICS_TRANSPORT_TIMEOUT_MS = 5_000;
+
 export interface SmartReadDiagnosticsClient {
   checkPostEditDiagnostics(
     filePath: string,
@@ -105,13 +110,14 @@ export function createSmartReadDiagnosticsClient(bus: BusLike): SmartReadDiagnos
     const canonicalPath = tryCanonical(resolve(filePath));
     const canonicalWorkspaceRoot = tryCanonical(resolve(root));
     const expectedContentSha256 = sha256OfString(content);
-    const req: CheckPostEditDiagnosticsRequest = {
+    const req = {
       canonicalPath,
       canonicalWorkspaceRoot,
       expectedContentSha256,
       waitMs: 3000,
       maxDiagnostics: 100,
-    };
+      timeoutMs: POST_EDIT_DIAGNOSTICS_SERVICE_TIMEOUT_MS,
+    } as CheckPostEditDiagnosticsRequest;
     try {
       const client = getRemoteClient();
       const reply = await client.request(LANGUAGE_INTELLIGENCE_RPC_METHODS.checkPostEditDiagnostics, req);

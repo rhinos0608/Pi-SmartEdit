@@ -98,6 +98,42 @@ describe("LSPConnection", () => {
     await conn.shutdown();
   });
 
+  it("frames non-ASCII responses by bytes, not JavaScript string length", async () => {
+    const conn = new LSPConnection(process.execPath, [resolve(__dirname, "lsp", "mock-server.js")]);
+    await conn.initialize("file:///test-project");
+    const result = await conn.request("test/unicode") as { text: string };
+    assert.equal(result.text, "naïve café 🦏");
+    await conn.shutdown();
+  });
+
+  it("frames non-ASCII requests by bytes too", async () => {
+    const conn = new LSPConnection(process.execPath, [resolve(__dirname, "lsp", "mock-server.js")]);
+    await conn.initialize("file:///test-project");
+    const result = await conn.request("test/echo", { text: "naïve café 🦏" }) as { text: string };
+    assert.equal(result.text, "naïve café 🦏");
+    await conn.shutdown();
+  });
+
+  it("does not let a colliding server-request id settle a client request", async () => {
+    const conn = new LSPConnection(process.execPath, [resolve(__dirname, "lsp", "mock-server.js")]);
+    await conn.initialize("file:///test-project");
+    const result = await conn.request("test/collision") as { ok: boolean };
+    assert.deepEqual(result, { ok: true });
+    await conn.shutdown();
+  });
+
+  it("sends $/cancelRequest when an in-flight request is aborted", async () => {
+    const conn = new LSPConnection(process.execPath, [resolve(__dirname, "lsp", "mock-server.js")]);
+    await conn.initialize("file:///test-project");
+    const controller = new AbortController();
+    const pending = conn.request("test/cancellable", {}, controller.signal);
+    setTimeout(() => { controller.abort(); }, 20);
+    await assert.rejects(pending, /aborted/);
+    const seen = await conn.request("test/cancelSeen") as { seen: boolean };
+    assert.equal(seen.seen, true);
+    await conn.shutdown();
+  });
+
   it("diagnostics notification received", async () => {
     const conn = new LSPConnection(process.execPath, [resolve(__dirname, "lsp", "mock-server.js")]);
     await conn.initialize("file:///test-project");

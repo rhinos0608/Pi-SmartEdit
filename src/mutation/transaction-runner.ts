@@ -35,7 +35,17 @@ import type {
     WorkspaceEvidenceEnvelope,
 } from "@rhinos0608/pi-workspace-protocol";
 import type { PriorAuthorityStore } from "../context/evidence-authority.js";
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { EditTransaction } from "./edit-transaction.js";
+import {
+    appendIntent,
+    buildJournalRecord,
+    deleteJournal,
+    markCommitted,
+    recoverStaleJournals,
+    writePreparedJournal,
+} from "./recovery-journal.js";
 import { saveTransactionUndoRecords } from "../undo/edit-history.js";
 import { executeEditGroup } from "../patch/group-application.js";
 import { buildRollbackInfo, makeFailed, makeRejected } from "../patch/result-builders.js";
@@ -72,6 +82,41 @@ export type RunPatchTransactionResult =
     | { ok: true; rollbackInfo?: { ok: boolean; reason?: string } }
     | { ok: false; result: PatchResult };
 
+/**
+ * Crash-journal per-mutation hook: wrap the transaction's fs-op methods so
+ * each intent is durably journaled BEFORE its filesystem op runs. A throw
+ * from the journal write propagates, blocking the mutation.
+ */
+function armJournalIntents(transaction: EditTransaction, transactionId: string): void {
+    const sha = (text: string): string => createHash("sha256").update(text).digest("hex");
+    const write = transaction.write.bind(transaction);
+    const create = transaction.create.bind(transaction);
+    const remove = transaction.remove.bind(transaction);
+    const rename = transaction.rename.bind(transaction);
+    transaction.write = async (path: string, content: string): Promise<void> => {
+        await appendIntent(transactionId, { op: "write", paths: [path], expectedPostSha: sha(content), expectedExists: true });
+        await write(path, content);
+    };
+    transaction.create = async (path: string, content: string, mode?: number): Promise<void> => {
+        await appendIntent(transactionId, { op: "create", paths: [path], expectedPostSha: sha(content), expectedExists: true });
+        await create(path, content, mode);
+    };
+    transaction.remove = async (path: string): Promise<void> => {
+        await appendIntent(transactionId, { op: "remove", paths: [path], expectedPostSha: null, expectedExists: false });
+        await remove(path);
+    };
+    transaction.rename = async (oldPath: string, newPath: string): Promise<void> => {
+        // Two per-path intents: source must end absent, destination must end
+        // holding the source's bytes. Recovery matches each path separately.
+        let expectedPostSha: string | null = null;
+        try {
+            expectedPostSha = sha(await readFile(oldPath, "utf8"));
+        } catch { expectedPostSha = null; }
+        await appendIntent(transactionId, { op: "rename", paths: [oldPath], expectedPostSha: null, expectedExists: false });
+        await appendIntent(transactionId, { op: "rename", paths: [newPath], expectedPostSha, expectedExists: true });
+        await rename(oldPath, newPath);
+    };}
+
 export async function runPatchTransaction(args: RunPatchTransactionArgs): Promise<RunPatchTransactionResult> {
     const { deps, ctx, toolCallId, tool, evidenceRefForDetails, canonicalRoot, envelope, priorStore, groups, resourceIntents, operations, state, stream } = args;
     const createdPaths = new Set(resourceIntents.filter((intent) => intent.kind === "create-new").map((intent) => intent.canonicalPath));
@@ -94,6 +139,19 @@ export async function runPatchTransaction(args: RunPatchTransactionArgs): Promis
         ...groups.map((group) => canonicalTxPath(group.absolutePath)),
         ...observationPaths,
     ])];
+    // Crash-journal recovery runs BEFORE new mutations: roll back partial
+    // writes from dead-PID journals (or preserve committed ones) first.
+    // Best-effort: recovery failure must not block this transaction.
+    try {
+        const recovery = await recoverStaleJournals();
+        for (const conflict of recovery.conflicts) {
+            diagnostics.push(
+                `recovery conflict: ${conflict.path} drifted after crash of ${conflict.transactionId}; preserved on disk`,
+            );
+        }
+    } catch (err) {
+        diagnostics.push(`recovery scan failed (continuing): ${err instanceof Error ? err.message : String(err)}`);
+    }
     let transaction: EditTransaction;
     try {
         transaction = await EditTransaction.begin(transactionPaths);
@@ -139,11 +197,34 @@ export async function runPatchTransaction(args: RunPatchTransactionArgs): Promis
             }
         }
 
+        // Crash-journal PREPARED write: locks held + snapshots taken, no
+        // mutation yet. Failure fails tx before first mutation (never decorative).
+        const snapshots = transactionPaths.map((path) => {
+            const snap = transaction.getSnapshot(path);
+            return { path, exists: snap?.exists ?? false, content: snap?.content, mode: snap?.mode };
+        });
+        try {
+            await writePreparedJournal(buildJournalRecord(transaction.transactionId, snapshots));
+        } catch (err) {
+            committed = false;
+            await transaction.rollback().catch(() => {});
+            await deleteJournal(transaction.transactionId).catch(() => {});
+            const msg = `crash-journal prepare failed: ${err instanceof Error ? err.message : String(err)}`;
+            diagnostics.push(msg);
+            return {
+                ok: false,
+                result: {
+                    content: [{ type: "text" as const, text: `error: ${msg}` }],
+                    details: makeFailed(toolCallId, "stage", msg, evidenceRefForDetails, checks, diagnostics, usedEvidence, invalidations),
+                },
+            };
+        }
+        // Per-mutation hook: each intent durable BEFORE its fs op.
+        armJournalIntents(transaction, transaction.transactionId);
         for (const operation of operations) {
             const applied = operation({ transaction, groups, priorStore, envelope, evidenceRefForDetails, toolCallId, tool, checks, diagnostics, usedEvidence, invalidations });
             if (!applied.ok) return { ok: false, result: applied.result };
         }
-
         const groupAppContext = { deps, ctx, toolCallId, tool, evidenceRefForDetails, canonicalRoot, envelope, priorStore, createdPaths, transaction, canonicalTxPath, stream };
         // MutationState is structurally identical to GroupApplicationState
         // (same eleven live array/map references) — pass it straight through,
@@ -171,8 +252,16 @@ export async function runPatchTransaction(args: RunPatchTransactionArgs): Promis
         // release and a fresh post-commit disk read, which would corrupt
         // afterSha with someone else's write.
         const undoRecords = await transaction.getUndoRecords().catch(() => []);
+        // Mark COMMITTED while locks still held (writes already durable),
+        // then release locks, delete journal, persist undo (advisory).
+        try {
+            await markCommitted(transaction.transactionId);
+        } catch (err) {
+            diagnostics.push(`crash-journal commit mark failed (continuing): ${err instanceof Error ? err.message : String(err)}`);
+        }
         await transaction.commit();
         committed = true;
+        await deleteJournal(transaction.transactionId).catch(() => {});
         try {
             await saveTransactionUndoRecords(ctx.cwd, undoRecords);
         } catch (err) {
@@ -182,6 +271,8 @@ export async function runPatchTransaction(args: RunPatchTransactionArgs): Promis
         }
     } finally {
         if (!committed) {
+            // Own-journal cleanup on rollback: nothing left to recover.
+            await deleteJournal(transaction.transactionId).catch(() => {});
             const rollback = await transaction.rollback();
             rollbackInfo = buildRollbackInfo(transaction.transactionId, rollback);
             const failedRollbackPaths = new Set(rollback.failed);

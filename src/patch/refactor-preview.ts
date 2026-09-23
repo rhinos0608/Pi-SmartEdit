@@ -16,7 +16,7 @@ import {
     sha256OfString,
 } from "@rhinos0608/pi-workspace-protocol";
 import { planPositionalEdits } from "../lsp/positional-planner.js";
-import { globalRenamePreviewCache } from "../lsp/rename-preview-cache.js";
+import { globalRefactorPreviewCache, type RefactorPreviewSource } from "../lsp/refactor-preview-cache.js";
 import { requestRenamePreview, requestOrganizeImports, requestFormatting, requestCodeAction } from "../lsp/lsp-smartread-client.js";
 import { checkResourceCoverage } from "../context/patch-authorization.js";
 import type {
@@ -40,6 +40,23 @@ import {
     failResult,
     makeRejected,
 } from "./result-builders.js";
+
+const CAPS_REQUIRED_DOC = "message must be an object";
+
+/** Service-side budget sent inside each proposal request (protocol v0.6.0 timeoutMs envelope). */
+export const PREVIEW_SERVICE_TIMEOUT_MS = 10_000;
+/** Transport timeout = service budget + slack. */
+export const PREVIEW_TRANSPORT_TIMEOUT_MS = 15_000;
+
+/**
+ * Require UTF-16 proposal encoding before staging.
+ * LspWorkspaceEdit.positionEncoding carries this (protocol v0.6.0).
+ */
+export function checkWorkspaceEditEncoding(workspaceEdit: unknown): string | null {
+    const enc = (workspaceEdit as { positionEncoding?: unknown } | null | undefined)?.positionEncoding;
+    if (enc !== "utf-16") return "refactor preview workspaceEdit positionEncoding must be 'utf-16' (UTF-16 proposal encoding required before staging)";
+    return null;
+}
 
 /**
  * Legacy runtime helpers kept for backward-compatible imports. Required
@@ -76,16 +93,16 @@ export async function storeRefactorPreview(args: {
     toolCallId: string;
     workspaceEdit: unknown;
     planned: { stagedFiles: Array<{ filePath: string; newContent: string }>; diffString: string };
-    meta: { filePath: string; line: number; character: number; newName: string; serverDescriptorId: unknown };
+    source: RefactorPreviewSource;
 }): Promise<PatchResult | null> {
-    const { deps, toolCallId, workspaceEdit, planned, meta } = args;
+    const { deps, toolCallId, workspaceEdit, planned, source } = args;
     const sessionFilePath = deps.getSessionFilePath();
     if (!sessionFilePath) {
         return failResult(toolCallId, "failed: refactor preview requires an active session (no session file path available)", "no session file path", ["no session file path"]);
     }
     const root = deps.getCanonicalWorkspaceRoot();
     const sid = hashSessionFilePath(sessionFilePath);
-    const previewId = globalRenamePreviewCache.store(workspaceEdit as never, planned as never, { ...meta, serverDescriptorId: meta.serverDescriptorId as never, sessionId: sid, sessionRoot: root });
+    const previewId = globalRefactorPreviewCache.store(workspaceEdit as never, planned as never, { source, serverDescriptorId: (source as { serverDescriptorId?: unknown }).serverDescriptorId as string | undefined, sessionId: sid, sessionRoot: root });
     return {
         content: [{ type: "text" as const, text: `preview ${previewId}: ${planned.stagedFiles.length} file(s)\n${planned.diffString.slice(0, 4000)}` }],
         details: { tool: "edit", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: planned.diffString, diffs: planned.stagedFiles.map((sf) => ({ path: sf.filePath, diff: sf.newContent })), previewId, stagedFiles: planned.stagedFiles.length } as unknown as PatchToolDetails,
@@ -112,12 +129,14 @@ export async function planAndStorePreview(
     deps: PatchToolDeps,
     toolCallId: string,
     workspaceEdit: unknown,
-    meta: { filePath: string; line: number; character: number; newName: string; serverDescriptorId: unknown },
+    source: RefactorPreviewSource & { serverDescriptorId?: unknown },
 ): Promise<PatchResult> {
+    const encErr = checkWorkspaceEditEncoding(workspaceEdit);
+    if (encErr) return failResult(toolCallId, `rejected: ${encErr}`, encErr, [encErr]);
     const planned = await planPositionalEdits(workspaceEdit as never, async (p) => (await fsReadFile(p)).toString("utf8"));
     const capsErr = checkPlannedPreviewCaps(planned);
     if (capsErr) return failResult(toolCallId, `rejected: ${capsErr}`, capsErr, [capsErr]);
-    const stored = await storeRefactorPreview({ deps, toolCallId, workspaceEdit, planned, meta });
+    const stored = await storeRefactorPreview({ deps, toolCallId, workspaceEdit, planned, source });
     if (stored) return stored;
     return failResult(toolCallId, "failed: refactor preview requires an active session (no session file path available)", "no session file path", ["no session file path"]);
 }
@@ -127,9 +146,9 @@ export async function runBusPreview(args: {
     toolCallId: string;
     label: string;
     request: (bus: NonNullable<ReturnType<NonNullable<PatchToolDeps["getBus"]>>>) => Promise<BusPreviewResponse>;
-    meta: { filePath: string; line: number; character: number; newName: string };
+    source: RefactorPreviewSource;
 }): Promise<PatchResult> {
-    const { deps, toolCallId, label, request, meta } = args;
+    const { deps, toolCallId, label, request, source } = args;
     const bus = deps.getBus?.() ?? null;
     if (!bus) return failResult(toolCallId, `failed: ${label} requires bus`, "bus unavailable", ["bus unavailable"]);
     try {
@@ -137,7 +156,7 @@ export async function runBusPreview(args: {
         if (!resp.ok || !resp.workspaceEdit) {
             return failResult(toolCallId, `failed: ${label}: ${resp.error ?? "no edit"}`, resp.error ?? "no workspaceEdit", [resp.error ?? "no workspaceEdit"]);
         }
-        return await planAndStorePreview(deps, toolCallId, resp.workspaceEdit, { ...meta, serverDescriptorId: resp.serverDescriptorId });
+        return await planAndStorePreview(deps, toolCallId, resp.workspaceEdit, { ...source, ...(resp.serverDescriptorId !== undefined ? { serverDescriptorId: resp.serverDescriptorId } : {}) });
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return failResult(toolCallId, `failed: ${label} ${msg}`, msg, [msg]);
@@ -157,16 +176,20 @@ export async function handleRenamePreview(deps: PatchToolDeps, toolCallId: strin
     if (!deps.getBus?.()) return failResult(toolCallId, "failed: rename-preview requires bus", "bus unavailable", ["bus unavailable"]);
     const { path, line, character, newName } = refactor;
     return runBusPreview({ deps, toolCallId, label: "rename-preview",
-        request: (bus) => requestRenamePreview(bus, { filePath: path, line, character, newName }),
-        meta: { filePath: path, line, character, newName } });
+        request: (bus) => requestRenamePreview(bus,
+            { filePath: path, line, character, newName, timeoutMs: PREVIEW_SERVICE_TIMEOUT_MS },
+            { timeoutMs: PREVIEW_TRANSPORT_TIMEOUT_MS }),
+        source: { kind: "rename", filePath: path, line, character, newName } });
 }
 
 export async function handleOrganizeImportsPreview(deps: PatchToolDeps, toolCallId: string, refactor: OrganizeImportsPreviewRefactor): Promise<PatchResult> {
     if (!deps.getBus?.()) return failResult(toolCallId, "failed: organize-imports-preview requires bus", "bus unavailable", ["bus unavailable"]);
     const path = refactor.path;
     return runBusPreview({ deps, toolCallId, label: "organize-imports-preview",
-        request: (bus) => requestOrganizeImports(bus, { filePath: path }),
-        meta: { filePath: path, line: 0, character: 0, newName: "" } });
+        request: (bus) => requestOrganizeImports(bus,
+            { filePath: path, timeoutMs: PREVIEW_SERVICE_TIMEOUT_MS },
+            { timeoutMs: PREVIEW_TRANSPORT_TIMEOUT_MS }),
+        source: { kind: "organize-imports", filePath: path } });
 }
 
 export async function handleFormattingPreview(deps: PatchToolDeps, toolCallId: string, refactor: FormattingPreviewRefactor): Promise<PatchResult> {
@@ -174,21 +197,25 @@ export async function handleFormattingPreview(deps: PatchToolDeps, toolCallId: s
     const path = refactor.path;
     const { tabSize, insertSpaces } = refactor;
     return runBusPreview({ deps, toolCallId, label: "formatting-preview",
-        request: (bus) => requestFormatting(bus, { filePath: path, tabSize, insertSpaces }),
-        meta: { filePath: path, line: 0, character: 0, newName: "" } });
+        request: (bus) => requestFormatting(bus,
+            { filePath: path, tabSize, insertSpaces, timeoutMs: PREVIEW_SERVICE_TIMEOUT_MS },
+            { timeoutMs: PREVIEW_TRANSPORT_TIMEOUT_MS }),
+        source: { kind: "formatting", filePath: path, ...(tabSize !== undefined ? { tabSize } : {}), ...(insertSpaces !== undefined ? { insertSpaces } : {}) } });
 }
 
 export async function handleCodeActionPreview(deps: PatchToolDeps, toolCallId: string, refactor: CodeActionPreviewRefactor): Promise<PatchResult> {
     const bus = deps.getBus?.() ?? null;
     if (!bus) return failResult(toolCallId, "failed: code-action-preview requires bus", "bus unavailable", ["bus unavailable"]);
     try {
-        const resp = await requestCodeAction(bus, { filePath: refactor.path, line: refactor.line, character: refactor.character, endLine: refactor.endLine, endCharacter: refactor.endCharacter, diagnostics: refactor.diagnostics as never, only: refactor.only as never });
+        const resp = await requestCodeAction(bus,
+            { filePath: refactor.path, line: refactor.line, character: refactor.character, endLine: refactor.endLine, endCharacter: refactor.endCharacter, diagnostics: refactor.diagnostics as never, only: refactor.only as never, timeoutMs: PREVIEW_SERVICE_TIMEOUT_MS },
+            { timeoutMs: PREVIEW_TRANSPORT_TIMEOUT_MS });
         if (!resp.ok) {
             return failResult(toolCallId, `failed: code-action-preview: ${resp.error ?? "no actions"}`, resp.error ?? "code action failed", [resp.error ?? "code action failed"]);
         }
         const selected = selectCodeActionWorkspaceEdit(resp.actions ?? []);
         if (!selected.ok) return failResult(toolCallId, `failed: ${selected.reason}`, selected.reason, [selected.reason]);
-        return await planAndStorePreview(deps, toolCallId, selected.workspaceEdit, { filePath: refactor.path, line: refactor.line, character: refactor.character, newName: "", serverDescriptorId: resp.serverDescriptorId });
+        return await planAndStorePreview(deps, toolCallId, selected.workspaceEdit, { kind: "code-action", filePath: refactor.path, line: refactor.line, character: refactor.character, ...(refactor.endLine !== undefined ? { endLine: refactor.endLine } : {}), ...(refactor.endCharacter !== undefined ? { endCharacter: refactor.endCharacter } : {}), serverDescriptorId: resp.serverDescriptorId });
     } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return failResult(toolCallId, `failed: code-action-preview ${msg}`, msg, [msg]);
@@ -243,11 +270,11 @@ export async function handleApplyRefactorPreview(deps: PatchToolDeps, toolCallId
     const root = deps.getCanonicalWorkspaceRoot();
     const sid = hashSessionFilePath(sessionFilePath);
     const applyPreviewId = refactor.previewId;
-    const cached = globalRenamePreviewCache.get(applyPreviewId, { sessionId: sid, sessionRoot: root });
+    const cached = globalRefactorPreviewCache.get(applyPreviewId, { sessionId: sid, sessionRoot: root });
     if (!cached) {
         return { content: [{ type: "text" as const, text: "rejected: preview not found or expired" }], details: makeRejected(toolCallId, "coverage", ["preview not found or expired"], { inspectionId: "", resourceIds: [] }, freshChecks()) };
     }
-    const files = cached.plannedRename.stagedFiles;
+    const files = cached.planned.stagedFiles;
     try {
         const { EditTransaction: ET } = await import("../mutation/edit-transaction.js");
         const tx = await ET.begin(files.map((f) => f.filePath));
@@ -268,8 +295,8 @@ export async function handleApplyRefactorPreview(deps: PatchToolDeps, toolCallId
             try { await tx.rollback(); } catch {}
             throw e;
         }
-        globalRenamePreviewCache.delete(applyPreviewId);
-        return { content: [{ type: "text" as const, text: `applied refactor ${applyPreviewId}: ${files.length} file(s)` }], details: { tool: "edit", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: cached.plannedRename.diffString } as unknown as PatchToolDetails };
+        globalRefactorPreviewCache.delete(applyPreviewId);
+        return { content: [{ type: "text" as const, text: `applied refactor ${applyPreviewId}: ${files.length} file(s)` }], details: { tool: "edit", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: cached.planned.diffString } as unknown as PatchToolDetails };
     } catch (err) {
         return mapApplyPreviewError(toolCallId, err);
     }

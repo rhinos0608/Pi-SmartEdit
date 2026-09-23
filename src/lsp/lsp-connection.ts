@@ -46,7 +46,7 @@ export class LSPConnection {
   private process: ChildProcess;
   private messageId = 0;
   private pending = new Map<number, PendingCallback>();
-  private buffer = "";
+  private buffer = Buffer.alloc(0);
   private bufferLimit = 50 * 1024 * 1024; // 50MB max buffer before truncation
   private notificationHandlers = new Map<string, Array<(params: unknown) => void>>();
   private closed = false;
@@ -110,8 +110,9 @@ export class LSPConnection {
 
     const onError = (err: Error) => {
       this.closed = true;
-      // Process spawn failed — reject all pending requests
+      // Process spawn failed — reject all pending requests.
       for (const [, cb] of this.pending) {
+        if (cb.timer) clearTimeout(cb.timer);
         cb.reject(err);
       }
       this.pending.clear();
@@ -212,6 +213,9 @@ export class LSPConnection {
       const abortHandler = () => {
         clearTimeout(timer);
         this.pending.delete(id);
+        if (!this.closed) {
+          this.write({ jsonrpc: "2.0", method: "$/cancelRequest", params: { id } });
+        }
         reject(new Error(`LSP request "${method}" was aborted`));
       };
 
@@ -224,6 +228,9 @@ export class LSPConnection {
           signal.removeEventListener("abort", abortHandler);
         }
         this.pending.delete(id);
+        if (!this.closed) {
+          this.write({ jsonrpc: "2.0", method: "$/cancelRequest", params: { id } });
+        }
         reject(
           new Error(`LSP request "${method}" timed out after 5s`)
         );
@@ -312,7 +319,7 @@ export class LSPConnection {
     this.notificationHandlers.clear();
     for (const cleanup of this.cleanupHandlers) { cleanup(); }
     this.cleanupHandlers = [];
-    this.buffer = "";
+    this.buffer = Buffer.alloc(0);
   }
 
   private write(msg: object): void {
@@ -327,69 +334,58 @@ export class LSPConnection {
    * Handles concatenated messages in a single chunk.
    */
   private onData(chunk: Buffer): void {
-    const appended = this.buffer + chunk.toString();
+    const appended = Buffer.concat([this.buffer, chunk]);
     if (appended.length > this.bufferLimit) {
-      // Overflow: reject any in-flight requests with a clear cause so callers
-      // don't just hit a 5s timeout. Malformed/oversized message framing can
-      // cause this — closing the connection is the only safe recovery.
+      // Content-Length is byte-based, so keep the receive buffer byte-based too.
+      // Overflow means framing is no longer trustworthy; fail in-flight work.
       const err = new Error(
         `LSP receive buffer exceeded ${this.bufferLimit} bytes; aborting connection`
       );
-      for (const [id, cb] of this.pending) {
+      for (const [, cb] of this.pending) {
         if (cb.timer) clearTimeout(cb.timer);
         cb.reject(err);
       }
       this.pending.clear();
       this.notificationHandlers.clear();
-      this.buffer = "";
-      this.closed = true; // Mark closed BEFORE kill so request()/notify() reject immediately
+      this.buffer = Buffer.alloc(0);
+      this.closed = true;
       for (const cleanup of this.cleanupHandlers) { cleanup(); }
       this.cleanupHandlers = [];
-      // Force-close so we don't keep accumulating on a broken stream.
       try { this.process.kill(); } catch { /* already dead */ }
       return;
     }
     this.buffer = appended;
 
     while (this.buffer.length > 0) {
-      // Check for Content-Length header
-      // NOTE: Don't anchor to start of buffer — some LSP servers send
-      // other headers (e.g., Content-Type) before Content-Length.
-      const headerMatch = this.buffer.match(
-        /Content-Length:\s*(\d+)\r\n/i
-      );
-      if (!headerMatch) {
-        // No complete header yet — wait for more data
-        break;
-      }
-
-      const contentLength = parseInt(headerMatch[1], 10);
-      const headerStart = headerMatch.index ?? 0;
-      const headerEnd = this.buffer.indexOf("\r\n\r\n", headerStart);
+      const headerEnd = this.buffer.indexOf("\r\n\r\n");
       if (headerEnd === -1) break;
-      const bodyStart = headerEnd + "\r\n\r\n".length;
 
-      if (this.buffer.length < bodyStart + contentLength) {
-        // Don't have the full body yet — wait for more data
-        break;
-      }
+      // LSP headers are ASCII; other headers may precede Content-Length.
+      const headerText = this.buffer.subarray(0, headerEnd).toString("ascii");
+      const headerMatch = headerText.match(
+        /(?:^|\r\n)Content-Length:\s*(\d+)(?:\r\n|$)/i
+      );
+      if (!headerMatch) break;
 
-      // Extract the JSON body
-      const body = this.buffer.slice(bodyStart, bodyStart + contentLength);
-      this.buffer = this.buffer.slice(bodyStart + contentLength);
+      const contentLength = Number.parseInt(headerMatch[1], 10);
+      const bodyStart = headerEnd + 4;
+      const bodyEnd = bodyStart + contentLength;
+      if (this.buffer.length < bodyEnd) break;
+
+      const body = this.buffer.subarray(bodyStart, bodyEnd).toString("utf8");
+      this.buffer = this.buffer.subarray(bodyEnd);
 
       try {
         const message = JSON.parse(body) as { id?: number; error?: unknown; result?: unknown; method?: string; params?: unknown };
 
-        // Check if this is a response to a pending request
-        if (message.id != null && this.pending.has(message.id)) {
+        // A JSON-RPC response has an id and no method. Server-initiated
+        // requests also carry an id, and may numerically collide with one of
+        // our client request ids, so never let id+method settle a pending call.
+        if (message.id != null && !message.method && this.pending.has(message.id)) {
           const cb = this.pending.get(message.id);
           if (!cb) break;
           this.pending.delete(message.id);
-
-          // Clear the timeout timer so it doesn't keep Node alive
           if (cb.timer) clearTimeout(cb.timer);
-
 
           const errorObj = message.error;
           if (errorObj && typeof errorObj === "object") {
@@ -403,7 +399,6 @@ export class LSPConnection {
           }
         }
 
-        // Check if this is a notification (has method but no id)
         if (message.method) {
           const handlers = this.notificationHandlers.get(message.method);
           if (handlers) {
@@ -417,7 +412,7 @@ export class LSPConnection {
           }
         }
       } catch {
-        // Malformed JSON — skip and continue
+        // Malformed JSON — skip the framed message and continue.
       }
     }
   }

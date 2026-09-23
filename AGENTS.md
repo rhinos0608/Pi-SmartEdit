@@ -4,12 +4,12 @@ Pi-SmartEdit is the Pi coding agent's `edit`/`write` extension. It relies on two
 
 ## `/Users/rhinesharar/Pi-Workspace-Protocol`
 
-- **Package:** `@rhinos0608/pi-workspace-protocol` (pinned in `package.json` as `github:rhinos0608/Pi-Workspace-Protocol#v0.4.0`).
+- **Package:** `@rhinos0608/pi-workspace-protocol` (pinned in `package.json` as `github:rhinos0608/Pi-Workspace-Protocol#v0.6.0`).
 - **Purpose:** Versioned TypeScript contracts, SHA-256/id helpers, runtime validators, and an event-bus RPC layer for the SmartRead/SmartEdit inspect+patch protocol.
 - **What Pi-SmartEdit consumes:**
   - `src/index.ts` imports `createRpcClient` and `RPC_CHANNELS`.
   - `src/patch.ts` imports validators/types: `PROTOCOL_SCHEMA_VERSION`, `hashSessionFilePath`, `inspectionIdFor`, `resourceIdFor`, `sha256OfString`, `validatePatchRequest`, `WorkspaceEvidenceEnvelope`, `InspectedResource`, `LineRange`, `PatchDetails`, `EvidenceRef`, `CheckRecord`, `ResourceInvalidation`, `PostEditEvidence`, `RpcMethod`.
-  - `createPatchTool` receives `PatchToolDeps.getRpcClient`, which `src/index.ts` wires as `() => createRpcClient({ bus, channel: RPC_CHANNELS.inspectPatch, timeoutMs: 2000 })`.
+  - Refactor RPC clients are constructed per call in `src/lsp/lsp-smartread-client.ts` with `timeoutMs` passed per call (default 15 s transport; provider service budget 10 s). Post-edit diagnostics uses `src/lsp/smartread-diagnostics-client.ts` with a 4 s service budget inside the request envelope plus 5 s transport timeout (protocol v0.6.0 `timeoutMs` envelope), after a 250 ms lazy capability probe.
   - `patch.ts` calls `rpc.request("resolve_evidence", ...)` to fetch a `WorkspaceEvidenceEnvelope`, then validates `sessionId` via `hashSessionFilePath`, `canonicalWorkspaceRoot`, resource coverage (`full-file`/`line-range`), and `fullFileSha256` freshness.
 
 ## `/Users/rhinesharar/Pi-SmartRead`
@@ -43,6 +43,18 @@ Default `SMART_EDIT_APPROVAL_LEVEL` is `prompt_on_dangerous` (not `never_prompt`
 
 ### reconstructOldText completeness validation
 `src/core/hashline-edit.ts:1329-1330` validates that every line in the anchor range has a corresponding entry before returning reconstructed text. If the anchor coverage is incomplete, return `null` (fuzzy fallback). Identical pattern at line 1357 in `reconstructOldTextByLine`. New anchor-reconstruction functions must follow the same completeness-check pattern.
+
+### RefactorPreviewCache — generalized preview store
+`src/lsp/refactor-preview-cache.ts` is generalized across all four refactor kinds via `RefactorPreviewKind` / `RefactorPreviewSource` discriminants (rename, organize-imports, formatting, code-action) — no rename-only naming, no sentinel values. `previewId` is SmartEdit-owned (`crypto.randomUUID()`); there is no cross-repo lease. Entries carry session binding (`sessionId`/`sessionRoot`), 5-minute TTL, max 16 with oldest-evicted-first.
+
+### Timeout budgets are per call
+`timeoutMs` is sent per RPC call (protocol v0.6.0 envelope): refactor RPCs default to 15 s transport against a 10 s provider service budget; post-edit diagnostics sends a 4 s service budget with a 5 s transport timeout. No shared hardwired client timeout.
+
+### UTF-16 validation is pre-stage
+`WorkspaceEdit` UTF-16 range checks (in-bounds, non-overlapping, bounded counts) run at the provider boundary before staging content — never after partial apply.
+
+### Handled-failure atomicity exists; crash journal is a separate milestone
+`EditTransaction` rollback covers handled process failures only. Crash recovery (`src/mutation/recovery-journal.ts`, kill-tested via `test/recovery-journal.test.ts`) is a separate milestone: `recovery-journal.test.ts` is NOT yet wired into the `npm test` chain (docs-only scope leaves `package.json` untouched) — owner follow-up to wire it in.
 
 ### Evidence contract (shared with Pi-Workspace-Protocol, Pi-SmartRead)
 Pi-SmartEdit is the **consumer** side of the workspace-evidence contract. `src/patch.ts` requests `resolve_evidence` over `RPC_CHANNELS.inspectPatch`, then validates:

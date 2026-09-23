@@ -5,8 +5,7 @@
  * Handles Content-Length header parsing and JSON-RPC messages.
  */
 
-let buffer = "";
-let contentLength = -1;
+let buffer = Buffer.alloc(0);
 
 function sendMessage(msg) {
   const json = JSON.stringify(msg);
@@ -14,63 +13,48 @@ function sendMessage(msg) {
   process.stdout.write(header + json);
 }
 
-/** Read one complete message from stdin. */
+/** Read one complete message from stdin using byte-based LSP framing. */
 async function readMessage() {
   while (true) {
-    // Try to parse from buffer
-    if (contentLength === -1) {
-      // Look for Content-Length header
-      const match = buffer.match(/^Content-Length:\s*(\d+)\r\n/i);
-      if (match) {
-        contentLength = parseInt(match[1], 10);
-        buffer = buffer.slice(match[0].length);
-      } else {
-        // Need more data
-        await waitForData();
-        continue;
-      }
+    const headerEnd = buffer.indexOf("\r\n\r\n");
+    if (headerEnd === -1) {
+      await waitForData();
+      continue;
     }
 
-    // Skip the \r\n after Content-Length header
-    if (buffer.startsWith("\r\n")) {
-      buffer = buffer.slice(2);
+    const headerText = buffer.subarray(0, headerEnd).toString("ascii");
+    const match = /(?:^|\r\n)Content-Length:\s*(\d+)(?:\r\n|$)/i.exec(headerText);
+    if (!match) {
+      // Discard one malformed header block so a later valid frame can recover.
+      buffer = buffer.subarray(headerEnd + 4);
+      continue;
     }
 
-    // Check if we have enough data for the body
-    if (buffer.length >= contentLength) {
-      const body = buffer.slice(0, contentLength);
-      buffer = buffer.slice(contentLength);
-      contentLength = -1;
-      try {
-        return JSON.parse(body);
-      } catch {
-        // Malformed JSON — try to continue
-        continue;
-      }
+    const contentLength = Number.parseInt(match[1], 10);
+    const bodyStart = headerEnd + 4;
+    const bodyEnd = bodyStart + contentLength;
+    if (buffer.length < bodyEnd) {
+      await waitForData();
+      continue;
     }
 
-    await waitForData();
+    const body = buffer.subarray(bodyStart, bodyEnd).toString("utf8");
+    buffer = buffer.subarray(bodyEnd);
+    try {
+      return JSON.parse(body);
+    } catch {
+      // Malformed JSON — skip the framed message and continue.
+    }
   }
 }
 
-/** Wait for data on stdin. */
+/** Wait for one more stdin chunk. */
 function waitForData() {
   return new Promise((resolve) => {
-    let settled = false;
-    const handler = (chunk) => {
-      if (settled) return;
-      settled = true;
-      buffer += chunk.toString();
-      process.stdin.removeListener("data", handler);
+    process.stdin.once("data", (chunk) => {
+      buffer = Buffer.concat([buffer, Buffer.from(chunk)]);
       resolve();
-    };
-    process.stdin.on("data", handler);
-    if (buffer.length > 0) {
-      if (settled) return;
-      settled = true;
-      process.stdin.removeListener("data", handler);
-      resolve();
-    }
+    });
   });
 }
 
@@ -96,6 +80,8 @@ async function main() {
       },
     },
   });
+
+  const cancelledIds = new Set();
 
   // Process loop
   while (true) {
@@ -192,6 +178,63 @@ async function main() {
         jsonrpc: "2.0",
         id: msg.id,
         result: { contents: "[MockHover] This is mock hover content for testing." },
+      });
+      continue;
+    }
+
+    // Unicode response — verifies byte-based Content-Length framing.
+    if (msg.method === "test/unicode") {
+      sendMessage({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: { text: "naïve café 🦏" },
+      });
+      continue;
+    }
+
+    // Echo verifies client->server Content-Length is byte-based too.
+    if (msg.method === "test/echo") {
+      sendMessage({ jsonrpc: "2.0", id: msg.id, result: msg.params ?? null });
+      continue;
+    }
+
+    // Emit a server request that deliberately reuses the client's id before
+    // the real response. A correct client must not confuse id+method with a
+    // response to its own request.
+    if (msg.method === "test/collision") {
+      sendMessage({
+        jsonrpc: "2.0",
+        id: msg.id,
+        method: "workspace/configuration",
+        params: { items: [] },
+      });
+      sendMessage({ jsonrpc: "2.0", id: msg.id, result: { ok: true } });
+      continue;
+    }
+
+    // Hold this request open until the client sends $/cancelRequest.
+    if (msg.method === "test/cancellable") {
+      continue;
+    }
+
+    if (msg.method === "$/cancelRequest") {
+      const id = msg.params?.id;
+      cancelledIds.add(id);
+      // A late cancellation response is valid server behavior; the client
+      // should have already removed its local pending entry.
+      sendMessage({
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32800, message: "Request cancelled" },
+      });
+      continue;
+    }
+
+    if (msg.method === "test/cancelSeen") {
+      sendMessage({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: { seen: cancelledIds.size > 0 },
       });
       continue;
     }

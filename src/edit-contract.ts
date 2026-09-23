@@ -686,7 +686,7 @@ function checkRefactorAdmissionCaps(refactor: unknown): string | null {
     if (diagnostics !== undefined) {
         let serialized: string;
         try { serialized = JSON.stringify(diagnostics) ?? ""; }
-        catch { serialized = String(diagnostics); }
+        catch { return "edit.refactor.diagnostics must be JSON-serializable"; }
         const err = accountCappedString("edit.refactor.diagnostics", serialized, total);
         if (err) return err;
     }
