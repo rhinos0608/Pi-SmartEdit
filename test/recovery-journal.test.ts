@@ -4,6 +4,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { spawn, type ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { buildPersistentSpawnTarget } from "../src/lsp/spawn-utils.js";
 import { EditTransaction } from "../src/mutation/edit-transaction.js";
 import {
     appendIntent,
@@ -91,9 +92,18 @@ async function killTree(child: ChildProcess, jdir: string): Promise<void> {
 async function spawnCrash(scenario: string, workDir: string): Promise<{ child: ChildProcess; sentinel: string; jdir: string }> {
     const jdir = await makeTempDir("smartedit-recovery-");
     const sentinel = join(workDir, `${scenario}.sentinel`);
-    const child = spawn(TSX, [CHILD, scenario, workDir, sentinel], {
+    // npm's .bin/tsx is a POSIX shim: raw-spawning it fails ENOENT on
+    // Windows, and raw-spawning tsx.cmd trips the CVE-2024-27980 EINVAL
+    // guard. Route through the repo's batch-file gate (cmd.exe + proper
+    // escaping); POSIX passes through unchanged.
+    const tsxCommand = process.platform === "win32" ? `${TSX}.cmd` : TSX;
+    const target = buildPersistentSpawnTarget(tsxCommand, [CHILD, scenario, workDir, sentinel]);
+    const child = spawn(target.command, target.args, {
         env: { ...process.env, PI_SMARTEDIT_RECOVERY_DIR: jdir },
         stdio: ["ignore", "pipe", "pipe"],
+        ...(target.windowsVerbatimArguments !== undefined
+            ? { windowsVerbatimArguments: target.windowsVerbatimArguments }
+            : {}),
     });
     return { child, sentinel, jdir };
 }
