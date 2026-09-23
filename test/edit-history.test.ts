@@ -268,19 +268,28 @@ describe("edit-history", () => {
     const newPath = resolve(cwd, "new.txt");
     await fsWriteFile(original, "after");
     const { rm } = await import("fs/promises");
+    // Record the files' real modes: hand-crafted 0o644 mismatches the lossy
+    // Windows mode bits (typically 0o666) and would fail preflight there.
+    // (Mode bits never change on content write/remove, so stat timing is free.)
+    const modeOf = async (p: string) => (await fsStat(p)).mode & 0o7777;
+    const mDeleted = await modeOf(deleted);
+    const mOld = await modeOf(oldPath);
     await rm(deleted);
     await rm(oldPath);
     await fsWriteFile(newPath, "moved");
+    await fsWriteFile(added, "");
+    const mOriginal = await modeOf(original);
+    const mAdded = await modeOf(added);
+    const mNew = await modeOf(newPath);
     const hash = (s: string) => createHash("sha256").update(s).digest("hex");
     const id = "tx-regression";
     const record = (path: string, before: string, after: string | undefined, operation: "text" | "add" | "delete" | "rename", extra: Record<string, unknown> = {}) => ({ path, originalContent: Buffer.from(before).toString("base64"), timestamp: new Date().toISOString(), editCount: 1, snapshotHash: hash(before).slice(0, 16), changedSymbols: [], version: 2 as const, beforeSha: hash(before), afterSha: after === undefined ? undefined : hash(after), beforeMode: 0o644, afterMode: 0o644, existed: operation !== "add", afterExists: after !== undefined, operation, transactionId: id, ...extra });
     await saveTransactionUndoRecords(cwd, [
-      record(original, "before", "after", "text"),
-      record(added, "", "", "add"),
-      record(deleted, "gone", undefined, "delete"),
-      record(oldPath, "moved", "moved", "rename", { oldPath, newPath }),
+      record(original, "before", "after", "text", { beforeMode: mOriginal, afterMode: mOriginal }),
+      record(added, "", "", "add", { afterMode: mAdded }),
+      record(deleted, "gone", undefined, "delete", { beforeMode: mDeleted }),
+      record(oldPath, "moved", "moved", "rename", { oldPath, newPath, beforeMode: mOld, afterMode: mNew }),
     ]);
-    await fsWriteFile(added, "");
     assert.equal(await restoreTransactionUndoState(cwd, id), true);
     assert.equal(await fsReadFile(original, "utf8"), "before");
     assert.equal(await fsReadFile(deleted, "utf8"), "gone");
@@ -372,6 +381,10 @@ describe("edit-history", () => {
     const newPath = resolve(cwd, "new.txt");
     await fsWriteFile(newPath, "moved");
     await fsRm(oldPath, { force: true });
+    // Real mode of newPath (0o666 on Windows): hardcoded 0o644 fails the
+    // guard there. beforeMode stays 0o600 — the value under test, asserted
+    // below on POSIX.
+    const newMode = (await fsStat(newPath)).mode & 0o7777;
     const hash = (s: string) => createHash("sha256").update(s).digest("hex");
     const entry = {
       path: newPath,
@@ -384,7 +397,7 @@ describe("edit-history", () => {
       beforeSha: hash("moved"),
       afterSha: hash("moved"),
       beforeMode: 0o600,
-      afterMode: 0o644,
+      afterMode: newMode,
       existed: true,
       afterExists: true,
       operation: "rename",
@@ -430,7 +443,9 @@ describe("edit-history", () => {
     const a = await writeTestFile(cwd, "a.txt", "A");
     await fsWriteFile(a, "AX");
     // No recordCount field — simulates a legacy transaction record.
-    const entry = { path: a, originalContent: Buffer.from("A").toString("base64"), timestamp: new Date().toISOString(), editCount: 1, snapshotHash: hash("A").slice(0, 16), changedSymbols: [], version: 2, beforeSha: hash("A"), afterSha: hash("AX"), beforeMode: 0o644, afterMode: 0o644, existed: true, afterExists: true, operation: "text", transactionId: id };
+    // Real modes: see above — hardcoded 0o644 fails preflight on Windows.
+    const legacyMode = (await fsStat(a)).mode & 0o7777;
+    const entry = { path: a, originalContent: Buffer.from("A").toString("base64"), timestamp: new Date().toISOString(), editCount: 1, snapshotHash: hash("A").slice(0, 16), changedSymbols: [], version: 2, beforeSha: hash("A"), afterSha: hash("AX"), beforeMode: legacyMode, afterMode: legacyMode, existed: true, afterExists: true, operation: "text", transactionId: id };
     await fsMkdir(undoDir, { recursive: true });
     await fsWriteFile(join(undoDir, "legacy.json"), JSON.stringify(entry), "utf8");
     assert.equal(await restoreTransactionUndoState(cwd, id), true);
