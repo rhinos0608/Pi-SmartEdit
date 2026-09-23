@@ -25,7 +25,7 @@
  */
 import { createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve, basename } from "node:path";
+import { join, resolve, basename, dirname } from "node:path";
 import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 
 export type JournalState = "prepared" | "committed";
@@ -82,8 +82,10 @@ export function journalPath(transactionId: string): string {
 
 /** Durable write: content + fsync before close so PREPARED survives a kill. */
 async function durableWriteJson(path: string, value: unknown): Promise<void> {
-    await mkdir(join(path, "..") === path ? path : journalDir(), { recursive: true }).catch(() => {});
-    const dir = path.slice(0, path.lastIndexOf("/"));
+    await mkdir(journalDir(), { recursive: true }).catch(() => {});
+    // dirname(), not a "/" split: journal paths carry the platform
+    // separator ("\" on Windows), where lastIndexOf("/") misses.
+    const dir = dirname(path);
     await mkdir(dir, { recursive: true });
     const tmp = `${path}.${process.pid}.tmp`;
     const handle = await open(tmp, "w");

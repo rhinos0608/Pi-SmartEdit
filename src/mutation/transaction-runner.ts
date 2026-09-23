@@ -38,6 +38,7 @@ import type { PriorAuthorityStore } from "../context/evidence-authority.js";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { EditTransaction } from "./edit-transaction.js";
+import type { TransactionOutcome } from "./edit-transaction.js";
 import {
     appendIntent,
     buildJournalRecord,
@@ -252,12 +253,23 @@ export async function runPatchTransaction(args: RunPatchTransactionArgs): Promis
         // release and a fresh post-commit disk read, which would corrupt
         // afterSha with someone else's write.
         const undoRecords = await transaction.getUndoRecords().catch(() => []);
-        // Mark COMMITTED while locks still held (writes already durable),
-        // then release locks, delete journal, persist undo (advisory).
+        // Mark COMMITTED while locks still held (writes already durable).
+        // A commit-mark failure is FATAL, never advisory: the journal still
+        // reads PREPARED, so acknowledging success would let a later crash
+        // recovery roll back a "committed" transaction. Return terminal
+        // failure instead; the outer finally rolls the landed writes back.
         try {
             await markCommitted(transaction.transactionId);
         } catch (err) {
-            diagnostics.push(`crash-journal commit mark failed (continuing): ${err instanceof Error ? err.message : String(err)}`);
+            const msg = `crash-journal commit mark failed: ${err instanceof Error ? err.message : String(err)}; commit NOT acknowledged, writes rolled back`;
+            diagnostics.push(msg);
+            return {
+                ok: false,
+                result: {
+                    content: [{ type: "text" as const, text: `error: ${msg}` }],
+                    details: makeFailed(toolCallId, "stage", msg, evidenceRefForDetails, checks, diagnostics, usedEvidence, invalidations),
+                },
+            };
         }
         await transaction.commit();
         committed = true;
@@ -271,18 +283,35 @@ export async function runPatchTransaction(args: RunPatchTransactionArgs): Promis
         }
     } finally {
         if (!committed) {
-            // Own-journal cleanup on rollback: nothing left to recover.
-            await deleteJournal(transaction.transactionId).catch(() => {});
-            const rollback = await transaction.rollback();
-            rollbackInfo = buildRollbackInfo(transaction.transactionId, rollback);
-            const failedRollbackPaths = new Set(rollback.failed);
-            invalidations.splice(
-                0,
-                invalidations.length,
-                ...invalidations.filter((invalidation) => failedRollbackPaths.has(invalidation.canonicalPath)),
-            );
-            diagnostics.push(`rollback: restored ${rollback.restored.length} path(s)`);
-            if (rollback.failed.length > 0) diagnostics.push(`rollback failed: ${rollback.failed.join(", ")}`);
+            // Rollback BEFORE journal removal: the journal is the durable
+            // record for a rollback that never completes in-process. Delete
+            // it only after a fully successful rollback; on partial failure
+            // (or a rollback throw) preserve it so the next process's
+            // recoverStaleJournals() can finish the job.
+            let rollback: TransactionOutcome | null = null;
+            try {
+                rollback = await transaction.rollback();
+            } catch (err) {
+                const msg = `rollback threw: ${err instanceof Error ? err.message : String(err)}; crash journal preserved for recovery`;
+                diagnostics.push(msg);
+                rollbackInfo = { ok: false, reason: msg };
+            }
+            if (rollback !== null) {
+                rollbackInfo = buildRollbackInfo(transaction.transactionId, rollback);
+                const failedRollbackPaths = new Set(rollback.failed);
+                invalidations.splice(
+                    0,
+                    invalidations.length,
+                    ...invalidations.filter((invalidation) => failedRollbackPaths.has(invalidation.canonicalPath)),
+                );
+                diagnostics.push(`rollback: restored ${rollback.restored.length} path(s)`);
+                if (rollback.failed.length > 0) {
+                    diagnostics.push(`rollback failed: ${rollback.failed.join(", ")}; crash journal preserved for recovery`);
+                } else {
+                    // Own-journal cleanup: nothing left to recover.
+                    await deleteJournal(transaction.transactionId).catch(() => {});
+                }
+            }
         }
     }
 

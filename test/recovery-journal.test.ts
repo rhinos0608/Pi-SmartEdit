@@ -44,9 +44,9 @@ async function waitForFile(path: string, label: string): Promise<void> {
 
 function kill9(child: ChildProcess): Promise<void> {
     return new Promise((resolve) => {
-        child.on("exit", () => resolve());
+        child.on("exit", () => { resolve(); });
         try { child.kill("SIGKILL"); } catch { resolve(); }
-        setTimeout(() => resolve(), 5000);
+        setTimeout(() => { resolve(); }, 5000);
     });
 }
 
@@ -66,7 +66,7 @@ function pidDead(pid: number): boolean {
  */
 async function killTree(child: ChildProcess, jdir: string): Promise<void> {
     await kill9(child);
-    let owners: number[] = [];
+    const owners: number[] = [];
     try {
         const files = await readdir(jdir);
         for (const f of files) {
@@ -192,7 +192,7 @@ test("committed-not-deleted: disk preserved, journal removed", async () => {
     await writeFile(join(work, "a.txt"), "A-ORIG");
     const { child, sentinel, jdir } = await spawnCrash("committed-not-deleted", work);
     await new Promise<void>((resolve, reject) => {
-        child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`child exit ${code}`))));
+        child.on("exit", (code) => { if (code === 0) { resolve(); } else { reject(new Error(`child exit ${code}`)); } });;
         child.on("error", reject);
     });
     await waitForFile(sentinel, "child commit");
@@ -346,6 +346,26 @@ test("committed journal round-trips state; live-PID journals are skipped", async
         const report = await recoverStaleJournals();
         assert.deepEqual(report.preserved, []);
         assert.notEqual(await readJournal(txId), null); // untouched
+        await deleteJournal(txId);
+    });
+});
+
+test("journal write creates a missing nested recovery dir", async () => {
+    // Guards the parent-dir derivation inside the durable writer: the
+    // journal directory may not exist yet and must be created recursively.
+    const base = await makeTempDir("smartedit-recovery-");
+    const nested = join(base, "no", "such", "dir", "yet");
+    await withJournalEnv(nested, async () => {
+        const txId = "nested-dir-roundtrip";
+        await writePreparedJournal({
+            transactionId: txId,
+            ownerPid: process.pid,
+            createdAt: new Date().toISOString(),
+            state: "prepared",
+            preimages: [],
+            intents: [],
+        });
+        assert.equal((await readJournal(txId))?.state, "prepared");
         await deleteJournal(txId);
     });
 });
