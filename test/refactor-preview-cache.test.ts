@@ -4,8 +4,8 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LspWorkspaceEdit } from "@rhinos0608/pi-workspace-protocol";
-import { RefactorPreviewCache, type RefactorPreviewSource } from "../src/lsp/refactor-preview-cache.js";
-import { checkWorkspaceEditEncoding, runBusPreview } from "../src/patch/refactor-preview.js";
+import { RefactorPreviewCache, globalRefactorPreviewCache, type RefactorPreviewSource } from "../src/lsp/refactor-preview-cache.js";
+import { checkWorkspaceEditEncoding, runBusPreview, planAndStorePreview } from "../src/patch/refactor-preview.js";
 import type { PatchToolDeps } from "../src/patch/types.js";
 
 const SID = "s1";
@@ -101,9 +101,7 @@ describe("refactor-preview-cache encoding gate", () => {
   });
   it("planAndStorePreview rejects missing encoding before staging", async () => {
     const deps = {} as unknown as PatchToolDeps;
-    const res = await import("../src/patch/refactor-preview.js").then((m) =>
-      m.planAndStorePreview(deps, "t", { fileEdits: [] }, { kind: "organize-imports", filePath: "/a.ts" }),
-    );
+    const res = await planAndStorePreview(deps, "t", { fileEdits: [] }, { kind: "organize-imports", filePath: "/a.ts" });
     assert.equal(res.details.status.kind, "failed");
     assert.match(res.content[0]!.text, /positionEncoding must be 'utf-16'/);
   });
@@ -127,7 +125,10 @@ describe("refactor-preview-cache handler discriminants", () => {
   }
 
   it("runBusPreview stores proper discriminant per kind", async () => {
-    const { globalRefactorPreviewCache } = await import("../src/lsp/refactor-preview-cache.js");
+    // Static import (module top): dynamic import() of the same .ts file can
+    // resolve to a second module instance under tsx on Node 20, so the
+    // global cache must be reached through the static binding the src
+    // modules share — never a fresh dynamic import.
     const table: RefactorPreviewSource[] = [
       { kind: "rename", filePath: "__P__", line: 1, character: 1, newName: "b" },
       { kind: "organize-imports", filePath: "__P__" },
