@@ -360,6 +360,37 @@ test("committed journal round-trips state; live-PID journals are skipped", async
     });
 });
 
+test("malformed journal skipped: scan recovers valid records", async () => {
+    const work = await makeTempDir("rec-malformed-");
+    const target = join(work, "a.txt");
+    await writeFile(target, "A-ORIG");
+    const jdir = await makeTempDir("smartedit-recovery-");
+    const deadPid = 2 ** 30; // no such process: journal reads as stale
+    await withJournalEnv(jdir, async () => {
+        // Valid stale journal: must still recover.
+        const valid = buildJournalRecord("good-tx", [{ path: target, exists: true, content: Buffer.from("A-ORIG") }]);
+        valid.ownerPid = deadPid;
+        await writePreparedJournal(valid);
+        await writeFile(target, "A-PARTIAL"); // simulate crash mid-write
+        // Malformed: syntactically valid JSON, missing preimages entirely.
+        await writeFile(join(jdir, "bad-missing-preimages.json"), JSON.stringify({
+            transactionId: "bad-missing-preimages", ownerPid: deadPid, state: "prepared", intents: [],
+        }));
+        // Malformed: preimages present but not an array.
+        await writeFile(join(jdir, "bad-preimages-string.json"), JSON.stringify({
+            transactionId: "bad-preimages-string", ownerPid: deadPid, state: "prepared", preimages: "oops", intents: [],
+        }));
+        const report = await recoverStaleJournals();
+        assert.equal(await readFile(target, "utf8"), "A-ORIG");
+        assert.ok(report.recovered.some((p) => p.endsWith("a.txt")));
+        assert.ok(report.removed.includes("good-tx"));
+        // Bad records skipped, left on disk for operator inspection.
+        assert.equal(await readFile(join(jdir, "bad-missing-preimages.json"), "utf8").then(() => true), true);
+        assert.equal(await readFile(join(jdir, "bad-preimages-string.json"), "utf8").then(() => true), true);
+        assert.equal(report.scanned, 3);
+    });
+});
+
 test("journal write creates a missing nested recovery dir", async () => {
     // Guards the parent-dir derivation inside the durable writer: the
     // journal directory may not exist yet and must be created recursively.

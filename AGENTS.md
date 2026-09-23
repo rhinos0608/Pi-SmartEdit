@@ -54,7 +54,7 @@ Default `SMART_EDIT_APPROVAL_LEVEL` is `prompt_on_dangerous` (not `never_prompt`
 `WorkspaceEdit` UTF-16 range checks (in-bounds, non-overlapping, bounded counts) run at the provider boundary before staging content — never after partial apply.
 
 ### Handled-failure atomicity exists; crash journal is a separate milestone
-`EditTransaction` rollback covers handled process failures only. Crash recovery (`src/mutation/recovery-journal.ts`, kill-tested via `test/recovery-journal.test.ts`) is a separate milestone: `recovery-journal.test.ts` is NOT yet wired into the `npm test` chain (docs-only scope leaves `package.json` untouched) — owner follow-up to wire it in.
+`EditTransaction` rollback covers handled process failures only. Crash recovery (`src/mutation/recovery-journal.ts`, kill-tested via `test/recovery-journal.test.ts`) is wired into the `npm test` chain.
 
 ### Evidence contract (shared with Pi-Workspace-Protocol, Pi-SmartRead)
 Pi-SmartEdit is the **consumer** side of the workspace-evidence contract. `src/patch.ts` requests `resolve_evidence` over `RPC_CHANNELS.inspectPatch`, then validates:

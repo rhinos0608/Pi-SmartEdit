@@ -140,6 +140,32 @@ export async function deleteJournal(transactionId: string): Promise<void> {
     await rm(journalPath(transactionId), { force: true }).catch(() => {});
 }
 
+function isValidPreimage(pre: unknown): pre is JournalPreimage {
+    if (typeof pre !== "object" || pre === null) return false;
+    const p = pre as Record<string, unknown>;
+    return typeof p.path === "string" && p.path.length > 0
+        && typeof p.existed === "boolean"
+        && typeof p.beforeSha === "string";
+}
+
+function isValidIntent(intent: unknown): intent is JournalIntent {
+    if (typeof intent !== "object" || intent === null) return false;
+    const v = intent as Record<string, unknown>;
+    return typeof v.op === "string"
+        && Array.isArray(v.paths)
+        && v.paths.every((p) => typeof p === "string");
+}
+
+/** Runtime schema check: recovery dir is user-owned, corruption likely post-crash. */
+function isValidJournal(journal: unknown): journal is RecoveryJournal {
+    if (typeof journal !== "object" || journal === null) return false;
+    const j = journal as Record<string, unknown>;
+    return typeof j.transactionId === "string" && j.transactionId.length > 0
+        && typeof j.ownerPid === "number"
+        && (j.state === "prepared" || j.state === "committed")
+        && Array.isArray(j.preimages) && (j.preimages as unknown[]).every(isValidPreimage)
+        && Array.isArray(j.intents) && (j.intents as unknown[]).every(isValidIntent);
+}
 function isProcessAlive(pid: number): boolean {
     if (!Number.isInteger(pid) || pid <= 0) return false;
     try {
@@ -249,14 +275,17 @@ export async function recoverStaleJournals(): Promise<RecoveryReport> {
     }
     for (const file of files) {
         const full = join(journalDir(), file);
-        let journal: RecoveryJournal;
+        let raw: unknown;
         try {
-            journal = JSON.parse(await readFile(full, "utf8")) as RecoveryJournal;
+            raw = JSON.parse(await readFile(full, "utf8")) as unknown;
         } catch {
             continue;
         }
         report.scanned++;
-        if (!journal || !journal.transactionId || typeof journal.ownerPid !== "number") continue;
+        // Corrupted/truncated journal (e.g. missing preimages): skip record,
+        // leave file for operator inspection. Never abort whole scan.
+        if (!isValidJournal(raw)) continue;
+        const journal = raw;
         if (isProcessAlive(journal.ownerPid)) continue; // live owner: hands off
         const paths = journal.preimages.map((p) => p.path);
         let release: (() => Promise<void>) | undefined;
@@ -312,6 +341,9 @@ export async function recoverStaleJournals(): Promise<RecoveryReport> {
                 await rm(full, { force: true }).catch(() => {});
                 report.removed.push(journal.transactionId);
             }
+        } catch {
+            // One corrupt/unreadable record must not abort the whole scan.
+            continue;
         } finally {
             await release?.().catch(() => {});
         }
