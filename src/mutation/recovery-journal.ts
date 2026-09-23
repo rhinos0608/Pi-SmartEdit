@@ -100,9 +100,12 @@ async function durableWriteJson(path: string, value: unknown): Promise<void> {
         await handle.close().catch(() => {});
     }
     await rename(tmp, path);
+    // Directory fsync is best-effort by design (the open above already
+    // tolerates failure): on Windows an opened directory handle's sync()
+    // throws EPERM, which must degrade durability, never fail the edit.
     const dirHandle = await open(dir, "r").catch(() => null);
     if (dirHandle) {
-        try { await dirHandle.sync(); } finally { await dirHandle.close().catch(() => {}); }
+        try { await dirHandle.sync().catch(() => {}); } finally { await dirHandle.close().catch(() => {}); }
     }
 }
 
