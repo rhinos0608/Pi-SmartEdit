@@ -34,6 +34,7 @@ import {
   detectIndentation,
 } from "./edit-diff.js";
 import { applyHashlinePath, type HashlineEditInput } from "../hashline/hashline-edit.js";
+import { verifyHashlineStructuralRecovery } from "../hashline/hashline-structure.js";
 import {
   resolveAnchorToScope,
   lineRangeToScope,
@@ -665,6 +666,7 @@ async function collectOneHashlineMutation(
   batch: BatchMutations,
   normalized: string,
   filePath: string,
+  astResolver: AstResolverLike | null,
   findTextFn: ReturnType<typeof makeHashlineFindText>,
   resolveScopeFn: ReturnType<typeof makeHashlineScopeResolver>,
   getSnapshot: (path: string) => FileSnapshot | null,
@@ -686,6 +688,17 @@ async function collectOneHashlineMutation(
     resolveScopeFn,
     findTextFn,
     detectIndentation,
+    astResolver?.findEnclosingSymbols
+      ? ({ original, recovered, currentContent, snapshot: recoverySnapshot }) =>
+          verifyHashlineStructuralRecovery({
+            original,
+            recovered,
+            currentContent,
+            snapshot: recoverySnapshot,
+            filePath,
+            astResolver,
+          })
+      : undefined,
   );
   const { startByte, endByte, replacement } = computeChangedSpan(normalized, result.newContent);
   // A hashline whose target already matches (no before/after change) is a
@@ -739,6 +752,7 @@ async function collectHashlineMutations(
       batch,
       normalized,
       filePath,
+      astResolver,
       findTextFn,
       resolveScopeFn,
       getSnapshot,

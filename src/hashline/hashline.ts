@@ -292,7 +292,7 @@ export function computeLineHashSync(
 
   let seed = 0;
   if (!hasSignificantChar(normalized)) {
-    mf: seed = lineNumber;
+    seed = lineNumber;
   }
 
   const hash = _xxhash32(normalized, seed) % HASHLINE_BIGRAMS_COUNT;

@@ -1,15 +1,78 @@
-import { statSync } from "fs";
 import { readFile as fsReadFile } from "fs/promises";
 import { resolve } from "path";
 
-import { recordRead, recordReadSession, getSnapshot } from "../context/read-cache";
-import { buildHashlineAnchors } from "../hashline/hashline";
+import { recordRead, recordReadSession } from "../context/read-cache";
+import {
+  buildHashlineAnchors,
+  HASHLINE_BIGRAM_RE_SRC,
+  HASHLINE_CONTENT_SEPARATOR,
+} from "../hashline/hashline";
 import { getSmartEditRuntimeConfig } from "../config/edit-mode";
 import { releaseDiagnosticsOwner } from "../mutation/mutation-ownership.js";
 import { isMutationTool } from "../mutation/types.js";
 import type { PriorAuthorityStore } from "../context/evidence-authority.js";
 
 const smartEditRuntimeConfig = getSmartEditRuntimeConfig();
+
+type HashlineSnapshotData = Awaited<ReturnType<typeof buildHashlineAnchors>>;
+
+const DISPLAYED_HASHLINE_ROW_RE = new RegExp(
+  `^\\s*(?:>>>|>>)?\\s*(\\d+${HASHLINE_BIGRAM_RE_SRC})\\${HASHLINE_CONTENT_SEPARATOR}(.*)$`,
+);
+
+export interface DisplayedHashlineRows {
+  hashline: HashlineSnapshotData;
+  lineNumbers: number[];
+}
+
+/**
+ * Extract the exact LINE+ID tokens the model actually saw from SmartRead's
+ * rendered response. The response may be wrapped in @path/PINE envelope lines;
+ * only canonical hashline rows are retained.
+ *
+ * When rawContent is provided, rows whose displayed text does not equal the
+ * corresponding raw file line are discarded. That prevents a raced or
+ * malformed tool result from becoming recovery authority.
+ */
+export function parseDisplayedHashlineRows(
+  renderedText: string,
+  rawContent?: string,
+): DisplayedHashlineRows | null {
+  const rawLines = rawContent === undefined ? null : rawContent.replace(/\r/g, "").split("\n");
+  const anchors = new Map<string, { text: string; line: number }>();
+  const formattedLines: string[] = [];
+  const lineNumbers: number[] = [];
+
+  for (const renderedLine of renderedText.replace(/\r/g, "").split("\n")) {
+    const match = DISPLAYED_HASHLINE_ROW_RE.exec(renderedLine);
+    if (!match) continue;
+
+    const token = match[1];
+    const text = match[2] ?? "";
+    const lineMatch = /^(\d+)/.exec(token);
+    if (!lineMatch) continue;
+    const line = Number(lineMatch[1]);
+    if (!Number.isSafeInteger(line) || line < 1) continue;
+
+    if (rawLines && rawLines[line - 1] !== text) continue;
+    anchors.set(token, { text, line });
+    formattedLines.push(`${token}${HASHLINE_CONTENT_SEPARATOR}${text}`);
+    lineNumbers.push(line);
+  }
+
+  if (anchors.size === 0) return null;
+  return { hashline: { anchors, formattedLines }, lineNumbers };
+}
+
+function coversWholeFile(rows: DisplayedHashlineRows | null, totalLines: number): boolean {
+  if (!rows || rows.lineNumbers.length !== totalLines) return false;
+  const seen = new Set(rows.lineNumbers);
+  if (seen.size !== totalLines) return false;
+  for (let line = 1; line <= totalLines; line++) {
+    if (!seen.has(line)) return false;
+  }
+  return true;
+}
 
 export function coerceText(value: unknown): string {
   if (typeof value === "string") return value;
@@ -58,49 +121,73 @@ export async function recordOffsetLimitSingleRead(
   input: SingleReadInput,
   toolCwd: string,
   inputPath: string,
-  fullText: string,
+  renderedText: string,
 ): Promise<void> {
   const readOffset = input?.offset ?? 1;
-  const lines = fullText.split("\n");
-  const hashline = smartEditRuntimeConfig.useHashlineEditing
-    ? await buildHashlineAnchors(lines, readOffset)
-    : undefined;
-  recordRead(inputPath, toolCwd, fullText, true, hashline, readOffset);
-  const explicitLimit = input?.limit;
-  if (explicitLimit === undefined) {
-    let totalFileLines = lines.length + readOffset - 1;
-    try {
-      const snapshot = getSnapshot(inputPath, toolCwd);
-      if (snapshot?.hashline?.formattedLines?.length) {
-        totalFileLines = snapshot.hashline.formattedLines.length;
-      }
-    } catch {
-      // Fall back to computed value
-    }
-    recordReadSession(inputPath, toolCwd, readOffset, -1, totalFileLines, "read");
-  } else {
-    recordReadSession(inputPath, toolCwd, readOffset, explicitLimit, lines.length + readOffset - 1, "read");
+  let rawContent = renderedText;
+  try {
+    rawContent = (await fsReadFile(resolve(toolCwd, inputPath))).toString("utf-8");
+  } catch {
+    // Keep the rendered fallback; this snapshot remains partial/fail-closed.
   }
+
+  const rawLines = rawContent.replace(/\r/g, "").split("\n");
+  const displayed = parseDisplayedHashlineRows(renderedText, rawContent);
+
+  // Partial reads retain raw bytes for freshness, but hashline provenance is
+  // restricted to the exact rows the model actually saw.
+  recordRead(inputPath, toolCwd, rawContent, true, displayed?.hashline, readOffset);
+
+  const explicitLimit = input?.limit;
+  const totalFileLines = rawLines.length;
+  recordReadSession(
+    inputPath,
+    toolCwd,
+    readOffset,
+    explicitLimit ?? -1,
+    totalFileLines,
+    "read",
+  );
 }
 
 /** tool_result single-read seam: full (possibly truncated) branch. */
-export async function recordCompleteSingleRead(toolCwd: string, inputPath: string, fullText: string): Promise<void> {
-  let isTruncated = false;
+export async function recordCompleteSingleRead(
+  toolCwd: string,
+  inputPath: string,
+  renderedText: string,
+): Promise<void> {
+  let rawContent = renderedText;
+  let rawReadSucceeded = false;
   try {
-    const resolvedPath = resolve(toolCwd, inputPath);
-    const fileStat = statSync(resolvedPath);
-    if (fileStat.size > fullText.length) {
-      isTruncated = true;
-    }
+    rawContent = (await fsReadFile(resolve(toolCwd, inputPath))).toString("utf-8");
+    rawReadSucceeded = true;
   } catch {
-    // file may not exist or stat failed — record normally
+    // Fall back to rendered text, but mark the snapshot partial below.
   }
-  const lines = fullText.split("\n");
-  const hashline = smartEditRuntimeConfig.useHashlineEditing
-    ? await buildHashlineAnchors(lines)
-    : undefined;
-  recordRead(inputPath, toolCwd, fullText, isTruncated, hashline);
-  recordReadSession(inputPath, toolCwd, 1, -1, lines.length, "read");
+
+  const rawLines = rawContent.replace(/\r/g, "").split("\n");
+  const displayed = parseDisplayedHashlineRows(
+    renderedText,
+    rawReadSucceeded ? rawContent : undefined,
+  );
+
+  // A "full" SmartRead call can still truncate its presentation. Only mark the
+  // cache complete when every raw file line was actually displayed. This keeps
+  // provenance scoped to observed rows while freshness hashes the real bytes.
+  const isTruncated = !rawReadSucceeded || (
+    displayed
+      ? !coversWholeFile(displayed, rawLines.length)
+      : renderedText !== rawContent
+  );
+
+  const hashline = displayed?.hashline ?? (
+    smartEditRuntimeConfig.useHashlineEditing && !isTruncated && renderedText === rawContent
+      ? await buildHashlineAnchors(rawLines)
+      : undefined
+  );
+
+  recordRead(inputPath, toolCwd, rawContent, isTruncated, hashline);
+  recordReadSession(inputPath, toolCwd, 1, isTruncated ? (displayed?.lineNumbers.length ?? -1) : -1, rawLines.length, "read");
 }
 
 /**

@@ -11,6 +11,7 @@ import { runRepairLoop } from "../verification/repair-loop";
 import { appendDiagnosticsToContent } from "../mutation/post-mutation.js";
 import { createPatchTool, type PatchToolDeps } from "../patch.js";
 import { normalizeFlatEditRequest } from "../edit-contract.js";
+import { loadConfig } from "../config/schema.js";
 import { renderEditCall, renderEditResult } from "./render.js";
 import {
   applyRetryBudget,
@@ -78,7 +79,9 @@ export function registerEditTool(pi: ExtensionAPI, session: SessionState): void 
       emit: (c: string, d: unknown) => void;
       on: (c: string, h: (d: unknown) => void) => () => void;
     };
+    const useHashlineEditing = loadConfig().useHashlineEditing;
     const patchDeps: PatchToolDeps = {
+      useHashlineEditing,
       getBus: () => bus,
       getRpcClient: () => createRpcClient({ bus, channel: RPC_CHANNELS.inspectPatch, timeoutMs: 2000 }),
       getSessionFilePath: () => session.currentSessionFilePath,
@@ -142,12 +145,19 @@ export function registerEditTool(pi: ExtensionAPI, session: SessionState): void 
         onUpdate: ((u: { content: Array<{ type: "text"; text: string }> }) => void) | undefined,
         ctx: { cwd: string; hasUI?: boolean; ui?: unknown; [k: string]: unknown },
       ) {
-        const result = await patchTool.execute(
-          toolCallId,
-          omitAgentEvidenceRef(params),
-          signal,
-          onUpdate,
-          ctx,
+        const toolOwnedParams = omitAgentEvidenceRef(params);
+        const loopBlocked = session.mutationLoopGuard.preflight("edit", toolOwnedParams, toolCallId);
+        if (loopBlocked) return loopBlocked;
+        const result = session.mutationLoopGuard.observe(
+          "edit",
+          toolOwnedParams,
+          await patchTool.execute(
+            toolCallId,
+            toolOwnedParams,
+            signal,
+            onUpdate,
+            ctx,
+          ),
         );
         const reason = result.details?.status?.kind === "rejected" ? result.details.status.reason : undefined;
         const hasLineRangeFailure = reason === "coverage" && result.details.diagnostics.some(
@@ -170,9 +180,10 @@ export function registerEditTool(pi: ExtensionAPI, session: SessionState): void 
       prepareArguments(args: Record<string, unknown> | undefined): Record<string, unknown> {
         if (!args || typeof args !== "object") return args ?? {};
         const toolOwnedArgs = omitAgentEvidenceRef(args);
-        // Migrate flat single oldText/newText to edits array via the canonical
-        // contract normalizer (flat fields are authoritative).
-        return normalizeFlatEditRequest(toolOwnedArgs);
+        // Classic mode keeps the resumed-session compatibility shim. In
+        // hashline-only mode, oldText/newText is deliberately not migrated:
+        // the active protocol is exclusive and runtime validation rejects it.
+        return useHashlineEditing ? toolOwnedArgs : normalizeFlatEditRequest(toolOwnedArgs);
       },
     } as unknown);
   }

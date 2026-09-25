@@ -119,12 +119,18 @@ export function registerTransferTool(pi: ExtensionAPI, session: SessionState): v
                 ctx: { cwd: string; hasUI?: boolean; ui?: unknown; [k: string]: unknown },
             ) {
                 const { evidenceRef: _ignored, ...toolOwnedArgs } = params;
-                const result = await transferTool.execute(
-                    toolCallId,
+                const loopBlocked = session.mutationLoopGuard.preflight("transfer", toolOwnedArgs, toolCallId);
+                if (loopBlocked) return loopBlocked;
+                const result = session.mutationLoopGuard.observe(
+                    "transfer",
                     toolOwnedArgs,
-                    signal,
-                    onUpdate,
-                    ctx,
+                    await transferTool.execute(
+                        toolCallId,
+                        toolOwnedArgs,
+                        signal,
+                        onUpdate,
+                        ctx,
+                    ),
                 );
                 const reason = result.details?.status?.kind === "rejected" ? result.details.status.reason : undefined;
                 const note = reason === "stale"

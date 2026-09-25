@@ -109,6 +109,12 @@ export function formatAnchor(anchor: Anchor): string {
 // ─── Rebase Logic ────────────────────────────────────────────────────────────
 
 /**
+ * Low-level short-hash candidate locator retained for legacy/internal tests.
+ * DO NOT use this function to authorize a mutation: a unique two-letter hash
+ * within ±N lines is not proof of anchor identity. Public hashline edit
+ * recovery must go through hashline-recovery.ts, which requires retained
+ * snapshot provenance plus coherent contextual drift.
+ *
  * Check whether a hash anchor matches at the exact line position, or
  * attempt to find it within the rebase window.
  *
@@ -164,6 +170,9 @@ export function tryRebaseAnchor(
 }
 
 /**
+ * Legacy short-hash batch rebasing helper. Not safe as mutation authority.
+ * Public protocol recovery uses tryRecoverHashlineEdits() instead.
+ *
  * Attempt to rebase all mismatched anchors within an edit.
  * Returns updated anchors if all mismatches were resolved.
  */

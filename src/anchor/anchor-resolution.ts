@@ -1,5 +1,6 @@
 import type { EditItem, EditAnchor, SearchScope, LineRange } from "../core/types";
 import type { ParseResult } from "../ast/ast-resolver";
+import type { SymbolRef } from "../core/types.js";
 import { lineRangeToByteRange, validateLineRange } from "../core/edit-diff.js";
 
 /**
@@ -9,6 +10,13 @@ import { lineRangeToByteRange, validateLineRange } from "../core/edit-diff.js";
 export interface AstResolverLike {
   parseFile(content: string, filePath: string): Promise<ParseResult | null>;
   findSymbolNode(tree: { rootNode?: unknown; walk?: () => unknown }, anchor: { symbolName?: string; symbolNamePath?: string; symbolKind?: string; symbolLine?: number }): unknown;
+  /** Optional structural-context seam used by hashline stale-anchor recovery.
+   * Existing lightweight test resolvers need not implement it. */
+  findEnclosingSymbols?: (
+    tree: ParseResult["tree"],
+    startByte: number,
+    endByte: number,
+  ) => SymbolRef[];
   disposeParseResult(result: ParseResult): void;
 }
 

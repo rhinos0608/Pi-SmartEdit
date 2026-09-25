@@ -844,6 +844,58 @@ export function validateEditRequest(
 }
 
 /**
+ * Validate the hashline-only wire contract used when hashline mode is enabled.
+ * The normal validator remains intentionally unchanged for classic mode and
+ * stored-session compatibility; this stricter layer rejects every alternate
+ * mutation dialect at runtime as well as hiding it from the agent schema.
+ */
+export function validateHashlineOnlyEditRequest(
+    input: unknown,
+): { ok: true; value: EditRequest } | { ok: false; error: string } {
+    const validated = validateEditRequest(input);
+    if (!validated.ok) return validated;
+
+    const { value } = validated;
+    if (value.raw !== undefined || value.refactor !== undefined) {
+        return fail("hashline edit mode accepts only `edits` with hashline metadata");
+    }
+    if (!value.edits || value.edits.length === 0) {
+        return fail("hashline edit mode requires at least one hashline edit");
+    }
+
+    for (let i = 0; i < value.edits.length; i++) {
+        const edit = value.edits[i] as EditOperation;
+        if (!edit.hashline) {
+            return fail(`edit.edits[${i}] must use hashline metadata while hashline edit mode is enabled`);
+        }
+        if (!Object.prototype.hasOwnProperty.call(edit.hashline, "content")) {
+            return fail(`edit.edits[${i}].hashline.content is required in hashline edit mode; use null explicitly to delete`);
+        }
+        const { pos, end } = edit.hashline.range;
+        const insertionSuffix = pos.endsWith(":after")
+            ? ":after"
+            : pos.endsWith(":before")
+                ? ":before"
+                : null;
+        if (insertionSuffix) {
+            const base = pos.slice(0, -insertionSuffix.length);
+            if (end !== base) {
+                return fail(`edit.edits[${i}].hashline.range.end must equal unsuffixed insertion anchor "${base}"`);
+            }
+            if (edit.hashline.content === null) {
+                return fail(`edit.edits[${i}].hashline.content must be non-null for ${insertionSuffix} insertion`);
+            }
+        }
+        const keys = Object.keys(edit as unknown as Record<string, unknown>);
+        const unsupported = keys.find((key) => key !== "path" && key !== "hashline");
+        if (unsupported) {
+            return fail(`edit.edits[${i}].${unsupported} is not supported while hashline edit mode is enabled`);
+        }
+    }
+    return validated;
+}
+
+/**
  * Normalize a flat `{path, oldText, newText}` request (the single-edit
  * shorthand still sent by resumed sessions with stored calls) into the
  * canonical `edits` array shape. Flat fields are authoritative and overwrite
@@ -925,12 +977,13 @@ export const EDIT_PARAMETERS = {
                                 additionalProperties: false,
                                 description: "Hashline anchor range.",
                                 properties: {
-                                    pos: { type: "string", minLength: 1, description: "Start hashline anchor." },
-                                    end: { type: "string", minLength: 1, description: "End hashline anchor." },
+                                    pos: { type: "string", minLength: 1, description: "Complete start LINE+ID anchor from read output, e.g. \"112zc\"." },
+                                    end: { type: "string", minLength: 1, description: "Complete end LINE+ID anchor from read output, e.g. \"114aa\". Use the same anchor as pos for a single-line replacement." },
                                 },
                                 required: ["pos", "end"],
                             },
                             content: {
+                                description: "Replacement content for the anchored range. Use a string or array of replacement lines; use null to delete the anchored range. This is new content, not source/old text.",
                                 oneOf: [
                                     { type: "array", items: { type: "string" } },
                                     { type: "string" },
@@ -1001,3 +1054,89 @@ export const EDIT_PARAMETERS = {
         },
     },
 } as const;
+
+
+/**
+ * Hashline-only agent schema. Enabled only when hashline editing is active.
+ * Unlike the normal schema, this intentionally exposes no oldText/newText,
+ * raw patch, AST-target, lineRange, or refactor dialects.
+ */
+export const HASHLINE_EDIT_PARAMETERS = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+        path: {
+            type: "string",
+            minLength: 1,
+            description: "Default target file path. May be omitted when every edit provides its own path.",
+        },
+        edits: {
+            type: "array",
+            minItems: 1,
+            maxItems: 100,
+            description: "One or more hashline-only edits. This field must be a native JSON array of edit objects, never a JSON-encoded string and never a singleton object. All anchors must come from lines actually shown by a current read of the target file and must be copied as complete LINE+ID tokens; never combine a line number with a hash suffix from another row. Use tight ranges and separate nonadjacent changes.",
+            items: {
+                type: "object",
+                additionalProperties: false,
+                properties: {
+                    path: {
+                        type: "string",
+                        minLength: 1,
+                        description: "Per-edit target file path. Overrides the top-level path.",
+                    },
+                    hashline: {
+                        type: "object",
+                        additionalProperties: false,
+                        description: "Hashline mutation. Replace/delete shape: { range: { pos: \"112zc\", end: \"114aa\" }, content: replacement }. Insert shape: { range: { pos: \"112zc:after\", end: \"112zc\" }, content: inserted }. From read row \"112zc|const x = 1\", copy the complete token \"112zc\" before | as one unit. SmartEdit verifies token provenance against the retained read snapshot. Do not place pos/end directly under hashline.",
+                        properties: {
+                            range: {
+                                type: "object",
+                                additionalProperties: false,
+                                description: "Source locator from the read snapshot. For replacement/deletion, pos/end are inclusive LINE+ID anchors. For insertion without replacing source text, append :after or :before to pos (for example \"42ab:after\") and set end to the unsuffixed base anchor \"42ab\". All anchors refer to the pre-edit file version.",
+                                properties: {
+                                    pos: {
+                                        type: "string",
+                                        minLength: 1,
+                                        description: "Complete start LINE+ID anchor token from read output, e.g. \"112zc\". If the read row is \"112zc|const x = 1\", send only \"112zc\": no | and no source text. To insert without replacing a line, use \"112zc:after\" or \"112zc:before\" here.",
+                                    },
+                                    end: {
+                                        type: "string",
+                                        minLength: 1,
+                                        description: "Complete end LINE+ID anchor token from read output, e.g. \"114aa\". Send only the token before |. For a one-line replacement repeat pos. For :after/:before insertion, use the unsuffixed base anchor here.",
+                                    },
+                                },
+                                required: ["pos", "end"],
+                            },
+                            content: {
+                                description: "Replacement content for the anchored range. Use a string or array of replacement lines. Use null explicitly to delete the range. Never put the source/old text here.",
+                                oneOf: [
+                                    { type: "array", items: { type: "string" } },
+                                    { type: "string" },
+                                    { type: "null" },
+                                ],
+                            },
+                            symbol: {
+                                type: "object",
+                                additionalProperties: false,
+                                description: "Optional symbol hint used only to scope safe fallback when anchors are stale.",
+                                properties: {
+                                    name: { type: "string", minLength: 1 },
+                                    kind: { type: "string" },
+                                    line: { type: "integer", minimum: 1 },
+                                },
+                                required: ["name"],
+                            },
+                        },
+                        required: ["range", "content"],
+                    },
+                },
+                required: ["hashline"],
+            },
+        },
+    },
+    required: ["edits"],
+} as const;
+
+export function getEditParameters(useHashlineEditing: boolean): typeof EDIT_PARAMETERS | typeof HASHLINE_EDIT_PARAMETERS {
+    return useHashlineEditing ? HASHLINE_EDIT_PARAMETERS : EDIT_PARAMETERS;
+}

@@ -48,7 +48,7 @@ import {
 } from "@rhinos0608/pi-workspace-protocol";
 import { generateDiffString } from "./core/edit-diff.js";
 import { checkEditSafety } from "./safety/approval-gating.js";
-import { EDIT_PARAMETERS, validateEditRequest, type RefactorRequest } from "./edit-contract.js";
+import { getEditParameters, validateEditRequest, type RefactorRequest } from "./edit-contract.js";
 import type { PriorAuthorityStore } from "./context/evidence-authority.js";
 import type { EditItem, EditTarget, FileSnapshot, HashlineEditMetadata } from "./core/types.js";
 import type { RepairLoopResult } from "./verification/repair-loop.js";
@@ -140,12 +140,22 @@ import { executePatch } from "./patch/execute.js";
 // ── Patch tool factory ──────────────────────────────────────────────
 
 export function createPatchTool(deps: PatchToolDeps): PatchTool {
+    const hashlineOnly = deps.useHashlineEditing === true;
     return {
         name: "patch",
         label: "patch",
-        description:
-            "Apply edits to files gated by workspace evidence. Existing files require prior strong read authority; new files may use empty-file semantics. Provide a `path` and a list of `edits`, or a `raw` patch string (mutually exclusive); each edit may carry its own `path`. Freshness and coverage are validated automatically; returns a discriminated lifecycle result (applied | rejected | failed). Use patch to transform or generate content; when existing content should be preserved and relocated/reused, prefer transfer.",
-        parameters: EDIT_PARAMETERS as unknown as Record<string, unknown>,
+        description: hashlineOnly
+            ? [
+                "Apply hashline edits only, gated by workspace evidence.",
+                "Read each target file first and copy complete LINE+ID anchors exactly from read output; only anchor lines actually shown by read, and read an elided/unseen target range before editing it.",
+                "Keep ranges tight around changed lines; split nonadjacent changes into separate edit items instead of including unchanged keeper lines.",
+                "The top-level edits field must be a native JSON array of edit objects, never a JSON-encoded string and never a singleton object. Each edit must use nested hashline.range plus hashline.content. Replace/delete example: { edits: [{ hashline: { range: { pos: \"112zc\", end: \"114aa\" }, content: replacement } }] }. Insert-after example: { edits: [{ hashline: { range: { pos: \"112zc:after\", end: \"112zc\" }, content: inserted } }] }.",
+                "Copy only the LINE+ID token before the | separator from read output; never include the | or source text. Use :after or :before on pos for pure insertion instead of re-emitting keeper source lines. All anchors in one call refer to the same pre-edit file version.",
+                "After a successful edit call, re-read before issuing another hashline edit against that file.",
+                "Do not send oldText/newText, raw patches, lineRange, AST target operations, or refactor requests in hashline mode.",
+              ].join(" ")
+            : "Apply edits to files gated by workspace evidence. Existing files require prior strong read authority; new files may use empty-file semantics. Provide a `path` and a list of `edits`, or a `raw` patch string (mutually exclusive); each edit may carry its own `path`. Freshness and coverage are validated automatically; returns a discriminated lifecycle result (applied | rejected | failed). Use patch to transform or generate content; when existing content should be preserved and relocated/reused, prefer transfer.",
+        parameters: getEditParameters(hashlineOnly) as unknown as Record<string, unknown>,
 
         async execute(toolCallId, params, signal, onUpdate, ctx) {
             // Pipeline owned by ./patch/execute.js (dispatchValidatedRequest →

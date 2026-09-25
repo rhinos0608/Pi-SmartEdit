@@ -1,12 +1,24 @@
 /**
- * Transfer resolution: frozen anchor-resolution semantics for copy/move.
+ * Transfer resolution for copy/move.
  *
- * Pure extraction from `src/transfer-edit.ts` (`resolveSourceRange`) plus
- * the destination-anchor rebasing previously inlined in `src/patch.ts`
- * (touching-span and duplicate-destination checks). No behavior change.
+ * Transfer runs behind workspace evidence + transaction freshness checks, so
+ * anchors are exact references to the observed preimage. Unlike hashline edit
+ * recovery, transfer has no independent retained read snapshot to prove a
+ * relocation; stale source/destination anchors therefore fail closed.
  */
-import { parseTag, tryRebaseAnchor } from "../hashline/hashline-edit.js";
+import { parseTag } from "../hashline/hashline-edit.js";
+import { computeLineHashSync } from "../hashline/hashline.js";
 import { normalizeToLF, stripBom } from "../core/edit-diff.js";
+
+function resolveExactAnchor(
+  anchor: ReturnType<typeof parseTag>,
+  fileLines: readonly string[],
+): number | null {
+  if (anchor.line < 1 || anchor.line > fileLines.length) return null;
+  const text = fileLines[anchor.line - 1];
+  if (text === undefined) return null;
+  return computeLineHashSync(anchor.line, text) === anchor.hash ? anchor.line : null;
+}
 
 export interface ResolvedSourceRange {
   startLine: number;
@@ -14,11 +26,11 @@ export interface ResolvedSourceRange {
   lines: string[];
 }
 
-/** Resolve pos/end anchors against the logical source text: BOM-stripped,
+/** Resolve pos/end anchors exactly against logical source text: BOM-stripped,
  *  LF-normalized. Raw snapshot bytes (BOM/CRLF) are a freshness concern, not
  *  an addressing concern — anchors always address logical lines, so a
  *  first-line copy/move never carries the file BOM and CRLF never shifts
- *  line numbers. Tolerates anchor drift the same way hashline edits do. */
+ *  line numbers. */
 export function resolveSourceRange(
   sourceContent: string,
   posStr: string,
@@ -42,16 +54,13 @@ export function resolveSourceRange(
 
   const { text: withoutBom } = stripBom(sourceContent);
   const fileLines = normalizeToLF(withoutBom).split("\n");
-  const startRebase = tryRebaseAnchor(posAnchor, fileLines);
-  const endRebase = tryRebaseAnchor(endAnchor, fileLines);
-  if (startRebase === null || endRebase === null) {
-    return { ok: false, error: "transfer anchor is stale or ambiguous; re-read the source file and retry with fresh anchors" };
-  }
-
-  const startLine = startRebase === "exact" ? posAnchor.line : startRebase;
-  const endLine = endRebase === "exact" ? endAnchor.line : endRebase;
-  if (startLine > endLine) {
-    return { ok: false, error: "transfer range inverted after anchor relocation; re-read the source file and retry with fresh anchors" };
+  // Transfer already runs behind transaction/evidence freshness checks. A
+  // source anchor that no longer matches its observed line is therefore stale,
+  // not a license to search nearby by a two-letter hash.
+  const startLine = resolveExactAnchor(posAnchor, fileLines);
+  const endLine = resolveExactAnchor(endAnchor, fileLines);
+  if (startLine === null || endLine === null) {
+    return { ok: false, error: "transfer anchor is stale; re-read the source file and retry with fresh anchors" };
   }
 
   return {
@@ -61,14 +70,10 @@ export function resolveSourceRange(
 }
 
 /**
- * Rebase a destination `after` anchor against logical destination lines.
- *
- * Returns the 1-based line the anchor resolves to, `"start"` for the
- * prepend sentinel, or `null` when there is nothing to resolve
- * (`after` omitted) or the anchor is unparsable/stale. `null` preserves
- * the historical `patch.ts` behavior of skipping the touching-span and
- * duplicate-destination checks when the anchor cannot be rebased, rather
- * than failing the transfer on destination resolution alone.
+ * Resolve a destination `after` anchor exactly against logical destination
+ * lines. Returns the 1-based line, `"start"` for the prepend sentinel, or
+ * `null` when omitted, malformed, or stale. Higher-level transfer planning
+ * turns a stale required destination into a pre-write conflict/failure.
  */
 export function resolveDestination(
   after: string | undefined,
@@ -78,10 +83,7 @@ export function resolveDestination(
   if (after === "start") return "start";
   try {
     const anchor = parseTag(after);
-    const rebased = tryRebaseAnchor(anchor, [...destLogicalLines]);
-    if (rebased === "exact") return anchor.line;
-    if (typeof rebased === "number") return rebased;
-    return null;
+    return resolveExactAnchor(anchor, destLogicalLines);
   } catch {
     return null;
   }

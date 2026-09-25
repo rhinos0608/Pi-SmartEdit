@@ -9,10 +9,10 @@
  */
 
 import type { EditAnchor, FileSnapshot } from "../core/types";
+import { initHashline } from "./hashline";
 import {
   formatAnchor,
   parseTag,
-  tryRebaseAll,
   type Anchor,
   type HashlineEditOp,
 } from "./hashline-anchor";
@@ -75,6 +75,22 @@ export {
   validateHashlineEdits,
 } from "./hashline-validate";
 export type { HashMismatch, ValidationResult } from "./hashline-validate";
+
+import {
+  checkHashlineSnapshotProvenance,
+  HashlineAnchorProvenanceError,
+  tryRecoverHashlineEdits,
+} from "./hashline-recovery";
+import {
+  HashlineStructuralContextError,
+  type StructuralRecoveryCheck,
+} from "./hashline-structure.js";
+export {
+  checkHashlineSnapshotProvenance,
+  HashlineAnchorProvenanceError,
+  tryRecoverHashlineEdit,
+  tryRecoverHashlineEdits,
+} from "./hashline-recovery";
 
 // Apply logic (applyHashlineEdits, applySingleEdit, getEditEndLine,
 // formatEditLoc, linesEqual) moved to ./hashline-apply — see import/re-export above.
@@ -200,7 +216,18 @@ export async function applyHashlinePath(
     matchNote?: string;
   },
   detectIndentFn: (content: string) => { char: "\t" | " "; width: number },
+  verifyRecoveryStructureFn?: (args: {
+    original: HashlineEditOp;
+    recovered: HashlineEditOp;
+    currentContent: string;
+    snapshot: FileSnapshot;
+  }) => Promise<StructuralRecoveryCheck>,
 ): Promise<ApplyHashlinePathResult> {
+  // Validation and rebasing intentionally use the synchronous hash API. Make
+  // its initialization an explicit invariant of the async routing boundary
+  // instead of relying on an earlier read path to have warmed xxhash-wasm.
+  await initHashline();
+
   const warnings: string[] = [];
 
   // ── Step 1: Resolve hashline edits ──────────────────────────────────────────
@@ -217,7 +244,15 @@ export async function applyHashlinePath(
   // ── Normalize anchor line numbers for offset reads ────────────────
   // Anchors are built with absolute line numbers (via buildHashlineAnchors(lines, readOffset))
   // so no adjustment needed — the parsed anchor line numbers already match the file.
-  // ── Step 2: Validate all hashes ─────────────────────────────────────────────
+  // ── Step 2: Verify anchor provenance, then validate live hashes ──────────────
+  // A retained hashline read lets us reject model-spliced LINE+ID tokens even
+  // when their short hash suffix happens to be syntactically valid.
+  const provenance = checkHashlineSnapshotProvenance(resolvedEdits, snapshot);
+  if (!provenance.valid) {
+    recordFallbackTier("hash-mismatch-reject");
+    throw new HashlineAnchorProvenanceError(provenance.missing);
+  }
+
   const fileLines = fileContent.split("\n");
   const validation = validateHashlineEdits(resolvedEdits, fileLines);
 
@@ -234,19 +269,40 @@ export async function applyHashlinePath(
     };
   }
 
-  // ── Step 3: Try rebasing mismatched anchors ────────────────────────────────
-  const rebaseResult = tryRebaseAll(resolvedEdits, fileLines);
+  // ── Step 3: Snapshot-proven recovery of coherent line drift ───────────────
+  // Never relocate an edit merely because a two-letter hash occurs nearby.
+  // Recovery requires the authored token to exist in the retained read,
+  // byte-identical target text, a uniform shift, and neighbouring context.
+  const rebaseResult = tryRecoverHashlineEdits(resolvedEdits, fileLines, snapshot);
 
   if (rebaseResult.allResolved) {
-    // Rebased successfully — apply with warning
-    const result = applyHashlineEdits(fileContent, rebaseResult.rebasedEdits);
+    if (verifyRecoveryStructureFn && snapshot) {
+      for (let i = 0; i < resolvedEdits.length; i++) {
+        const structural = await verifyRecoveryStructureFn({
+          original: resolvedEdits[i],
+          recovered: rebaseResult.recoveredEdits[i],
+          currentContent: fileContent,
+          snapshot,
+        });
+        if (structural.checked && !structural.ok) {
+          recordFallbackTier("hash-mismatch-reject");
+          throw new HashlineStructuralContextError(structural.reason);
+        }
+        if (structural.checked && structural.ok) {
+          rebaseResult.warnings.push(
+            `Structural recovery context preserved: ${structural.fingerprint}.`,
+          );
+        }
+      }
+    }
+    const result = applyHashlineEdits(fileContent, rebaseResult.recoveredEdits);
     recordFallbackTier("hashline-rebased");
     return {
       newContent: result.lines,
       tier: "hashline-rebased",
       warnings: [...rebaseResult.warnings],
       firstChangedLine: result.firstChangedLine,
-      appliedOps: rebaseResult.rebasedEdits,
+      appliedOps: rebaseResult.recoveredEdits,
     };
   }
 

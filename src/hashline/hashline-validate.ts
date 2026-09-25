@@ -260,7 +260,7 @@ function buildModelMessage(
     msg += `  ${mm.correctedAnchor}  (was ${mm.line}${mm.expected}, now ${mm.line}${mm.actual})\n`;
   }
 
-  msg += `\nUse the corrected anchors above and retry without re-reading.`;
+  msg += `\nRe-read the target lines to refresh the complete LINE+ID tokens, then retry. Do not splice a line number and hash suffix from different read rows.`;
 
   return msg;
 }

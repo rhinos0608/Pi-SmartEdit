@@ -10,6 +10,7 @@ import { createSmartReadDiagnosticsClient } from "../lsp/smartread-diagnostics-c
 import { resetRetryCounts } from "../verification/auto-validate";
 import { createPriorAuthorityStore, type PriorAuthorityStore } from "../context/evidence-authority.js";
 import { narrowPostEditRanges, type NarrowHintsByPath } from "./post-lanes.js";
+import { MutationLoopGuard } from "./mutation-loop-guard.js";
 import {
   PROTOCOL_SCHEMA_VERSION,
   hashSessionFilePath,
@@ -28,6 +29,7 @@ export type SessionState = {
   currentSessionFilePath: string | null;
   currentCanonicalWorkspaceRoot: string | null;
   currentCwd: string | null;
+  mutationLoopGuard: MutationLoopGuard;
 };
 
 export function createSessionState(): SessionState {
@@ -39,6 +41,7 @@ export function createSessionState(): SessionState {
     currentSessionFilePath: null,
     currentCanonicalWorkspaceRoot: null,
     currentCwd: null,
+    mutationLoopGuard: new MutationLoopGuard(),
   };
 }
 
@@ -58,6 +61,7 @@ export async function initSessionState(state: SessionState, pi: ExtensionAPI, ct
   }
 
   resetRetryCounts();
+  state.mutationLoopGuard.reset();
 
   // Capture the real session file path and canonical workspace root.
   // We require a REAL (non-ephemeral) session file for `patch` authorization.
@@ -94,6 +98,7 @@ export async function shutdownSessionState(state: SessionState): Promise<void> {
   state.lspManager = null;
   state.priorAuthorityStore?.clear();
   state.priorAuthorityStore = null;
+  state.mutationLoopGuard.reset();
 }
 
 export async function buildMutationEvidence(
