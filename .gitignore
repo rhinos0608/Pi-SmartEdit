@@ -31,3 +31,6 @@ research/
 .subagents/
 .scouting/
 .subagent-artifacts/
+
+# Generated benchmark run artifacts
+benchmark/runs/

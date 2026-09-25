@@ -1,0 +1,1 @@
+In src/options.ts, inside retry only, change timeoutMs from 1500 to 2500 and insert jitter: true, immediately after retries: 2,. Preserve the file's existing tab indentation and leave logging unchanged.

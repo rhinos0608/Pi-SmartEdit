@@ -47,6 +47,10 @@ export interface RpcClientLike {
 }
 
 export interface PatchToolDeps {
+    /** Selects the agent-visible and runtime edit protocol. When true, only
+     * hashline edits are accepted; classic/raw/refactor dialects are hidden
+     * and rejected. Defaults to false for callers that do not opt in. */
+    readonly useHashlineEditing?: boolean;
     readonly getBus?: () => { emit: (c: string, d: unknown) => void; on: (c: string, h: (d: unknown) => void) => () => void };
     readonly getRpcClient: () => RpcClientLike;
     readonly getSessionFilePath: () => string | null;

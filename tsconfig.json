@@ -17,6 +17,7 @@
     "test/**/*.ts"
   ],
   "exclude": [
+    "benchmark/fixtures/**",
     "test/fixtures/**",
     "test/legacy/**",
     "test/manual/**",

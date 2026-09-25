@@ -14,6 +14,7 @@ export default tseslint.config(
       "**/coverage/**",
       "**/.pi-smartread.embeddings.cache/**",
       "**/.pi-smartread.tags.cache/**",
+      "**/benchmark/fixtures/**",
       "**/test/fixtures/**",
       "**/test/package-fixtures/**",
       "**/test/lsp/**",
