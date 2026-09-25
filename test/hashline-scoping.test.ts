@@ -13,6 +13,7 @@ import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert";
 
 import {
+  buildHashlineAnchors,
   computeLineHashSync,
   initHashline,
 } from "../src/hashline/hashline.js";
@@ -22,6 +23,7 @@ import {
   validateHashlineEdits,
   applyHashlineEdits,
   tryRebaseAll,
+  HashlineAnchorProvenanceError,
   HashlineMismatchError,
   parseSymbolAnchor,
   applyHashlinePath,
@@ -32,7 +34,7 @@ import {
   type FallbackTier,
 } from "../src/hashline/hashline-edit.js";
 
-import type { EditAnchor } from "../src/core/types.js";
+import type { EditAnchor, FileSnapshot } from "../src/core/types.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -90,6 +92,18 @@ function makeStaleAnchors(lineNum: number, text: string): { pos: string; end: st
   return {
     pos: `${lineNum}${computeLineHashSync(lineNum, text)}`,
     end: `${lineNum}${computeLineHashSync(lineNum + 1, text + " line 2")}`,
+  };
+}
+
+async function snapshotFor(content: string): Promise<FileSnapshot> {
+  return {
+    path: "/tmp/hashline-test.ts",
+    mtimeMs: 1,
+    size: Buffer.byteLength(content),
+    contentHash: "test-snapshot",
+    readAt: 1,
+    readOffset: 1,
+    hashline: await buildHashlineAnchors(content.split("\n")),
   };
 }
 
@@ -184,24 +198,50 @@ describe("applyHashlinePath — rebase", () => {
   before(async () => { await ensureHashline(); });
   beforeEach(() => { resetHashlineMetrics(); });
 
-  it("rebases when anchor line doesn't match but hash found elsewhere in ±5", async () => {
-    // File shifted by 2 lines — hash of "const x = 1;" was at line 1, now at line 3
-    const content = "// comment\n// comment\nconst x = 1;\n";
-    // Use hash of target content at line 1 (will be at line 3)
-    const staleAnchor = `1${computeLineHashSync(1, "const x = 1;")}`;
+  it("recovers a snapshot-proven uniform line shift with neighbouring context", async () => {
+    const original = "const before = 0;\nconst x = 1;\nconst after = 2;\n";
+    const snapshot = await snapshotFor(original);
+    const content = "// inserted 1\n// inserted 2\n" + original;
+    const staleAnchor = `2${computeLineHashSync(2, "const x = 1;")}`;
 
     const result = await applyHashlinePath(
       { anchor: { range: { pos: staleAnchor, end: staleAnchor } }, content: ["const x = 99;"] },
       content,
-      null,
+      snapshot,
       mockResolveScope,
       mockFindTextFail,
       mockDetectIndent,
     );
 
     assert.strictEqual(result.tier, "hashline-rebased");
-    assert.ok(result.warnings.some(w => w.includes("rebased")));
+    assert.ok(result.warnings.some(w => w.includes("Snapshot-proven")));
+    assert.ok(result.newContent.includes("const x = 99;"));
     assert.strictEqual(getHashlineMetrics().hashlineRebased, 1);
+  });
+
+  it("rejects a LINE+ID token spliced from two different read rows", async () => {
+    const original = "export function createOptions() {\n  return {\n    retries: 2,\n  };\n}\n";
+    const snapshot = await snapshotFor(original);
+    const lines = original.split("\n");
+    const line1Hash = computeLineHashSync(1, lines[0]!);
+    const wrongLine = lines.findIndex((text, index) =>
+      index > 0 && computeLineHashSync(index + 1, text) !== line1Hash
+    ) + 1;
+    assert.ok(wrongLine > 1);
+    const spliced = `${wrongLine}${line1Hash}`;
+
+    await assert.rejects(
+      () => applyHashlinePath(
+        { anchor: { range: { pos: spliced, end: spliced } }, content: ["corrupt();"] },
+        original,
+        snapshot,
+        mockResolveScope,
+        mockFindTextFail,
+        mockDetectIndent,
+      ),
+      HashlineAnchorProvenanceError,
+    );
+    assert.strictEqual(getHashlineMetrics().hashMismatchRejects, 1);
   });
 
   it("throws HashlineMismatchError when rebase window exhausted", async () => {
@@ -530,22 +570,23 @@ describe("fallback chain — end-to-end", () => {
     assert.strictEqual(result.newContent, "const x = 2;\n");
   });
 
-  it("Tier 2 -> rebase when hashes stale within window", async () => {
-    // Hash of "const x = 1;" is at line 3 (shifted by 2)
-    const content = "// shift\n// shift\nconst x = 1;\n";
-    const staleAnchor = `1${computeLineHashSync(1, "const x = 1;")}`;
+  it("Tier 2 -> snapshot-proven recovery when the observed block shifts", async () => {
+    const original = "const before = 0;\nconst x = 1;\nconst after = 2;\n";
+    const snapshot = await snapshotFor(original);
+    const content = "// shift\n// shift\n" + original;
+    const staleAnchor = `2${computeLineHashSync(2, "const x = 1;")}`;
 
     const result = await applyHashlinePath(
       { anchor: { range: { pos: staleAnchor, end: staleAnchor } }, content: ["const x = 99;"] },
       content,
-      null,
+      snapshot,
       mockResolveScope,
       mockFindTextFail,
       mockDetectIndent,
     );
 
     assert.strictEqual(result.tier, "hashline-rebased");
-    assert.ok(result.warnings.length > 0);
+    assert.ok(result.warnings.some((warning) => warning.includes("Snapshot-proven")));
   });
 
   it("Tier 3 -> scoped fallback when hashes stale and symbol provided", async () => {

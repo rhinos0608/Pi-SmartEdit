@@ -16,7 +16,9 @@ import assert from "node:assert/strict";
 import smartEdit from "../src/index.js";
 import {
     validateEditRequest,
+    validateHashlineOnlyEditRequest,
     normalizeFlatEditRequest,
+    getEditParameters,
 } from "../src/edit-contract.js";
 
 // ── Minimal mock capturing registration ─────────────────────────────
@@ -120,8 +122,159 @@ test("registered edit schema advertises nested lineRange and hashline fields", (
     const range = hashlineProps.range as { properties?: Record<string, unknown> };
     assert.ok(range.properties?.pos, "hashline.range must advertise pos");
     assert.ok(range.properties?.end, "hashline.range must advertise end");
+    assert.match(String((range.properties?.pos as { description?: string }).description), /LINE\+ID.*112zc/);
+    assert.match(String((range.properties?.end as { description?: string }).description), /LINE\+ID.*single-line/);
     assert.ok(hashlineProps.content, "hashline must advertise content");
+    assert.match(String((hashlineProps.content as { description?: string }).description), /Replacement content.*null.*delete.*not source\/old text/i);
     assert.ok(hashlineProps.symbol, "hashline must advertise symbol");
+});
+
+test("hashline mode exposes only the hashline edit protocol", () => {
+    const params = getEditParameters(true) as unknown as {
+        required?: string[];
+        properties?: Record<string, unknown>;
+    };
+    assert.deepEqual(params.required, ["edits"]);
+    const props = params.properties ?? {};
+    assert.ok(props.path);
+    assert.ok(props.edits);
+    assert.ok(!("raw" in props), "hashline schema must hide raw patches");
+    assert.ok(!("refactor" in props), "hashline schema must hide refactors");
+
+    const edits = props.edits as {
+        items?: {
+            required?: string[];
+            properties?: Record<string, unknown>;
+        };
+    };
+    assert.deepEqual(edits.items?.required, ["hashline"]);
+    const itemProps = edits.items?.properties ?? {};
+    assert.deepEqual(Object.keys(itemProps).sort(), ["hashline", "path"]);
+    assert.ok(!("oldText" in itemProps));
+    assert.ok(!("newText" in itemProps));
+    assert.ok(!("lineRange" in itemProps));
+    assert.ok(!("target" in itemProps));
+
+    const hashline = itemProps.hashline as {
+        required?: string[];
+        properties?: Record<string, unknown>;
+    };
+    assert.deepEqual(hashline.required, ["range", "content"]);
+    const content = hashline.properties?.content as { description?: string };
+    assert.match(String(content.description), /replacement content.*null explicitly.*delete.*never put the source\/old text/i);
+    const range = hashline.properties?.range as { description?: string; properties?: Record<string, unknown> };
+    assert.match(String(range.description), /:after.*:before.*unsuffixed base anchor/i);
+    assert.match(String((range.properties?.pos as { description?: string }).description), /insert.*:after.*:before/i);
+});
+
+test("normal mode keeps the existing full edit schema", () => {
+    const params = getEditParameters(false) as unknown as { properties?: Record<string, unknown> };
+    const props = params.properties ?? {};
+    assert.ok(props.raw);
+    assert.ok(props.refactor);
+    const edits = props.edits as { items?: { properties?: Record<string, unknown> } };
+    const itemProps = edits.items?.properties ?? {};
+    assert.ok(itemProps.oldText);
+    assert.ok(itemProps.newText);
+    assert.ok(itemProps.target);
+    assert.ok(itemProps.lineRange);
+    assert.ok(itemProps.hashline);
+});
+
+test("extension registration switches to the hashline-only schema when enabled", () => {
+    const priorDirect = process.env.SMART_EDIT_USE_HASHLINE_EDITING;
+    const priorAlias = process.env.SMART_EDIT_HASHLINE_EXPERIMENTAL;
+    try {
+        process.env.SMART_EDIT_USE_HASHLINE_EDITING = "1";
+        delete process.env.SMART_EDIT_HASHLINE_EXPERIMENTAL;
+        const params = registeredEditParams();
+        const props = params.properties as Record<string, unknown>;
+        assert.ok(props.edits);
+        assert.ok(!props.raw);
+        assert.ok(!props.refactor);
+        const edits = props.edits as { items?: { properties?: Record<string, unknown> } };
+        assert.deepEqual(Object.keys(edits.items?.properties ?? {}).sort(), ["hashline", "path"]);
+    } finally {
+        if (priorDirect === undefined) delete process.env.SMART_EDIT_USE_HASHLINE_EDITING;
+        else process.env.SMART_EDIT_USE_HASHLINE_EDITING = priorDirect;
+        if (priorAlias === undefined) delete process.env.SMART_EDIT_HASHLINE_EXPERIMENTAL;
+        else process.env.SMART_EDIT_HASHLINE_EXPERIMENTAL = priorAlias;
+    }
+});
+
+test("hashline-only runtime validator rejects alternate edit dialects", () => {
+    const classic = validateHashlineOnlyEditRequest({
+        path: "a.ts",
+        edits: [{ oldText: "x", newText: "y" }],
+    });
+    assert.ok(!classic.ok);
+    assert.match(classic.error, /must use hashline metadata/);
+
+    const mixed = validateHashlineOnlyEditRequest({
+        path: "a.ts",
+        edits: [{
+            oldText: "x",
+            newText: "y",
+            hashline: { range: { pos: "1ab", end: "1ab" }, content: "z" },
+        }],
+    });
+    assert.ok(!mixed.ok);
+    assert.match(mixed.error, /oldText.*not supported/);
+
+    const missingContent = validateHashlineOnlyEditRequest({
+        path: "a.ts",
+        edits: [{ hashline: { range: { pos: "1ab", end: "1ab" } } }],
+    });
+    assert.ok(!missingContent.ok);
+    assert.match(missingContent.error, /content is required.*null explicitly to delete/);
+
+    const raw = validateHashlineOnlyEditRequest({ raw: "*** Begin Patch" });
+    assert.ok(!raw.ok);
+    assert.match(raw.error, /accepts only.*hashline metadata/);
+});
+
+test("hashline-only runtime validator accepts explicit replacement, deletion, and gap insertion", () => {
+    const replacement = validateHashlineOnlyEditRequest({
+        path: "a.ts",
+        edits: [{
+            hashline: { range: { pos: "1ab", end: "2cd" }, content: ["x", "y"] },
+        }],
+    });
+    assert.ok(replacement.ok);
+
+    const deletion = validateHashlineOnlyEditRequest({
+        path: "a.ts",
+        edits: [{
+            hashline: { range: { pos: "1ab", end: "1ab" }, content: null },
+        }],
+    });
+    assert.ok(deletion.ok);
+
+    const insertion = validateHashlineOnlyEditRequest({
+        path: "a.ts",
+        edits: [{
+            hashline: { range: { pos: "1ab:after", end: "1ab" }, content: ["new line"] },
+        }],
+    });
+    assert.ok(insertion.ok);
+
+    const wrongInsertionEnd = validateHashlineOnlyEditRequest({
+        path: "a.ts",
+        edits: [{
+            hashline: { range: { pos: "1ab:after", end: "2cd" }, content: ["new line"] },
+        }],
+    });
+    assert.ok(!wrongInsertionEnd.ok);
+    assert.match(wrongInsertionEnd.error, /end must equal unsuffixed insertion anchor/);
+
+    const nullInsertion = validateHashlineOnlyEditRequest({
+        path: "a.ts",
+        edits: [{
+            hashline: { range: { pos: "1ab:before", end: "1ab" }, content: null },
+        }],
+    });
+    assert.ok(!nullInsertion.ok);
+    assert.match(nullInsertion.error, /content must be non-null.*insertion/);
 });
 
 test("registered edit schema omits top-level oneOf for Anthropic input_schema compat", () => {

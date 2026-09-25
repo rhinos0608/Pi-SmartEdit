@@ -32,6 +32,25 @@ function sha256(s: string): string {
   return createHash("sha256").update(s, "utf8").digest("hex");
 }
 
+function hashlineSnapshot(lines: string[]): FileSnapshot {
+  const anchors = new Map<string, { text: string; line: number }>();
+  for (let i = 0; i < lines.length; i++) {
+    const text = lines[i];
+    if (text === undefined) continue;
+    const line = i + 1;
+    anchors.set(formatLineHash(line, text), { text, line });
+  }
+  return {
+    path: "",
+    mtimeMs: 0,
+    size: lines.join("\n").length,
+    contentHash: "test-snapshot",
+    readAt: 0,
+    readOffset: 1,
+    hashline: { anchors, formattedLines: [] },
+  };
+}
+
 type Anchor = { symbolName?: string; symbolKind?: string; symbolLine?: number };
 
 function mockAstResolver(
@@ -614,34 +633,30 @@ describe("hashline operations through public execute", () => {
     assert.equal(readFileSync(canonicalFile, "utf8"), content, "file must be unchanged");
   });
 
-  test("rebase applies a shifted anchor within the rebase window", async () => {
+  test("snapshot-proven recovery applies a coherently shifted anchor", async () => {
     await initHashline();
     const workdir = realpathSync(mkdtempSync(join(tmpdir(), "cap-hash-rebase-")));
-    const content = "alpha\nbeta\ngamma\n";
-    const shiftedAnchor = formatLineHash(1, "gamma");
+    const original = ["alpha", "beta", "gamma"];
+    const snapshot = hashlineSnapshot(original);
+    const content = "// inserted\nalpha\nbeta\ngamma\n";
+    const shiftedAnchor = formatLineHash(2, "beta");
     const { res, canonicalFile } = await runTool({
       workdir,
       fileContent: content,
-      edits: [{ hashline: { range: { pos: shiftedAnchor, end: shiftedAnchor }, content: ["GAMMA"] } }],
+      edits: [{ hashline: { range: { pos: shiftedAnchor, end: shiftedAnchor }, content: ["BETA"] } }],
+      getSnapshot: () => snapshot,
     });
     assert.equal(res.details.status.kind, "applied");
-    assert.equal(readFileSync(canonicalFile, "utf8"), "alpha\nbeta\nGAMMA\n");
+    assert.equal(readFileSync(canonicalFile, "utf8"), "// inserted\nalpha\nBETA\ngamma\n");
   });
 
-  test("AST-scoped fallback applies a stale hashline edit within its symbol", async () => {
+  test("AST-scoped fallback applies a provenance-valid stale hashline edit within its symbol", async () => {
     await initHashline();
     const workdir = realpathSync(mkdtempSync(join(tmpdir(), "cap-hash-scoped-")));
-    const content = "function foo() {\n  return 1;\n}\n";
-    const staleAnchor = formatLineHash(99, "nonexistent");
-    const snapshot: FileSnapshot = {
-      path: "",
-      mtimeMs: 0,
-      size: content.length,
-      contentHash: "",
-      readAt: 0,
-      readOffset: 1,
-      hashline: { anchors: new Map([[staleAnchor, { text: "  return 1;", line: 2 }]]), formattedLines: [] },
-    };
+    const original = ["function foo() {", "  return 1;", "}", ""];
+    const snapshot = hashlineSnapshot(original);
+    const staleAnchor = formatLineHash(2, "  return 1;");
+    const content = "function foo() {\n  // inserted\n  return 1;\n}\n";
     const { res, canonicalFile } = await runTool({
       workdir,
       fileContent: content,
@@ -658,23 +673,16 @@ describe("hashline operations through public execute", () => {
       getSnapshot: () => snapshot,
     });
     assert.equal(res.details.status.kind, "applied");
-    assert.equal(readFileSync(canonicalFile, "utf8"), "function foo() {\n  return 2;\n}\n");
+    assert.equal(readFileSync(canonicalFile, "utf8"), "function foo() {\n  // inserted\n  return 2;\n}\n");
   });
 
-  test("full fuzzy fallback reconstructs oldText from snapshot", async () => {
+  test("full fuzzy fallback reconstructs oldText from a provenance-valid snapshot", async () => {
     await initHashline();
     const workdir = realpathSync(mkdtempSync(join(tmpdir(), "cap-hash-fuzzy-")));
-    const content = "alpha\nbeta\ngamma\n";
-    const staleAnchor = formatLineHash(99, "nonexistent");
-    const snapshot: FileSnapshot = {
-      path: "",
-      mtimeMs: 0,
-      size: content.length,
-      contentHash: "",
-      readAt: 0,
-      readOffset: 1,
-      hashline: { anchors: new Map([[staleAnchor, { text: "beta", line: 2 }]]), formattedLines: [] },
-    };
+    const original = ["alpha", "beta", "gamma", ""];
+    const snapshot = hashlineSnapshot(original);
+    const staleAnchor = formatLineHash(2, "beta");
+    const content = "alpha\n// inserted\nbeta\ngamma\n";
     const { res, canonicalFile } = await runTool({
       workdir,
       fileContent: content,
@@ -683,7 +691,7 @@ describe("hashline operations through public execute", () => {
     });
     const d = res.details as any;
     assert.equal(d.status.kind, "applied");
-    assert.equal(readFileSync(canonicalFile, "utf8"), "alpha\nBETA\ngamma\n");
+    assert.equal(readFileSync(canonicalFile, "utf8"), "alpha\n// inserted\nBETA\ngamma\n");
   });
 
   test("mismatch fails during planning when oldText cannot be reconstructed", async () => {
@@ -707,24 +715,17 @@ describe("hashline operations through public execute", () => {
   test("prior line-range blocks a resolved hashline fallback span outside authority", async () => {
     await initHashline();
     const workdir = realpathSync(mkdtempSync(join(tmpdir(), "cap-hash-out-")));
-    const content = "alpha\nbeta\ngamma\n";
-    const staleAnchor = formatLineHash(99, "nonexistent");
-    const snapshot: FileSnapshot = {
-      path: "",
-      mtimeMs: 0,
-      size: content.length,
-      contentHash: "",
-      readAt: 0,
-      readOffset: 1,
-      hashline: { anchors: new Map([[staleAnchor, { text: "beta", line: 2 }]]), formattedLines: [] },
-    };
+    const original = ["alpha", "beta", "gamma", ""];
+    const snapshot = hashlineSnapshot(original);
+    const staleAnchor = formatLineHash(2, "beta");
+    const content = "alpha\n// inserted\nbeta\ngamma\n";
     const { res, canonicalFile } = await runTool({
       workdir,
       fileContent: content,
       edits: [{ hashline: { range: { pos: staleAnchor, end: staleAnchor }, content: ["BETA"] } }],
       getSnapshot: () => snapshot,
       // Prior authority covers only line 1; the fallback's actual changed span
-      // is line 2, so it must be rejected rather than broadening authority.
+      // is line 3, so it must be rejected rather than broadening authority.
       prior: (cf) => [lineRangeResource(cf, { startLine: 1, endLine: 1 }, content)],
     });
     const d = res.details as any;

@@ -21,6 +21,23 @@ function rowOfIndex(content: string, byte: number): number {
   return content.slice(0, byte).split("\n").length - 1;
 }
 
+function hashlineSnapshot(lines: string[]): FileSnapshot {
+  const anchors = new Map<string, { text: string; line: number }>();
+  for (let i = 0; i < lines.length; i++) {
+    const line = i + 1;
+    anchors.set(formatLineHash(line, lines[i]), { text: lines[i], line });
+  }
+  return {
+    path: "x.ts",
+    mtimeMs: 0,
+    size: lines.join("\n").length,
+    contentHash: "test-snapshot",
+    readAt: 0,
+    readOffset: 1,
+    hashline: { anchors, formattedLines: [] },
+  };
+}
+
 function mockAstResolver(
   resolve: (anchor: Anchor) => { startIndex: number; endIndex: number } | null,
 ): AstResolverLike {
@@ -344,19 +361,14 @@ test("hashline fast path applies through the planner", async () => {
   assert.deepEqual(r.preimageLineRanges, [{ startLine: 2, endLine: 2 }]);
 });
 
-test("hashline full fuzzy fallback reconstructs oldText from snapshot", async () => {
+test("hashline full fuzzy fallback reconstructs oldText from a provenance-valid snapshot", async () => {
   await initHashline();
-  const content = "alpha\nbeta\ngamma\n";
-  const staleAnchor = formatLineHash(99, "nonexistent");
-  const snapshot: FileSnapshot = {
-    path: "x.ts",
-    mtimeMs: 0,
-    size: content.length,
-    contentHash: "",
-    readAt: 0,
-    readOffset: 1,
-    hashline: { anchors: new Map([[staleAnchor, { text: "beta", line: 2 }]]), formattedLines: [] },
-  };
+  const original = ["alpha", "beta", "gamma"];
+  const snapshot = hashlineSnapshot(original);
+  const staleAnchor = formatLineHash(2, "beta");
+  // Local insertion breaks uniform-neighbour recovery: alpha stayed at line 1
+  // while beta/gamma moved down. The snapshot can still reconstruct exact oldText.
+  const content = "alpha\n// inserted\nbeta\ngamma\n";
   const r = await planTextEdits({
     content,
     edits: [{ hashline: { range: { pos: staleAnchor, end: staleAnchor }, content: ["BETA"] } }],
@@ -364,8 +376,8 @@ test("hashline full fuzzy fallback reconstructs oldText from snapshot", async ()
     astResolver: null,
     getSnapshot: () => snapshot,
   });
-  assert.equal(r.newContent, "alpha\nBETA\ngamma\n");
-  assert.deepEqual(r.preimageLineRanges, [{ startLine: 2, endLine: 2 }]);
+  assert.equal(r.newContent, "alpha\n// inserted\nBETA\ngamma\n");
+  assert.deepEqual(r.preimageLineRanges, [{ startLine: 3, endLine: 3 }]);
 });
 
 test("hashline mismatch rejects when oldText cannot be reconstructed", async () => {
@@ -384,18 +396,20 @@ test("hashline mismatch rejects when oldText cannot be reconstructed", async () 
   );
 });
 
-test("hashline rebase applies a shifted anchor within the window", async () => {
+test("hashline recovery applies a snapshot-proven uniform shift", async () => {
   await initHashline();
-  const content = "alpha\nbeta\ngamma\n";
-  // Anchor claims line 1 but carries gamma's hash (line 3) → rebase to line 3.
-  const shiftedAnchor = formatLineHash(1, "gamma");
+  const original = ["alpha", "beta", "gamma"];
+  const snapshot = hashlineSnapshot(original);
+  const shiftedAnchor = formatLineHash(2, "beta");
+  const content = "// inserted\nalpha\nbeta\ngamma\n";
   const r = await planTextEdits({
     content,
-    edits: [{ hashline: { range: { pos: shiftedAnchor, end: shiftedAnchor }, content: ["GAMMA"] } }],
+    edits: [{ hashline: { range: { pos: shiftedAnchor, end: shiftedAnchor }, content: ["BETA"] } }],
     filePath: "x.ts",
     astResolver: null,
+    getSnapshot: () => snapshot,
   });
-  assert.equal(r.newContent, "alpha\nbeta\nGAMMA\n");
+  assert.equal(r.newContent, "// inserted\nalpha\nBETA\ngamma\n");
   assert.deepEqual(r.preimageLineRanges, [{ startLine: 3, endLine: 3 }]);
 });
 
