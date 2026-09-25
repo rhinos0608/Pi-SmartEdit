@@ -1,7 +1,7 @@
 /**
  * Unit tests for src/transfer-edit.ts (resolveSourceRange, buildTransferInsertEdit,
- * buildTransferDeleteEdit) — pure anchor-drift-tolerant source-range resolution
- * for copy/move transfer edits.
+ * buildTransferDeleteEdit) — fail-closed observed-anchor resolution for
+ * copy/move transfer edits.
  */
 
 import { test, before } from "node:test";
@@ -44,21 +44,16 @@ test("resolveSourceRange: exact-match resolution returns the literal line range"
     }
 });
 
-test("resolveSourceRange: rebases within the +/-5 anchor window when lines shift", () => {
-    const originalLines = ["alpha", "beta", "gamma", "delta"];
-    // Capture the anchor for "beta" at its original position (line 2), then
-    // shift file content so "beta" now lives at line 4 — still within +/-5.
+test("resolveSourceRange: fails closed when an observed anchor shifts", () => {
     const pos = lineAnchor(2, "beta");
     const end = lineAnchor(2, "beta");
     const shiftedContent = ["one", "two", "three", "beta", "five"].join("\n");
     const result = resolveSourceRange(shiftedContent, pos, end);
-    assert.equal(result.ok, true);
-    if (result.ok) {
-        assert.equal(result.value.startLine, 4);
-        assert.equal(result.value.endLine, 4);
-        assert.deepEqual(result.value.lines, ["beta"]);
+    assert.equal(result.ok, false);
+    if (!result.ok) {
+        assert.match(result.error, /stale/i);
+        assert.match(result.error, /re-read/i);
     }
-    void originalLines;
 });
 
 test("resolveSourceRange: rejects when the anchor cannot be found within the rebase window", () => {
