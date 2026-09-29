@@ -89,13 +89,43 @@ function setup() {
   });
   const bus = fakeBus();
   let finalLanesCalls = 0;
+  let lastLanesCwd: string | null = null;
   const deps: PatchToolDeps = buildPatchToolDeps(session, bus, {
-    runFinalSuccessLanes: async () => {
+    runFinalSuccessLanes: async (args: { cwd: string }) => {
       finalLanesCalls++;
+      lastLanesCwd = args.cwd;
       return { diagnostics: [], checks: [], evidence: [] };
     },
   });
-  return { dir, sessionFile, file, session, bus, deps, finalLanesCalls: () => finalLanesCalls };
+  return { dir, sessionFile, file, session, bus, deps, finalLanesCalls: () => finalLanesCalls, lanesCwd: () => lastLanesCwd };
+}
+
+function grantFullFile(args: { session: SessionState; dir: string; sessionFile: string; file: string; endLine: number }): void {
+  const { session, dir, sessionFile, file, endLine } = args;
+  const content = readFileSync(file, "utf8");
+  const sid = hashSessionFilePath(sessionFile);
+  const store = session.priorAuthorityStore;
+  assert.ok(store, "expected a prior-authority store on the test session");
+  store.record({
+    schemaVersion: PROTOCOL_SCHEMA_VERSION,
+    inspectionId: inspectionIdFor({ sessionId: sid, workspaceRoot: dir, resources: [{ canonicalPath: file }] }),
+    sessionId: sid,
+    workspaceRoot: dir,
+    canonicalWorkspaceRoot: dir,
+    createdAt: new Date().toISOString(),
+    resources: [
+      {
+        resourceId: resourceIdFor({ canonicalPath: file, kind: "full" }),
+        canonicalPath: file,
+        kind: "full",
+        coverage: "full-file",
+        allowedRanges: [{ startLine: 1, endLine }],
+        fullFileSha256: sha256OfString(content),
+        fresh: true,
+      },
+    ],
+    mode: "path",
+  });
 }
 
 function renameEdit(file: string, from: string, to: string): LspWorkspaceEdit {
@@ -122,6 +152,7 @@ describe("workspace-edit RPC", () => {
     const edit = renameEdit(ctx.file, "hello", "HELLO");
     const staged = await stageWorkspaceEdit({
       deps: ctx.deps,
+      session: ctx.session,
       payload: { workspaceEdit: edit, source: { operation: "rename" }, sessionFilePath: ctx.sessionFile, cwd: ctx.dir },
     });
     assert.equal(staged.ok, true);
@@ -144,6 +175,7 @@ describe("workspace-edit RPC", () => {
   it("stale file between stage and apply → rejected, file untouched", async () => {
     const staged = await stageWorkspaceEdit({
       deps: ctx.deps,
+      session: ctx.session,
       payload: {
         workspaceEdit: renameEdit(ctx.file, "hello", "HELLO"),
         source: { operation: "rename" },
@@ -182,6 +214,7 @@ describe("workspace-edit RPC", () => {
   it("foreign sessionFilePath → rejected on stage and apply", async () => {
     const staged = await stageWorkspaceEdit({
       deps: ctx.deps,
+      session: ctx.session,
       payload: {
         workspaceEdit: renameEdit(ctx.file, "hello", "HELLO"),
         source: { operation: "rename" },
@@ -193,6 +226,7 @@ describe("workspace-edit RPC", () => {
 
     const real = await stageWorkspaceEdit({
       deps: ctx.deps,
+      session: ctx.session,
       payload: {
         workspaceEdit: renameEdit(ctx.file, "hello", "HELLO"),
         source: { operation: "rename" },
@@ -213,10 +247,11 @@ describe("workspace-edit RPC", () => {
   });
 
   it("invalid payload → rejected", async () => {
-    const staged = await stageWorkspaceEdit({ deps: ctx.deps, payload: { source: {}, sessionFilePath: ctx.sessionFile, cwd: ctx.dir } });
+    const staged = await stageWorkspaceEdit({ deps: ctx.deps, session: ctx.session, payload: { source: {}, sessionFilePath: ctx.sessionFile, cwd: ctx.dir } });
     assert.equal(staged.ok, false);
     const staged2 = await stageWorkspaceEdit({
       deps: ctx.deps,
+      session: ctx.session,
       payload: {
         workspaceEdit: { positionEncoding: "utf-8", fileEdits: [] },
         source: { operation: "rename" },
@@ -237,6 +272,7 @@ describe("workspace-edit RPC", () => {
   it("apply runs post-mutation lanes: undo record, read cache, final lanes, diagnostics claim", async () => {
     const staged = await stageWorkspaceEdit({
       deps: ctx.deps,
+      session: ctx.session,
       payload: {
         workspaceEdit: renameEdit(ctx.file, "hello", "HELLO"),
         source: { operation: "rename" },
@@ -317,6 +353,7 @@ describe("workspace-edit RPC", () => {
     };
     const staged = await stageWorkspaceEdit({
       deps: ctx.deps,
+      session: ctx.session,
       payload: { workspaceEdit: edit, source: { operation: "rename" }, sessionFilePath: ctx.sessionFile, cwd: ctx.dir },
     });
     assert.equal(staged.ok, true);
@@ -348,6 +385,67 @@ describe("workspace-edit RPC", () => {
     for (const r of authB.allowedRanges) {
       assert.ok(r.startLine > 50, `file B authority leaked a low range: ${r.startLine}-${r.endLine}`);
     }
+  });
+
+  it("stage without prior read authority is rejected and leaks no diff", async () => {
+    const other = join(ctx.dir, "unread.txt");
+    writeFileSync(other, "top secret\n");
+    const staged = await stageWorkspaceEdit({
+      deps: ctx.deps,
+      session: ctx.session,
+      payload: {
+        workspaceEdit: renameEdit(other, "secret", "SECRET"),
+        source: { operation: "rename" },
+        sessionFilePath: ctx.sessionFile,
+        cwd: ctx.dir,
+      },
+    });
+    assert.equal(staged.ok, false);
+    if (staged.ok) return;
+    assert.match(staged.reason, /read authority/);
+    assert.ok(!("diff" in staged) || !(staged as { diff?: string }).diff?.includes("top secret"));
+    assert.ok(!("proposalId" in staged));
+  });
+
+  it("apply ignores caller-supplied cwd and uses the session directory", async () => {
+    const edit = renameEdit(ctx.file, "hello", "HELLO");
+    const staged = await stageWorkspaceEdit({
+      deps: ctx.deps,
+      session: ctx.session,
+      payload: { workspaceEdit: edit, source: { operation: "rename" }, sessionFilePath: ctx.sessionFile, cwd: ctx.dir },
+    });
+    assert.equal(staged.ok, true);
+    if (!staged.ok) return;
+    const applied = await applyStagedEdit({
+      deps: ctx.deps,
+      session: ctx.session,
+      payload: { proposalId: staged.proposalId, toolCallId: "lsp-evil-cwd", sessionFilePath: ctx.sessionFile, cwd: "/nonexistent-evil-dir" },
+    });
+    assert.equal(applied.ok, true);
+    assert.equal(applied.status, "applied");
+    assert.equal(readFileSync(ctx.file, "utf8"), "HELLO\nworld\n");
+    assert.equal(ctx.lanesCwd(), ctx.dir);
+  });
+
+  it("apply on a dangerous path succeeds with an advisory risk warning", async () => {
+    const risky = join(ctx.dir, "app-config.ts");
+    writeFileSync(risky, "export const x = 1;\n");
+    grantFullFile({ session: ctx.session, dir: ctx.dir, sessionFile: ctx.sessionFile, file: risky, endLine: 1 });
+    const edit = renameEdit(risky, "x", "y");
+    const staged = await stageWorkspaceEdit({
+      deps: ctx.deps,
+      session: ctx.session,
+      payload: { workspaceEdit: edit, source: { operation: "rename" }, sessionFilePath: ctx.sessionFile, cwd: ctx.dir },
+    });
+    assert.equal(staged.ok, true);
+    if (!staged.ok) return;
+    const applied = await applyStagedEdit({
+      deps: ctx.deps,
+      session: ctx.session,
+      payload: { proposalId: staged.proposalId, toolCallId: "lsp-risky", sessionFilePath: ctx.sessionFile, cwd: ctx.dir },
+    });
+    assert.equal(applied.status, "applied");
+    assert.ok(applied.diagnostics.some((d) => d.includes("Risk warning")), "expected an advisory risk warning in diagnostics");
   });
 
   it("full RPC round trip over the event bus", async () => {

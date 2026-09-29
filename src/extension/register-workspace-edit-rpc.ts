@@ -21,14 +21,27 @@ import type { PatchToolDeps } from "../patch/types.js";
 import {
   checkPlannedPreviewCaps,
   checkWorkspaceEditEncoding,
+  findPreviewUnauthorizedFiles,
   handleApplyRefactorPreview,
 } from "../patch/refactor-preview.js";
+import { checkEditSafety } from "../safety/approval-gating.js";
 import { buildPatchToolDeps } from "./patch-deps.js";
 import { parsePostEditDiff, refreshReadCacheAfterEdit } from "./post-lanes.js";
 import { buildMutationEvidence, type SessionState } from "./session.js";
 
 /** Bounded diff bytes returned in a stage reply (mirrors preview text cap). */
 const STAGE_DIFF_MAX_CHARS = 4000;
+
+/**
+ * Working directory for lanes and diagnostics. Always session-derived:
+ * the RPC payload cwd is caller-controlled and must never reach
+ * compiler/linter execution (a hostile cwd could point at a crate whose
+ * build scripts run during `cargo check`). Null when the session has none.
+ */
+function resolveSessionCwd(deps: PatchToolDeps, session: SessionState): string | null {
+  const cwd = session.currentCwd ?? deps.getCanonicalWorkspaceRoot();
+  return cwd && cwd.length > 0 ? cwd : null;
+}
 
 function currentSession(deps: PatchToolDeps): string | null {
   return deps.getSessionFilePath();
@@ -47,14 +60,18 @@ function sessionBinding(deps: PatchToolDeps): { sessionId: string; sessionRoot: 
 
 export async function stageWorkspaceEdit(args: {
   deps: PatchToolDeps;
+  session: SessionState;
   payload: unknown;
 }): Promise<StageWorkspaceEditResponse> {
-  const { deps, payload } = args;
+  const { deps, session, payload } = args;
   const v = validateStageWorkspaceEditRequest(payload);
   if (!v.ok) return { ok: false, reason: `invalid stage request: ${v.error}` };
   const req = v.value;
   if (!sessionMatches(deps, req.sessionFilePath)) {
     return { ok: false, reason: "rejected: session mismatch — proposal belongs to another session" };
+  }
+  if (!resolveSessionCwd(deps, session)) {
+    return { ok: false, reason: "rejected: no active session working directory" };
   }
   const enc = checkWorkspaceEditEncoding(req.workspaceEdit);
   if (enc) return { ok: false, reason: enc };
@@ -84,6 +101,13 @@ async function planAndStoreStagedEdit(
   }
   const capsErr = checkPlannedPreviewCaps(planned);
   if (capsErr) return { reason: capsErr };
+  // Fail closed before disclosing anything: staging reads the files and
+  // returns their diffs, so it requires the same prior read authority as
+  // apply. Otherwise any bus caller could exfiltrate unread file content.
+  const unauthorized = findPreviewUnauthorizedFiles(deps, planned.stagedFiles);
+  if (unauthorized.length > 0) {
+    return { reason: `rejected: missing read authority for: ${unauthorized.join(", ")} — read the file first, then retry` };
+  }
   const binding = sessionBinding(deps);
   if (!binding) return { reason: "rejected: no active session" };
   const previewId = globalRefactorPreviewCache.store(req.workspaceEdit as never, planned as never, {
@@ -140,12 +164,25 @@ type StagedFile = ApplyGate["cached"]["planned"]["stagedFiles"][number];
 async function runApplyPostLanes(
   deps: PatchToolDeps,
   req: ApplyGate["req"],
+  cwd: string,
   stagedFiles: StagedFile[],
 ): Promise<string[]> {
   const laneDiagnostics: string[] = [];
+  // Advisory risk warnings the edit path emits via checkEditSafety
+  // (dangerous paths, generated files, risky symbols). Advisory only:
+  // collected into diagnostics, never block the already-committed apply.
+  // Never wire assertEditableFile here (see transaction-runner invariants).
+  try {
+    for (const sf of stagedFiles) {
+      const safety = await checkEditSafety(sf.filePath, [], undefined, [sf.newContent]);
+      laneDiagnostics.push(...safety.warnings);
+    }
+  } catch {
+    // Safety scan is advisory — silent degradation
+  }
   try {
     const lanes = await deps.runFinalSuccessLanes?.({
-      cwd: req.cwd,
+      cwd,
       toolCallId: req.toolCallId,
       files: stagedFiles.map((sf) => ({
         path: sf.filePath,
@@ -162,7 +199,7 @@ async function runApplyPostLanes(
     laneDiagnostics.push(`finalization: ${err instanceof Error ? err.message : String(err)}`);
   }
   for (const sf of stagedFiles) {
-    await refreshReadCacheAfterEdit(sf.filePath, req.cwd).catch(() => {
+    await refreshReadCacheAfterEdit(sf.filePath, cwd).catch(() => {
       // File might not exist yet or can't be read — skip silently
     });
   }
@@ -191,6 +228,10 @@ export async function applyStagedEdit(args: {
   payload: unknown;
 }): Promise<ApplyStagedEditResponse> {
   const { deps, session, payload } = args;
+  const sessionCwd = resolveSessionCwd(deps, session);
+  if (!sessionCwd) {
+    return applyRejected("rejected: no active session working directory", ["no active session working directory"]);
+  }
   const gate = gateApplyRequest(deps, session, payload);
   if (!gate.ok) return gate.rejected;
   const { req, binding, cached } = gate;
@@ -202,7 +243,7 @@ export async function applyStagedEdit(args: {
       deps,
       req.toolCallId,
       { kind: "apply-refactor-preview", previewId: req.proposalId },
-      req.cwd,
+      sessionCwd,
     ),
   );
   const text = result.content.map((e) => e.text).join("\n");
@@ -218,7 +259,7 @@ export async function applyStagedEdit(args: {
     };
   }
   const stagedFiles = cached.planned.stagedFiles;
-  const laneDiagnostics = await runApplyPostLanes(deps, req, stagedFiles);
+  const laneDiagnostics = await runApplyPostLanes(deps, req, sessionCwd, stagedFiles);
   await mintApplyEvidence(session, stagedFiles);
   return {
     ok: true,
@@ -243,7 +284,7 @@ export function registerWorkspaceEditRpc(
     bus,
     channel: RPC_CHANNELS.workspaceEdit,
     handler: async (req: RequestEvent): Promise<unknown> => {
-      if (req.rpc === "stage_workspace_edit") return stageWorkspaceEdit({ deps, payload: req.payload });
+      if (req.rpc === "stage_workspace_edit") return stageWorkspaceEdit({ deps, session, payload: req.payload });
       if (req.rpc === "apply_staged_edit") return applyStagedEdit({ deps, session, payload: req.payload });
       throw new Error(`unknown workspace-edit method ${req.rpc}`);
     },
