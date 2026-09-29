@@ -1,12 +1,6 @@
 // ── Execute orchestrator (shared kernel: ./patch/execute.js) ──
-import {
-    validateEditRequest,
-    validateHashlineOnlyEditRequest,
-    type EditRequest,
-    type RefactorRequest,
-} from "../edit-contract.js";
+import type { EditRequest } from "../edit-contract.js";
 import { freshChecks, makeRejected } from "./result-builders.js";
-import { handleRefactorRequest } from "./refactor-preview.js";
 import { executeMutationKernel } from "../mutation/kernel.js";
 import { preparePatchExecution } from "./execution-prep.js";
 import type { PatchInvocation, PatchResult, PatchToolDeps } from "./types.js";
@@ -17,13 +11,11 @@ export type ValidatedPatchDispatch =
 
 export async function dispatchValidatedRequest(args: { deps: PatchToolDeps; toolCallId: string; params: Record<string, unknown> }): Promise<ValidatedPatchDispatch> {
     const { deps, toolCallId, params } = args;
-    const validate = deps.useHashlineEditing ? validateHashlineOnlyEditRequest : validateEditRequest;
-    const v = validate({ ...params, toolCallId });
-    if ((v as { ok: boolean; value?: { refactor?: { kind: string } } }).ok && (v as unknown as { value: { refactor?: { kind: string } } }).value?.refactor) {
-        const refactor = (v as unknown as { value: { refactor: RefactorRequest } }).value.refactor;
-        const handled = await handleRefactorRequest(deps, toolCallId, refactor);
-        if (handled) return { kind: "handled", result: handled };
-    }
+    // Mode-owned validation: the text spec layers its own rejections over the
+    // shared internal validator; the hashline spec enforces hashline-only.
+    // validateEditRequest also backs the public args.ts API; raw stays there
+    // for internal planners only — no agent schema exposes it in either mode.
+    const v = deps.editMode.validate({ ...params, toolCallId });
     if (!v.ok) return { kind: "handled", result: { content: [{ type: "text" as const, text: `invalid patch request: ${v.error}` }], details: makeRejected(toolCallId, "session", [v.error], { inspectionId: "", resourceIds: [] }, freshChecks(), [], [], "edit") } };
     return { kind: "patch", validated: v };
 }

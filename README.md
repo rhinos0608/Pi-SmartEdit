@@ -432,8 +432,9 @@ npx tsx --test test/<file>  # e.g., test/symbolic-edits.test.ts
 
 | Env Variable | Values | Default | Effect |
 |---|---|---|---|
-| `SMART_EDIT_USE_HASHLINE_EDITING` | `1`/`true`/`yes`/`on` | off | Enable hashline edit mode |
-| `SMART_EDIT_HASHLINE_EXPERIMENTAL` | same | off | Alias for hashline toggle |
+| `PI_EDIT_MODE` | `text` / `hashline` | `text` | Operator edit dialect (resolved in protocol; legacy flags honoured when unset) |
+| `SMART_EDIT_USE_HASHLINE_EDITING` | `1`/`true`/`yes`/`on` | off | Legacy: enable hashline edit mode (ignored when `PI_EDIT_MODE` is set) |
+| `SMART_EDIT_HASHLINE_EXPERIMENTAL` | same | off | Legacy alias for hashline toggle (ignored when `PI_EDIT_MODE` is set) |
 | `SMART_EDIT_APPROVAL_LEVEL` | `never_prompt` / `prompt_on_dangerous` / `prompt_always` | `prompt_on_dangerous` | Risk-warning verbosity (advisory, never blocks) |
 | `SMART_EDIT_REPAIR_ENABLED` | `1`/`true`/`yes`/`on` | **on** | Enable edit repair loop (Aider-style retry) |
 | `SMART_EDIT_REPAIR_ENABLED=0`/`false` | disable | — | Disable the repair loop (defaults to on) |

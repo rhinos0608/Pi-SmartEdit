@@ -9,7 +9,8 @@ export type RefactorPreviewSource =
   | { kind: "rename"; filePath: string; line: number; character: number; newName: string }
   | { kind: "organize-imports"; filePath: string }
   | { kind: "formatting"; filePath: string; tabSize?: number; insertSpaces?: boolean }
-  | { kind: "code-action"; filePath: string; line: number; character: number; endLine?: number; endCharacter?: number };
+  | { kind: "code-action"; filePath: string; line: number; character: number; endLine?: number; endCharacter?: number }
+  | { kind: "workspace-edit"; operation: string };
 
 export interface CachedRefactorPreview {
   previewId: string;

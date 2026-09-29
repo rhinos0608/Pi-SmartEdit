@@ -20,6 +20,9 @@ const DISPLAYED_HASHLINE_ROW_RE = new RegExp(
   `^\\s*(?:>>>|>>)?\\s*(\\d+${HASHLINE_BIGRAM_RE_SRC})\\${HASHLINE_CONTENT_SEPARATOR}(.*)$`,
 );
 
+/** Plain text-mode read rows: `N|content` with no hash suffix. */
+const DISPLAYED_TEXT_ROW_RE = /^\s*(\d+)\|(.*)$/;
+
 export interface DisplayedHashlineRows {
   hashline: HashlineSnapshotData;
   lineNumbers: number[];
@@ -29,6 +32,10 @@ export interface DisplayedHashlineRows {
  * Extract the exact LINE+ID tokens the model actually saw from SmartRead's
  * rendered response. The response may be wrapped in @path/PINE envelope lines;
  * only canonical hashline rows are retained.
+ *
+ * Text-mode `N|content` rows carry no hash suffix: they contribute observed
+ * line numbers (driving full/partial authority) but no hashline anchors, so
+ * hashline-anchored edits stay fail-closed after a text-mode read.
  *
  * When rawContent is provided, rows whose displayed text does not equal the
  * corresponding raw file line are discarded. That prevents a raced or
@@ -45,22 +52,32 @@ export function parseDisplayedHashlineRows(
 
   for (const renderedLine of renderedText.replace(/\r/g, "").split("\n")) {
     const match = DISPLAYED_HASHLINE_ROW_RE.exec(renderedLine);
-    if (!match) continue;
+    if (match) {
+      const token = match[1];
+      const text = match[2] ?? "";
+      const lineMatch = /^(\d+)/.exec(token);
+      if (!lineMatch) continue;
+      const line = Number(lineMatch[1]);
+      if (!Number.isSafeInteger(line) || line < 1) continue;
 
-    const token = match[1];
-    const text = match[2] ?? "";
-    const lineMatch = /^(\d+)/.exec(token);
-    if (!lineMatch) continue;
-    const line = Number(lineMatch[1]);
+      if (rawLines && rawLines[line - 1] !== text) continue;
+      anchors.set(token, { text, line });
+      formattedLines.push(`${token}${HASHLINE_CONTENT_SEPARATOR}${text}`);
+      lineNumbers.push(line);
+      continue;
+    }
+
+    const textMatch = DISPLAYED_TEXT_ROW_RE.exec(renderedLine);
+    if (!textMatch) continue;
+    const line = Number(textMatch[1]);
+    const text = textMatch[2] ?? "";
     if (!Number.isSafeInteger(line) || line < 1) continue;
-
     if (rawLines && rawLines[line - 1] !== text) continue;
-    anchors.set(token, { text, line });
-    formattedLines.push(`${token}${HASHLINE_CONTENT_SEPARATOR}${text}`);
+    formattedLines.push(`${line}|${text}`);
     lineNumbers.push(line);
   }
 
-  if (anchors.size === 0) return null;
+  if (anchors.size === 0 && lineNumbers.length === 0) return null;
   return { hashline: { anchors, formattedLines }, lineNumbers };
 }
 

@@ -16,8 +16,7 @@ export interface TransferRequest {
   description?: string;
 }
 
-/** Agent-visible schema fragment for a transfer edit item. Mirrors the
- *  transfer fields of `EDIT_PARAMETERS` in `src/edit-contract.ts`. */
+/** Agent-visible schema fragment for a transfer item. */
 export const TRANSFER_PARAMETERS = {
   type: "object",
   additionalProperties: false,

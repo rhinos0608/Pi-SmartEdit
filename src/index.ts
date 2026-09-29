@@ -22,9 +22,9 @@ import { isMutationTool } from "./mutation/types.js";
 import type { WorkspaceEvidenceEnvelope } from "@rhinos0608/pi-workspace-protocol";
 
 // ─── Schema ───────────────────────────────────────────────────────
-// The canonical edit request schema lives in src/edit-contract.ts
-// (EDIT_PARAMETERS) and is the single registration source. Rich edit
-// metadata is validated there.
+// The agent-visible edit schema comes from the active edit mode spec
+// (src/edit-modes/), selected by PI_EDIT_MODE. Shared request validation
+// lives in src/edit-contract.ts.
 
 
 export { resolveEditPath } from "./extension/paths.js";
@@ -82,6 +82,7 @@ import {
 } from "./extension/post-lanes.js";
 
 import { registerTransferTool } from "./extension/register-transfer.js";
+import { registerWorkspaceEditRpc } from "./extension/register-workspace-edit-rpc.js";
 import {
   registerEditTool,
   buildRetryEvidenceForSession,
@@ -208,6 +209,7 @@ export default function smartEdit(pi: ExtensionAPI) {
   // event wiring above stays here and calls into session/lane fns.
   registerEditTool(pi, session);
   registerTransferTool(pi, session);
+  registerWorkspaceEditRpc(pi, session);
 }
 
 // ── Exports for testing ─────────────────────────────────────────────

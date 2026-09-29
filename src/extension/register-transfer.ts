@@ -8,6 +8,7 @@ import { getSnapshot } from "../context/read-cache.js";
 import { runRepairLoop } from "../verification/repair-loop.js";
 import { appendDiagnosticsToContent } from "../mutation/post-mutation.js";
 import type { PatchToolDeps } from "../patch.js";
+import { getActiveEditMode } from "../edit-modes/index.js";
 import { createTransferTool } from "../transfer/tool.js";
 import { EditTextComponent, renderEditDiff } from "./render.js";
 import {
@@ -82,6 +83,7 @@ export function registerTransferTool(pi: ExtensionAPI, session: SessionState): v
             on: (c: string, h: (d: unknown) => void) => () => void;
         };
         const transferDeps: PatchToolDeps = {
+            editMode: getActiveEditMode(),
             getBus: () => bus,
             getRpcClient: () => createRpcClient({ bus, channel: RPC_CHANNELS.inspectPatch, timeoutMs: 2000 }),
             getSessionFilePath: () => session.currentSessionFilePath,

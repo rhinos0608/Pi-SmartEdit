@@ -8,8 +8,9 @@
  * Supported env vars:
  *   SMART_EDIT_APPROVAL_LEVEL        — never_prompt | prompt_on_dangerous | prompt_always
  *   SMART_EDIT_EDIT_AUTOGEN          — allow editing auto-generated files (1|true|yes|on)
- *   SMART_EDIT_USE_HASHLINE_EDITING  — opt-in to hashline-based editing (1|true|yes|on)
- *   SMART_EDIT_HASHLINE_EXPERIMENTAL — alias for USE_HASHLINE_EDITING
+ *   PI_EDIT_MODE                       — text | hashline (operator edit dialect; resolved in protocol)
+ *   SMART_EDIT_USE_HASHLINE_EDITING  — legacy opt-in to hashline-based editing (1|true|yes|on)
+ *   SMART_EDIT_HASHLINE_EXPERIMENTAL — legacy alias for USE_HASHLINE_EDITING
  *   SMART_EDIT_FUZZY_MATCHING        — enable similarity rescue (default: true)
  *   SMART_EDIT_VERIFICATION_COMMANDS — JSON array of verification commands
  *   SMART_EDIT_REPAIR_ENABLED        — enable repair loop (default: true)
@@ -18,6 +19,8 @@
  *   SMART_EDIT_LINT_ENABLED          — detect lint artifact placeholders (default: true)
  *   JDT_LS_JAR                       — path to JDT-LS jar for Java LSP
  */
+
+import { resolveEditMode, type EditMode } from "@rhinos0608/pi-workspace-protocol";
 
 // ─── Types ───────────────────────────────────────────────────────────────
 
@@ -32,7 +35,13 @@ export interface SmartEditConfig {
   /** Allow editing files that appear auto-generated. */
   editAutogen: boolean;
 
-  /** Opt-in to hashline-based editing (experimental). */
+  /** Active edit dialect (operator config; defaults to text). */
+  editMode: EditMode;
+
+  /** Resolution warning (e.g. invalid PI_EDIT_MODE value), if any. */
+  editModeWarning: string | undefined;
+
+  /** Derived: editMode === "hashline". Kept for existing internal readers. */
   useHashlineEditing: boolean;
 
   /** Enable similarity-based fuzzy matching. */
@@ -97,15 +106,13 @@ export function loadConfig(
   // ── editAutogen ─────────────────────────────────────────
   const editAutogen = parseBooleanEnv(env["SMART_EDIT_EDIT_AUTOGEN"]);
 
-  // ── useHashlineEditing (two possible env var names) ─────
-  let useHashlineEditing = false;
-  const hashlineDirect = env["SMART_EDIT_USE_HASHLINE_EDITING"];
-  const hashlineAlias = env["SMART_EDIT_HASHLINE_EXPERIMENTAL"];
-  if (hashlineDirect != null) {
-    useHashlineEditing = parseBooleanEnv(hashlineDirect);
-  } else if (hashlineAlias != null) {
-    useHashlineEditing = parseBooleanEnv(hashlineAlias);
-  }
+  // ── editMode (single operator config, resolved in protocol) ─
+  const resolved = resolveEditMode(env);
+  const editMode = resolved.mode;
+  const editModeWarning = resolved.warning;
+
+  // ── useHashlineEditing (derived for existing internal readers) ─
+  const useHashlineEditing = editMode === "hashline";
 
   // ── allowFuzzyMatching ──────────────────────────────────
   const fuzzyRaw = env["SMART_EDIT_FUZZY_MATCHING"];
@@ -142,6 +149,8 @@ export function loadConfig(
   return {
     approvalLevel,
     editAutogen,
+    editMode,
+    editModeWarning,
     useHashlineEditing,
     allowFuzzyMatching,
     verificationCommands,
