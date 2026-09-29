@@ -55,7 +55,7 @@ export interface EditRequest {
     evidenceRef?: { inspectionId: string; resourceIds: string[] };
 }
 
-function isPlainObject(v: unknown): v is Record<string, unknown> {
+export function isPlainObject(v: unknown): v is Record<string, unknown> {
     return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
@@ -67,7 +67,7 @@ function ok(value: EditRequest): { ok: true; value: EditRequest } {
     return { ok: true, value };
 }
 
-function isPositiveInteger(v: unknown): boolean {
+export function isPositiveInteger(v: unknown): boolean {
     return typeof v === "number" && Number.isInteger(v) && v >= 1;
 }
 

@@ -18,6 +18,7 @@ import {
     sha256OfString,
 } from "@rhinos0608/pi-workspace-protocol";
 import { planPositionalEdits } from "../lsp/positional-planner.js";
+import type { EditTransaction } from "../mutation/edit-transaction.js";
 import { globalRefactorPreviewCache, type RefactorPreviewSource } from "../lsp/refactor-preview-cache.js";
 import {
     buildJournalRecord,
@@ -205,19 +206,78 @@ export function mapApplyPreviewError(toolCallId: string, err: unknown): PatchRes
     return failResult(toolCallId, `failed: apply refactor ${msg}`, msg, [msg], "write");
 }
 
-export async function handleApplyRefactorPreview(deps: PatchToolDeps, toolCallId: string, refactor: ApplyRefactorPreviewRefactor, cwd?: string): Promise<PatchResult> {
+type PreviewApplyContext = {
+    deps: PatchToolDeps;
+    toolCallId: string;
+    tx: EditTransaction;
+    files: StagedPreviewFile[];
+};
+
+async function resolveApplyPreviewTarget(args: { deps: PatchToolDeps; toolCallId: string; previewId: string }): Promise<{ files: StagedPreviewFile[]; diffString: string } | PatchResult> {
+    const { deps, toolCallId, previewId } = args;
     const sessionFilePath = deps.getSessionFilePath();
     if (!sessionFilePath) {
         return failResult(toolCallId, "failed: refactor preview requires an active session (no session file path available)", "no session file path", ["no session file path"]);
     }
     const root = deps.getCanonicalWorkspaceRoot();
     const sid = hashSessionFilePath(sessionFilePath);
-    const applyPreviewId = refactor.previewId;
-    const cached = globalRefactorPreviewCache.get(applyPreviewId, { sessionId: sid, sessionRoot: root });
+    const cached = globalRefactorPreviewCache.get(previewId, { sessionId: sid, sessionRoot: root });
     if (!cached) {
         return { content: [{ type: "text" as const, text: "rejected: preview not found or expired" }], details: makeRejected(toolCallId, "coverage", ["preview not found or expired"], { inspectionId: "", resourceIds: [] }, freshChecks()) };
     }
-    const files = cached.planned.stagedFiles;
+    return { files: cached.planned.stagedFiles, diffString: cached.planned.diffString };
+}
+
+async function verifyPreviewPreconditions(args: PreviewApplyContext): Promise<PatchResult | null> {
+    const { deps, toolCallId, tx, files } = args;
+    const staleFiles = await findStalePreviewFiles(files);
+    if (staleFiles.length > 0) {
+        await tx.rollback();
+        await deleteJournal(tx.transactionId).catch(() => {});
+        return { content: [{ type: "text", text: `rejected: files changed since preview: ${staleFiles.join(", ")}` }], details: makeRejected(toolCallId, "stale", [`files changed since preview: ${staleFiles.join(", ")}`], { inspectionId: "", resourceIds: [] }, freshChecks()) };
+    }
+    const unauthorized = findPreviewUnauthorizedFiles(deps, files);
+    if (unauthorized.length > 0) {
+        await tx.rollback();
+        await deleteJournal(tx.transactionId).catch(() => {});
+        return { content: [{ type: "text", text: `rejected: missing read authority for: ${unauthorized.join(", ")} — read the file first, then retry` }], details: makeRejected(toolCallId, "coverage", [`missing read authority for: ${unauthorized.join(", ")}`], { inspectionId: "", resourceIds: [] }, freshChecks()) };
+    }
+    return null;
+}
+
+async function writePreviewPreparedJournal(args: { tx: EditTransaction; files: StagedPreviewFile[] }): Promise<void> {
+    const { tx, files } = args;
+    // Crash-journal PREPARED write while locks are held, before the
+    // first mutation — mirrors runPatchTransaction.
+    try {
+        const snapshots = files.map((f) => {
+            const snap = tx.getSnapshot(f.filePath);
+            return { path: f.filePath, exists: snap?.exists ?? false, content: snap?.content, mode: snap?.mode };
+        });
+        await writePreparedJournal(buildJournalRecord(tx.transactionId, snapshots));
+    } catch (e) {
+        try { await tx.rollback(); } catch { /* rollback best-effort */ }
+        throw e;
+    }
+}
+
+async function commitPreviewFiles(args: { tx: EditTransaction; files: StagedPreviewFile[]; undoCwd: string }): Promise<void> {
+    const { tx, files, undoCwd } = args;
+    await writePreviewPreparedJournal({ tx, files });
+    for (const sf of files) await tx.write(sf.filePath, sf.newContent);
+    // Capture undo records (post-write disk content) BEFORE commit
+    // releases the lock; persist AFTER commit, best-effort.
+    const undoRecords = await tx.getUndoRecords().catch(() => []);
+    await markCommitted(tx.transactionId);
+    await tx.commit();
+    await deleteJournal(tx.transactionId).catch(() => {});
+    try { await saveTransactionUndoRecords(undoCwd, undoRecords); } catch { /* undo persistence is advisory */ }
+}
+
+export async function handleApplyRefactorPreview(deps: PatchToolDeps, toolCallId: string, refactor: ApplyRefactorPreviewRefactor, cwd?: string): Promise<PatchResult> {
+    const target = await resolveApplyPreviewTarget({ deps, toolCallId, previewId: refactor.previewId });
+    if ("content" in target) return target;
+    const { files, diffString } = target;
     const undoCwd = cwd ?? deps.getCanonicalWorkspaceRoot();
     try {
         const { EditTransaction: ET } = await import("../mutation/edit-transaction.js");
@@ -226,44 +286,15 @@ export async function handleApplyRefactorPreview(deps: PatchToolDeps, toolCallId
         try { await recoverStaleJournals(); } catch { /* advisory; never block apply */ }
         const tx = await ET.begin(files.map((f) => f.filePath));
         try {
-            const staleFiles = await findStalePreviewFiles(files);
-            if (staleFiles.length > 0) {
-                await tx.rollback();
-                await deleteJournal(tx.transactionId).catch(() => {});
-                return { content: [{ type: "text", text: `rejected: files changed since preview: ${staleFiles.join(", ")}` }], details: makeRejected(toolCallId, "stale", [`files changed since preview: ${staleFiles.join(", ")}`], { inspectionId: "", resourceIds: [] }, freshChecks()) };
-            }
-            const unauthorized = findPreviewUnauthorizedFiles(deps, files);
-            if (unauthorized.length > 0) {
-                await tx.rollback();
-                await deleteJournal(tx.transactionId).catch(() => {});
-                return { content: [{ type: "text", text: `rejected: missing read authority for: ${unauthorized.join(", ")} — read the file first, then retry` }], details: makeRejected(toolCallId, "coverage", [`missing read authority for: ${unauthorized.join(", ")}`], { inspectionId: "", resourceIds: [] }, freshChecks()) };
-            }
-            // Crash-journal PREPARED write while locks are held, before the
-            // first mutation — mirrors runPatchTransaction.
-            try {
-                const snapshots = files.map((f) => {
-                    const snap = tx.getSnapshot(f.filePath);
-                    return { path: f.filePath, exists: snap?.exists ?? false, content: snap?.content, mode: snap?.mode };
-                });
-                await writePreparedJournal(buildJournalRecord(tx.transactionId, snapshots));
-            } catch (e) {
-                try { await tx.rollback(); } catch { /* rollback best-effort */ }
-                throw e;
-            }
-            for (const sf of files) await tx.write(sf.filePath, sf.newContent);
-            // Capture undo records (post-write disk content) BEFORE commit
-            // releases the lock; persist AFTER commit, best-effort.
-            const undoRecords = await tx.getUndoRecords().catch(() => []);
-            await markCommitted(tx.transactionId);
-            await tx.commit();
-            await deleteJournal(tx.transactionId).catch(() => {});
-            try { await saveTransactionUndoRecords(undoCwd, undoRecords); } catch { /* undo persistence is advisory */ }
+            const blocked = await verifyPreviewPreconditions({ deps, toolCallId, tx, files });
+            if (blocked) return blocked;
+            await commitPreviewFiles({ tx, files, undoCwd });
         } catch (e) {
             try { await tx.rollback(); } catch {}
             throw e;
         }
-        globalRefactorPreviewCache.delete(applyPreviewId);
-        return { content: [{ type: "text" as const, text: `applied refactor ${applyPreviewId}: ${files.length} file(s)` }], details: { tool: "edit", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: cached.planned.diffString } as unknown as PatchToolDetails };
+        globalRefactorPreviewCache.delete(refactor.previewId);
+        return { content: [{ type: "text" as const, text: `applied refactor ${refactor.previewId}: ${files.length} file(s)` }], details: { tool: "edit", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: diffString } as unknown as PatchToolDetails };
     } catch (err) {
         return mapApplyPreviewError(toolCallId, err);
     }

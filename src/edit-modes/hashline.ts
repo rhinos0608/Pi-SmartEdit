@@ -11,6 +11,59 @@ function fail(error: string): { ok: false; error: string } {
  * stored-session compatibility; this stricter layer rejects every alternate
  * mutation dialect at runtime as well as hiding it from the agent schema.
  */
+/** Gate the request-level variant: raw dialect and empty edits rejected. */
+function gateHashlineVariant(value: EditRequest): string | null {
+    if (value.raw !== undefined) {
+        return "hashline edit mode accepts only `edits` with hashline metadata";
+    }
+    if (!value.edits || value.edits.length === 0) {
+        return "hashline edit mode requires at least one hashline edit";
+    }
+    return null;
+}
+
+/** Check one edit carries hashline metadata with explicit content. */
+function checkHashlineEditShape(edit: EditOperation, i: number): string | null {
+    if (!edit.hashline) {
+        return `edit.edits[${i}] must use hashline metadata while hashline edit mode is enabled`;
+    }
+    if (!Object.prototype.hasOwnProperty.call(edit.hashline, "content")) {
+        return `edit.edits[${i}].hashline.content is required in hashline edit mode; use null explicitly to delete`;
+    }
+    return null;
+}
+
+/** Check :after/:before insertion suffix invariants for one edit. */
+function checkInsertionSuffix(edit: EditOperation, i: number): string | null {
+    const h = edit.hashline;
+    if (!h) return null;
+    const { pos, end } = h.range;
+    const insertionSuffix = pos.endsWith(":after")
+        ? ":after"
+        : pos.endsWith(":before")
+            ? ":before"
+            : null;
+    if (!insertionSuffix) return null;
+    const base = pos.slice(0, -insertionSuffix.length);
+    if (end !== base) {
+        return `edit.edits[${i}].hashline.range.end must equal unsuffixed insertion anchor "${base}"`;
+    }
+    if (h.content === null) {
+        return `edit.edits[${i}].hashline.content must be non-null for ${insertionSuffix} insertion`;
+    }
+    return null;
+}
+
+/** Check one edit exposes no dialect beyond path + hashline. */
+function checkHashlineEditKeys(edit: EditOperation, i: number): string | null {
+    const keys = Object.keys(edit as unknown as Record<string, unknown>);
+    const unsupported = keys.find((key) => key !== "path" && key !== "hashline");
+    if (unsupported) {
+        return `edit.edits[${i}].${unsupported} is not supported while hashline edit mode is enabled`;
+    }
+    return null;
+}
+
 export function validateHashlineOnlyEditRequest(
     input: unknown,
 ): { ok: true; value: EditRequest } | { ok: false; error: string } {
@@ -18,41 +71,18 @@ export function validateHashlineOnlyEditRequest(
     if (!validated.ok) return validated;
 
     const { value } = validated;
-    if (value.raw !== undefined) {
-        return fail("hashline edit mode accepts only `edits` with hashline metadata");
-    }
-    if (!value.edits || value.edits.length === 0) {
-        return fail("hashline edit mode requires at least one hashline edit");
-    }
+    const variantErr = gateHashlineVariant(value);
+    if (variantErr) return fail(variantErr);
 
-    for (let i = 0; i < value.edits.length; i++) {
-        const edit = value.edits[i] as EditOperation;
-        if (!edit.hashline) {
-            return fail(`edit.edits[${i}] must use hashline metadata while hashline edit mode is enabled`);
-        }
-        if (!Object.prototype.hasOwnProperty.call(edit.hashline, "content")) {
-            return fail(`edit.edits[${i}].hashline.content is required in hashline edit mode; use null explicitly to delete`);
-        }
-        const { pos, end } = edit.hashline.range;
-        const insertionSuffix = pos.endsWith(":after")
-            ? ":after"
-            : pos.endsWith(":before")
-                ? ":before"
-                : null;
-        if (insertionSuffix) {
-            const base = pos.slice(0, -insertionSuffix.length);
-            if (end !== base) {
-                return fail(`edit.edits[${i}].hashline.range.end must equal unsuffixed insertion anchor "${base}"`);
-            }
-            if (edit.hashline.content === null) {
-                return fail(`edit.edits[${i}].hashline.content must be non-null for ${insertionSuffix} insertion`);
-            }
-        }
-        const keys = Object.keys(edit as unknown as Record<string, unknown>);
-        const unsupported = keys.find((key) => key !== "path" && key !== "hashline");
-        if (unsupported) {
-            return fail(`edit.edits[${i}].${unsupported} is not supported while hashline edit mode is enabled`);
-        }
+    // gateHashlineVariant returning null guarantees a non-empty edits array;
+    // the fallback only satisfies the type checker and is unreachable.
+    const edits = value.edits ?? [];
+    for (let i = 0; i < edits.length; i++) {
+        const edit = edits[i] as EditOperation;
+        const err = checkHashlineEditShape(edit, i)
+            ?? checkInsertionSuffix(edit, i)
+            ?? checkHashlineEditKeys(edit, i);
+        if (err) return fail(err);
     }
     return validated;
 }

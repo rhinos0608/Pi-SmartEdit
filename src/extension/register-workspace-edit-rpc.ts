@@ -58,89 +58,90 @@ export async function stageWorkspaceEdit(args: {
   }
   const enc = checkWorkspaceEditEncoding(req.workspaceEdit);
   if (enc) return { ok: false, reason: enc };
-  let planned;
+  const stored = await planAndStoreStagedEdit(deps, req);
+  if ("reason" in stored) return { ok: false, reason: stored.reason };
+  return {
+    ok: true,
+    proposalId: stored.previewId,
+    files: stored.planned.stagedFiles.map((f) => f.filePath),
+    diff: stored.planned.diffString.slice(0, STAGE_DIFF_MAX_CHARS),
+  };
+}
+
+type StagedPlan = Awaited<ReturnType<typeof planPositionalEdits>>;
+
+async function planAndStoreStagedEdit(
+  deps: PatchToolDeps,
+  req: { workspaceEdit: unknown; source: { operation: string; serverDescriptorId?: string } },
+): Promise<{ planned: StagedPlan; previewId: string } | { reason: string }> {
+  let planned: StagedPlan;
   try {
     planned = await planPositionalEdits(req.workspaceEdit as LspWorkspaceEdit, async (p) =>
       (await readFile(p)).toString("utf-8"),
     );
   } catch (err) {
-    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+    return { reason: err instanceof Error ? err.message : String(err) };
   }
   const capsErr = checkPlannedPreviewCaps(planned);
-  if (capsErr) return { ok: false, reason: capsErr };
+  if (capsErr) return { reason: capsErr };
   const binding = sessionBinding(deps);
-  if (!binding) return { ok: false, reason: "rejected: no active session" };
+  if (!binding) return { reason: "rejected: no active session" };
   const previewId = globalRefactorPreviewCache.store(req.workspaceEdit as never, planned as never, {
     source: { kind: "workspace-edit", operation: req.source.operation },
     ...(req.source.serverDescriptorId !== undefined ? { serverDescriptorId: req.source.serverDescriptorId } : {}),
     sessionId: binding.sessionId,
     sessionRoot: binding.sessionRoot,
   });
-  return {
-    ok: true,
-    proposalId: previewId,
-    files: planned.stagedFiles.map((f) => f.filePath),
-    diff: planned.diffString.slice(0, STAGE_DIFF_MAX_CHARS),
-  };
+  return { planned, previewId };
 }
 
 function applyRejected(text: string, diagnostics: string[] = []): ApplyStagedEditResponse {
   return { ok: false, status: "rejected", text, diagnostics, changedFiles: [] };
 }
 
-export async function applyStagedEdit(args: {
-  deps: PatchToolDeps;
-  session: SessionState;
-  payload: unknown;
-}): Promise<ApplyStagedEditResponse> {
-  const { deps, session, payload } = args;
+type ApplyGate = {
+  req: { proposalId: string; toolCallId: string; sessionFilePath: string; cwd: string };
+  binding: { sessionId: string; sessionRoot: string };
+  cached: NonNullable<ReturnType<typeof globalRefactorPreviewCache.get>>;
+};
+
+function gateApplyRequest(
+  deps: PatchToolDeps,
+  session: SessionState,
+  payload: unknown,
+): { ok: true; req: ApplyGate["req"]; binding: ApplyGate["binding"]; cached: ApplyGate["cached"] } | { ok: false; rejected: ApplyStagedEditResponse } {
   const v = validateApplyStagedEditRequest(payload);
   if (!v.ok) {
-    return applyRejected(`rejected: invalid apply request: ${v.error}`, [v.error]);
+    return { ok: false, rejected: applyRejected(`rejected: invalid apply request: ${v.error}`, [v.error]) };
   }
   const req = v.value;
   if (!sessionMatches(deps, req.sessionFilePath)) {
-    return applyRejected("rejected: session mismatch — proposal belongs to another session", ["session mismatch"]);
+    return { ok: false, rejected: applyRejected("rejected: session mismatch — proposal belongs to another session", ["session mismatch"]) };
   }
   const binding = sessionBinding(deps);
-  if (!binding) return applyRejected("rejected: no active session", ["no active session"]);
+  if (!binding) return { ok: false, rejected: applyRejected("rejected: no active session", ["no active session"]) };
   // The mutation lands under the SmartRead `lsp` tool name, so the edit
   // tool's own execute wrapper and `edit`-keyed tool_result hooks never run.
-  // Everything below that the edit path would do after a successful
-  // mutation is performed explicitly here (see report for the full list).
+  // The loop-guard preflight the edit path would do happens here instead.
   const loopBlocked = session.mutationLoopGuard.preflight("edit", { proposalId: req.proposalId }, req.toolCallId);
   if (loopBlocked) {
     const text = loopBlocked.content.map((e) => e.text).join("\n");
-    return applyRejected(text, [...(loopBlocked.details.diagnostics ?? [])]);
+    return { ok: false, rejected: applyRejected(text, [...(loopBlocked.details.diagnostics ?? [])]) };
   }
   const cached = globalRefactorPreviewCache.get(req.proposalId, binding);
   if (!cached) {
-    return applyRejected("rejected: unknown or expired preview", ["unknown or expired preview"]);
+    return { ok: false, rejected: applyRejected("rejected: unknown or expired preview", ["unknown or expired preview"]) };
   }
-  claimDiagnosticsOwner(req.toolCallId);
-  const result = session.mutationLoopGuard.observe(
-    "edit",
-    { proposalId: req.proposalId },
-    await handleApplyRefactorPreview(
-      deps,
-      req.toolCallId,
-      { kind: "apply-refactor-preview", previewId: req.proposalId },
-      req.cwd,
-    ),
-  );
-  const text = result.content.map((e) => e.text).join("\n");
-  const kind = result.details.status.kind;
-  if (kind !== "applied") {
-    releaseDiagnosticsOwner(req.toolCallId);
-    return {
-      ok: false,
-      status: kind === "failed" ? "failed" : "rejected",
-      text,
-      diagnostics: [...result.details.diagnostics],
-      changedFiles: [],
-    };
-  }
-  const stagedFiles = cached.planned.stagedFiles;
+  return { ok: true, req, binding, cached };
+}
+
+type StagedFile = ApplyGate["cached"]["planned"]["stagedFiles"][number];
+
+async function runApplyPostLanes(
+  deps: PatchToolDeps,
+  req: ApplyGate["req"],
+  stagedFiles: StagedFile[],
+): Promise<string[]> {
   const laneDiagnostics: string[] = [];
   try {
     const lanes = await deps.runFinalSuccessLanes?.({
@@ -165,6 +166,10 @@ export async function applyStagedEdit(args: {
       // File might not exist yet or can't be read — skip silently
     });
   }
+  return laneDiagnostics;
+}
+
+async function mintApplyEvidence(session: SessionState, stagedFiles: StagedFile[]): Promise<void> {
   try {
     const narrowHints = new Map(
       stagedFiles.map((sf) => [sf.filePath, parsePostEditDiff(generateDiffString(sf.originalContent, sf.newContent).diff)]),
@@ -178,6 +183,43 @@ export async function applyStagedEdit(args: {
   } catch {
     // Evidence mint is advisory — silent degradation
   }
+}
+
+export async function applyStagedEdit(args: {
+  deps: PatchToolDeps;
+  session: SessionState;
+  payload: unknown;
+}): Promise<ApplyStagedEditResponse> {
+  const { deps, session, payload } = args;
+  const gate = gateApplyRequest(deps, session, payload);
+  if (!gate.ok) return gate.rejected;
+  const { req, binding, cached } = gate;
+  claimDiagnosticsOwner(req.toolCallId);
+  const result = session.mutationLoopGuard.observe(
+    "edit",
+    { proposalId: req.proposalId },
+    await handleApplyRefactorPreview(
+      deps,
+      req.toolCallId,
+      { kind: "apply-refactor-preview", previewId: req.proposalId },
+      req.cwd,
+    ),
+  );
+  const text = result.content.map((e) => e.text).join("\n");
+  const kind = result.details.status.kind;
+  if (kind !== "applied") {
+    releaseDiagnosticsOwner(req.toolCallId);
+    return {
+      ok: false,
+      status: kind === "failed" ? "failed" : "rejected",
+      text,
+      diagnostics: [...result.details.diagnostics],
+      changedFiles: [],
+    };
+  }
+  const stagedFiles = cached.planned.stagedFiles;
+  const laneDiagnostics = await runApplyPostLanes(deps, req, stagedFiles);
+  await mintApplyEvidence(session, stagedFiles);
   return {
     ok: true,
     status: "applied",

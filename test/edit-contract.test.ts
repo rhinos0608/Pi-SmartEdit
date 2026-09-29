@@ -76,20 +76,28 @@ function registeredEditParams(env?: Record<string, string | undefined>): Record<
     return editTool.parameters;
 }
 
-function withEnv(vars: Record<string, string | undefined>, fn: () => void): void {
-    const prior: Record<string, string | undefined> = {};
+function applyEnvVars(vars: Record<string, string | undefined>, prior: Record<string, string | undefined>): void {
     for (const key of Object.keys(vars)) {
         prior[key] = process.env[key];
         if (vars[key] === undefined) delete process.env[key];
         else process.env[key] = vars[key];
     }
+}
+
+function restoreEnvVars(vars: Record<string, string | undefined>, prior: Record<string, string | undefined>): void {
+    for (const key of Object.keys(vars)) {
+        if (prior[key] === undefined) delete process.env[key];
+        else process.env[key] = prior[key];
+    }
+}
+
+function withEnv(vars: Record<string, string | undefined>, fn: () => void): void {
+    const prior: Record<string, string | undefined> = {};
+    applyEnvVars(vars, prior);
     try {
         fn();
     } finally {
-        for (const key of Object.keys(vars)) {
-            if (prior[key] === undefined) delete process.env[key];
-            else process.env[key] = prior[key];
-        }
+        restoreEnvVars(vars, prior);
     }
 }
 

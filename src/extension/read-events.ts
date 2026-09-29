@@ -41,6 +41,36 @@ export interface DisplayedHashlineRows {
  * corresponding raw file line are discarded. That prevents a raced or
  * malformed tool result from becoming recovery authority.
  */
+function matchHashlineRow(
+  renderedLine: string,
+  rawLines: string[] | null,
+): { token: string; text: string; line: number } | null {
+  const match = DISPLAYED_HASHLINE_ROW_RE.exec(renderedLine);
+  if (!match) return null;
+  const token = match[1];
+  const text = match[2] ?? "";
+  const lineMatch = /^(\d+)/.exec(token);
+  if (!lineMatch) return null;
+  const line = Number(lineMatch[1]);
+  if (!Number.isSafeInteger(line) || line < 1) return null;
+  if (rawLines && rawLines[line - 1] !== text) return null;
+  return { token, text, line };
+}
+
+/** Parse one text-mode `N|content` row; null when absent or stale. */
+function matchTextModeRow(
+  renderedLine: string,
+  rawLines: string[] | null,
+): { line: number; text: string } | null {
+  const textMatch = DISPLAYED_TEXT_ROW_RE.exec(renderedLine);
+  if (!textMatch) return null;
+  const line = Number(textMatch[1]);
+  const text = textMatch[2] ?? "";
+  if (!Number.isSafeInteger(line) || line < 1) return null;
+  if (rawLines && rawLines[line - 1] !== text) return null;
+  return { line, text };
+}
+
 export function parseDisplayedHashlineRows(
   renderedText: string,
   rawContent?: string,
@@ -51,30 +81,18 @@ export function parseDisplayedHashlineRows(
   const lineNumbers: number[] = [];
 
   for (const renderedLine of renderedText.replace(/\r/g, "").split("\n")) {
-    const match = DISPLAYED_HASHLINE_ROW_RE.exec(renderedLine);
-    if (match) {
-      const token = match[1];
-      const text = match[2] ?? "";
-      const lineMatch = /^(\d+)/.exec(token);
-      if (!lineMatch) continue;
-      const line = Number(lineMatch[1]);
-      if (!Number.isSafeInteger(line) || line < 1) continue;
-
-      if (rawLines && rawLines[line - 1] !== text) continue;
-      anchors.set(token, { text, line });
-      formattedLines.push(`${token}${HASHLINE_CONTENT_SEPARATOR}${text}`);
-      lineNumbers.push(line);
+    const row = matchHashlineRow(renderedLine, rawLines);
+    if (row) {
+      anchors.set(row.token, { text: row.text, line: row.line });
+      formattedLines.push(`${row.token}${HASHLINE_CONTENT_SEPARATOR}${row.text}`);
+      lineNumbers.push(row.line);
       continue;
     }
 
-    const textMatch = DISPLAYED_TEXT_ROW_RE.exec(renderedLine);
-    if (!textMatch) continue;
-    const line = Number(textMatch[1]);
-    const text = textMatch[2] ?? "";
-    if (!Number.isSafeInteger(line) || line < 1) continue;
-    if (rawLines && rawLines[line - 1] !== text) continue;
-    formattedLines.push(`${line}|${text}`);
-    lineNumbers.push(line);
+    const textRow = matchTextModeRow(renderedLine, rawLines);
+    if (!textRow) continue;
+    formattedLines.push(`${textRow.line}|${textRow.text}`);
+    lineNumbers.push(textRow.line);
   }
 
   if (anchors.size === 0 && lineNumbers.length === 0) return null;

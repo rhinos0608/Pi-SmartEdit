@@ -266,7 +266,7 @@ describe("workspace-edit RPC", () => {
     assert.equal(selected?.fullFileSha256, sha256OfString("HELLO\nworld\n"));
   });
 
-  it("two-file apply mints per-file narrow authority (no cross-file range leak)", async () => {
+  async function setupTwoFileEdit() {
     const lines = Array.from({ length: 100 }, (_, i) => `line ${i + 1}`);
     const fileA = join(ctx.dir, "leak-a.txt");
     const fileB = join(ctx.dir, "leak-b.txt");
@@ -320,13 +320,24 @@ describe("workspace-edit RPC", () => {
       payload: { workspaceEdit: edit, source: { operation: "rename" }, sessionFilePath: ctx.sessionFile, cwd: ctx.dir },
     });
     assert.equal(staged.ok, true);
-    if (!staged.ok) return;
+    if (!staged.ok) throw new Error("two-file stage failed");
     const applied = await applyStagedEdit({
       deps: ctx.deps,
       session: ctx.session,
       payload: { proposalId: staged.proposalId, toolCallId: "lsp-leak", sessionFilePath: ctx.sessionFile, cwd: ctx.dir },
     });
     assert.equal(applied.status, "applied");
+    return { fileA, fileB };
+  }
+
+  it("two-file apply writes both files", async () => {
+    const { fileA, fileB } = await setupTwoFileEdit();
+    assert.ok(readFileSync(fileA, "utf8").includes("CHANGED-A"));
+    assert.ok(readFileSync(fileB, "utf8").includes("CHANGED-B"));
+  });
+
+  it("two-file apply mints per-file narrow authority (no cross-file range leak)", async () => {
+    const { fileA, fileB } = await setupTwoFileEdit();
     const authA = ctx.session.priorAuthorityStore?.select(fileA);
     const authB = ctx.session.priorAuthorityStore?.select(fileB);
     assert.ok(authA, "expected post-apply authority for file A");

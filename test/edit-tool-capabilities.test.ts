@@ -22,8 +22,7 @@ import {
 } from "@rhinos0608/pi-workspace-protocol";
 
 import { createPatchTool, type PatchToolDeps } from "../src/patch.js";
-import { getEditModeSpec } from "../src/edit-modes/index.js";
-import { validateEditRequest } from "../src/edit-contract.js";
+import { getInternalPlannerEditModeSpec } from "../src/edit-modes/index.js";
 import { createPriorAuthorityStore } from "../src/context/evidence-authority.js";
 import { initHashline, formatLineHash } from "../src/hashline/hashline.js";
 import type { FileSnapshot } from "../src/core/types.js";
@@ -188,7 +187,7 @@ async function runTool(opts: {
     // lineRange/AST-target/raw dialects, but those internals stay reachable
     // from the exported args.ts API, and this file pins their behavior
     // through the shared validator.
-    editMode: { ...getEditModeSpec("text"), validate: validateEditRequest },
+    editMode: getInternalPlannerEditModeSpec(),
     getRpcClient: () => ({ request: async () => { throw new Error("unused"); }, dispose: () => {} }),
     getSessionFilePath: () => sessionFilePath,
     getCanonicalWorkspaceRoot: () => opts.workdir,

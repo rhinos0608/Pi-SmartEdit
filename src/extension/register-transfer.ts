@@ -1,20 +1,10 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { Theme } from "@mariozechner/pi-coding-agent";
-import {
-    createRpcClient,
-    RPC_CHANNELS,
-} from "@rhinos0608/pi-workspace-protocol";
-import { getSnapshot } from "../context/read-cache.js";
-import { runRepairLoop } from "../verification/repair-loop.js";
 import { appendDiagnosticsToContent } from "../mutation/post-mutation.js";
 import type { PatchToolDeps } from "../patch.js";
-import { getActiveEditMode } from "../edit-modes/index.js";
 import { createTransferTool } from "../transfer/tool.js";
 import { EditTextComponent, renderEditDiff } from "./render.js";
-import {
-    runSingleFileFinalLanes,
-    recordFileCoChanges,
-} from "./final-lanes.js";
+import { buildPatchToolDeps } from "./patch-deps.js";
 import type { SessionState } from "./session.js";
 
 export function getTransferDisplayPaths(args: unknown): string[] {
@@ -82,31 +72,7 @@ export function registerTransferTool(pi: ExtensionAPI, session: SessionState): v
             emit: (c: string, d: unknown) => void;
             on: (c: string, h: (d: unknown) => void) => () => void;
         };
-        const transferDeps: PatchToolDeps = {
-            editMode: getActiveEditMode(),
-            getBus: () => bus,
-            getRpcClient: () => createRpcClient({ bus, channel: RPC_CHANNELS.inspectPatch, timeoutMs: 2000 }),
-            getSessionFilePath: () => session.currentSessionFilePath,
-            getCanonicalWorkspaceRoot: () => session.currentCanonicalWorkspaceRoot ?? "",
-            getPriorAuthority: () => session.priorAuthorityStore,
-            getAstResolver: () => session.astResolver,
-            getSnapshot: (path) => (session.currentCwd ? getSnapshot(path, session.currentCwd) : null),
-            runRepair: ({ path, content, cwd }) => runRepairLoop(path, content, { maxRetries: 1 }, cwd),
-            runFinalSuccessLanes: async ({ cwd, files }) => {
-                const diagnostics: string[] = [];
-                const checks: Array<{ id: string; outcome: "pass" | "fail" | "skipped" | "timeout"; detail?: string }> = [];
-                const evidence: unknown[] = [];
-                for (const file of files) {
-                    await runSingleFileFinalLanes(file, {
-                        cwd, diagnostics, checks, evidence,
-                        editedPaths: files.map((entry) => entry.path),
-                        lspManager: session.lspManager, diagnosticsClient: session.smartReadDiagnosticsClient,
-                    });
-                }
-                recordFileCoChanges(files, cwd, diagnostics);
-                return { diagnostics, checks, evidence };
-            },
-        };
+        const transferDeps: PatchToolDeps = buildPatchToolDeps(session, bus);
         const transferTool = createTransferTool(transferDeps);
         (pi.registerTool as (t: unknown) => void)({
             ...transferTool,
