@@ -234,14 +234,25 @@ describe("Performance Regression Tests", () => {
         const newContent = generateEditedCode(oldContent, 0.1, rng);
         const snapshot = await makeSnapshot(oldContent);
 
-        const start = performance.now();
-        await computeAnchorDelta(snapshot, newContent);
-        checkPatchCorrectness(oldContent, newContent, "typescript");
-        timings.push(performance.now() - start);
+        const runPipeline = async () => {
+          await computeAnchorDelta(snapshot, newContent);
+          checkPatchCorrectness(oldContent, newContent, "typescript");
+        };
+
+        // Warm each size so JIT compilation is outside the measurement.
+        for (let i = 0; i < 3; i++) await runPipeline();
+        const samples: number[] = [];
+        for (let i = 0; i < 7; i++) {
+          const start = performance.now();
+          await runPipeline();
+          samples.push(performance.now() - start);
+        }
+        samples.sort((a, b) => a - b);
+        timings.push(samples[Math.floor(samples.length / 2)]);
       }
 
-      // Tiny baseline timings make this ratio sensitive to timer noise; retain
-      // a broad guard for material super-linear regressions.
+      // Median timings resist isolated GC/scheduling pauses on shared runners;
+      // retain the same guard for material super-linear regressions.
       const ratio = timings[2] / timings[0];
       assert.ok(
         ratio < 40,
