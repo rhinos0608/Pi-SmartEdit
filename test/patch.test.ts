@@ -24,6 +24,7 @@ import {
     type PatchToolDeps,
     type VerificationCheck,
 } from "../src/patch.js";
+import { getInternalPlannerEditModeSpec } from "../src/edit-modes/index.js";
 import { createTransferTool } from "../src/transfer/tool.js";
 import { createPriorAuthorityStore } from "../src/context/evidence-authority.js";
 import { computeLineHashSync, initHashline } from "../src/hashline/hashline.js";
@@ -250,6 +251,9 @@ async function runApply(opts: {
     });
     const resource = envelope.resources[0]!;
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({
             request: async () => {
                 const r = opts.rpc(envelope);
@@ -417,6 +421,9 @@ test("end-to-end: replaces via resolvePatchAuthorization, no parsing of rendered
     });
     const resource = envelope.resources[0]!;
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({
             request: async () => {
                 rpcCalled = true;
@@ -476,6 +483,9 @@ test("end-to-end: multi-file patch with per-edit paths (v3)", async () => {
     const resA = envelope.resources[0]!;
     const resC = envelope.resources[1]!;
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({
             request: async () => ({
                 kind: "reply" as const,
@@ -521,6 +531,9 @@ test("end-to-end: omitted evidence rejects existing-file edit", async () => {
     writeFileSync(file, "alpha\nbeta\n", "utf8");
     const sessionFilePath = "/sessions/a.jsonl";
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({
             request: async () => {
                 throw new Error("rpc must not be called when evidenceRef is omitted");
@@ -556,6 +569,9 @@ test("end-to-end: toolCallId is not required in the wire payload (Pi supplies it
     const resource = makeResource({ canonicalPath: realpathSync(file), full: true, content: "alpha\nbeta\n" });
     const envelope = makeEnvelope({ sessionFilePath, canonicalRoot: workdir, resources: [resource] });
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({ request: async () => ({ kind: "reply" as const, schemaVersion: PROTOCOL_SCHEMA_VERSION, requestId: "r1", ok: true, payload: envelope }), dispose: () => {} }),
         getSessionFilePath: () => sessionFilePath,
         getCanonicalWorkspaceRoot: () => workdir,
@@ -588,6 +604,9 @@ test("end-to-end: successful multi-file patch returns renderable diffs for every
     ];
     const envelope = makeEnvelope({ sessionFilePath, canonicalRoot: workdir, resources });
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({ request: async () => ({ kind: "reply" as const, schemaVersion: PROTOCOL_SCHEMA_VERSION, requestId: "r1", ok: true, payload: envelope }), dispose: () => {} }),
         getSessionFilePath: () => sessionFilePath,
         getCanonicalWorkspaceRoot: () => workdir,
@@ -636,6 +655,9 @@ test("end-to-end: multi-file pre-write failure restores earlier staged writes", 
     });
     const [r1, r2] = envelope.resources;
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({
             request: async () => ({
                 kind: "reply" as const,
@@ -688,6 +710,9 @@ test("end-to-end: query-mode-style evidence (search-match coverage, no sha) is r
     };
     const envelope = makeEnvelope({ sessionFilePath, canonicalRoot: workdir, resources: [weakResource] });
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({
             request: async () => ({
                 kind: "reply" as const,
@@ -741,6 +766,9 @@ test("end-to-end: metadata-only coverage is also rejected", async () => {
     };
     const envelope = makeEnvelope({ sessionFilePath, canonicalRoot: workdir, resources: [weakResource] });
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({
             request: async () => ({
                 kind: "reply" as const,
@@ -869,6 +897,9 @@ test("end-to-end: missing file with empty oldText is treated as new-file creatio
     assert.equal(existsSync(newFile), false, "fixture: new file should not exist yet");
     const sessionFilePath = "/sessions/new.jsonl";
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({
             request: async () => ({
                 kind: "reply" as const,
@@ -908,6 +939,9 @@ test("end-to-end: missing file with non-empty oldText returns actionable error",
     mkdirSync(workdir, { recursive: true });
     const sessionFilePath = "/sessions/missing.jsonl";
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({
             request: async () => ({
                 kind: "reply" as const,
@@ -1101,6 +1135,9 @@ test("end-to-end: SHA changed between initial check and write is rejected as sta
     // fires (which is the moment patch resolves the envelope). This races the
     // pre-write re-SHA guard.
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({
             request: async () => {
                 writeFileSync(canonicalFile, "alpha\nbeta\nGAMMA\n", "utf8");
@@ -1204,6 +1241,9 @@ async function runApplyWithPrior(opts: {
     }
     opts.mutateBeforeExecute?.(canonicalFile);
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => {
             if (opts.rpcShouldThrow) throw new Error("rpc must not be called when prior authority covers all groups");
             return {
@@ -1396,6 +1436,9 @@ test("prior authority: outside-workspace target still requires authority", async
     const sessionFilePath = "/sessions/prior.jsonl";
     const store = createPriorAuthorityStore({ sessionFilePath, canonicalWorkspaceRoot: workdir });
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({ request: async () => { throw new Error("unused"); }, dispose: () => {} }),
         getSessionFilePath: () => sessionFilePath,
         getCanonicalWorkspaceRoot: () => workdir,
@@ -1437,6 +1480,9 @@ test("regression: cross-folder edits apply when evidence exists", async () => {
         ],
     });
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({
             request: async () => ({
                 kind: "reply" as const,
@@ -1498,6 +1544,9 @@ test("topology delete failure returns failed/write (not an uncaught throw) and r
     mkdirSync(workdir, { recursive: true });
     const sessionFilePath = "/sessions/topo.jsonl";
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({ request: async () => { throw new Error("unused"); }, dispose: () => {} }),
         getSessionFilePath: () => sessionFilePath,
         getCanonicalWorkspaceRoot: () => workdir,
@@ -1520,6 +1569,9 @@ test("risk-warning: topology-only add runs path warnings and scans add-file cont
     mkdirSync(workdir, { recursive: true });
     const sessionFilePath = "/sessions/topo-add.jsonl";
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({ request: async () => { throw new Error("unused"); }, dispose: () => {} }),
         getSessionFilePath: () => sessionFilePath,
         getCanonicalWorkspaceRoot: () => workdir,
@@ -1551,6 +1603,9 @@ test("risk-warning: topology-only delete runs path risk warnings", async () => {
     const resource = makeResource({ canonicalPath: canonicalFile, full: true, content: "x\n" });
     const envelope = makeEnvelope({ sessionFilePath, canonicalRoot: workdir, resources: [resource] });
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({ request: async () => ({ kind: "reply" as const, schemaVersion: PROTOCOL_SCHEMA_VERSION, requestId: "r1", ok: true, payload: envelope }), dispose: () => {} }),
         getSessionFilePath: () => sessionFilePath,
         getCanonicalWorkspaceRoot: () => workdir,
@@ -1599,6 +1654,9 @@ test("Bug 3 regression: EditTransaction.begin() failure returns a typed failed r
     }));
 
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({ request: async () => { throw new Error("rpc must not be called: prior authority covers the only group"); }, dispose: () => {} }),
         getSessionFilePath: () => sessionFilePath,
         getCanonicalWorkspaceRoot: () => workdir,
@@ -1665,6 +1723,9 @@ test("structural: freshness mismatch rejects structural edit before any write, s
   // Mutate file after envelope was minted so SHA is stale.
   writeFileSync(canonicalFile, "console.log(1);\nconsole.log(999);\n", "utf8");
   const deps: PatchToolDeps = {
+    // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
     getRpcClient: () => ({
       request: async () => ({
         kind: "reply" as const,
@@ -1751,6 +1812,9 @@ async function execAutoInspect(
     const store = createPriorAuthorityStore({ sessionFilePath, canonicalWorkspaceRoot: workdir });
     if (resources.length) store.record(makeEnvelope({ sessionFilePath, canonicalRoot: workdir, resources }));
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({
             request: async () => { throw new Error("prior authority must not use RPC"); },
             dispose: () => {},
@@ -1780,6 +1844,9 @@ async function execWithEnvelope(
 ) {
     const sessionFilePath = "/sessions/transfer.jsonl";
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({
             request: async () => ({
                 kind: "reply" as const,
@@ -2146,6 +2213,9 @@ test("transfer: rejects a copy whose source is a prior line-range authority miss
     store.record(makeEnvelope({ sessionFilePath, canonicalRoot: workdir, resources: [srcResource, dstResource] }));
 
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({
             request: async () => ({
                 kind: "reply" as const,
@@ -2534,6 +2604,9 @@ test("transfer: cross-file copy into a brand-new destination file creates it wit
         resources: [makeResource({ canonicalPath: srcCanonical, full: true, content: srcContent })],
     }));
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({ request: async () => { throw new Error("auto-inspect must not use RPC"); }, dispose: () => {} }),
         getSessionFilePath: () => sessionFilePath,
         getCanonicalWorkspaceRoot: () => workdir,
@@ -2630,6 +2703,9 @@ test("transfer: a supplied `after` anchor is rejected when `to` is a brand-new f
         resources: [makeResource({ canonicalPath: srcCanonical, full: true, content: srcContent })],
     }));
     const deps: PatchToolDeps = {
+        // Internal-planner spec (see test/edit-tool-capabilities.test.ts): raw/topology and
+        // structural-target dialects stay reachable via the shared validator.
+        editMode: getInternalPlannerEditModeSpec(),
         getRpcClient: () => ({ request: async () => { throw new Error("auto-inspect must not use RPC"); }, dispose: () => {} }),
         getSessionFilePath: () => sessionFilePath,
         getCanonicalWorkspaceRoot: () => workdir,

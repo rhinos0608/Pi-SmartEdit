@@ -20,6 +20,9 @@ const DISPLAYED_HASHLINE_ROW_RE = new RegExp(
   `^\\s*(?:>>>|>>)?\\s*(\\d+${HASHLINE_BIGRAM_RE_SRC})\\${HASHLINE_CONTENT_SEPARATOR}(.*)$`,
 );
 
+/** Plain text-mode read rows: `N|content` with no hash suffix. */
+const DISPLAYED_TEXT_ROW_RE = /^\s*(\d+)\|(.*)$/;
+
 export interface DisplayedHashlineRows {
   hashline: HashlineSnapshotData;
   lineNumbers: number[];
@@ -30,10 +33,44 @@ export interface DisplayedHashlineRows {
  * rendered response. The response may be wrapped in @path/PINE envelope lines;
  * only canonical hashline rows are retained.
  *
+ * Text-mode `N|content` rows carry no hash suffix: they contribute observed
+ * line numbers (driving full/partial authority) but no hashline anchors, so
+ * hashline-anchored edits stay fail-closed after a text-mode read.
+ *
  * When rawContent is provided, rows whose displayed text does not equal the
  * corresponding raw file line are discarded. That prevents a raced or
  * malformed tool result from becoming recovery authority.
  */
+function matchHashlineRow(
+  renderedLine: string,
+  rawLines: string[] | null,
+): { token: string; text: string; line: number } | null {
+  const match = DISPLAYED_HASHLINE_ROW_RE.exec(renderedLine);
+  if (!match) return null;
+  const token = match[1];
+  const text = match[2] ?? "";
+  const lineMatch = /^(\d+)/.exec(token);
+  if (!lineMatch) return null;
+  const line = Number(lineMatch[1]);
+  if (!Number.isSafeInteger(line) || line < 1) return null;
+  if (rawLines && rawLines[line - 1] !== text) return null;
+  return { token, text, line };
+}
+
+/** Parse one text-mode `N|content` row; null when absent or stale. */
+function matchTextModeRow(
+  renderedLine: string,
+  rawLines: string[] | null,
+): { line: number; text: string } | null {
+  const textMatch = DISPLAYED_TEXT_ROW_RE.exec(renderedLine);
+  if (!textMatch) return null;
+  const line = Number(textMatch[1]);
+  const text = textMatch[2] ?? "";
+  if (!Number.isSafeInteger(line) || line < 1) return null;
+  if (rawLines && rawLines[line - 1] !== text) return null;
+  return { line, text };
+}
+
 export function parseDisplayedHashlineRows(
   renderedText: string,
   rawContent?: string,
@@ -44,23 +81,21 @@ export function parseDisplayedHashlineRows(
   const lineNumbers: number[] = [];
 
   for (const renderedLine of renderedText.replace(/\r/g, "").split("\n")) {
-    const match = DISPLAYED_HASHLINE_ROW_RE.exec(renderedLine);
-    if (!match) continue;
+    const row = matchHashlineRow(renderedLine, rawLines);
+    if (row) {
+      anchors.set(row.token, { text: row.text, line: row.line });
+      formattedLines.push(`${row.token}${HASHLINE_CONTENT_SEPARATOR}${row.text}`);
+      lineNumbers.push(row.line);
+      continue;
+    }
 
-    const token = match[1];
-    const text = match[2] ?? "";
-    const lineMatch = /^(\d+)/.exec(token);
-    if (!lineMatch) continue;
-    const line = Number(lineMatch[1]);
-    if (!Number.isSafeInteger(line) || line < 1) continue;
-
-    if (rawLines && rawLines[line - 1] !== text) continue;
-    anchors.set(token, { text, line });
-    formattedLines.push(`${token}${HASHLINE_CONTENT_SEPARATOR}${text}`);
-    lineNumbers.push(line);
+    const textRow = matchTextModeRow(renderedLine, rawLines);
+    if (!textRow) continue;
+    formattedLines.push(`${textRow.line}|${textRow.text}`);
+    lineNumbers.push(textRow.line);
   }
 
-  if (anchors.size === 0) return null;
+  if (anchors.size === 0 && lineNumbers.length === 0) return null;
   return { hashline: { anchors, formattedLines }, lineNumbers };
 }
 

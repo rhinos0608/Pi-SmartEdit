@@ -19,6 +19,7 @@ import { mintRetryEvidenceFromSelection } from "../src/extension/retry-evidence.
 import { acquirePatchEnvelope, buildAutoInspectEnvelope } from "../src/patch/request-prep.js";
 import { resolveTransferBatch } from "../src/transfer/resolve-batch.js";
 import { freshChecks } from "../src/patch/result-builders.js";
+import { getEditModeSpec } from "../src/edit-modes/index.js";
 
 test("retry envelope inspectionId differs per range and matches provider recompute", async () => {
     const workdir = realpathSync(mkdtempSync(join(tmpdir(), "proto-retry-")));
@@ -54,6 +55,7 @@ test("resolve_evidence path rejects malformed envelope payload", async () => {
     const file = join(workdir, "a.ts");
     writeFileSync(file, "alpha\nbeta\n", "utf8");
     const deps: Parameters<typeof acquirePatchEnvelope>[0]["deps"] = {
+        editMode: getEditModeSpec("text"),
         getRpcClient: () => ({
             request: async () => ({
                 kind: "reply" as const,
@@ -121,6 +123,7 @@ test("mismatched-id envelope rejects (resolver-spoof guard)", async () => {
     const requestedId = "a".repeat(64);
     const otherId = "b".repeat(64);
     const deps: Parameters<typeof acquirePatchEnvelope>[0]["deps"] = {
+        editMode: getEditModeSpec("text"),
         getRpcClient: () => ({
             request: async () => ({
                 kind: "reply" as const,

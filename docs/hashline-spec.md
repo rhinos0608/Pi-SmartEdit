@@ -1,6 +1,6 @@
 # Hashline Edit Mode — Technical Specification
 
-> **Status**: Implemented (May 2026) — available via `SMART_EDIT_USE_HASHLINE_EDITING=1`
+> **Status**: Implemented (May 2026) — selected via `PI_EDIT_MODE=hashline` (legacy: `SMART_EDIT_USE_HASHLINE_EDITING=1`)
 > **Version**: 1.0
 > **Date**: 2026-05-01
 > **Author**: Smart Edit Architecture Analysis

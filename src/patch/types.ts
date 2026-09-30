@@ -32,6 +32,7 @@ import type { AstResolverLike } from "../anchor/anchor-resolution.js";
 import type { StructuralResolver } from "../core/edit-planner.js";
 import type { EditTarget, FileSnapshot, HashlineEditMetadata } from "../core/types.js";
 import type { RepairLoopResult } from "../verification/repair-loop.js";
+import type { EditModeSpec } from "../edit-modes/types.js";
 import type { EditOperation } from "../edit-contract.js";
 
 export interface RpcClientLike {
@@ -47,10 +48,8 @@ export interface RpcClientLike {
 }
 
 export interface PatchToolDeps {
-    /** Selects the agent-visible and runtime edit protocol. When true, only
-     * hashline edits are accepted; classic/raw/refactor dialects are hidden
-     * and rejected. Defaults to false for callers that do not opt in. */
-    readonly useHashlineEditing?: boolean;
+    /** Active edit dialect spec: owns agent-visible schema, description, validation, and prepareArguments. */
+    readonly editMode: EditModeSpec;
     readonly getBus?: () => { emit: (c: string, d: unknown) => void; on: (c: string, h: (d: unknown) => void) => () => void };
     readonly getRpcClient: () => RpcClientLike;
     readonly getSessionFilePath: () => string | null;
@@ -117,21 +116,6 @@ export type GroupedEdit = KernelMutationEdit;
 export type EditGroup = KernelMutationGroup;
 
 export type RawTopology = KernelMutationTopology;
-
-export interface RefactorRequestFields {
-    readonly kind: string;
-    readonly path?: string;
-    readonly line?: number;
-    readonly character?: number;
-    readonly newName?: string;
-    readonly previewId?: string;
-    readonly tabSize?: number;
-    readonly insertSpaces?: boolean;
-    readonly endLine?: number;
-    readonly endCharacter?: number;
-    readonly diagnostics?: unknown;
-    readonly only?: unknown;
-}
 
 export type PatchResult = { content: Array<{ type: "text"; text: string }>; details: PatchToolDetails };
 

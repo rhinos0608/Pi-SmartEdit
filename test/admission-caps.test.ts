@@ -119,20 +119,9 @@ test("raw fan-out: 60 hunks across 51 files rejected", () => {
     assert.match((r as { ok: false; error: string }).error, /raw (expands|touches)|touches \d+ files/);
 });
 
-test("refactor bypass closed: oversized newName rejected", () => {
-    const r = validateEditRequest({
-        refactor: {
-            kind: "rename-preview",
-            path: "/tmp/a.ts",
-            line: 1,
-            character: 1,
-            newName: "n".repeat(MAX_REQUEST_STRING_BYTES + 1),
-        },
-    });
-    assert.equal(r.ok, false);
-    assert.match((r as { ok: false; error: string }).error, /newName/);
-});
-
+// Refactor admission cases moved with the contract to Stage 4's
+// workspace-edit RPC server tests; the edit tool exposes no refactor
+// operation in either mode.
 test("staged preview caps: oversized planned output rejected", () => {
     const err = checkPlannedPreviewCaps({
         stagedFiles: [{ filePath: "/tmp/a.ts", newContent: "x".repeat(MAX_REQUEST_TEXT_BYTES + 1) }],
@@ -192,16 +181,8 @@ test("raw search/replace blocks over item cap rejected at admission", () => {
     if (!res.ok) assert.match(res.error, /expands to 101 operations/);
 });
 
-test("code-action-preview with 5MiB serialized diagnostics rejected at admission", () => {
-    const big = "x".repeat(5 * 1024 * 1024);
-    const res = validateEditRequest({
-        toolCallId: "t-diag",
-        refactor: { kind: "code-action-preview", path: "/tmp/a.ts", line: 1, character: 1, diagnostics: [{ message: big }] },
-    });
-    assert.equal(res.ok, false);
-    if (!res.ok) assert.match(res.error, /diagnostics/);
-});
-
+// Refactor admission cases moved with the contract to Stage 4's
+// workspace-edit RPC server tests.
 test("transfer batch touching 51 files rejected", () => {
     const transfers = Array.from({ length: 51 }, (_, i) => ({
         op: "copy", from: `/tmp/src${i}.txt`,

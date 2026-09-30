@@ -19,6 +19,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { visibleWidth } from "@mariozechner/pi-tui";
 import smartEdit from "../src/index.js";
 import { createPatchTool, type PatchToolDeps, type PatchTool } from "../src/patch.js";
+import { getEditModeSpec } from "../src/edit-modes/index.js";
 import { claimDiagnosticsOwner, isDiagnosticsClaimed, resetDiagnosticsOwnership } from "../src/mutation/mutation-ownership.js";
 import { PROTOCOL_SCHEMA_VERSION, hashSessionFilePath, resourceIdFor, validateInspectionEnvelope, type WorkspaceEvidenceEnvelope, type InspectedResource } from "@rhinos0608/pi-workspace-protocol";
 
@@ -175,7 +176,7 @@ test("edit tool has prepareArguments compatibility shim", () => {
     "edit tool must have prepareArguments for session resume compat");
 });
 
-test("edit tool advertises canonical contract schema (raw, rich fields, no evidenceRef)", () => {
+test("edit tool advertises text-mode schema (edits with scope, no evidenceRef)", () => {
   const pi = createMockPI();
   init(pi);
 
@@ -183,31 +184,28 @@ test("edit tool advertises canonical contract schema (raw, rich fields, no evide
   const params = editTool.parameters as { properties: Record<string, unknown> };
   const props = params.properties;
 
-  assert.ok(props.raw, "schema must advertise mutually exclusive `raw` input");
+  assert.ok(!props.raw, "text schema must hide `raw`");
+  assert.ok(!props.refactor, "text schema must hide `refactor`");
   assert.ok(props.edits, "schema must advertise `edits` array");
 
   const edits = props.edits as { items?: { properties?: Record<string, unknown> } };
   const editProps = edits.items?.properties ?? {};
-  assert.ok(editProps.target, "edit items must advertise `target`");
-  assert.ok(editProps.lineRange, "edit items must advertise `lineRange`");
-  assert.ok(editProps.hashline, "edit items must advertise `hashline`");
+  assert.ok(editProps.scope, "edit items must advertise `scope`");
+  assert.ok(!editProps.target, "edit items must hide `target` (scope is the agent key)");
+  assert.ok(!editProps.lineRange, "edit items must hide `lineRange`");
+  assert.ok(!editProps.hashline, "edit items must hide `hashline`");
 
   assert.ok(!("evidenceRef" in props),
     "agent-visible schema must not advertise `evidenceRef` (tool-owned authority)");
 });
 
-test("edit tool advertises flat refactor subschema with all five kinds", () => {
+test("edit tool exposes no agent-facing refactor operation (moved to Stage 4 LSP)", () => {
   const pi = createMockPI();
   init(pi);
 
   const editTool = pi._tools.get("edit")!;
   const params = editTool.parameters as { properties: Record<string, unknown> };
-  const refactor = params.properties.refactor as Record<string, unknown>;
-  assert.ok(refactor, "schema must advertise `refactor`");
-  assert.ok(!("oneOf" in refactor) && !("anyOf" in refactor) && !("allOf" in refactor),
-    "refactor subschema must stay flat for provider compat");
-  const kind = (refactor.properties as Record<string, { enum?: string[] }>).kind;
-  assert.deepEqual(kind?.enum, ["rename-preview", "apply-refactor-preview", "organize-imports-preview", "formatting-preview", "code-action-preview"]);
+  assert.ok(!("refactor" in params.properties), "agent-visible schema must not expose `refactor`");
 });
 
 test("edit renderer names paths supplied only on multi-file edit items", () => {
@@ -394,6 +392,7 @@ test("old-format edit call converts through prepareArguments and survives valida
   //
   // We build minimal deps (session will be rejected but for the right reason).
   const deps: PatchToolDeps = {
+    editMode: getEditModeSpec("text"),
     getRpcClient: () => ({
       request: async () => ({ kind: "reply", schemaVersion: PROTOCOL_SCHEMA_VERSION, requestId: "x", ok: false, error: "no session" }),
       dispose: () => {},
@@ -667,16 +666,19 @@ test("failed edit result emits retry evidence and authorizes only covered retry"
     const toolResult = [...pi._events.get("tool_result")!][0];
     await toolResult({ toolName: "write", toolCallId: "seed-retry", isError: false, input: { path: filePath }, content: [{ type: "text", text: "wrote" }] }, {});
     const editTool = pi._tools.get("edit")!;
-    const failedInput = { path: filePath, edits: [{ oldText: "missing", newText: "x", lineRange: { startLine: 2, endLine: 2 } }] };
+    const failedInput = { path: filePath, edits: [{ oldText: "missing", newText: "x" }] };
     const failed = await editTool.execute("failed-retry", failedInput, undefined, undefined, { cwd: process.cwd() });
     assert.equal(failed.details.status.kind, "failed");
     assert.equal((failed.details as { status: { phase?: string }; matchFailure?: string }).status.phase, "stage");
     assert.equal((failed.details as { matchFailure?: string }).matchFailure, "NOT_FOUND");
-    const retryResult = await toolResult({ toolName: "edit", toolCallId: "failed-retry", isError: false, input: failedInput, content: failed.content, details: failed.details }, {}) as { content: Array<{ text?: string }>; details?: { workspaceEvidence?: unknown } };
+    // The retry lane reads the stored failure input directly (no mode gate),
+    // so the crafted lineRange input still yields the narrowed retry window.
+    const retryInput = { path: filePath, edits: [{ oldText: "missing", newText: "x", lineRange: { startLine: 2, endLine: 2 } }] };
+    const retryResult = await toolResult({ toolName: "edit", toolCallId: "failed-retry", isError: false, input: retryInput, content: failed.content, details: failed.details }, {}) as { content: Array<{ text?: string }>; details?: { workspaceEvidence?: unknown } };
     assert.ok(retryResult?.details?.workspaceEvidence);
     assert.equal(validateInspectionEnvelope(retryResult.details.workspaceEvidence).ok, true);
     assert.match(retryResult.content.map((block) => block.text ?? "").join(""), /lineRange 1-4/);
-    const corrected = await editTool.execute("corrected-retry", { path: filePath, edits: [{ oldText: "l2", newText: "L2", lineRange: { startLine: 2, endLine: 2 } }] }, undefined, undefined, { cwd: process.cwd() });
+    const corrected = await editTool.execute("corrected-retry", { path: filePath, edits: [{ oldText: "l2", newText: "L2" }] }, undefined, undefined, { cwd: process.cwd() });
     assert.equal(corrected.details.status.kind, "applied");
     const adjacent = await editTool.execute("adjacent-retry", { path: filePath, edits: [{ oldText: "l5", newText: "L5" }] }, undefined, undefined, { cwd: process.cwd() });
     assert.equal(adjacent.details.status.kind, "rejected");

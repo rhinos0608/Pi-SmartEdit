@@ -31,6 +31,7 @@ import {
 } from "@rhinos0608/pi-workspace-protocol";
 
 import { createPatchTool, type PatchToolDeps } from "../src/patch.js";
+import { getEditModeSpec } from "../src/edit-modes/index.js";
 import { createPriorAuthorityStore } from "../src/context/evidence-authority.js";
 import {
     handleEditSuccessResult,
@@ -124,6 +125,7 @@ async function setup(contentFiles: Record<string, string>, priors: (cf: (rel: st
     session.priorAuthorityStore = store;
 
     const deps: PatchToolDeps = {
+        editMode: getEditModeSpec("text"),
         getRpcClient: () => ({ request: async () => { throw new Error("unused"); }, dispose: () => {} }),
         getSessionFilePath: () => SESSION_FILE,
         getCanonicalWorkspaceRoot: () => workdir,

@@ -40,185 +40,6 @@ export interface EditOperation {
     hashline?: HashlineEditMetadata;
 }
 
-/** Rename preview: all fields required. */
-export interface RenamePreviewRefactor {
-    kind: "rename-preview";
-    path: string;
-    /** 1-based positions */
-    line: number;
-    /** 1-based positions */
-    character: number;
-    newName: string;
-}
-
-/** Apply a stored preview: only the preview id is relevant. */
-export interface ApplyRefactorPreviewRefactor {
-    kind: "apply-refactor-preview";
-    previewId: string;
-}
-
-/** Organize-imports preview: path only. */
-export interface OrganizeImportsPreviewRefactor {
-    kind: "organize-imports-preview";
-    path: string;
-}
-
-/** Formatting preview: path plus optional format options. */
-export interface FormattingPreviewRefactor {
-    kind: "formatting-preview";
-    path: string;
-    tabSize?: number;
-    insertSpaces?: boolean;
-}
-
-/** Code-action preview: position plus optional range/diagnostics filters. */
-export interface CodeActionPreviewRefactor {
-    kind: "code-action-preview";
-    path: string;
-    /** 1-based positions */
-    line: number;
-    /** 1-based positions */
-    character: number;
-    /** 1-based positions */
-    endLine?: number;
-    /** 1-based positions */
-    endCharacter?: number;
-    diagnostics?: unknown;
-    only?: unknown;
-}
-
-/**
- * Kind-discriminated refactor request. Each variant carries only the
- * fields relevant to its kind; per-kind requirements are enforced by
- * `validateEditRequest` at validation time so handlers receive narrowed
- * variants and never re-check required fields at runtime.
- */
-export type RefactorRequest =
-    | RenamePreviewRefactor
-    | ApplyRefactorPreviewRefactor
-    | OrganizeImportsPreviewRefactor
-    | FormattingPreviewRefactor
-    | CodeActionPreviewRefactor;
-
-/** All wire keys accepted inside `edit.refactor` (union of per-kind keys). */
-const REFACTOR_KEYS = new Set([
-    "kind", "path", "line", "character", "newName", "previewId",
-    "tabSize", "insertSpaces", "endLine", "endCharacter", "diagnostics", "only",
-]);
-
-/** Per-kind relevant keys (excluding `kind` itself). */
-const REFACTOR_KEYS_BY_KIND: Record<string, ReadonlySet<string>> = {
-    "rename-preview": new Set(["path", "line", "character", "newName"]),
-    "apply-refactor-preview": new Set(["previewId"]),
-    "organize-imports-preview": new Set(["path"]),
-    "formatting-preview": new Set(["path", "tabSize", "insertSpaces"]),
-    "code-action-preview": new Set(["path", "line", "character", "endLine", "endCharacter", "diagnostics", "only"]),
-};
-
-function requirePath(r: Record<string, unknown>, kind: string): string | null {
-    if (typeof r.path !== "string" || r.path.length === 0)
-        return `edit.refactor.path is required for "${kind}": provide a non-empty file path`;
-    return null;
-}
-
-function requirePosField(r: Record<string, unknown>, kind: string, field: "line" | "character"): string | null {
-    const v = r[field];
-    if (v === undefined)
-        return `edit.refactor.${field} is required for "${kind}" (>=1, 1-based)`;
-    if (typeof v !== "number" || !Number.isInteger(v) || v < 1)
-        return `edit.refactor.${field} must be a positive integer (>=1, 1-based)`;
-    return null;
-}
-
-function checkOptionalPosField(r: Record<string, unknown>, field: "endLine" | "endCharacter"): string | null {
-    const v = r[field];
-    if (v !== undefined && (typeof v !== "number" || !Number.isInteger(v) || v < 1))
-        return `edit.refactor.${field} must be a positive integer (>=1, 1-based) if present`;
-    return null;
-}
-
-function validateRenamePreviewRefactor(r: Record<string, unknown>): string | null {
-    return requirePath(r, "rename-preview")
-        ?? requirePosField(r, "rename-preview", "line")
-        ?? requirePosField(r, "rename-preview", "character")
-        ?? ((typeof r.newName !== "string" || r.newName.length === 0)
-            ? `edit.refactor.newName is required for "rename-preview": provide a non-empty replacement name`
-            : null);
-}
-
-function validateApplyRefactorPreviewRefactor(r: Record<string, unknown>): string | null {
-    if (typeof r.previewId !== "string" || r.previewId.length === 0)
-        return `edit.refactor.previewId is required for "apply-refactor-preview": provide the preview id returned by a preview call`;
-    return null;
-}
-
-function validateOrganizeImportsPreviewRefactor(r: Record<string, unknown>): string | null {
-    return requirePath(r, "organize-imports-preview");
-}
-
-function validateFormattingPreviewRefactor(r: Record<string, unknown>): string | null {
-    const pathErr = requirePath(r, "formatting-preview");
-    if (pathErr) return pathErr;
-    if (r.tabSize !== undefined && !isPositiveInteger(r.tabSize))
-        return "edit.refactor.tabSize must be a positive integer if present";
-    if (r.insertSpaces !== undefined && typeof r.insertSpaces !== "boolean")
-        return "edit.refactor.insertSpaces must be a boolean if present";
-    return null;
-}
-
-function validateCodeActionPreviewRefactor(r: Record<string, unknown>): string | null {
-    return requirePath(r, "code-action-preview")
-        ?? requirePosField(r, "code-action-preview", "line")
-        ?? requirePosField(r, "code-action-preview", "character")
-        ?? checkOptionalPosField(r, "endLine")
-        ?? checkOptionalPosField(r, "endCharacter")
-        ?? ((r.diagnostics !== undefined && !Array.isArray(r.diagnostics))
-            ? "edit.refactor.diagnostics must be an array if present"
-            : null)
-        ?? ((r.only !== undefined && (!Array.isArray(r.only) || !(r.only as unknown[]).every((o) => typeof o === "string")))
-            ? "edit.refactor.only must be an array of strings if present"
-            : null);
-}
-
-/**
- * Kind-discriminated refactor validation. Rejects unknown keys, then
- * rejects keys irrelevant to the variant kind, then enforces the
- * per-kind required fields and field types with precise errors.
- */
-function checkRefactorKind(kind: unknown): string | null {
-    const allowedKinds = new Set(Object.keys(REFACTOR_KEYS_BY_KIND));
-    if (typeof kind !== "string" || !allowedKinds.has(kind))
-        return "edit.refactor.kind must be \"rename-preview\", \"apply-refactor-preview\", \"organize-imports-preview\", \"formatting-preview\" or \"code-action-preview\"";
-    return null;
-}
-
-function checkRefactorIrrelevantKeys(r: Record<string, unknown>, kind: string): string | null {
-    const allowed = REFACTOR_KEYS_BY_KIND[kind as string] ?? new Set<string>(["kind"]);
-    const irrelevant = Object.keys(r).find((key) => key !== "kind" && !allowed.has(key)) ?? null;
-    if (irrelevant) return `edit.refactor.${irrelevant} is not supported for kind "${kind}"`;
-    return null;
-}
-
-function validateRefactorByKind(kind: string, r: Record<string, unknown>): string | null {
-    switch (kind as string) {
-        case "rename-preview": return validateRenamePreviewRefactor(r);
-        case "apply-refactor-preview": return validateApplyRefactorPreviewRefactor(r);
-        case "organize-imports-preview": return validateOrganizeImportsPreviewRefactor(r);
-        case "formatting-preview": return validateFormattingPreviewRefactor(r);
-        default: return validateCodeActionPreviewRefactor(r);
-    }
-}
-
-function validateRefactor(r: Record<string, unknown>): string | null {
-    const unknown = firstUnknownKey(r, REFACTOR_KEYS);
-    if (unknown) return `edit.refactor.${unknown} is not supported`;
-    const kindErr = checkRefactorKind(r.kind);
-    if (kindErr) return kindErr;
-    const irrelevantErr = checkRefactorIrrelevantKeys(r, r.kind as string);
-    if (irrelevantErr) return irrelevantErr;
-    return validateRefactorByKind(r.kind as string, r);
-}
-
 export interface EditRequest {
     /** Default target file path. May be omitted when every edit provides its own. */
     path?: string;
@@ -226,7 +47,6 @@ export interface EditRequest {
     edits?: EditOperation[];
     /** Raw patch text in a supported format. Mutually exclusive with `edits`. */
     raw?: string;
-    refactor?: RefactorRequest;
     /** Injected by the runtime; not part of the agent-visible schema. */
     toolCallId?: string;
     /** Optional evidence reference for stored-call compatibility. Validated when
@@ -235,7 +55,7 @@ export interface EditRequest {
     evidenceRef?: { inspectionId: string; resourceIds: string[] };
 }
 
-function isPlainObject(v: unknown): v is Record<string, unknown> {
+export function isPlainObject(v: unknown): v is Record<string, unknown> {
     return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
@@ -247,7 +67,7 @@ function ok(value: EditRequest): { ok: true; value: EditRequest } {
     return { ok: true, value };
 }
 
-function isPositiveInteger(v: unknown): boolean {
+export function isPositiveInteger(v: unknown): boolean {
     return typeof v === "number" && Number.isInteger(v) && v >= 1;
 }
 
@@ -534,12 +354,11 @@ function validateEditOperation(e: Record<string, unknown>, i: number): string | 
  * `raw`+`edits` as mutually exclusive. `evidenceRef` is optional and never
  * required — authority is tool-owned.
  */
-function checkRequestVariantExclusivity(hasEdits: boolean, hasRaw: boolean, hasRefactor: boolean): string | null {
-    const variantCount = (hasEdits ? 1 : 0) + (hasRaw ? 1 : 0) + (hasRefactor ? 1 : 0);
-    if (variantCount > 1)
-        return "edit.edits, edit.raw, and edit.refactor are mutually exclusive; provide exactly one";
-    if (variantCount === 0)
-        return "edit requires either edits (array), raw (string), or refactor";
+function checkRequestVariantExclusivity(hasEdits: boolean, hasRaw: boolean): string | null {
+    if (hasEdits && hasRaw)
+        return "edit.edits and edit.raw are mutually exclusive; provide exactly one";
+    if (!hasEdits && !hasRaw)
+        return "edit requires either edits (array) or raw (string)";
     return null;
 }
 
@@ -668,41 +487,6 @@ function editItemStrings(e: Record<string, unknown>, i: number): Array<[string, 
     ];
 }
 
-function checkRefactorAdmissionCaps(refactor: unknown): string | null {
-    if (!isPlainObject(refactor)) return null;
-    const total = { bytes: 0 };
-    const strings: Array<[string, unknown]> = [
-        ["edit.refactor.path", (refactor as Record<string, unknown>).path],
-        ["edit.refactor.newName", (refactor as Record<string, unknown>).newName],
-        ["edit.refactor.previewId", (refactor as Record<string, unknown>).previewId],
-    ];
-    for (const [field, value] of strings) {
-        if (typeof value !== "string") continue;
-        const err = accountCappedString(field, value, total);
-        if (err) return err;
-    }
-    // diagnostics is an array of unknown-shaped objects; account serialized bytes.
-    const diagnostics = (refactor as Record<string, unknown>).diagnostics;
-    if (diagnostics !== undefined) {
-        let serialized: string;
-        try { serialized = JSON.stringify(diagnostics) ?? ""; }
-        catch { return "edit.refactor.diagnostics must be JSON-serializable"; }
-        const err = accountCappedString("edit.refactor.diagnostics", serialized, total);
-        if (err) return err;
-    }
-    // only is a string array; account each element.
-    for (const key of ["only"] as const) {
-        const arr = (refactor as Record<string, unknown>)[key];
-        if (!Array.isArray(arr)) continue;
-        for (let j = 0; j < arr.length; j++) {
-            if (typeof arr[j] !== "string") continue;
-            const err = accountCappedString(`edit.refactor.${key}[${j}]`, arr[j] as string, total);
-            if (err) return err;
-        }
-    }
-    return null;
-}
-
 /** Raw fan-out count via a single normalization pass.
  *  Counts every supported raw format (JSON, search/replace, unified diff,
  *  Codex/OpenAI patch, atomic envelope); unparseable raw throws so the
@@ -723,7 +507,7 @@ function checkAdmissionCaps(normalized: Record<string, unknown>): string | null 
     // Early admission gate: counts + body-text bytes, before per-item
     // validation (and far before locks/snapshots/hashing). Counts mirror LSP
     // WorkspaceEdit limits (50 files / 5000 edits); the 100-item cap governs.
-    const { edits, raw, path, refactor } = normalized;
+    const { edits, raw, path } = normalized;
     if (typeof raw === "string") {
         const rawBytes = Buffer.byteLength(raw, "utf8");
         if (rawBytes > MAX_REQUEST_STRING_BYTES)
@@ -744,8 +528,6 @@ function checkAdmissionCaps(normalized: Record<string, unknown>): string | null 
         } catch { /* fall through to format validation */ }
         return null;
     }
-    const refactorErr = checkRefactorAdmissionCaps(refactor);
-    if (refactorErr) return refactorErr;
     if (!Array.isArray(edits)) return null;
     if (edits.length > MAX_EDIT_ITEMS)
         return `edit.edits has ${edits.length} items (max ${MAX_EDIT_ITEMS}): split the request into smaller batches and retry`;
@@ -788,18 +570,10 @@ function checkRequestTopLevel(input: unknown): { normalized: Record<string, unkn
     if (!isPlainObject(input)) return fail("edit request must be an object");
     const normalized = normalizeFlatEditRequest(input);
     const unknown = firstUnknownKey(normalized, new Set([
-        "path", "edits", "raw", "toolCallId", "evidenceRef", "refactor",
+        "path", "edits", "raw", "toolCallId", "evidenceRef",
     ]));
     if (unknown) return fail(`edit.${unknown} is not supported`);
     return { normalized };
-}
-
-function checkRefactorRequest(refactor: unknown, normalized: Record<string, unknown>): { ok: true; value: EditRequest } | { ok: false; error: string } | null {
-    if (refactor === undefined) return null;
-    if (!isPlainObject(refactor)) return fail("edit.refactor must be an object");
-    const err = validateRefactor(refactor as Record<string, unknown>);
-    if (err) return fail(err);
-    return ok(normalized as EditRequest);
 }
 
 function checkEvidenceField(evidenceRef: unknown): { ok: false; error: string } | null {
@@ -819,18 +593,15 @@ export function validateEditRequest(
     const { normalized } = top;
     const capsErr = checkAdmissionCaps(normalized);
     if (capsErr) return fail(capsErr);
-    const { path, edits, raw, toolCallId, evidenceRef, refactor } = normalized;
+    const { path, edits, raw, toolCallId, evidenceRef } = normalized;
 
     const scalarsErr = checkTopLevelScalars(path, toolCallId);
     if (scalarsErr) return scalarsErr;
 
     const hasEdits = edits !== undefined;
     const hasRaw = raw !== undefined;
-    const hasRefactor = refactor !== undefined;
-    const variantErr = checkRequestVariantExclusivity(hasEdits, hasRaw, hasRefactor);
+    const variantErr = checkRequestVariantExclusivity(hasEdits, hasRaw);
     if (variantErr) return fail(variantErr);
-    const refactorResult = checkRefactorRequest(refactor, normalized);
-    if (refactorResult) return refactorResult;
     const rawErr = checkRawVariant(hasRaw, raw);
     if (rawErr) return rawErr;
 
@@ -841,58 +612,6 @@ export function validateEditRequest(
     if (evidenceErr) return evidenceErr;
 
     return ok(normalized as EditRequest);
-}
-
-/**
- * Validate the hashline-only wire contract used when hashline mode is enabled.
- * The normal validator remains intentionally unchanged for classic mode and
- * stored-session compatibility; this stricter layer rejects every alternate
- * mutation dialect at runtime as well as hiding it from the agent schema.
- */
-export function validateHashlineOnlyEditRequest(
-    input: unknown,
-): { ok: true; value: EditRequest } | { ok: false; error: string } {
-    const validated = validateEditRequest(input);
-    if (!validated.ok) return validated;
-
-    const { value } = validated;
-    if (value.raw !== undefined || value.refactor !== undefined) {
-        return fail("hashline edit mode accepts only `edits` with hashline metadata");
-    }
-    if (!value.edits || value.edits.length === 0) {
-        return fail("hashline edit mode requires at least one hashline edit");
-    }
-
-    for (let i = 0; i < value.edits.length; i++) {
-        const edit = value.edits[i] as EditOperation;
-        if (!edit.hashline) {
-            return fail(`edit.edits[${i}] must use hashline metadata while hashline edit mode is enabled`);
-        }
-        if (!Object.prototype.hasOwnProperty.call(edit.hashline, "content")) {
-            return fail(`edit.edits[${i}].hashline.content is required in hashline edit mode; use null explicitly to delete`);
-        }
-        const { pos, end } = edit.hashline.range;
-        const insertionSuffix = pos.endsWith(":after")
-            ? ":after"
-            : pos.endsWith(":before")
-                ? ":before"
-                : null;
-        if (insertionSuffix) {
-            const base = pos.slice(0, -insertionSuffix.length);
-            if (end !== base) {
-                return fail(`edit.edits[${i}].hashline.range.end must equal unsuffixed insertion anchor "${base}"`);
-            }
-            if (edit.hashline.content === null) {
-                return fail(`edit.edits[${i}].hashline.content must be non-null for ${insertionSuffix} insertion`);
-            }
-        }
-        const keys = Object.keys(edit as unknown as Record<string, unknown>);
-        const unsupported = keys.find((key) => key !== "path" && key !== "hashline");
-        if (unsupported) {
-            return fail(`edit.edits[${i}].${unsupported} is not supported while hashline edit mode is enabled`);
-        }
-    }
-    return validated;
 }
 
 /**
@@ -911,232 +630,4 @@ export function normalizeFlatEditRequest(args: Record<string, unknown>): Record<
         return { ...rest, edits: [{ oldText, newText }] };
     }
     return args;
-}
-
-/**
- * Agent-visible JSON schema for the registered `edit` tool. Omits
- * `evidenceRef` (tool-owned authority) and advertises mutually exclusive
- * `raw` plus rich edit fields. Nested objects are fully enumerated with
- * `additionalProperties: false`. `edits`/`raw` exclusivity is enforced by
- * `validateEditRequest`; the schema omits a top-level `oneOf` because the
- * Anthropic API rejects `oneOf`/`allOf`/`anyOf` at the input_schema root.
- */
-export const EDIT_PARAMETERS = {
-    type: "object",
-    additionalProperties: false,
-    properties: {
-        path: { type: "string", description: "Default target file path. May be omitted when every edit provides its own path." },
-        edits: {
-            type: "array",
-            minItems: 1,
-            maxItems: 100,
-            description: "One or more targeted edits that transform or generate content. Mutually exclusive with `raw`. When existing content should be preserved and relocated/reused, prefer transfer.",
-            items: {
-                type: "object",
-                additionalProperties: false,
-                properties: {
-                    path: { type: "string", description: "Per-edit target file path. Overrides the top-level path." },
-                    oldText: { type: "string" },
-                    newText: { type: "string" },
-                    description: { type: "string" },
-                    replaceAll: { type: "boolean" },
-                    target: {
-                        type: "object",
-                        additionalProperties: false,
-                        description: "AST target: scopes text search or drives symbolic and structural operations. Symbol operations (replaceBody/insertBefore/insertAfter) act on the matched AST node; structural operations (pattern/replacement) use ast-grep transforms.",
-                        properties: {
-                            name: { type: "string", description: "Symbol name to target (e.g., function name, class name)." },
-                            namePath: { type: "string", description: "Qualified symbol path; final component matched by AST name (e.g., 'MyClass.myMethod')." },
-                            kind: { type: "string", description: "AST node kind hint (e.g., 'function_declaration')." },
-                            line: { type: "integer", minimum: 1, description: "1-based line hint for disambiguation (e.g., 12)." },
-                            replaceBody: { type: "string", description: "Replace the entire AST symbol definition with this text." },
-                            insertBefore: { type: "string", description: "Insert this text immediately before the AST symbol definition." },
-                            insertAfter: { type: "string", description: "Insert this text immediately after the AST symbol definition." },
-                            description: { type: "string", description: "Optional target label for diagnostics." },
-                            pattern: { type: "string", description: "ast-grep structural pattern." },
-                            replacement: { type: "string", description: "Replacement for ast-grep pattern matches." },
-                        },
-                    },
-                    lineRange: {
-                        type: "object",
-                        additionalProperties: false,
-                        description: "1-based line-range scope for this edit.",
-                        properties: {
-                            startLine: { type: "integer", minimum: 1 },
-                            endLine: { type: "integer", minimum: 1 },
-                        },
-                        required: ["startLine", "endLine"],
-                    },
-                    hashline: {
-                        type: "object",
-                        additionalProperties: false,
-                        description: "Hashline-anchored edit metadata. Addresses source lines by stable anchor, with optional symbol scope for fallback.",
-                        properties: {
-                            range: {
-                                type: "object",
-                                additionalProperties: false,
-                                description: "Hashline anchor range.",
-                                properties: {
-                                    pos: { type: "string", minLength: 1, description: "Complete start LINE+ID anchor from read output, e.g. \"112zc\"." },
-                                    end: { type: "string", minLength: 1, description: "Complete end LINE+ID anchor from read output, e.g. \"114aa\". Use the same anchor as pos for a single-line replacement." },
-                                },
-                                required: ["pos", "end"],
-                            },
-                            content: {
-                                description: "Replacement content for the anchored range. Use a string or array of replacement lines; use null to delete the anchored range. This is new content, not source/old text.",
-                                oneOf: [
-                                    { type: "array", items: { type: "string" } },
-                                    { type: "string" },
-                                    { type: "null" },
-                                ],
-                            },
-                            symbol: {
-                                type: "object",
-                                additionalProperties: false,
-                                description: "Optional symbol scope for hashline fallback.",
-                                properties: {
-                                    name: { type: "string", minLength: 1 },
-                                    kind: { type: "string" },
-                                    line: { type: "integer", minimum: 1 },
-                                },
-                                required: ["name"],
-                            },
-                        },
-                        required: ["range"],
-                    },
-                },
-                // An edit item must be actionable: a text pair (oldText+newText) or
-                // a self-actionable target (symbolic op or structural pattern+replacement)
-                // or hashline. A scoping-only target/identifier without oldText/newText
-                // and without a symbolic/structural op is not actionable on its own.
-                anyOf: [
-                    { required: ["oldText", "newText"] },
-                    {
-                        required: ["target"],
-                        properties: {
-                            target: {
-                                anyOf: [
-                                    { required: ["replaceBody"] },
-                                    { required: ["insertBefore"] },
-                                    { required: ["insertAfter"] },
-                                    { required: ["pattern", "replacement"] },
-                                ],
-                            },
-                        },
-                    },
-                    { required: ["hashline"] },
-                ],
-            },
-        },
-        raw: {
-            type: "string",
-            description: "Raw patch text in a supported diff/patch format.",
-        },
-        refactor: {
-            type: "object",
-            additionalProperties: false,
-            description: "Refactor preview/apply variant. Mutually exclusive with edits/raw.",
-            properties: {
-                kind: { type: "string", enum: ["rename-preview", "apply-refactor-preview", "organize-imports-preview", "formatting-preview", "code-action-preview"] },
-                path: { type: "string" },
-                line: { type: "integer", minimum: 1 },
-                character: { type: "integer", minimum: 1 },
-                newName: { type: "string" },
-                previewId: { type: "string" },
-                tabSize: { type: "integer", minimum: 1 },
-                insertSpaces: { type: "boolean" },
-                endLine: { type: "integer", minimum: 1 },
-                endCharacter: { type: "integer", minimum: 1 },
-                diagnostics: { type: "array", items: { type: "object" } },
-                only: { type: "array", items: { type: "string" } },
-            },
-            required: ["kind"],
-        },
-    },
-} as const;
-
-
-/**
- * Hashline-only agent schema. Enabled only when hashline editing is active.
- * Unlike the normal schema, this intentionally exposes no oldText/newText,
- * raw patch, AST-target, lineRange, or refactor dialects.
- */
-export const HASHLINE_EDIT_PARAMETERS = {
-    type: "object",
-    additionalProperties: false,
-    properties: {
-        path: {
-            type: "string",
-            minLength: 1,
-            description: "Default target file path. May be omitted when every edit provides its own path.",
-        },
-        edits: {
-            type: "array",
-            minItems: 1,
-            maxItems: 100,
-            description: "One or more hashline-only edits. This field must be a native JSON array of edit objects, never a JSON-encoded string and never a singleton object. All anchors must come from lines actually shown by a current read of the target file and must be copied as complete LINE+ID tokens; never combine a line number with a hash suffix from another row. Use tight ranges and separate nonadjacent changes.",
-            items: {
-                type: "object",
-                additionalProperties: false,
-                properties: {
-                    path: {
-                        type: "string",
-                        minLength: 1,
-                        description: "Per-edit target file path. Overrides the top-level path.",
-                    },
-                    hashline: {
-                        type: "object",
-                        additionalProperties: false,
-                        description: "Hashline mutation. Replace/delete shape: { range: { pos: \"112zc\", end: \"114aa\" }, content: replacement }. Insert shape: { range: { pos: \"112zc:after\", end: \"112zc\" }, content: inserted }. From read row \"112zc|const x = 1\", copy the complete token \"112zc\" before | as one unit. SmartEdit verifies token provenance against the retained read snapshot. Do not place pos/end directly under hashline.",
-                        properties: {
-                            range: {
-                                type: "object",
-                                additionalProperties: false,
-                                description: "Source locator from the read snapshot. For replacement/deletion, pos/end are inclusive LINE+ID anchors. For insertion without replacing source text, append :after or :before to pos (for example \"42ab:after\") and set end to the unsuffixed base anchor \"42ab\". All anchors refer to the pre-edit file version.",
-                                properties: {
-                                    pos: {
-                                        type: "string",
-                                        minLength: 1,
-                                        description: "Complete start LINE+ID anchor token from read output, e.g. \"112zc\". If the read row is \"112zc|const x = 1\", send only \"112zc\": no | and no source text. To insert without replacing a line, use \"112zc:after\" or \"112zc:before\" here.",
-                                    },
-                                    end: {
-                                        type: "string",
-                                        minLength: 1,
-                                        description: "Complete end LINE+ID anchor token from read output, e.g. \"114aa\". Send only the token before |. For a one-line replacement repeat pos. For :after/:before insertion, use the unsuffixed base anchor here.",
-                                    },
-                                },
-                                required: ["pos", "end"],
-                            },
-                            content: {
-                                description: "Replacement content for the anchored range. Use a string or array of replacement lines. Use null explicitly to delete the range. Never put the source/old text here.",
-                                oneOf: [
-                                    { type: "array", items: { type: "string" } },
-                                    { type: "string" },
-                                    { type: "null" },
-                                ],
-                            },
-                            symbol: {
-                                type: "object",
-                                additionalProperties: false,
-                                description: "Optional symbol hint used only to scope safe fallback when anchors are stale.",
-                                properties: {
-                                    name: { type: "string", minLength: 1 },
-                                    kind: { type: "string" },
-                                    line: { type: "integer", minimum: 1 },
-                                },
-                                required: ["name"],
-                            },
-                        },
-                        required: ["range", "content"],
-                    },
-                },
-                required: ["hashline"],
-            },
-        },
-    },
-    required: ["edits"],
-} as const;
-
-export function getEditParameters(useHashlineEditing: boolean): typeof EDIT_PARAMETERS | typeof HASHLINE_EDIT_PARAMETERS {
-    return useHashlineEditing ? HASHLINE_EDIT_PARAMETERS : EDIT_PARAMETERS;
 }

@@ -282,8 +282,7 @@ function runTask(config: Config, task: Task, mode: Mode, run: number, stampDir: 
     cwd: workspace,
     env: {
       ...process.env,
-      SMART_EDIT_USE_HASHLINE_EDITING: mode === "hashline" ? "1" : "0",
-      SMART_EDIT_HASHLINE_EXPERIMENTAL: mode === "hashline" ? "1" : "0",
+      PI_EDIT_MODE: mode === "hashline" ? "hashline" : "text",
     },
     encoding: "utf8",
     ...(config.timeoutMs > 0 ? { timeout: config.timeoutMs } : {}),

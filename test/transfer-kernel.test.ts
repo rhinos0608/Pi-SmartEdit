@@ -25,6 +25,7 @@ import { createPriorAuthorityStore } from "../src/context/evidence-authority.js"
 import { computeLineHashSync, initHashline } from "../src/hashline/hashline.js";
 import { freshChecks } from "../src/patch/result-builders.js";
 import { runPatchTransaction } from "../src/mutation/transaction-runner.js";
+import { getEditModeSpec } from "../src/edit-modes/index.js";
 
 let hashlineInitialized = false;
 async function ensureHashline(): Promise<void> {
@@ -89,6 +90,7 @@ function depsWithPriorAuthority(workdir: string, sessionFilePath: string, files:
     const resources = files.map((f) => makeResource(realpathSync(join(workdir, f)), readFileSync(join(workdir, f), "utf8")));
     store.record(makeEnvelope({ sessionFilePath, canonicalRoot: workdir, resources }));
     return {
+        editMode: getEditModeSpec("text"),
         getRpcClient: () => ({
             request: async () => { throw new Error("prior authority must not use RPC"); },
             dispose: () => {},
@@ -194,6 +196,7 @@ test("transfer kernel: create-new race rejects before any write", async () => {
     const existing = join(workdir, "raced.ts");
     writeFileSync(existing, "present\n", "utf8");
     const deps: PatchToolDeps = {
+        editMode: getEditModeSpec("text"),
         getRpcClient: () => ({ request: async () => { throw new Error("must not be called"); }, dispose: () => {} }),
         getSessionFilePath: () => "/sessions/xfer-race.jsonl",
         getCanonicalWorkspaceRoot: () => workdir,
