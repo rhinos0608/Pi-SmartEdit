@@ -3,11 +3,10 @@ import type { PlannedRename as PlannedRefactor } from "./positional-planner.js";
 
 export type { PlannedRefactor };
 
-export type RefactorPreviewKind = "rename" | "organize-imports" | "formatting" | "code-action";
+export type RefactorPreviewKind = "rename" | "formatting" | "code-action";
 
 export type RefactorPreviewSource =
   | { kind: "rename"; filePath: string; line: number; character: number; newName: string }
-  | { kind: "organize-imports"; filePath: string }
   | { kind: "formatting"; filePath: string; tabSize?: number; insertSpaces?: boolean }
   | { kind: "code-action"; filePath: string; line: number; character: number; endLine?: number; endCharacter?: number }
   | { kind: "workspace-edit"; operation: string; document?: { canonicalPath: string; sha256: string } };

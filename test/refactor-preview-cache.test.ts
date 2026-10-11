@@ -1,11 +1,11 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { LspWorkspaceEdit } from "@rhinos0608/pi-workspace-protocol";
+import { hashSessionFilePath, sha256OfString, type LspWorkspaceEdit } from "@rhinos0608/pi-workspace-protocol";
 import { RefactorPreviewCache, globalRefactorPreviewCache, type RefactorPreviewSource } from "../src/lsp/refactor-preview-cache.js";
-import { checkWorkspaceEditEncoding, runBusPreview, planAndStorePreview } from "../src/patch/refactor-preview.js";
+import { checkWorkspaceEditEncoding, runBusPreview } from "../src/patch/refactor-preview.js";
 import type { PatchToolDeps } from "../src/patch/types.js";
 
 const SID = "s1";
@@ -17,7 +17,6 @@ function edit16(filePath: string): LspWorkspaceEdit {
 
 const SOURCES: RefactorPreviewSource[] = [
   { kind: "rename", filePath: "/a.ts", line: 1, character: 1, newName: "b" },
-  { kind: "organize-imports", filePath: "/a.ts" },
   { kind: "formatting", filePath: "/a.ts", tabSize: 2, insertSpaces: true },
   { kind: "code-action", filePath: "/a.ts", line: 1, character: 2, endLine: 1, endCharacter: 5 },
 ];
@@ -115,12 +114,6 @@ describe("refactor-preview-cache encoding gate", () => {
   it("utf-16 accepted", () => {
     assert.equal(checkWorkspaceEditEncoding({ positionEncoding: "utf-16", fileEdits: [] }), null);
   });
-  it("planAndStorePreview rejects missing encoding before staging", async () => {
-    const deps = {} as unknown as PatchToolDeps;
-    const res = await planAndStorePreview(deps, "t", { fileEdits: [] }, { kind: "organize-imports", filePath: "/a.ts" });
-    assert.equal(res.details.status.kind, "failed");
-    assert.match(res.content[0]!.text, /positionEncoding must be 'utf-16'/);
-  });
 });
 
 describe("refactor-preview-cache handler discriminants", () => {
@@ -140,84 +133,119 @@ describe("refactor-preview-cache handler discriminants", () => {
     } as unknown as PatchToolDeps;
   }
 
-  it("runBusPreview stores proper discriminant per kind", async () => {
+  it("runBusPreview consumes staged proposals per kind (D-81)", async () => {
     // Static import (module top): dynamic import() of the same .ts file can
     // resolve to a second module instance under tsx on Node 20, so the
     // global cache must be reached through the static binding the src
     // modules share — never a fresh dynamic import.
-    const table: RefactorPreviewSource[] = [
-      { kind: "rename", filePath: "__P__", line: 1, character: 1, newName: "b" },
-      { kind: "organize-imports", filePath: "__P__" },
-      { kind: "formatting", filePath: "__P__", tabSize: 2, insertSpaces: true },
-      { kind: "code-action", filePath: "__P__", line: 1, character: 2, endLine: 1, endCharacter: 5 },
+    const table: Array<{ kind: "rename" | "formatting" | "code-action" }> = [
+      { kind: "rename" },
+      { kind: "formatting" },
+      { kind: "code-action" },
     ];
-    for (const template of table) {
-      const p = tmpFile("const x = 1;\n");
-      const source = { ...template, filePath: p } as RefactorPreviewSource;
-      const dir = join(tmpdir());
+    for (const { kind } of table) {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), "refactor-cache-")));
+      writeFileSync(join(dir, "session.json"), "{}");
+      const p = join(dir, "a.ts");
+      writeFileSync(p, "const x = 1;\n");
       const deps = depsFor(dir);
-      const res2 = await runBusPreview({
-        deps,
-        toolCallId: "t",
-        label: `${source.kind}-preview`,
-        request: async () =>
-          ({
-            ok: true,
-            workspaceEdit: {
-              positionEncoding: "utf-16",
-              fileEdits: [{ filePath: p, edits: [{ filePath: p, range: { start: { line: 0, character: 6 }, end: { line: 0, character: 7 } }, newText: "y" }] }],
-            },
-          }),
-        source,
+      // Proposal staged by the workspace-edit RPC server (SmartRead stages
+      // through stage_workspace_edit); the bus reply carries only the id.
+      const proposalId = globalRefactorPreviewCache.store(edit16(p), { stagedFiles: [{ filePath: p, originalContent: "const x = 1;\n", newContent: "const y = 1;\n", edits: [] }], diffString: "-const x = 1;\n+const y = 1;\n" }, {
+        source: { kind: "workspace-edit", operation: kind, document: { canonicalPath: p, sha256: sha256OfString("const x = 1;\n") } },
+        sessionId: hashSessionFilePath(join(dir, "session.json")),
+        sessionRoot: dir,
       });
-      const previewId = (res2.details as { previewId?: string }).previewId;
-      assert.ok(previewId, `${source.kind} must return a previewId`);
-      const entry = globalRefactorPreviewCache.get(previewId!);
-      assert.ok(entry, `${source.kind} preview must be cached`);
-      assert.deepEqual(entry!.source, source);
-      globalRefactorPreviewCache.delete(previewId!);
+      try {
+        const res2 = await runBusPreview({
+          deps,
+          toolCallId: "t",
+          label: `${kind}-preview`,
+          kind,
+          request: async () => ({ ok: true, proposalId, files: [p], diff: "-const x = 1;\n+const y = 1;\n" }),
+        });
+        const previewId = (res2.details as { previewId?: string }).previewId;
+        assert.equal(previewId, proposalId, `${kind} must return the staged proposalId`);
+        const entry = globalRefactorPreviewCache.get(previewId!);
+        assert.ok(entry, `${kind} preview must resolve in the cache`);
+        assert.match(res2.content[0]!.text, /const y = 1/);
+      } finally {
+        globalRefactorPreviewCache.delete(proposalId);
+      }
     }
+  });
+
+  it("runBusPreview rejects workspaceEdit replies and unknown proposals", async () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "refactor-cache-")));
+    writeFileSync(join(dir, "session.json"), "{}");
+    const p = join(dir, "a.ts");
+    writeFileSync(p, "const x = 1;\n");
+    const deps = depsFor(dir);
+    const raw = await runBusPreview({
+      deps,
+      toolCallId: "t",
+      label: "rename-preview",
+      kind: "rename",
+      request: async () => ({
+        ok: true,
+        proposalId: "11111111-2222-4333-8444-555555555555",
+        files: [p],
+        diff: "forged",
+        workspaceEdit: { positionEncoding: "utf-16", fileEdits: [] },
+      }),
+    });
+    assert.equal(raw.details.status.kind, "failed");
+    assert.match(raw.content[0]!.text, /workspaceEdit|unknown field/i);
+    const unknown = await runBusPreview({
+      deps,
+      toolCallId: "t",
+      label: "rename-preview",
+      kind: "rename",
+      request: async () => ({ ok: true, proposalId: "22222222-3333-4444-8555-666666666666", files: [p], diff: "forged" }),
+    });
+    assert.equal(unknown.details.status.kind, "failed");
+    assert.match(unknown.content[0]!.text, /unknown or expired proposal/);
   });
 
   it("apply is kind-agnostic (same routing for every kind)", async () => {
     const m = await import("../src/patch/refactor-preview.js");
-    const kinds: RefactorPreviewSource[] = [
-      { kind: "rename", filePath: "__P__", line: 1, character: 1, newName: "b" },
-      { kind: "organize-imports", filePath: "__P__" },
-    ];
-    for (const template of kinds) {
-      const p = tmpFile("const x = 1;\n");
-      const dir = mkdtempSync(join(tmpdir(), "refactor-apply-"));
+    const kinds: Array<"rename" | "formatting" | "code-action"> = ["rename", "formatting", "code-action"];
+    for (const kind of kinds) {
+      const dir = realpathSync(mkdtempSync(join(tmpdir(), "refactor-apply-")));
+      writeFileSync(join(dir, "session.json"), "{}");
+      const p = join(dir, "a.ts");
+      writeFileSync(p, "const x = 1;\n");
       const bus = { emit() {}, on: () => () => {} };
       const deps = {
         getBus: () => bus,
         getSessionFilePath: () => join(dir, "session.json"),
         getCanonicalWorkspaceRoot: () => dir,
       } as unknown as PatchToolDeps;
-      const source = { ...template, filePath: p } as RefactorPreviewSource;
-      const preview = await runBusPreview({
-        deps,
-        toolCallId: "t",
-        label: `${source.kind}-preview`,
-        request: async () =>
-          ({
-            ok: true,
-            workspaceEdit: {
-              positionEncoding: "utf-16",
-              fileEdits: [{ filePath: p, edits: [{ filePath: p, range: { start: { line: 0, character: 6 }, end: { line: 0, character: 7 } }, newText: "y" }] }],
-            },
-          }),
-        source,
+      const proposalId = globalRefactorPreviewCache.store(edit16(p), { stagedFiles: [{ filePath: p, originalContent: "const x = 1;\n", newContent: "const y = 1;\n", edits: [] }], diffString: "-const x = 1;\n+const y = 1;\n" }, {
+        source: { kind: "workspace-edit", operation: kind, document: { canonicalPath: p, sha256: sha256OfString("const x = 1;\n") } },
+        sessionId: hashSessionFilePath(join(dir, "session.json")),
+        sessionRoot: dir,
       });
-      const previewId = (preview.details as { previewId?: string }).previewId;
-      assert.ok(previewId);
-      // No read authority in this harness, so the transaction rejects at the
-      // coverage gate — identically for every kind. That proves the apply path
-      // resolved the cached preview (not "unknown or expired") and routed
-      // kind-agnostically past the cache into EditTransaction.
-      const applied = await m.handleApplyRefactorPreview(deps, "t2", { kind: "apply-refactor-preview", previewId: previewId! });
-      assert.match(applied.content[0]!.text, /read authority/, `${source.kind} must reach the transaction stage`);
-      assert.ok(!/unknown or expired preview/.test(applied.content[0]!.text), `${source.kind} preview must resolve`);
+      try {
+        const preview = await runBusPreview({
+          deps,
+          toolCallId: "t",
+          label: `${kind}-preview`,
+          kind,
+          request: async () => ({ ok: true, proposalId, files: [p], diff: "-const x = 1;\n+const y = 1;\n" }),
+        });
+        const previewId = (preview.details as { previewId?: string }).previewId;
+        assert.equal(previewId, proposalId);
+        // No read authority in this harness, so the transaction rejects at the
+        // coverage gate — identically for every kind. That proves the apply path
+        // resolved the cached preview (not "unknown or expired") and routed
+        // kind-agnostically past the cache into EditTransaction.
+        const applied = await m.handleApplyRefactorPreview(deps, "t2", { kind: "apply-refactor-preview", previewId: previewId! });
+        assert.match(applied.content[0]!.text, /read authority/, `${kind} must reach the transaction stage`);
+        assert.ok(!/unknown or expired preview/.test(applied.content[0]!.text), `${kind} preview must resolve`);
+      } finally {
+        globalRefactorPreviewCache.delete(proposalId);
+      }
     }
   });
 });

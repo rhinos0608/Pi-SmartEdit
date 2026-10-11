@@ -119,13 +119,6 @@ export type RawTopology = KernelMutationTopology;
 
 export type PatchResult = { content: Array<{ type: "text"; text: string }>; details: PatchToolDetails };
 
-export interface BusPreviewResponse {
-    readonly ok: boolean;
-    readonly workspaceEdit?: unknown;
-    readonly serverDescriptorId?: unknown;
-    readonly error?: string;
-}
-
 export type StagedPreviewFile = { filePath: string; originalContent: string; newContent: string; edits: Array<{ range: { start: { line: number }; end: { line: number } } }> };
 
 // ── Stage 2 execution-state types (internal-only; not re-exported by the ──

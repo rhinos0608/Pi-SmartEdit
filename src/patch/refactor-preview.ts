@@ -1,11 +1,12 @@
 /**
- * Workspace-edit preview staging + apply (shared kernel).
+ * Workspace-edit preview consume + apply (shared kernel).
  *
- *  Stages raw LspWorkspaceEdit payloads (checkWorkspaceEditEncoding +
- *  planPositionalEdits + the global refactor preview cache) and applies
- *  them through EditTransaction with stale-file and prior-authority
- *  guards, crash-journal protection, and undo capture. The only
- *  stager/applier is the workspace-edit RPC server
+ *  D-81: SmartRead stages language-intelligence results through SmartEdit's
+ *  own stage_workspace_edit handler and returns SmartEdit-STAGED proposals
+ *  ({ok:true, proposalId, files, diff} | {ok:false, error}). This kernel
+ *  consumes those proposals by proposalId — raw workspaceEdit payloads never
+ *  ride the preview path and are rejected fail-closed by the protocol
+ *  validators. The only stager/applier is the workspace-edit RPC server
  *  (src/extension/register-workspace-edit-rpc.ts); the agent-facing edit
  *  tool exposes no refactor path.
  *  isBlockingPostwriteFailure is also used by the orchestrator postwrite
@@ -16,10 +17,12 @@ import { realpathSync } from "node:fs";
 import {
     hashSessionFilePath,
     sha256OfString,
+    validateCodeActionResponse,
+    validateFormattingResponse,
+    validateRenamePreviewResponse,
 } from "@rhinos0608/pi-workspace-protocol";
-import { planPositionalEdits } from "../lsp/positional-planner.js";
 import type { EditTransaction } from "../mutation/edit-transaction.js";
-import { globalRefactorPreviewCache, type RefactorPreviewSource } from "../lsp/refactor-preview-cache.js";
+import { globalRefactorPreviewCache } from "../lsp/refactor-preview-cache.js";
 import {
     buildJournalRecord,
     deleteJournal,
@@ -33,15 +36,13 @@ import { verifySourceOriginDocument } from "./source-origin.js";
 import type {
     PatchToolDeps,
     PatchResult,
-    BusPreviewResponse,
     StagedPreviewFile,
     PatchToolDetails,
 } from "./types.js";
-/** Stage 4 owns the edit-tool refactor contract; the workspace-edit RPC
- *  server (src/extension/register-workspace-edit-rpc.ts) stages raw
- *  LspWorkspaceEdit payloads directly via checkWorkspaceEditEncoding +
- *  planPositionalEdits + storeRefactorPreview, and applies them via
- *  handleApplyRefactorPreview. */
+/** The only stager is the workspace-edit RPC server
+ *  (src/extension/register-workspace-edit-rpc.ts), which stages raw
+ *  LspWorkspaceEdit payloads via checkWorkspaceEditEncoding +
+ *  planPositionalEdits and applies them via handleApplyRefactorPreview. */
 export interface ApplyRefactorPreviewRefactor {
     kind: "apply-refactor-preview";
     previewId: string;
@@ -92,25 +93,79 @@ export function isBlockingPostwriteFailure(kind: string, outcome: string): boole
     return kind === "blocking" && (outcome === "fail" || outcome === "timeout");
 }
 
-export async function storeRefactorPreview(args: {
+/** Language-intelligence preview kinds. organize_imports no longer exists
+ *  (D-81): callers use code-action discovery filtered to kind
+ *  "source.organizeImports" plus an explicit selection — never auto-pick. */
+export type BusPreviewKind = "rename" | "formatting" | "code-action";
+
+export async function runBusPreview(args: {
     deps: PatchToolDeps;
     toolCallId: string;
-    workspaceEdit: unknown;
-    planned: { stagedFiles: Array<{ filePath: string; newContent: string }>; diffString: string };
-    source: RefactorPreviewSource;
-}): Promise<PatchResult | null> {
-    const { deps, toolCallId, workspaceEdit, planned, source } = args;
-    const sessionFilePath = deps.getSessionFilePath();
-    if (!sessionFilePath) {
-        return failResult(toolCallId, "failed: refactor preview requires an active session (no session file path available)", "no session file path", ["no session file path"]);
+    label: string;
+    kind: BusPreviewKind;
+    request: (bus: NonNullable<ReturnType<NonNullable<PatchToolDeps["getBus"]>>>) => Promise<unknown>;
+}): Promise<PatchResult> {
+    const { deps, toolCallId, label, kind, request } = args;
+    const bus = deps.getBus?.() ?? null;
+    if (!bus) return failResult(toolCallId, `failed: ${label} requires bus`, "bus unavailable", ["bus unavailable"]);
+    try {
+        const raw = await request(bus);
+        const checked = validateBusProposal(kind, raw);
+        if (!checked.ok) {
+            return failResult(toolCallId, `failed: ${label}: ${checked.error}`, checked.error, [checked.error]);
+        }
+        const sessionFilePath = deps.getSessionFilePath();
+        if (!sessionFilePath) {
+            return failResult(toolCallId, "failed: refactor preview requires an active session (no session file path available)", "no session file path", ["no session file path"]);
+        }
+        // Fail closed: the proposal must already be staged in our own cache
+        // (SmartRead stages through stage_workspace_edit). A bare diff plus a
+        // proposalId never fabricates a preview — apply runs only via
+        // apply_staged_edit/proposalId against this entry.
+        const cached = globalRefactorPreviewCache.get(checked.proposalId, {
+            sessionId: hashSessionFilePath(sessionFilePath),
+            sessionRoot: deps.getCanonicalWorkspaceRoot(),
+        });
+        if (!cached) {
+            const msg = "unknown or expired proposal";
+            return failResult(toolCallId, `failed: ${label}: ${msg}`, msg, [msg]);
+        }
+        const diffString = cached.planned.diffString;
+        const stagedFiles = cached.planned.stagedFiles;
+        return {
+            content: [{ type: "text" as const, text: `preview ${checked.proposalId}: ${stagedFiles.length} file(s)\n${diffString.slice(0, 4000)}` }],
+            details: { tool: "edit", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: diffString, diffs: stagedFiles.map((sf) => ({ path: sf.filePath, diff: sf.newContent })), previewId: checked.proposalId, stagedFiles: stagedFiles.length } as unknown as PatchToolDetails,
+        };
+    } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return failResult(toolCallId, `failed: ${label} ${msg}`, msg, [msg]);
     }
-    const root = deps.getCanonicalWorkspaceRoot();
-    const sid = hashSessionFilePath(sessionFilePath);
-    const previewId = globalRefactorPreviewCache.store(workspaceEdit as never, planned as never, { source, serverDescriptorId: (source as { serverDescriptorId?: unknown }).serverDescriptorId as string | undefined, sessionId: sid, sessionRoot: root });
-    return {
-        content: [{ type: "text" as const, text: `preview ${previewId}: ${planned.stagedFiles.length} file(s)\n${planned.diffString.slice(0, 4000)}` }],
-        details: { tool: "edit", status: { kind: "applied" }, toolCallId, evidenceRef: { inspectionId: "", resourceIds: [] }, usedEvidence: [], changedResources: [], checks: freezeChecks(freshChecks()), diagnostics: [], diff: planned.diffString, diffs: planned.stagedFiles.map((sf) => ({ path: sf.filePath, diff: sf.newContent })), previewId, stagedFiles: planned.stagedFiles.length } as unknown as PatchToolDetails,
-    };
+}
+
+/** Validate a bus reply as a staged proposal (D-81). Raw workspaceEdit
+ *  payloads are rejected fail-closed by the protocol validators' exact key
+ *  sets; code-action discovery candidates without an explicit selection are
+ *  rejected here — never auto-pick. */
+function validateBusProposal(kind: BusPreviewKind, raw: unknown): { ok: true; proposalId: string } | { ok: false; error: string } {
+    if (kind === "rename") {
+        const v = validateRenamePreviewResponse(raw);
+        if (!v.ok) return { ok: false, error: v.error };
+        if (!v.value.ok) return { ok: false, error: v.value.error };
+        return { ok: true, proposalId: v.value.proposalId };
+    }
+    if (kind === "formatting") {
+        const v = validateFormattingResponse(raw);
+        if (!v.ok) return { ok: false, error: v.error };
+        if (!v.value.ok) return { ok: false, error: v.value.error };
+        return { ok: true, proposalId: v.value.proposalId };
+    }
+    const v = validateCodeActionResponse(raw);
+    if (!v.ok) return { ok: false, error: v.error };
+    if (!v.value.ok) return { ok: false, error: v.value.error };
+    if (!("proposalId" in v.value)) {
+        return { ok: false, error: "code_action discovery returned candidates without an explicit selection — refusing to auto-pick (pass selection {actionId, sourceSha256} to resolve)" };
+    }
+    return { ok: true, proposalId: v.value.proposalId };
 }
 
 /** Admission caps for LSP-planned refactor output, enforced before caching/apply. Mirrors edit caps. */
@@ -127,44 +182,6 @@ export function checkPlannedPreviewCaps(planned: { stagedFiles: Array<{ filePath
             return `refactor preview text is over ${MAX_PREVIEW_TEXT_BYTES} bytes total: narrow the refactor scope and retry`;
     }
     return null;
-}
-
-export async function planAndStorePreview(
-    deps: PatchToolDeps,
-    toolCallId: string,
-    workspaceEdit: unknown,
-    source: RefactorPreviewSource & { serverDescriptorId?: unknown },
-): Promise<PatchResult> {
-    const encErr = checkWorkspaceEditEncoding(workspaceEdit);
-    if (encErr) return failResult(toolCallId, `rejected: ${encErr}`, encErr, [encErr]);
-    const planned = await planPositionalEdits(workspaceEdit as never, async (p) => (await fsReadFile(p)).toString("utf8"));
-    const capsErr = checkPlannedPreviewCaps(planned);
-    if (capsErr) return failResult(toolCallId, `rejected: ${capsErr}`, capsErr, [capsErr]);
-    const stored = await storeRefactorPreview({ deps, toolCallId, workspaceEdit, planned, source });
-    if (stored) return stored;
-    return failResult(toolCallId, "failed: refactor preview requires an active session (no session file path available)", "no session file path", ["no session file path"]);
-}
-
-export async function runBusPreview(args: {
-    deps: PatchToolDeps;
-    toolCallId: string;
-    label: string;
-    request: (bus: NonNullable<ReturnType<NonNullable<PatchToolDeps["getBus"]>>>) => Promise<BusPreviewResponse>;
-    source: RefactorPreviewSource;
-}): Promise<PatchResult> {
-    const { deps, toolCallId, label, request, source } = args;
-    const bus = deps.getBus?.() ?? null;
-    if (!bus) return failResult(toolCallId, `failed: ${label} requires bus`, "bus unavailable", ["bus unavailable"]);
-    try {
-        const resp = await request(bus);
-        if (!resp.ok || !resp.workspaceEdit) {
-            return failResult(toolCallId, `failed: ${label}: ${resp.error ?? "no edit"}`, resp.error ?? "no workspaceEdit", [resp.error ?? "no workspaceEdit"]);
-        }
-        return await planAndStorePreview(deps, toolCallId, resp.workspaceEdit, { ...source, ...(resp.serverDescriptorId !== undefined ? { serverDescriptorId: resp.serverDescriptorId } : {}) });
-    } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        return failResult(toolCallId, `failed: ${label} ${msg}`, msg, [msg]);
-    }
 }
 
 export async function findStalePreviewFiles(files: StagedPreviewFile[]): Promise<string[]> {
