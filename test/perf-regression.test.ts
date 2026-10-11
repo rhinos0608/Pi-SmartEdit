@@ -6,6 +6,11 @@
  * (2000 lines) TypeScript files.
  *
  * Budgets are targets — CI variance may require adjustment.
+ *
+ * Each timing is the minimum of MEASURE_RUNS runs after one warm-up run.
+ * A single cold sample on a shared CI runner flaked just over budget with
+ * identical code (macOS: 61.6x and 42.5x ratio, 51.8ms delta), while a
+ * genuine regression still raises the minimum. Budgets are unchanged.
  */
 
 import { describe, it, before } from "node:test";
@@ -25,6 +30,20 @@ const COMBINED_BUDGET_MS = 80;
 const SMALL_FILE = 100;
 const MEDIUM_FILE = 500;
 const LARGE_FILE = 2000;
+
+const MEASURE_RUNS = 5;
+
+/** Minimum elapsed time of `fn` over MEASURE_RUNS runs, after one untimed warm-up. */
+async function minElapsedMs(fn: () => unknown): Promise<number> {
+  await fn();
+  let best = Number.POSITIVE_INFINITY;
+  for (let i = 0; i < MEASURE_RUNS; i++) {
+    const start = performance.now();
+    await fn();
+    best = Math.min(best, performance.now() - start);
+  }
+  return best;
+}
 
 // ─── Seeded PRNG for deterministic test data ───────────────────────
 function mulberry32(seed: number): () => number {
@@ -99,9 +118,8 @@ describe("Performance Regression Tests", () => {
       const rng = mulberry32(42);
       const edited = generateEditedCode(content, 0.1, rng);
 
-      const start = performance.now();
       const delta = await computeAnchorDelta(snapshot, edited);
-      const elapsed = performance.now() - start;
+      const elapsed = await minElapsedMs(() => computeAnchorDelta(snapshot, edited));
 
       assert.ok(delta !== undefined);
       assert.ok(
@@ -117,9 +135,8 @@ describe("Performance Regression Tests", () => {
       const rng = mulberry32(42);
       const edited = generateEditedCode(content, 0.1, rng);
 
-      const start = performance.now();
       const delta = await computeAnchorDelta(snapshot, edited);
-      const elapsed = performance.now() - start;
+      const elapsed = await minElapsedMs(() => computeAnchorDelta(snapshot, edited));
 
       assert.ok(
         elapsed < ANCHOR_DELTA_BUDGET_MS,
@@ -135,9 +152,8 @@ describe("Performance Regression Tests", () => {
       const rng = mulberry32(42);
       const edited = generateEditedCode(content, 0.1, rng);
 
-      const start = performance.now();
       const delta = await computeAnchorDelta(snapshot, edited);
-      const elapsed = performance.now() - start;
+      const elapsed = await minElapsedMs(() => computeAnchorDelta(snapshot, edited));
 
       assert.ok(
         elapsed < ANCHOR_DELTA_BUDGET_MS,
@@ -149,14 +165,13 @@ describe("Performance Regression Tests", () => {
   });
 
   describe("Patch Correctness Performance", () => {
-    it(`checks small file (${SMALL_FILE} lines) within budget`, () => {
+    it(`checks small file (${SMALL_FILE} lines) within budget`, async () => {
       const rng = mulberry32(42);
       const oldContent = generateCode(SMALL_FILE);
       const newContent = generateEditedCode(oldContent, 0.1, rng);
 
-      const start = performance.now();
       const result = checkPatchCorrectness(oldContent, newContent, "typescript");
-      const elapsed = performance.now() - start;
+      const elapsed = await minElapsedMs(() => checkPatchCorrectness(oldContent, newContent, "typescript"));
 
       assert.ok(result !== undefined);
       assert.ok(
@@ -166,14 +181,13 @@ describe("Performance Regression Tests", () => {
       );
     });
 
-    it(`checks medium file (${MEDIUM_FILE} lines) within budget`, () => {
+    it(`checks medium file (${MEDIUM_FILE} lines) within budget`, async () => {
       const rng = mulberry32(42);
       const oldContent = generateCode(MEDIUM_FILE);
       const newContent = generateEditedCode(oldContent, 0.1, rng);
 
-      const start = performance.now();
       const result = checkPatchCorrectness(oldContent, newContent, "typescript");
-      const elapsed = performance.now() - start;
+      const elapsed = await minElapsedMs(() => checkPatchCorrectness(oldContent, newContent, "typescript"));
 
       assert.ok(
         elapsed < PATCH_CORRECTNESS_BUDGET_MS,
@@ -183,14 +197,13 @@ describe("Performance Regression Tests", () => {
       assert.ok(result !== undefined);
     });
 
-    it(`checks large file (${LARGE_FILE} lines) within budget`, () => {
+    it(`checks large file (${LARGE_FILE} lines) within budget`, async () => {
       const rng = mulberry32(42);
       const oldContent = generateCode(LARGE_FILE);
       const newContent = generateEditedCode(oldContent, 0.1, rng);
 
-      const start = performance.now();
       const result = checkPatchCorrectness(oldContent, newContent, "typescript");
-      const elapsed = performance.now() - start;
+      const elapsed = await minElapsedMs(() => checkPatchCorrectness(oldContent, newContent, "typescript"));
 
       assert.ok(
         elapsed < PATCH_CORRECTNESS_BUDGET_MS,
@@ -208,12 +221,12 @@ describe("Performance Regression Tests", () => {
       const newContent = generateEditedCode(oldContent, 0.1, rng);
       const snapshot = await makeSnapshot(oldContent);
 
-      const start = performance.now();
-
       const delta = await computeAnchorDelta(snapshot, newContent);
       const correctness = checkPatchCorrectness(oldContent, newContent, "typescript");
-
-      const elapsed = performance.now() - start;
+      const elapsed = await minElapsedMs(async () => {
+        await computeAnchorDelta(snapshot, newContent);
+        checkPatchCorrectness(oldContent, newContent, "typescript");
+      });
 
       assert.ok(
         elapsed < COMBINED_BUDGET_MS,
@@ -234,14 +247,14 @@ describe("Performance Regression Tests", () => {
         const newContent = generateEditedCode(oldContent, 0.1, rng);
         const snapshot = await makeSnapshot(oldContent);
 
-        const start = performance.now();
-        await computeAnchorDelta(snapshot, newContent);
-        checkPatchCorrectness(oldContent, newContent, "typescript");
-        timings.push(performance.now() - start);
+        timings.push(await minElapsedMs(async () => {
+          await computeAnchorDelta(snapshot, newContent);
+          checkPatchCorrectness(oldContent, newContent, "typescript");
+        }));
       }
 
-      // Tiny baseline timings make this ratio sensitive to timer noise; retain
-      // a broad guard for material super-linear regressions.
+      // Tiny baseline timings make this ratio sensitive to timer noise even as
+      // minima; retain a broad guard for material super-linear regressions.
       const ratio = timings[2] / timings[0];
       assert.ok(
         ratio < 40,
@@ -255,10 +268,11 @@ describe("Performance Regression Tests", () => {
       const newContent = generateCode(MEDIUM_FILE); // Completely different content
       const snapshot = await makeSnapshot(oldContent);
 
-      const start = performance.now();
       const delta = await computeAnchorDelta(snapshot, newContent);
-      checkPatchCorrectness(oldContent, newContent, "typescript");
-      const elapsed = performance.now() - start;
+      const elapsed = await minElapsedMs(async () => {
+        await computeAnchorDelta(snapshot, newContent);
+        checkPatchCorrectness(oldContent, newContent, "typescript");
+      });
 
       // Worst case should still be reasonable
       assert.ok(
