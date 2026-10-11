@@ -29,6 +29,7 @@ import {
 } from "../mutation/recovery-journal.js";
 import { saveTransactionUndoRecords } from "../undo/edit-history.js";
 import { checkResourceCoverage } from "../context/patch-authorization.js";
+import { verifySourceOriginDocument } from "./source-origin.js";
 import type {
     PatchToolDeps,
     PatchResult,
@@ -211,9 +212,10 @@ type PreviewApplyContext = {
     toolCallId: string;
     tx: EditTransaction;
     files: StagedPreviewFile[];
+    originDocument?: { canonicalPath: string; sha256: string };
 };
 
-async function resolveApplyPreviewTarget(args: { deps: PatchToolDeps; toolCallId: string; previewId: string }): Promise<{ files: StagedPreviewFile[]; diffString: string } | PatchResult> {
+async function resolveApplyPreviewTarget(args: { deps: PatchToolDeps; toolCallId: string; previewId: string }): Promise<{ files: StagedPreviewFile[]; diffString: string; originDocument?: { canonicalPath: string; sha256: string } } | PatchResult> {
     const { deps, toolCallId, previewId } = args;
     const sessionFilePath = deps.getSessionFilePath();
     if (!sessionFilePath) {
@@ -225,11 +227,19 @@ async function resolveApplyPreviewTarget(args: { deps: PatchToolDeps; toolCallId
     if (!cached) {
         return { content: [{ type: "text" as const, text: "rejected: preview not found or expired" }], details: makeRejected(toolCallId, "coverage", ["preview not found or expired"], { inspectionId: "", resourceIds: [] }, freshChecks()) };
     }
-    return { files: cached.planned.stagedFiles, diffString: cached.planned.diffString };
+    return { files: cached.planned.stagedFiles, diffString: cached.planned.diffString, originDocument: cached.originDocument };
 }
 
 async function verifyPreviewPreconditions(args: PreviewApplyContext): Promise<PatchResult | null> {
-    const { deps, toolCallId, tx, files } = args;
+    const { deps, toolCallId, tx, files, originDocument } = args;
+    if (originDocument) {
+        const originCheck = await verifySourceOriginDocument(originDocument);
+        if (!originCheck.ok) {
+            await tx.rollback();
+            await deleteJournal(tx.transactionId).catch(() => {});
+            return { content: [{ type: "text", text: originCheck.reason }], details: makeRejected(toolCallId, "stale", [originCheck.reason], { inspectionId: "", resourceIds: [] }, freshChecks()) };
+        }
+    }
     const staleFiles = await findStalePreviewFiles(files);
     if (staleFiles.length > 0) {
         await tx.rollback();
@@ -261,9 +271,35 @@ async function writePreviewPreparedJournal(args: { tx: EditTransaction; files: S
     }
 }
 
-async function commitPreviewFiles(args: { tx: EditTransaction; files: StagedPreviewFile[]; undoCwd: string }): Promise<void> {
-    const { tx, files, undoCwd } = args;
+async function commitPreviewFiles(args: {
+    tx: EditTransaction;
+    files: StagedPreviewFile[];
+    undoCwd: string;
+    originDocument?: { canonicalPath: string; sha256: string };
+    toolCallId: string;
+}): Promise<PatchResult | null> {
+    const { tx, files, undoCwd, originDocument, toolCallId } = args;
     await writePreviewPreparedJournal({ tx, files });
+
+    // Final generation recheck immediately before entering first mutation while existing transaction held
+    if (originDocument) {
+        const finalOriginCheck = await verifySourceOriginDocument(originDocument);
+        if (!finalOriginCheck.ok) {
+            await tx.rollback();
+            await deleteJournal(tx.transactionId).catch(() => {});
+            return {
+                content: [{ type: "text", text: finalOriginCheck.reason }],
+                details: makeRejected(
+                    toolCallId,
+                    "stale",
+                    [finalOriginCheck.reason],
+                    { inspectionId: "", resourceIds: [] },
+                    freshChecks()
+                ),
+            };
+        }
+    }
+
     for (const sf of files) await tx.write(sf.filePath, sf.newContent);
     // Capture undo records (post-write disk content) BEFORE commit
     // releases the lock; persist AFTER commit, best-effort.
@@ -272,12 +308,13 @@ async function commitPreviewFiles(args: { tx: EditTransaction; files: StagedPrev
     await tx.commit();
     await deleteJournal(tx.transactionId).catch(() => {});
     try { await saveTransactionUndoRecords(undoCwd, undoRecords); } catch { /* undo persistence is advisory */ }
+    return null;
 }
 
 export async function handleApplyRefactorPreview(deps: PatchToolDeps, toolCallId: string, refactor: ApplyRefactorPreviewRefactor, cwd?: string): Promise<PatchResult> {
     const target = await resolveApplyPreviewTarget({ deps, toolCallId, previewId: refactor.previewId });
     if ("content" in target) return target;
-    const { files, diffString } = target;
+    const { files, diffString, originDocument } = target;
     const undoCwd = cwd ?? deps.getCanonicalWorkspaceRoot();
     try {
         const { EditTransaction: ET } = await import("../mutation/edit-transaction.js");
@@ -286,9 +323,10 @@ export async function handleApplyRefactorPreview(deps: PatchToolDeps, toolCallId
         try { await recoverStaleJournals(); } catch { /* advisory; never block apply */ }
         const tx = await ET.begin(files.map((f) => f.filePath));
         try {
-            const blocked = await verifyPreviewPreconditions({ deps, toolCallId, tx, files });
+            const blocked = await verifyPreviewPreconditions({ deps, toolCallId, tx, files, originDocument });
             if (blocked) return blocked;
-            await commitPreviewFiles({ tx, files, undoCwd });
+            const commitBlocked = await commitPreviewFiles({ tx, files, undoCwd, originDocument, toolCallId });
+            if (commitBlocked) return commitBlocked;
         } catch (e) {
             try { await tx.rollback(); } catch {}
             throw e;

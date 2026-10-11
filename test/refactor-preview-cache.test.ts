@@ -87,6 +87,22 @@ describe("refactor-preview-cache", () => {
     assert.equal(c.size({ sessionId: SID }), 1);
     assert.equal(c.size({ sessionId: "s2" }), 0);
   });
+
+  it("cached originDocument is immutable snapshot not vulnerable to external reference mutation", () => {
+    const c = new RefactorPreviewCache();
+    const doc = { canonicalPath: "/a.ts", sha256: "0".repeat(64) };
+    const id = c.store(edit16("/a.ts"), { stagedFiles: [], diffString: "" }, {
+      source: { kind: "workspace-edit", operation: "rename", document: doc },
+      sessionId: SID,
+      sessionRoot: ROOT,
+      originDocument: doc,
+    });
+    // Caller mutates the passed object
+    (doc as Record<string, unknown>).sha256 = "f".repeat(64);
+    const got = c.get(id, { sessionId: SID, sessionRoot: ROOT });
+    assert.ok(got);
+    assert.equal(got.originDocument?.sha256, "0".repeat(64), "cache must retain initial sha256 snapshot, not mutated reference");
+  });
 });
 
 describe("refactor-preview-cache encoding gate", () => {

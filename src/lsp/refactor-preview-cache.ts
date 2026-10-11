@@ -10,7 +10,7 @@ export type RefactorPreviewSource =
   | { kind: "organize-imports"; filePath: string }
   | { kind: "formatting"; filePath: string; tabSize?: number; insertSpaces?: boolean }
   | { kind: "code-action"; filePath: string; line: number; character: number; endLine?: number; endCharacter?: number }
-  | { kind: "workspace-edit"; operation: string };
+  | { kind: "workspace-edit"; operation: string; document?: { canonicalPath: string; sha256: string } };
 
 export interface CachedRefactorPreview {
   previewId: string;
@@ -22,6 +22,7 @@ export interface CachedRefactorPreview {
   serverDescriptorId?: string;
   sessionId: string;
   sessionRoot: string;
+  originDocument?: { canonicalPath: string; sha256: string };
 }
 
 export class RefactorPreviewCache {
@@ -37,20 +38,43 @@ export class RefactorPreviewCache {
   store(
     workspaceEdit: LspWorkspaceEdit,
     planned: PlannedRefactor,
-    meta: { source: RefactorPreviewSource; serverDescriptorId?: string; sessionId: string; sessionRoot: string },
+    meta: {
+      source: RefactorPreviewSource;
+      serverDescriptorId?: string;
+      sessionId: string;
+      sessionRoot: string;
+      originDocument?: { canonicalPath: string; sha256: string };
+    },
   ): string {
     const previewId = crypto.randomUUID();
     const createdAt = Date.now();
+    const rawOriginDoc = meta.originDocument ?? (meta.source.kind === "workspace-edit" && "document" in meta.source ? meta.source.document : undefined);
+    const immutableOriginDoc = rawOriginDoc !== undefined
+      ? Object.freeze({
+          canonicalPath: rawOriginDoc.canonicalPath,
+          sha256: rawOriginDoc.sha256,
+        })
+      : undefined;
+    const immutableSource: RefactorPreviewSource = Object.freeze(
+      meta.source.kind === "workspace-edit"
+        ? {
+            kind: "workspace-edit" as const,
+            operation: meta.source.operation,
+            ...(immutableOriginDoc !== undefined ? { document: immutableOriginDoc } : {}),
+          }
+        : { ...meta.source },
+    );
     const entry: CachedRefactorPreview = {
       previewId,
       createdAt,
       expiresAt: createdAt + this.ttlMs,
-      source: meta.source,
+      source: immutableSource,
       workspaceEdit,
       planned,
       ...(meta.serverDescriptorId ? { serverDescriptorId: meta.serverDescriptorId } : {}),
       sessionId: meta.sessionId,
       sessionRoot: meta.sessionRoot,
+      ...(immutableOriginDoc !== undefined ? { originDocument: immutableOriginDoc } : {}),
     };
     // Evict oldest if at capacity
     if (this.map.size >= this.maxEntries) {
@@ -77,7 +101,17 @@ export class RefactorPreviewCache {
     }
     if (opts?.sessionId !== undefined && entry.sessionId !== opts.sessionId) return null;
     if (opts?.sessionRoot !== undefined && entry.sessionRoot !== opts.sessionRoot) return null;
-    return entry;
+    return {
+      ...entry,
+      ...(entry.originDocument
+        ? {
+            originDocument: {
+              canonicalPath: entry.originDocument.canonicalPath,
+              sha256: entry.originDocument.sha256,
+            },
+          }
+        : {}),
+    };
   }
 
   delete(previewId: string): void {
