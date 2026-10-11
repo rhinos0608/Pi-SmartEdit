@@ -28,8 +28,8 @@ Smart Edit replaces Pi's built-in `edit` tool with safer matching, richer diagno
 - **Closest-match diagnostics**: shows the best near-match when an edit fails
 - **Post-edit diagnostics**: LSP + compiler fallback, scoped to changed targets
 - **Verification pipeline**: concurrency detection, traceability analysis, git history context, repair loop
-- **Refactor preview**: LSP-powered rename, organize imports, formatting, and code actions with unified diff preview and evidence-gated atomic apply
-- **SmartRead bridge**: RPC consumer for rename/format/code-action/organize-imports via Pi-SmartRead; lazy 250 ms capability probe, sticky remote-vs-standalone mode per session, per-call `timeoutMs` (15 s transport / 10 s provider service budget for refactor RPCs; 4 s service + 5 s transport for post-edit diagnostics, protocol v0.6.0 envelope); also records breakage and co-change events
+- **Refactor preview**: SmartEdit-staged rename, formatting, and code-action proposals (D-81) with unified diff preview and evidence-gated atomic apply
+- **SmartRead bridge**: RPC consumer for rename/format/code-action via Pi-SmartRead; lazy 250 ms capability probe, sticky remote-vs-standalone mode per session, per-call `timeoutMs` (15 s transport / 10 s provider service budget for refactor RPCs; 4 s service + 5 s transport for post-edit diagnostics, protocol v0.6.0 envelope); also records breakage and co-change events
 
 ## Refactor Preview
 
@@ -51,16 +51,9 @@ LSP-powered refactoring with preview-then-apply. The `refactor` field on the edi
 
 Positions are 1-based. Returns `previewId`, staged file count, and unified diff. Rename routes through SmartRead's language intelligence RPC to the LSP `textDocument/rename` flow.
 
-### Organize imports preview
+### Organize imports (D-81)
 
-```json
-{
-  "refactor": {
-    "kind": "organize-imports-preview",
-    "path": "src/auth.ts"
-  }
-}
-```
+There is no dedicated organize-imports RPC or preview kind. To organize imports, use code-action discovery filtered to `only: ["source.organizeImports"]`, then resolve the chosen candidate with an explicit `selection: { actionId, sourceSha256 }` — SmartEdit never auto-picks an action.
 
 ### Formatting preview
 
@@ -89,7 +82,7 @@ Positions are 1-based. Returns `previewId`, staged file count, and unified diff.
 }
 ```
 
-Automatically selects the preferred action or the first action with an edit. Optional `endLine`/`endCharacter` and `diagnostics` narrow the range/context.
+Discovery returns edit-free candidates; resolution requires an explicit `selection: { actionId, sourceSha256 }` — SmartEdit never auto-picks. Optional `endLine`/`endCharacter` and `diagnostics` narrow the range/context.
 
 ### Apply preview
 
@@ -102,7 +95,7 @@ Automatically selects the preferred action or the first action with an edit. Opt
 }
 ```
 
-Previews expire after 5 minutes, max 16 cached (oldest evicted first). `previewId` is SmartEdit-owned (UUID); there is no cross-repo lease. The cache is generalized across all four refactor kinds via kind discriminants — no rename-only naming, no sentinel values. Apply verifies:
+Previews expire after 5 minutes, max 16 cached (oldest evicted first). `previewId` is SmartEdit-owned (UUID); there is no cross-repo lease. The cache is generalized across the refactor kinds (rename, formatting, code-action; organize-imports removed under D-81) via kind discriminants — no rename-only naming, no sentinel values. Apply verifies:
 
 - **Session identity binding** — preview bound to originating session; cross-session use rejected
 - **File freshness** — content unchanged since preview (re-read and compared)
@@ -118,7 +111,7 @@ All LSP output is treated as untrusted. Every `WorkspaceEdit` is validated at th
 
 SmartEdit delegates language intelligence to Pi-SmartRead over the `languageIntelligence` RPC channel (`@rhinos0608/pi-workspace-protocol`).
 
-- **Operations**: `renamePreview`, `organizeImports`, `formatting`, `codeAction` — each with a dedicated `request*` function in `src/lsp/lsp-smartread-client.ts` (per-call `timeoutMs`, default 15 s transport vs 10 s provider service budget).
+- **Operations**: `renamePreview`, `formatting`, `codeAction` — via `requestRenamePreview` / `requestFormatting` / `requestCodeAction` in `src/lsp/lsp-smartread-client.ts` (per-call `timeoutMs`, default 15 s transport vs 10 s provider service budget). Code-action resolution uses `resolveCodeAction` with an explicit `selection: { actionId, sourceSha256 }`; replies are SmartEdit-staged proposals (`{ok:true, proposalId, files, diff}`) validated fail-closed — raw `workspaceEdit` payloads are rejected and discovery candidates are never auto-picked.
 - **Lazy capability probe**: first refactor call probes SmartRead with a 250 ms timeout to detect availability; result is cached per session.
 - **Sticky mode selection**: the probe outcome pins the session to `remote` (RPC) or `standalone` mode; no flapping between calls.
 - **Timeout alignment**: client budget 15 s vs provider budget 10 s, so provider timeouts surface as structured errors before the client races.

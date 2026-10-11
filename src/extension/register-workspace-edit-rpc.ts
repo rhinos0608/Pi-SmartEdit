@@ -1,3 +1,4 @@
+import { realpathSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
@@ -10,7 +11,9 @@ import {
   type ApplyStagedEditResponse,
   type LspWorkspaceEdit,
   type RequestEvent,
+  type StageWorkspaceEditRequest,
   type StageWorkspaceEditResponse,
+  type StageWorkspaceEditSource,
 } from "@rhinos0608/pi-workspace-protocol";
 
 import { generateDiffString } from "../core/edit-diff.js";
@@ -25,6 +28,11 @@ import {
   handleApplyRefactorPreview,
 } from "../patch/refactor-preview.js";
 import { checkEditSafety } from "../safety/approval-gating.js";
+import {
+  verifySourceOriginDocument,
+  verifyExactOriginBytes,
+  readBoundedOriginFile,
+} from "../patch/source-origin.js";
 import { buildPatchToolDeps } from "./patch-deps.js";
 import { parsePostEditDiff, refreshReadCacheAfterEdit } from "./post-lanes.js";
 import { buildMutationEvidence, type SessionState } from "./session.js";
@@ -67,6 +75,18 @@ export async function stageWorkspaceEdit(args: {
   const v = validateStageWorkspaceEditRequest(payload);
   if (!v.ok) return { ok: false, reason: `invalid stage request: ${v.error}` };
   const req = v.value;
+
+  // Snapshot validated origin/source BEFORE first await: detached immutable snapshot
+  const snapshotOriginDoc = Object.freeze({
+    canonicalPath: req.source.document.canonicalPath,
+    sha256: req.source.document.sha256,
+  });
+  const snapshotSource: StageWorkspaceEditSource = Object.freeze({
+    operation: req.source.operation,
+    document: snapshotOriginDoc,
+    ...(req.source.serverDescriptorId !== undefined ? { serverDescriptorId: req.source.serverDescriptorId } : {}),
+  });
+
   if (!sessionMatches(deps, req.sessionFilePath)) {
     return { ok: false, reason: "rejected: session mismatch — proposal belongs to another session" };
   }
@@ -75,7 +95,10 @@ export async function stageWorkspaceEdit(args: {
   }
   const enc = checkWorkspaceEditEncoding(req.workspaceEdit);
   if (enc) return { ok: false, reason: enc };
-  const stored = await planAndStoreStagedEdit(deps, req);
+  const stored = await planAndStoreStagedEdit(deps, {
+    workspaceEdit: req.workspaceEdit,
+    source: snapshotSource,
+  });
   if ("reason" in stored) return { ok: false, reason: stored.reason };
   return {
     ok: true,
@@ -89,16 +112,60 @@ type StagedPlan = Awaited<ReturnType<typeof planPositionalEdits>>;
 
 async function planAndStoreStagedEdit(
   deps: PatchToolDeps,
-  req: { workspaceEdit: unknown; source: { operation: string; serverDescriptorId?: string } },
+  req: { workspaceEdit: unknown; source: StageWorkspaceEditSource },
 ): Promise<{ planned: StagedPlan; previewId: string } | { reason: string }> {
+  const originDoc = req.source.document;
+
+  // 1. Initial verification of origin document (canonical realpath, regular file, size, fatal UTF-8, expected sha256)
+  const initialOriginCheck = await verifySourceOriginDocument(originDoc);
+  if (!initialOriginCheck.ok) {
+    return { reason: initialOriginCheck.reason };
+  }
+
+  // 2. Exact-bytes interceptor for planner
+  let originReadBytes: Buffer | null = null;
+  let originReadError: string | null = null;
+
+  const plannerReader = async (p: string): Promise<string> => {
+    let isOrigin = false;
+    try {
+      if (realpathSync(p) === originDoc.canonicalPath) {
+        isOrigin = true;
+      }
+    } catch {
+      if (p === originDoc.canonicalPath) isOrigin = true;
+    }
+
+    if (isOrigin) {
+      const readResult = await readBoundedOriginFile(originDoc);
+      if (!readResult.ok) {
+        originReadError = readResult.reason;
+        throw new Error(originReadError);
+      }
+      originReadBytes = readResult.bytes;
+      return readResult.content;
+    }
+
+    return (await readFile(p)).toString("utf-8");
+  };
+
   let planned: StagedPlan;
   try {
-    planned = await planPositionalEdits(req.workspaceEdit as LspWorkspaceEdit, async (p) =>
-      (await readFile(p)).toString("utf-8"),
-    );
+    planned = await planPositionalEdits(req.workspaceEdit as LspWorkspaceEdit, plannerReader);
   } catch (err) {
+    if (originReadError) return { reason: originReadError };
     return { reason: err instanceof Error ? err.message : String(err) };
   }
+  if (originReadError) return { reason: originReadError };
+
+  // 3. Verify exact planner bytes read for origin document
+  if (originReadBytes) {
+    const exactCheck = verifyExactOriginBytes(originDoc, originReadBytes);
+    if (!exactCheck.ok) {
+      return { reason: exactCheck.reason };
+    }
+  }
+
   const capsErr = checkPlannedPreviewCaps(planned);
   if (capsErr) return { reason: capsErr };
   // Fail closed before disclosing anything: staging reads the files and
@@ -110,11 +177,20 @@ async function planAndStoreStagedEdit(
   }
   const binding = sessionBinding(deps);
   if (!binding) return { reason: "rejected: no active session" };
+
+  // 4. Publication recheck: immediately before caching/publication, recheck actual
+  // origin on disk to ensure it was not mutated after planner read
+  const publicationCheck = await verifySourceOriginDocument(originDoc);
+  if (!publicationCheck.ok) {
+    return { reason: publicationCheck.reason };
+  }
+
   const previewId = globalRefactorPreviewCache.store(req.workspaceEdit as never, planned as never, {
-    source: { kind: "workspace-edit", operation: req.source.operation },
+    source: { kind: "workspace-edit", operation: req.source.operation, document: originDoc },
     ...(req.source.serverDescriptorId !== undefined ? { serverDescriptorId: req.source.serverDescriptorId } : {}),
     sessionId: binding.sessionId,
     sessionRoot: binding.sessionRoot,
+    originDocument: originDoc,
   });
   return { planned, previewId };
 }

@@ -45,7 +45,7 @@ Default `SMART_EDIT_APPROVAL_LEVEL` is `prompt_on_dangerous` (not `never_prompt`
 `src/core/hashline-edit.ts:1329-1330` validates that every line in the anchor range has a corresponding entry before returning reconstructed text. If the anchor coverage is incomplete, return `null` (fuzzy fallback). Identical pattern at line 1357 in `reconstructOldTextByLine`. New anchor-reconstruction functions must follow the same completeness-check pattern.
 
 ### RefactorPreviewCache — generalized preview store
-`src/lsp/refactor-preview-cache.ts` is generalized across all four refactor kinds via `RefactorPreviewKind` / `RefactorPreviewSource` discriminants (rename, organize-imports, formatting, code-action) — no rename-only naming, no sentinel values. `previewId` is SmartEdit-owned (`crypto.randomUUID()`); there is no cross-repo lease. Entries carry session binding (`sessionId`/`sessionRoot`), 5-minute TTL, max 16 with oldest-evicted-first.
+`src/lsp/refactor-preview-cache.ts` is generalized across the refactor kinds via `RefactorPreviewKind` / `RefactorPreviewSource` discriminants (rename, formatting, code-action; organize-imports removed under D-81) — no rename-only naming, no sentinel values. `previewId` is SmartEdit-owned (`crypto.randomUUID()`); there is no cross-repo lease. Entries carry session binding (`sessionId`/`sessionRoot`), 5-minute TTL, max 16 with oldest-evicted-first.
 
 ### Timeout budgets are per call
 `timeoutMs` is sent per RPC call (protocol v0.6.0 envelope): refactor RPCs default to 15 s transport against a 10 s provider service budget; post-edit diagnostics sends a 4 s service budget with a 5 s transport timeout. No shared hardwired client timeout.

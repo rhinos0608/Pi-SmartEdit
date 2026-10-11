@@ -124,7 +124,7 @@ export {
 
 // ── Refactor preview (shared kernel: ./patch/refactor-preview.js) ──
 // Workspace-edit staging (checkWorkspaceEditEncoding +
-// planPositionalEdits + storeRefactorPreview) plus apply-preview
+// planPositionalEdits in the workspace-edit RPC server) plus apply-preview
 // (handleApplyRefactorPreview) live in the shared kernel. The edit tool no
 // longer exposes a refactor path; the workspace-edit RPC server
 // (./extension/register-workspace-edit-rpc.js) is the only caller.

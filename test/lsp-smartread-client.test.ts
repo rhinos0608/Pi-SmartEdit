@@ -276,8 +276,8 @@ describe("SmartRead diagnostics client", () => {
   });
 });
 
-describe("refactor RPC clients", () => {
-  it("requestOrganizeImports sends correct RPC", async () => {
+describe("refactor RPC clients (D-81 staged proposals)", () => {
+  it("requestRenamePreview sends correct RPC and consumes a staged proposal", async () => {
     const bus = makeBus();
     let seenRpc: string | null = null;
     let seenPayload: unknown = null;
@@ -287,17 +287,38 @@ describe("refactor RPC clients", () => {
       handler: async (req) => {
         seenRpc = req.rpc;
         seenPayload = req.payload;
-        return { ok: true, workspaceEdit: { fileEdits: [{ filePath: "/a.ts", edits: [] }] } };
+        return { ok: true, proposalId: "p-rename", files: ["/a.ts"], diff: "-x\n+y\n" };
       },
     });
-    const { requestOrganizeImports } = await import("../src/lsp/lsp-smartread-client.js");
-    const resp = await requestOrganizeImports(bus as never, { filePath: "/a.ts" });
-    assert.equal(seenRpc, LANGUAGE_INTELLIGENCE_RPC_METHODS.organizeImports);
-    assert.deepEqual(seenPayload, { filePath: "/a.ts" });
+    const { requestRenamePreview } = await import("../src/lsp/lsp-smartread-client.js");
+    const resp = await requestRenamePreview(bus as never, { filePath: "/a.ts", line: 0, character: 0, newName: "b" });
+    assert.equal(seenRpc, LANGUAGE_INTELLIGENCE_RPC_METHODS.renamePreview);
+    assert.deepEqual(seenPayload, { filePath: "/a.ts", line: 0, character: 0, newName: "b" });
     assert.equal(resp.ok, true);
+    assert.equal("proposalId" in resp && resp.proposalId, "p-rename");
+    assert.equal("workspaceEdit" in resp, false, "staged proposal must not carry a workspaceEdit");
     srv.dispose();
   });
-  it("requestFormatting sends correct RPC", async () => {
+  it("requestRenamePreview rejects a workspaceEdit reply", async () => {
+    const bus = makeBus();
+    const srv = createRpcServer({
+      bus,
+      channel: RPC_CHANNELS.languageIntelligence,
+      handler: async (req) => {
+        if (req.rpc === LANGUAGE_INTELLIGENCE_RPC_METHODS.renamePreview) {
+          return { ok: true, proposalId: "p-1", files: ["/a.ts"], diff: "d", workspaceEdit: { fileEdits: [] } };
+        }
+        throw new Error("unknown");
+      },
+    });
+    const { requestRenamePreview } = await import("../src/lsp/lsp-smartread-client.js");
+    await assert.rejects(
+      requestRenamePreview(bus as never, { filePath: "/a.ts", line: 0, character: 0, newName: "b" }),
+      /unknown field|workspaceEdit/i,
+    );
+    srv.dispose();
+  });
+  it("requestFormatting sends correct RPC and consumes a staged proposal", async () => {
     const bus = makeBus();
     let seenRpc: string | null = null;
     let seenPayload: unknown = null;
@@ -307,7 +328,7 @@ describe("refactor RPC clients", () => {
       handler: async (req) => {
         seenRpc = req.rpc;
         seenPayload = req.payload;
-        return { ok: true, workspaceEdit: { fileEdits: [{ filePath: "/a.ts", edits: [] }] } };
+        return { ok: true, proposalId: "p-fmt", files: ["/a.ts"], diff: "-x\n+y\n" };
       },
     });
     const { requestFormatting } = await import("../src/lsp/lsp-smartread-client.js");
@@ -315,9 +336,10 @@ describe("refactor RPC clients", () => {
     assert.equal(seenRpc, LANGUAGE_INTELLIGENCE_RPC_METHODS.formatting);
     assert.deepEqual(seenPayload, { filePath: "/a.ts", tabSize: 4, insertSpaces: true });
     assert.equal(resp.ok, true);
+    assert.equal("proposalId" in resp && resp.proposalId, "p-fmt");
     srv.dispose();
   });
-  it("requestCodeAction sends correct RPC", async () => {
+  it("requestCodeAction discovery returns edit-free candidates", async () => {
     const bus = makeBus();
     let seenRpc: string | null = null;
     let seenPayload: unknown = null;
@@ -327,7 +349,7 @@ describe("refactor RPC clients", () => {
       handler: async (req) => {
         seenRpc = req.rpc;
         seenPayload = req.payload;
-        return { ok: true, actions: [{ title: "fix", workspaceEdit: { fileEdits: [{ filePath: "/a.ts", edits: [] }] } }] };
+        return { ok: true, actions: [{ title: "fix", actionId: "a".repeat(64), sourceSha256: "b".repeat(64) }] };
       },
     });
     const { requestCodeAction } = await import("../src/lsp/lsp-smartread-client.js");
@@ -335,6 +357,76 @@ describe("refactor RPC clients", () => {
     assert.equal(seenRpc, LANGUAGE_INTELLIGENCE_RPC_METHODS.codeAction);
     assert.deepEqual(seenPayload, { filePath: "/a.ts", line: 1, character: 2, only: ["quickfix"] });
     assert.equal(resp.ok, true);
+    assert.ok("actions" in resp);
     srv.dispose();
+  });
+  it("requestCodeAction rejects discovery candidates carrying edits", async () => {
+    const bus = makeBus();
+    const srv = createRpcServer({
+      bus,
+      channel: RPC_CHANNELS.languageIntelligence,
+      handler: async (req) => {
+        if (req.rpc === LANGUAGE_INTELLIGENCE_RPC_METHODS.codeAction) {
+          return { ok: true, actions: [{ title: "fix", actionId: "a".repeat(64), sourceSha256: "b".repeat(64), workspaceEdit: { fileEdits: [] } }] };
+        }
+        throw new Error("unknown");
+      },
+    });
+    const { requestCodeAction } = await import("../src/lsp/lsp-smartread-client.js");
+    await assert.rejects(
+      requestCodeAction(bus as never, { filePath: "/a.ts", line: 1, character: 2 }),
+      /unknown field|workspaceEdit|edit/i,
+    );
+    srv.dispose();
+  });
+  it("requestCodeAction refuses to auto-pick: proposal without selection is rejected", async () => {
+    const bus = makeBus();
+    const srv = createRpcServer({
+      bus,
+      channel: RPC_CHANNELS.languageIntelligence,
+      handler: async (req) => {
+        if (req.rpc === LANGUAGE_INTELLIGENCE_RPC_METHODS.codeAction) {
+          return { ok: true, proposalId: "p-auto", files: ["/a.ts"], diff: "d" };
+        }
+        throw new Error("unknown");
+      },
+    });
+    const { requestCodeAction } = await import("../src/lsp/lsp-smartread-client.js");
+    await assert.rejects(
+      requestCodeAction(bus as never, { filePath: "/a.ts", line: 1, character: 2 }),
+      /without an explicit selection|auto-pick/i,
+    );
+    srv.dispose();
+  });
+  it("resolveCodeAction requires an explicit selection and returns the staged proposal", async () => {
+    const bus = makeBus();
+    const srv = createRpcServer({
+      bus,
+      channel: RPC_CHANNELS.languageIntelligence,
+      handler: async (req) => {
+        if (req.rpc === LANGUAGE_INTELLIGENCE_RPC_METHODS.codeAction) {
+          return { ok: true, proposalId: "p-res", files: ["/a.ts"], diff: "-x\n+y\n" };
+        }
+        throw new Error("unknown");
+      },
+    });
+    const { resolveCodeAction } = await import("../src/lsp/lsp-smartread-client.js");
+    await assert.rejects(
+      (resolveCodeAction as (b: unknown, r: unknown) => Promise<unknown>)(bus as never, { filePath: "/a.ts", line: 1, character: 2 }),
+      /selection/,
+    );
+    const resp = await resolveCodeAction(bus as never, {
+      filePath: "/a.ts",
+      line: 1,
+      character: 2,
+      selection: { actionId: "a".repeat(64), sourceSha256: "b".repeat(64) },
+    });
+    assert.equal(resp.ok, true);
+    assert.equal("proposalId" in resp && resp.proposalId, "p-res");
+    srv.dispose();
+  });
+  it("organize-imports client is removed", async () => {
+    const m = (await import("../src/lsp/lsp-smartread-client.js")) as unknown as Record<string, unknown>;
+    assert.equal(m.requestOrganizeImports, undefined);
   });
 });
