@@ -94,6 +94,7 @@ test("refuses bytes from an opened inode after canonical pathname is atomically 
   let readBytes = 0;
   let closeCount = 0;
   let closeFdAfter = -1;
+  let renameError: unknown;
   const io: OriginFileIo = {
     realpath: (candidate) => realpathSync(candidate),
     stat: (candidate) => statSync(candidate),
@@ -105,7 +106,19 @@ test("refuses bytes from an opened inode after canonical pathname is atomically 
       const originalClose = handle.close.bind(handle);
       const openedStat = await originalStat();
       openedIdentity = { dev: openedStat.dev, ino: openedStat.ino };
-      await rename(replacement, path);
+      try {
+        await rename(replacement, path);
+      } catch (err) {
+        // The adapter cannot return a handle when the fixture rename is denied, so close the real descriptor here before rethrowing.
+        renameError = err;
+        try {
+          await originalClose();
+        } finally {
+          closeCount++;
+          closeFdAfter = handle.fd;
+        }
+        throw err;
+      }
       const current = await fsOpen(path, "r");
       try {
         const currentStat = await current.stat();
@@ -132,6 +145,19 @@ test("refuses bytes from an opened inode after canonical pathname is atomically 
   };
 
   const result = await readBoundedOriginFileWithIo({ canonicalPath, sha256: digest(h0) }, io);
+  if (process.platform === "win32" && renameError !== undefined) {
+    // Windows CI 38129042051 observed EPERM replacing a pathname while its target is open;
+    // the shared probe above cannot enact the rebound, so assert refusal, zero bytes, and cleanup here.
+    assert.ok(openedIdentity !== undefined, "first open of the valid H0 file must succeed; failure here is a product regression, not fixture denial");
+    assert.equal((renameError as NodeJS.ErrnoException | undefined)?.code, "EPERM", "atomic replace of the opened pathname was denied");
+    assert.equal(result.ok, false, "denied fixture must still refuse to authorize bytes");
+    assert.match(result.reason, /open failed \(EPERM\)/);
+    assert.equal(readBytes, 0, "zero bytes authorized when the open was denied");
+    assert.equal(closeCount, 1, "actually-opened descriptor was cleaned up exactly once");
+    assert.equal(closeFdAfter, -1, "actually-opened descriptor fd is -1 after cleanup");
+    assert.equal(openedHandle?.fd, -1);
+    return;
+  }
   assert.equal(readBytes, h0.length, `captured bytes came from actual opened H0 descriptor: ${JSON.stringify(result)}`);
   assert.notDeepEqual(openedIdentity, namedIdentity, "opened FD and current pathname have different dev/ino");
   assert.equal(closeCount, 1, "opened actual descriptor was closed exactly once");
